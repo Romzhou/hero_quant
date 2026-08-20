@@ -115,7 +115,19 @@ class MarketDataRegistry:
             return None
         return None
 
-    def _cross_source_check(self, symbol: str, bars, prov=None, interval="1d", start="2026-08-01", end="2026-08-19") -> None:
+    @staticmethod
+    def _infer_loader_source(loader) -> str:
+        cls_name = loader.__class__.__name__.lower()
+        if "tencent" in cls_name:
+            return "tencent"
+        elif "yahoo" in cls_name:
+            return "yahoo"
+        elif "akshare" in cls_name:
+            return "akshare"
+        else:
+            return getattr(loader, "source", getattr(loader, "name", cls_name))
+
+    def _cross_source_check(self, symbol: str, bars, prov=None, interval="1d", start=None, end=None) -> None:
         """Cross-source 1% block.
 
         Two modes:
@@ -135,16 +147,16 @@ class MarketDataRegistry:
                     return
                 ref_close = self._first_close(bars)
                 other_close = self._first_close(other_bars)
-                if ref_close and other_close and ref_close != 0:
+                if ref_close not in (None, 0) and other_close not in (None, 0):
                     diff = abs(ref_close - other_close) / abs(ref_close)
                     if diff > 0.01:
                         raise CrossSourceError(
                             f"cross-source 1% check failed for {symbol}: {ref_close:.2f} vs {other_close:.2f} diff={diff*100:.2f}%"
                         )
                 return
-        if prov and getattr(prov, "source", None) not in VALID_SOURCES:
-            pass
         if len(self._loaders) < 2 or self._bars_empty(bars):
+            return
+        if start is None or end is None:
             return
         # Determine primary close reference
         try:
@@ -156,16 +168,7 @@ class MarketDataRegistry:
         # infer current source to skip self
         current_source = getattr(prov, "source", "") if prov else ""
         for loader in self._loaders:
-            # infer loader source
-            cls_name = loader.__class__.__name__.lower()
-            if "tencent" in cls_name:
-                loader_source = "tencent"
-            elif "yahoo" in cls_name:
-                loader_source = "yahoo"
-            elif "akshare" in cls_name:
-                loader_source = "akshare"
-            else:
-                loader_source = getattr(loader, "source", getattr(loader, "name", cls_name))
+            loader_source = self._infer_loader_source(loader)
             if loader_source == current_source:
                 continue
             markets = getattr(loader, "markets", [])
@@ -183,7 +186,7 @@ class MarketDataRegistry:
                 continue
             try:
                 other_close = self._first_close(other_bars)
-                if ref_close and other_close and ref_close != 0:
+                if ref_close not in (None, 0) and other_close not in (None, 0):
                     diff = abs(ref_close - other_close) / abs(ref_close)
                     if diff > 0.01:
                         raise CrossSourceError(
@@ -234,16 +237,7 @@ class MarketDataRegistry:
             else:
                 bars = result
                 unit = getattr(loader, "unit", "shares")
-                # infer source from loader class name
-                cls_name = loader.__class__.__name__.lower()
-                if "tencent" in cls_name:
-                    source = "tencent"
-                elif "yahoo" in cls_name:
-                    source = "yahoo"
-                elif "akshare" in cls_name:
-                    source = "akshare"
-                else:
-                    source = getattr(loader, "source", getattr(loader, "name", cls_name))
+                source = self._infer_loader_source(loader)
                 prov = Provenance(source=source, unit=unit, symbol=symbol)
             if self._bars_empty(bars):
                 continue
