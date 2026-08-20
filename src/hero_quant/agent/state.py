@@ -15,6 +15,7 @@ def _add_messages(left: List[Dict[str, Any]], right: List[Dict[str, Any]]) -> Li
 
 
 def _add_list(left: List[Any], right: List[Any]) -> List[Any]:
+    """Generic list reducer — append."""
     if not isinstance(left, list):
         left = [left] if left else []
     if not isinstance(right, list):
@@ -23,7 +24,16 @@ def _add_list(left: List[Any], right: List[Any]) -> List[Any]:
 
 
 class State(TypedDict, total=False):
-    """Research team state — plan→execute→verify."""
+    """Research team state — plan -> execute -> verify.
+
+    Fields:
+        messages: chat history with additive reducer
+        delegation_depth: current delegation depth (budget 5)
+        plan: plan text from plan node
+        intermediate_results: results from parallel subagents
+        verification: verification output
+        subagent_outputs: outputs from leaf subagents (parallel placeholder)
+    """
 
     messages: Annotated[List[Dict[str, Any]], _add_messages]
     delegation_depth: int
