@@ -1,11 +1,12 @@
 """TraceWriter: 崩溃安全的 JSONL trace writer（加固版）.
 
-加固版特性（Wave A2）：
+加固版特性（Wave A2+A7）：
 - 统一阈值: TOOL_RESULT_OFFLOAD=50000 TEXT_OFFLOAD=50000 PREVIEW=500 支持 HERO_TRACE_* env
 - 构造函数兼容 dir_path 与 file path 两种签名；支持 sidecar_threshold / hard_threshold 别名
 - 侧车持久化: tmp(pid).txt → fsync → link(tmp,final) EEXIST 不覆盖 → fsync(dir)
 - read(resolve_offloads) 回灌能力 + _safe_sidecar_path allowlist
 - 对 tool_result 大 content 以 result_path + preview 落盘，通用大记录以 sidecar 引用落盘
+- FC 格式化（Wave A7）：模型侧截断由 config/limits TOOL_RESULT_LIMIT=10000 + tools/redaction choke 负责，trace 侧车保持 50k 分流（result_path+preview）
 - 保持对旧测试（sidecar_threshold=50 + trace.jsonl 文件路径）的完全兼容
 
 参考 vibe-trading agent/src/agent/trace.py 的崩溃安全设计。
