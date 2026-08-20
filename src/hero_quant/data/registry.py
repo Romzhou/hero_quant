@@ -1,10 +1,19 @@
 from dataclasses import dataclass, field
 import time
 import logging
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from hero_quant.data.trait import SourceTrait
 
 logger = logging.getLogger(__name__)
 
-# 16-source table placeholder (CN保真 + US + Crypto + synthetic)
+# VALID_SOURCES：全量 16 源白名单（契约表），用于审计、Provenance 校验与文档
+# _traits：   Trait 注册表 dict[str, type[SourceTrait]]，按 name 索引的类/协议实现（轻量 Trait 边界）
+# _loaders：  实例注册表 list[loader实例]，按 markets 分发的运行态 fallback 链
+# 关系：VALID_SOURCES 是契约枚举；_traits 是 Trait 类型注册；_loaders 是实例路由
+#       三者保持一致：任一 loader 的 name/source 必在 VALID_SOURCES，且应在 _traits 有注册
+#       未来可合一为单一 Registry，但现阶段保留双轨以兼容实例级 get_bars 调度
 VALID_SOURCES = [
     "tencent",
     "synthetic",
@@ -35,14 +44,16 @@ class MarketDataRegistry:
     VALID_SOURCES = VALID_SOURCES
 
     def __init__(self):
-        self._loaders = []
-        self._traits: dict = {}
+        self._loaders: list = []
+        self._traits: dict[str, type["SourceTrait"]] = {}
         self.audit_log: list[dict] = []
 
-    def register_trait(self, name: str, trait_cls):
+    def register_trait(self, name: str, trait_cls: type["SourceTrait"]) -> None:
+        if name in self._traits:
+            raise ValueError(f"trait already registered: {name}")
         self._traits[name] = trait_cls
 
-    def list_sources(self):
+    def list_sources(self) -> list[str]:
         return list(self._traits.keys())
 
     def register(self, loader):
@@ -67,6 +78,38 @@ class MarketDataRegistry:
             return suffix
         return "UNKNOWN"
 
+    @staticmethod
+    def _bars_empty(bars) -> bool:
+        if bars is None:
+            return True
+        try:
+            if hasattr(bars, "empty"):
+                return bool(bars.empty)  # DataFrame
+            return len(bars) == 0
+        except Exception:
+            return not bool(bars)
+
+    @staticmethod
+    def _first_close(bars) -> float | None:
+        try:
+            # DataFrame path
+            if hasattr(bars, "iloc"):
+                if hasattr(bars, "empty") and bars.empty:
+                    return None
+                try:
+                    # column close
+                    if "close" in bars.columns:
+                        return float(bars.iloc[0]["close"])
+                    # fallback first numeric
+                    return float(bars.iloc[0].iloc[0])
+                except Exception:
+                    return None
+            for b in bars[:1]:
+                return float(b.get("close", 0) if isinstance(b, dict) else 0)
+        except Exception:
+            return None
+        return None
+
     def _cross_source_check(self, symbol: str, bars, prov, interval="1d", start="2026-08-01", end="2026-08-19") -> None:
         """Cross-source 1% regression placeholder.
 
@@ -75,13 +118,11 @@ class MarketDataRegistry:
         """
         if prov and getattr(prov, "source", None) not in VALID_SOURCES:
             pass
-        if len(self._loaders) < 2 or not bars:
+        if len(self._loaders) < 2 or self._bars_empty(bars):
             return
         # Determine primary close reference
         try:
-            ref_close = None
-            for b in bars[:1]:
-                ref_close = float(b.get("close", 0) if isinstance(b, dict) else 0)
+            ref_close = self._first_close(bars)
             if not ref_close:
                 return
         except Exception:
@@ -95,8 +136,10 @@ class MarketDataRegistry:
                 loader_source = "tencent"
             elif "yahoo" in cls_name:
                 loader_source = "yahoo"
+            elif "akshare" in cls_name:
+                loader_source = "akshare"
             else:
-                loader_source = getattr(loader, "source", cls_name)
+                loader_source = getattr(loader, "source", getattr(loader, "name", cls_name))
             if loader_source == current_source:
                 continue
             markets = getattr(loader, "markets", [])
@@ -110,10 +153,10 @@ class MarketDataRegistry:
             if result is None:
                 continue
             other_bars = result[0] if isinstance(result, tuple) and len(result)==2 else result
-            if not other_bars or len(other_bars)==0:
+            if self._bars_empty(other_bars):
                 continue
             try:
-                other_close = float(other_bars[0].get("close",0) if isinstance(other_bars[0], dict) else 0)
+                other_close = self._first_close(other_bars)
                 if ref_close and other_close:
                     diff = abs(ref_close - other_close) / ref_close
                     if diff > 0.01:
@@ -163,10 +206,12 @@ class MarketDataRegistry:
                     source = "tencent"
                 elif "yahoo" in cls_name:
                     source = "yahoo"
+                elif "akshare" in cls_name:
+                    source = "akshare"
                 else:
-                    source = getattr(loader, "source", cls_name)
+                    source = getattr(loader, "source", getattr(loader, "name", cls_name))
                 prov = Provenance(source=source, unit=unit, symbol=symbol)
-            if not bars or len(bars) == 0:
+            if self._bars_empty(bars):
                 continue
             # ensure provenance has required fields
             if not getattr(prov, "source", None):
