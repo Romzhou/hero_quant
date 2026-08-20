@@ -6,7 +6,10 @@ class YahooLoader:
     markets = ["US"]
     unit = "shares"
 
-    def get_bars(self, symbol, interval, start, end):
+    def get_bars(self, symbol, start, end, interval="1d"):
+        _intervals = {"1d", "1m", "5m", "15m", "30m", "1h", "1wk", "1mo", "1D", "1W"}
+        if start in _intervals and "-" in end and "-" in interval:
+            start, end, interval = end, interval, start
         # lazy import yfinance
         try:
             import yfinance as yf

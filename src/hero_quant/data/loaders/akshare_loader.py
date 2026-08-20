@@ -2,8 +2,6 @@
 
 from datetime import datetime, timedelta
 import logging
-import random
-import time
 from typing import Any
 
 import pandas as pd
@@ -132,40 +130,6 @@ class AKShareLoader:
         df = df[cols]
         return df
 
-    def _parse_args(
-        self, args: tuple, kwargs: dict
-    ) -> tuple[str, str, str]:
-        """Support both (symbol, start, end, interval) and registry (symbol, interval, start, end)."""
-        start = kwargs.get("start")
-        end = kwargs.get("end")
-        interval = kwargs.get("interval", "1d")
-        intervals = {"1d", "1m", "5m", "15m", "30m", "1h", "1wk", "1mo", "1D", "1W"}
-        if args:
-            if len(args) == 2:
-                # (start, end)
-                if start is None:
-                    start = args[0]
-                if end is None:
-                    end = args[1]
-            elif len(args) == 3:
-                a0, a1, a2 = args[0], args[1], args[2]
-                # detect registry order: (interval, start, end)
-                if a0 in intervals or (isinstance(a0, str) and a0.endswith(("d", "m", "h")) and "-" not in a0 and len(a0) <= 4):
-                    interval, start, end = a0, a1, a2
-                else:
-                    # (start, end, interval)
-                    start, end, interval = a0, a1, a2
-            elif len(args) >= 1 and start is None:
-                start = args[0]
-        # defaults
-        if not start:
-            start = "2025-01-01"
-        if not end:
-            end = "2025-01-10"
-        if not interval:
-            interval = "1d"
-        return str(start), str(end), str(interval)
-
     def health(self) -> dict[str, Any]:
         try:
             import akshare  # noqa: F401
@@ -176,15 +140,12 @@ class AKShareLoader:
         return {"status": "ok", "source": self.name, "akshare_available": ak_ok, "unit": self.unit, "markets": self.markets}
 
     # ------------------------------------------------------------------ #
-    def get_bars(self, symbol: str, *args, **kwargs) -> pd.DataFrame:
-        """Fetch bars — DataFrame with columns open, high, low, close, volume.
-
-        Accepts both `get_bars(symbol, start, end, interval)` (test) and
-        `get_bars(symbol, interval, start, end)` (registry).
-        """
-        start, end, interval = self._parse_args(args, kwargs)
-        # Allow symbol/start/end passed as positional without interval if caller uses named signature:
-        # get_bars("600519.SH", "2025-01-01", "2025-01-10") already parsed as start/end
+    def get_bars(self, symbol: str, start: str, end: str, interval: str = "1d") -> pd.DataFrame:
+        """Fetch bars — DataFrame with columns open, high, low, close, volume."""
+        # legacy adapter: registry old order (symbol, interval, start, end) -> trait order
+        _intervals = {"1d", "1m", "5m", "15m", "30m", "1h", "1wk", "1mo", "1D", "1W"}
+        if start in _intervals and "-" in end and "-" in interval:
+            start, end, interval = end, interval, start
 
         # HERO_DATA_MODE single gate — synthetic 直回
         try:
@@ -221,11 +182,6 @@ class AKShareLoader:
             except Exception:
                 start_n = "20250101"
                 end_n = "20250110"
-            # small jitter avoid burst
-            try:
-                time.sleep(random.random() * 0.1)
-            except Exception:
-                pass
             df_ak = None
             # primary: stock_zh_a_hist
             try:

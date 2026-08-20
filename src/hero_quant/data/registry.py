@@ -147,7 +147,7 @@ class MarketDataRegistry:
             if markets and market not in markets:
                 continue
             try:
-                result = loader.get_bars(symbol, interval, start, end)
+                result = loader.get_bars(symbol, start, end, interval)
             except Exception:
                 continue
             if result is None:
@@ -165,7 +165,11 @@ class MarketDataRegistry:
                 continue
         return
 
-    def get_bars(self, symbol, interval, start, end):
+    def get_bars(self, symbol, start, end, interval="1d"):
+        # legacy adapter: support old registry order (symbol, interval, start, end)
+        _intervals = {"1d", "1m", "5m", "15m", "30m", "1h", "1wk", "1mo", "1D", "1W"}
+        if start in _intervals and "-" in str(end) and "-" in str(interval):
+            start, end, interval = end, interval, start
         if not self._loaders:
             raise ImportError(f"pip install hero-quant[us] or [ashare] - no loader registered for {symbol}")
         market = self._detect_market(symbol)
@@ -177,7 +181,7 @@ class MarketDataRegistry:
                 last_error = ImportError(f"pip install hero-quant[us] or [ashare] for {symbol}: no loader available for market {market}")
                 continue
             try:
-                result = loader.get_bars(symbol, interval, start, end)
+                result = loader.get_bars(symbol, start, end, interval)
             except Exception as e:
                 # preserve actionable pip install message
                 if isinstance(e, ImportError) and "pip install" in str(e):
