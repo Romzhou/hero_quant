@@ -23,6 +23,8 @@ from typing import Any, Dict, List
 
 logger = logging.getLogger(__name__)
 
+import threading
+
 # 默认阈值（可被 env 或构造参数覆盖）
 DEFAULT_TOOL_RESULT_OFFLOAD = 50000
 DEFAULT_TEXT_OFFLOAD = 50000
@@ -167,6 +169,7 @@ class TraceWriter:
         self.hard_threshold = self.preview_len
 
         self._fsync_warned = False
+        self._lock = threading.RLock()
         created = not self.path.exists()
         self._file = open(self.path, "a", encoding="utf-8")
         try:
@@ -179,61 +182,67 @@ class TraceWriter:
     # -- 公共 API --
 
     def append(self, obj: Dict[str, Any]) -> None:
-        """追加一条记录，崩溃安全.
+        """追加一条记录，崩溃安全（线程安全：原子追加）.
 
         分支：
         - type == tool_result 且 content 长度 > tool_result_offload → 落 result_path + preview
         - 否则若 json dumps 长度 > text_offload → 落 sidecar 引用
         - 否则直接 inline
         """
-        # 优先处理 tool_result 大 content（Wave A2 新阈值）
-        if isinstance(obj, dict) and obj.get("type") == "tool_result" and "content" in obj:
-            content = obj["content"]
-            # 统一转为字符串度量长度（测试用 str）
-            if isinstance(content, str):
-                content_str = content
-            else:
-                # 非字符串 content 以 json 长度度量
-                try:
-                    content_str = json.dumps(content, ensure_ascii=False)
-                except Exception:
-                    content_str = str(content)
-            if len(content_str) > self.tool_result_offload:
-                digest = hashlib.sha256(content_str.encode("utf-8")).hexdigest()
-                sidecar_name = f"{digest[:16]}.txt"
+        with self._lock:
+            # 优先处理 tool_result 大 content（Wave A2 新阈值）
+            if isinstance(obj, dict) and obj.get("type") == "tool_result" and "content" in obj:
+                content = obj["content"]
+                # 统一转为字符串度量长度（测试用 str）
+                if isinstance(content, str):
+                    content_str = content
+                else:
+                    # 非字符串 content 以 json 长度度量
+                    try:
+                        content_str = json.dumps(content, ensure_ascii=False)
+                    except Exception:
+                        content_str = str(content)
+                if len(content_str) > self.tool_result_offload:
+                    digest = hashlib.sha256(content_str.encode("utf-8")).hexdigest()
+                    sidecar_name = f"{digest[:16]}.txt"
+                    sidecar_path = self.dir_path / sidecar_name
+                    if not sidecar_path.exists():
+                        self._write_sidecar_durable(sidecar_path, content_str)
+                    preview = content_str[: self.preview_len]
+                    # 保留除 content 外的所有字段，并注入 result_path/preview
+                    rec: Dict[str, Any] = {k: v for k, v in obj.items() if k != "content"}
+                    rec["result_path"] = sidecar_name
+                    rec["preview"] = preview
+                    line = json.dumps(rec, ensure_ascii=False) + "\n"
+                    self._append_line_locked(line)
+                    return
+
+            # 通用大记录侧车（兼容旧逻辑，阈值使用 text_offload）
+            raw = json.dumps(obj, ensure_ascii=False)
+            if len(raw) > self.text_offload:
+                digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+                sidecar_name = f"{digest[:16]}.json"
                 sidecar_path = self.dir_path / sidecar_name
                 if not sidecar_path.exists():
-                    self._write_sidecar_durable(sidecar_path, content_str)
-                preview = content_str[: self.preview_len]
-                # 保留除 content 外的所有字段，并注入 result_path/preview
-                rec: Dict[str, Any] = {k: v for k, v in obj.items() if k != "content"}
-                rec["result_path"] = sidecar_name
-                rec["preview"] = preview
+                    self._write_sidecar_durable(sidecar_path, raw)
+                try:
+                    rel = sidecar_path.relative_to(self.dir_path)
+                    rel_str = rel.as_posix()
+                except ValueError:
+                    rel_str = sidecar_name
+                rec = {"sidecar": rel_str}
                 line = json.dumps(rec, ensure_ascii=False) + "\n"
-                self._append_line(line)
-                return
+            else:
+                line = raw + "\n"
 
-        # 通用大记录侧车（兼容旧逻辑，阈值使用 text_offload）
-        raw = json.dumps(obj, ensure_ascii=False)
-        if len(raw) > self.text_offload:
-            digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
-            sidecar_name = f"{digest[:16]}.json"
-            sidecar_path = self.dir_path / sidecar_name
-            if not sidecar_path.exists():
-                self._write_sidecar_durable(sidecar_path, raw)
-            try:
-                rel = sidecar_path.relative_to(self.dir_path)
-                rel_str = rel.as_posix()
-            except ValueError:
-                rel_str = sidecar_name
-            rec = {"sidecar": rel_str}
-            line = json.dumps(rec, ensure_ascii=False) + "\n"
-        else:
-            line = raw + "\n"
-
-        self._append_line(line)
+            self._append_line_locked(line)
 
     def _append_line(self, line: str) -> None:
+        # Public wrapper holds lock for single-thread callers
+        with self._lock:
+            self._append_line_locked(line)
+
+    def _append_line_locked(self, line: str) -> None:
         self._file.write(line)
         self._file.flush()
         try:
@@ -242,11 +251,12 @@ class TraceWriter:
             self._warn_fsync_failure(exc, self.path)
 
     def close(self) -> None:
-        """关闭文件句柄."""
-        try:
-            self._file.close()
-        except Exception:
-            pass
+        """关闭文件句柄（线程安全）."""
+        with self._lock:
+            try:
+                self._file.close()
+            except Exception:
+                pass
 
     def __enter__(self) -> "TraceWriter":
         return self
@@ -311,70 +321,71 @@ class TraceWriter:
     # -- 崩溃安全内部方法 --
 
     def _write_sidecar_durable(self, path: Path, value: str) -> None:
-        """原子且尽量持久地写入 sidecar 文件.
+        """原子且尽量持久地写入 sidecar 文件（线程安全）.
 
         顺序: tmp 写全量 → fsync → link(tmp, final) EEXIST 不覆盖 → fsync(dir)
         HardLink 发布保证不覆盖已存在快照；崩溃后要么没有侧车，要么是完整的。
         """
-        tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        try:
-            payload = value.encode("utf-8")
-            written = 0
-            while written < len(payload):
-                written += os.write(fd, payload[written:])
+        with self._lock:
+            tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             try:
-                os.fsync(fd)
-            except OSError as exc:
-                self._warn_fsync_failure(exc, tmp)
-        except BaseException:
-            os.close(fd)
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
-        else:
-            os.close(fd)
-        # HardLink 发布：若目标已存在则不覆盖
-        try:
-            os.link(tmp, path)
-            linked = True
-        except FileExistsError:
-            # 已存在，不覆盖，直接清理 tmp
-            linked = False
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            return
-        except OSError as exc:
-            # 跨设备或 Windows 特殊情况：回退到 replace（仅当 link 不可用）
-            # 但仍需保证不覆盖语义？若文件已存在则不再 replace
-            if path.exists():
+                payload = value.encode("utf-8")
+                written = 0
+                while written < len(payload):
+                    written += os.write(fd, payload[written:])
+                try:
+                    os.fsync(fd)
+                except OSError as exc:
+                    self._warn_fsync_failure(exc, tmp)
+            except BaseException:
+                os.close(fd)
                 try:
                     os.unlink(tmp)
                 except OSError:
                     pass
-                return
+                raise
+            else:
+                os.close(fd)
+            # HardLink 发布：若目标已存在则不覆盖
             try:
-                os.replace(tmp, path)
+                os.link(tmp, path)
                 linked = True
-            except OSError:
+            except FileExistsError:
+                # 已存在，不覆盖，直接清理 tmp
+                linked = False
                 try:
                     os.unlink(tmp)
                 except OSError:
                     pass
-                # 记录警告但不抛出，避免 trace 写入整体失败
-                self._warn_fsync_failure(exc, path)
                 return
-        # 仅在成功创建新文件后 fsync 目录并清理 tmp
-        if linked:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            self._fsync_dir(path.parent)
+            except OSError as exc:
+                # 跨设备或 Windows 特殊情况：回退到 replace（仅当 link 不可用）
+                # 但仍需保证不覆盖语义？若文件已存在则不再 replace
+                if path.exists():
+                    try:
+                        os.unlink(tmp)
+                    except OSError:
+                        pass
+                    return
+                try:
+                    os.replace(tmp, path)
+                    linked = True
+                except OSError:
+                    try:
+                        os.unlink(tmp)
+                    except OSError:
+                        pass
+                    # 记录警告但不抛出，避免 trace 写入整体失败
+                    self._warn_fsync_failure(exc, path)
+                    return
+            # 仅在成功创建新文件后 fsync 目录并清理 tmp
+            if linked:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                self._fsync_dir(path.parent)
 
     def _fsync_dir(self, directory: Path) -> None:
         """fsync 目录条目，使新建/重命名落盘."""
