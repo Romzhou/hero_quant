@@ -1,0 +1,22 @@
+name: test
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install locked dependencies (hash-checked)
+        run: pip install --require-hashes -r requirements-lock.txt
+      - name: Install CI tools
+        run: pip install pytest ruff pip-audit
+      - name: Lint with ruff
+        run: ruff check .
+      - name: Run tests
+        run: pytest -q
+      - name: Audit dependencies
+        run: pip-audit || true
+      - name: Secret scan
+        run: gitleaks detect --no-git || true

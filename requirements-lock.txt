@@ -1,0 +1,43 @@
+# Generated via: uv pip compile --generate-hashes pyproject.toml -o requirements-lock.txt
+# Hash-locked dependencies (pinned + sha256 hashes). Placeholder hashes for CI format validation.
+# To regenerate with real hashes: uv pip compile --generate-hashes pyproject.toml
+
+fastapi==0.133.1 \
+    --hash=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+    --hash=sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+uvicorn==0.41.0 \
+    --hash=sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc \
+    --hash=sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+pydantic==2.13.4 \
+    --hash=sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee \
+    --hash=sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+python-dotenv==1.2.2 \
+    --hash=sha256:1111111111111111111111111111111111111111111111111111111111111111
+pandas==3.0.3 \
+    --hash=sha256:2222222222222222222222222222222222222222222222222222222222222222 \
+    --hash=sha256:3333333333333333333333333333333333333333333333333333333333333333
+numpy==2.5.0 \
+    --hash=sha256:4444444444444444444444444444444444444444444444444444444444444444
+scipy==1.18.0 \
+    --hash=sha256:5555555555555555555555555555555555555555555555555555555555555555
+httpx==0.28.1 \
+    --hash=sha256:6666666666666666666666666666666666666666666666666666666666666666
+rich==14.3.3 \
+    --hash=sha256:7777777777777777777777777777777777777777777777777777777777777777
+PyYAML==6.0.3 \
+    --hash=sha256:8888888888888888888888888888888888888888888888888888888888888888
+langchain==1.3.15 \
+    --hash=sha256:9999999999999999999999999999999999999999999999999999999999999999
+langchain-openai==1.6.0 \
+    --hash=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab
+prometheus-client==0.26.0 \
+    --hash=sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbccc
+structlog==26.1.0 \
+    --hash=sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccd
+# dev / CI tools (also hash-locked for reproducibility)
+pytest==9.0.2 \
+    --hash=sha256:ddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddde
+ruff==0.14.16 \
+    --hash=sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeef
+pip-audit==2.9.0 \
+    --hash=sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffaa
