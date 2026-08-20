@@ -1,0 +1,52 @@
+[project]
+name = "hero-quant"
+version = "0.1.0"
+description = "真英雄量化 - 极简投研 Agent (borrowed from Vibe-Trading)"
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+license = {text = "MIT"}
+keywords = ["quant", "trading", "agent", "research", "backtest"]
+dependencies = [
+    "fastapi>=0.104",
+    "uvicorn[standard]>=0.24",
+    "pydantic>=2.0",
+    "python-dotenv>=1.0",
+    "pandas>=2.0",
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "httpx>=0.28",
+    "rich>=13.0",
+    "pyyaml>=6.0",
+    "langchain>=1.3",
+    "langchain-openai>=1.0",
+    "prometheus_client>=0.20",
+    "structlog>=24.0",
+]
+
+[project.optional-dependencies]
+ashare = ["tushare>=1.2.89", "akshare>=1.12.0"]
+us = ["yfinance>=0.2.30"]
+crypto = ["ccxt>=4.5.71"]
+dev = ["pytest>=7.0", "pytest-cov>=4.0", "ruff>=0.9", "black>=24.0"]
+
+[project.urls]
+Repository = "https://github.com/your-org/hero-quant"
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W"]
+ignore = ["E501"]
