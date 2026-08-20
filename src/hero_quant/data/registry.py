@@ -36,7 +36,14 @@ class MarketDataRegistry:
 
     def __init__(self):
         self._loaders = []
+        self._traits: dict = {}
         self.audit_log: list[dict] = []
+
+    def register_trait(self, name: str, trait_cls):
+        self._traits[name] = trait_cls
+
+    def list_sources(self):
+        return list(self._traits.keys())
 
     def register(self, loader):
         # validate loader has markets/unit/get_bars
