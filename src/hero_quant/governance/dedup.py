@@ -250,7 +250,6 @@ class DedupStore:
         try:
             # cleanup expired first: delete where updated_at < now() - ttl
             if self.ttl_seconds > 0:
-                ttl_sql = "DELETE FROM dedup WHERE key=%s AND updated_at < now() - interval '%s seconds'" % ("%s", int(self.ttl_seconds))  # placeholder handled below
                 # we skip ttl delete for now to keep SQL simple; expiry handled in SELECT
                 pass
             sql = """
@@ -316,7 +315,7 @@ class DedupStore:
             # TTL via updated_at > now() - interval
             ttl_clause = f"AND updated_at > now() - interval '{int(self.ttl_seconds)} seconds'" if self.ttl_seconds > 0 else ""
             sql = f"SELECT key, tool, status, result, updated_at FROM dedup WHERE key=%s {ttl_clause}"
-            sql2 = f"SELECT idempotency_key, status, tool, result, error, created_at, updated_at FROM tool_call_dedup WHERE idempotency_key=%s"
+            sql2 = "SELECT idempotency_key, status, tool, result, error, created_at, updated_at FROM tool_call_dedup WHERE idempotency_key=%s"
             row = None
             if hasattr(self.pool, "connection"):
                 with self.pool.connection() as conn:  # type: ignore

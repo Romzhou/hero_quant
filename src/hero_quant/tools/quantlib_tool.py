@@ -108,8 +108,8 @@ def compute_indicator(
             else:
                 mid = s.rolling(n).mean()
                 std = s.rolling(n).std()
-                upper = mid + 2 * std
-                lower = mid - 2 * std
+                _upper = mid + 2 * std
+                _lower = mid - 2 * std
                 values = [float(x) if pd.notna(x) else 0.0 for x in mid.tolist()]
         elif ind in ("macd",):
             if macd is not None:

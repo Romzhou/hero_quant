@@ -18,12 +18,11 @@ import hashlib
 import json
 import logging
 import os
+import threading
 from pathlib import Path
 from typing import Any, Dict, List
 
 logger = logging.getLogger(__name__)
-
-import threading
 
 # 默认阈值（可被 env 或构造参数覆盖）
 DEFAULT_TOOL_RESULT_OFFLOAD = 50000

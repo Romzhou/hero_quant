@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -162,7 +162,7 @@ class AgentLoop:
         metrics: Optional[Dict[str, Any]] = None
         reason = "completed"
         terminated = False
-        tool_success_global = False
+        _tool_success_global = False
 
         trace_writer = self._ensure_trace_writer()
 
@@ -302,7 +302,7 @@ class AgentLoop:
 
             # 5. accumulate text deltas, update token_count, while iterating chunks
             tool_calls_this_iter: List[Dict[str, Any]] = []
-            chunk_error: Optional[BaseException] = None
+            _chunk_error: Optional[BaseException] = None
             try:
                 for chunk in stream:  # type: ignore[union-attr]
                     # chunk may be dict, string, or object
@@ -379,7 +379,7 @@ class AgentLoop:
                 if terminated and reason == "token_limit":
                     break
             except BaseException as e:
-                chunk_error = e
+                _chunk_error = e
                 should = False
                 if retry_policy is not None:
                     try:
@@ -486,18 +486,18 @@ class AgentLoop:
 
                     # execute
                     result: Any = None
-                    tool_error: Optional[BaseException] = None
+                    _tool_error: Optional[BaseException] = None
                     if spec is not None:
                         try:
                             result = spec.func(**args) if isinstance(args, dict) else spec.func(args)
                             tool_success_this_iter = True
-                            tool_success_global = True
+                            _tool_success_global = True
                         except BaseException as e:
-                            tool_error = e
+                            _tool_error = e
                             result = f"tool_error: {e}"
                     else:
                         result = f"tool_not_found: {tool_name}"
-                        tool_error = Exception(result)
+                        _tool_error = Exception(result)
 
                     # redact result
                     redacted_result_str: str

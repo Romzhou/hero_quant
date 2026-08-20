@@ -6,10 +6,8 @@ full/partial without requiring docker/bwrap at test time.
 """
 from __future__ import annotations
 
-import os
 import shutil
 import subprocess
-import warnings
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import List, Tuple, Union

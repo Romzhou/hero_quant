@@ -103,7 +103,7 @@ def turnover(positions: pd.DataFrame | pd.Series | None = None, weights=None) ->
     # fallback heuristic from weights: stable weights => low turnover
     if weights is not None:
         try:
-            w = np.asarray(weights, dtype=float)
+            _w = np.asarray(weights, dtype=float)
             # turnover proxy: if rebalanced daily, turnover ~ 0
             # keep minimal non-zero to indicate costs impact
             return 0.0

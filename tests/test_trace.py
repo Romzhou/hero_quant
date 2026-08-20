@@ -16,7 +16,6 @@ def test_trace_atomic_write(tmp_path):
     text = p.read_text(encoding="utf-8")
     assert "x" * 100 in text
     # 防目录穿越
-    from pathlib import Path
 
     assert TraceWriter._safe_sidecar_path(tmp_path, "../etc/passwd") is None
     # 正常路径应可解析

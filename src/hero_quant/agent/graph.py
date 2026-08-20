@@ -116,7 +116,7 @@ def execute_node(state: State) -> Dict[str, Any]:
             # Saga error_handler → compensate
             if error_handler is not None:
                 try:
-                    cmd = error_handler(state, e)
+                    _ = error_handler(state, e)
                     # In real graph, would return Command(goto="compensate")
                     # Minimal: record error and continue
                     msgs.append({"role": "assistant", "content": f"{name}: error {e} -> compensate"})

@@ -1,7 +1,9 @@
 def test_context_compact_marks_truncation():
     from hero_quant.agent.context import ContextManager
+
     cm = ContextManager(max_chars=100)
-    for i in range(20): cm.add("user", f"msg {i} " + "x"*20)
+    for i in range(20):
+        cm.add("user", f"msg {i} " + "x" * 20)
     compacted = cm.compact()
     assert compacted.truncated is True
     assert "TRUNCATED" in compacted.banner

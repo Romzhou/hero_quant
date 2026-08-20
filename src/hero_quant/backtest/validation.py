@@ -96,7 +96,7 @@ def validate(
                 raise ValidationError("non-positive price detected in prices['close']")
         except ValidationError:
             raise
-        except Exception as e:
+        except Exception:
             # 若转换失败视为校验不通过的边界情况，忽略
             pass
 
