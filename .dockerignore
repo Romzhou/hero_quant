@@ -1,0 +1,50 @@
+# Version control & CI
+.git/
+.github/
+
+# IDE & editor
+.claude/
+.vscode/
+.editorconfig
+
+# Python artifacts
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+hero_quant.egg-info/
+src/hero_quant/__pycache__/
+
+# Runtime data (generated at runtime, not in repo)
+agent/runs/
+agent/sessions/
+data/
+
+# Env files (injected via compose env_file)
+.env
+agent/.env
+
+# Frontend build (built inside Docker, don't copy local)
+frontend/dist/
+frontend/node_modules/
+frontend/tsconfig.tsbuildinfo
+node_modules/
+dist/
+build/
+
+# Tests & docs (not needed in production image)
+tests/
+docs/
+assets/
+
+# Project docs — keep README/LICENSE in image, ignore other root md
+CLAUDE.md
+CONTRIBUTING.md
+/*.md
+!README.md
+!LICENSE

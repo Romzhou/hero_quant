@@ -1,0 +1,38 @@
+services:
+  hero-quant:
+    build: .
+    ports:
+      - "127.0.0.1:8899:8899"
+    env_file:
+      - .env
+    volumes:
+      - hero-runs:/app/agent/runs
+      - hero-sessions:/app/agent/sessions
+      # User-level state: persistent memory, sessions, skills, config.
+      # Without this volume a rebuild/recreate wipes it.
+      - hero-home:/home/vibe/.hero-quant
+    # --- Runtime hardening ---
+    cap_drop:
+      - ALL
+    # SETUID/SETGID are kept on purpose: sandbox runner drops privilege to the
+    # unprivileged vibe-sandbox user (uid 10001) for LLM-generated-code subprocesses.
+    cap_add:
+      - SETUID
+      - SETGID
+    security_opt:
+      - "no-new-privileges:true"
+    read_only: true
+    # Writable scratch on the read-only rootfs. Named volumes above already
+    # cover agent/runs, agent/sessions and /home/vibe/.hero-quant; these tmpfs
+    # mounts cover /tmp and the cache dirs matplotlib/fontconfig write to.
+    tmpfs:
+      - /tmp
+      - /home/vibe/.cache
+    mem_limit: 2g
+    cpus: 1.5
+    restart: unless-stopped
+
+volumes:
+  hero-runs:
+  hero-sessions:
+  hero-home:

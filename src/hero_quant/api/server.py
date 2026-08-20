@@ -1,10 +1,13 @@
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, generate_latest
 import structlog
 import structlog.contextvars
 import uuid
 import logging
+import os
+import pathlib
 
 # -- structlog JSON backbone (OTel placeholder) --
 structlog.configure(
@@ -92,3 +95,41 @@ def query_stream(q: str = ""):
         yield f"data: {{\"query\": \"{q}\", \"status\": \"ok\"}}\n\n"
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
+# -- Static frontend serving (Docker single-machine deployment) --
+# Mount frontend/dist at "/" if present. Must be last so /live /ready /metrics
+# /v1/query remain reachable and StaticFiles does not shadow API routes.
+# Supports both Docker (/app/frontend/dist) and local repo layout.
+def _resolve_frontend_dist() -> pathlib.Path | None:
+    candidates: list[pathlib.Path] = []
+    # Explicit env override (e.g. FRONTEND_DIST=/app/frontend/dist)
+    env_path = os.environ.get("FRONTEND_DIST")
+    if env_path:
+        candidates.append(pathlib.Path(env_path))
+    # Docker absolute path
+    candidates.append(pathlib.Path("/app/frontend/dist"))
+    # Repo-root relative: file is at src/hero_quant/api/server.py -> repo root is 4 parents up
+    try:
+        repo_root_dist = pathlib.Path(__file__).resolve().parents[3] / "frontend" / "dist"
+        candidates.append(repo_root_dist)
+    except Exception:
+        pass
+    # CWD relative (covers `uvicorn` launched from repo root)
+    candidates.append(pathlib.Path("frontend/dist"))
+    candidates.append(pathlib.Path.cwd() / "frontend" / "dist")
+    for p in candidates:
+        try:
+            if p.is_dir() and (p / "index.html").is_file():
+                return p.resolve()
+        except Exception:
+            continue
+    return None
+
+
+_dist_path = _resolve_frontend_dist()
+if _dist_path is not None:
+    app.mount("/", StaticFiles(directory=str(_dist_path), html=True), name="frontend")
+    logger.info("frontend.mounted", dist_path=str(_dist_path))
+else:
+    logger.info("frontend.not_found", msg="frontend/dist not found, serving API only")
