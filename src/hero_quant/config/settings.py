@@ -14,3 +14,4 @@ class Settings:
     llm_model: str = field(default_factory=lambda: os.getenv("HERO_LLM_MODEL", "gpt-4o-mini"))
     api_key: str | None = field(default_factory=lambda: os.getenv("HERO_API_KEY"))  # type: ignore[arg-type]
     data_default_market: str = field(default_factory=lambda: os.getenv("HERO_DATA_MARKET", "CN"))
+    data_mode: str = field(default_factory=lambda: os.getenv("HERO_DATA_MODE", "synthetic"))
