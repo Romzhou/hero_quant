@@ -8,6 +8,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+class CrossSourceError(ValueError):
+    """Raised when cross-source close deviates >1% (data integrity block)."""
+
+
 # VALID_SOURCES：全量 16 源白名单（契约表），用于审计、Provenance 校验与文档
 # _traits：   Trait 注册表 dict[str, type[SourceTrait]]，按 name 索引的类/协议实现（轻量 Trait 边界）
 # _loaders：  实例注册表 list[loader实例]，按 markets 分发的运行态 fallback 链
@@ -110,12 +115,33 @@ class MarketDataRegistry:
             return None
         return None
 
-    def _cross_source_check(self, symbol: str, bars, prov, interval="1d", start="2026-08-01", end="2026-08-19") -> None:
-        """Cross-source 1% regression placeholder.
+    def _cross_source_check(self, symbol: str, bars, prov=None, interval="1d", start="2026-08-01", end="2026-08-19") -> None:
+        """Cross-source 1% block.
 
-        If multiple loaders registered for same symbol, compare closes within 1% tolerance.
-        Loop over other loaders get_bars and compare.
+        Two modes:
+        1) Direct two-bars comparison: _cross_source_check(symbol, df_a, df_b)
+           where prov is actually second bars (DataFrame or list[dict]).
+           Raises CrossSourceError if abs(a-b)/a > 0.01 for first bar close.
+        2) Registry loader loop: _cross_source_check(symbol, bars, prov, interval, start, end)
+           compares primary bars against other registered loaders.
         """
+        # --- Mode 1: direct two-bars comparison (test / simple API) ---
+        if prov is not None and not hasattr(prov, "source"):
+            # prov is not Provenance — check if it looks like bars (DataFrame or list)
+            is_bars_like = hasattr(prov, "iloc") or isinstance(prov, (list, tuple))
+            if is_bars_like:
+                other_bars = prov
+                if self._bars_empty(bars) or self._bars_empty(other_bars):
+                    return
+                ref_close = self._first_close(bars)
+                other_close = self._first_close(other_bars)
+                if ref_close and other_close and ref_close != 0:
+                    diff = abs(ref_close - other_close) / abs(ref_close)
+                    if diff > 0.01:
+                        raise CrossSourceError(
+                            f"cross-source 1% check failed for {symbol}: {ref_close:.2f} vs {other_close:.2f} diff={diff*100:.2f}%"
+                        )
+                return
         if prov and getattr(prov, "source", None) not in VALID_SOURCES:
             pass
         if len(self._loaders) < 2 or self._bars_empty(bars):
@@ -128,7 +154,7 @@ class MarketDataRegistry:
         except Exception:
             return
         # infer current source to skip self
-        current_source = getattr(prov, "source", "")
+        current_source = getattr(prov, "source", "") if prov else ""
         for loader in self._loaders:
             # infer loader source
             cls_name = loader.__class__.__name__.lower()
@@ -157,10 +183,14 @@ class MarketDataRegistry:
                 continue
             try:
                 other_close = self._first_close(other_bars)
-                if ref_close and other_close:
-                    diff = abs(ref_close - other_close) / ref_close
+                if ref_close and other_close and ref_close != 0:
+                    diff = abs(ref_close - other_close) / abs(ref_close)
                     if diff > 0.01:
-                        logger.warning("cross-source 1%% check failed for %s: %s=%.2f vs %s=%.2f diff=%.2f%%", symbol, current_source, ref_close, loader_source, other_close, diff*100)
+                        raise CrossSourceError(
+                            f"cross-source 1% check failed for {symbol}: {current_source}={ref_close:.2f} vs {loader_source}={other_close:.2f} diff={diff*100:.2f}%"
+                        )
+            except CrossSourceError:
+                raise
             except Exception:
                 continue
         return
@@ -237,9 +267,11 @@ class MarketDataRegistry:
                 "ts": time.time(),
             }
             self.audit_log.append(audit_entry)
-            # Cross-source 1% regression placeholder — compare would go here
+            # Cross-source 1% block — raise CrossSourceError on >1% deviation
             try:
                 self._cross_source_check(symbol, bars, prov, interval, start, end)
+            except CrossSourceError:
+                raise
             except Exception:
                 pass
             return bars, prov
