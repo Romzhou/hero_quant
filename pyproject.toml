@@ -3,7 +3,7 @@ name = "hero-quant"
 version = "0.1.0"
 description = "真英雄量化 - 极简投研 Agent (borrowed from Vibe-Trading)"
 readme = "README.md"
-requires-python = ">=3.11,<3.13"
+requires-python = ">=3.11,<3.14"
 license = {text = "MIT"}
 keywords = ["quant", "trading", "agent", "research", "backtest"]
 dependencies = [
