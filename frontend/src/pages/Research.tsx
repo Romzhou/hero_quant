@@ -10,20 +10,31 @@ const MOCK_POSITIONS = `date,symbol,weight,close
 2026-08-14,600519.SH,0.5,1671.0
 2026-08-15,600519.SH,0.5,1701.3`
 
-export default function Research() {
-  const [metrics, setMetrics] = useState<Metrics>({ sharpe: 1.62, annual_return: 0.184, max_drawdown: -0.032, turnover: 0.42 })
-  const [drawdowns] = useState<Drawdown[]>([
+export type ResearchProps = {
+  /** ECharts heatmap dataset: [weekIndex, dayIndex, value] ; if provided from backend, use it */
+  heatmapDataset?: [number, number, number][]
+  heatmapWeeks?: string[]
+  heatmapDays?: string[]
+  metrics?: Metrics
+  drawdowns?: Drawdown[]
+  csvPreview?: string
+}
+
+export default function Research(props: ResearchProps) {
+  const [metrics, setMetrics] = useState<Metrics>(props.metrics ?? { sharpe: 1.62, annual_return: 0.184, max_drawdown: -0.032, turnover: 0.42 })
+  const [drawdowns] = useState<Drawdown[]>(props.drawdowns ?? [
     { start: "2026-08-13", end: "2026-08-14", depth: -1.27, duration: 2 },
     { start: "2026-08-16", end: "2026-08-17", depth: -0.98, duration: 1 },
     { start: "2026-08-10", end: "2026-08-12", depth: -0.62, duration: 3 },
   ])
-  const [csvPreview, setCsvPreview] = useState<string>(MOCK_POSITIONS)
+  const [csvPreview, setCsvPreview] = useState<string>(props.csvPreview ?? MOCK_POSITIONS)
   const [tearsheetLoaded, setTearsheetLoaded] = useState(false)
   const [tearsheetHtml, setTearsheetHtml] = useState<string | null>(null)
 
-  // 尝试真渲染：positions.csv / metrics.json / tearsheet.html
+  // 尝试真渲染：positions.csv / metrics.json / tearsheet.html（无需后端也能构建）
   useEffect(() => {
     let aborted = false
+    // if props provided, skip fetch for those fields but still try tearsheet
     async function fetchArtifact(path: string, setter: (v: string) => void) {
       try {
         const r = await fetch(path, { cache: "no-store" })
@@ -35,6 +46,8 @@ export default function Research() {
       }
     }
     async function fetchMetrics() {
+      // if parent passed metrics, don't override
+      if (props.metrics) return
       try {
         const r = await fetch("/v1/backtest/metrics.json", { cache: "no-store" })
         if (r.ok) {
@@ -43,7 +56,7 @@ export default function Research() {
         }
       } catch {}
     }
-    fetchArtifact("/v1/backtest/positions.csv", setCsvPreview)
+    if (!props.csvPreview) fetchArtifact("/v1/backtest/positions.csv", setCsvPreview)
     fetchMetrics()
     // tearsheet.html 真渲染
     fetch("/v1/backtest/tearsheet.html", { cache: "no-store" })
@@ -51,7 +64,7 @@ export default function Research() {
       .then(html => { if (!aborted) { setTearsheetHtml(html.slice(0, 8000)); setTearsheetLoaded(true) } })
       .catch(() => {})
     return () => { aborted = true }
-  }, [])
+  }, [props.metrics, props.csvPreview])
 
   const cumulativeOption = useMemo(() => ({
     backgroundColor: "transparent",
@@ -102,19 +115,23 @@ export default function Research() {
   }), [])
 
   const heatmapOption = useMemo(() => {
-    // 本月收益热力：5周 x 7日 网格，模拟日收益 %
-    const days = ["周一","周二","周三","周四","周五","周六","周日"]
-    const weeks = ["W1","W2","W3","W4","W5"]
-    const data: [number, number, number][] = []
-    // 生成 5*7 随机热力，工作日为主
-    const vals = [
-      [0.32, -0.12, 0.55, 0.08, 0.91, 0, 0],
-      [-0.45, 0.22, 0.11, -0.67, 0.34, 0, 0],
-      [0.18, 0.42, -0.21, 0.73, 0.05, 0, 0],
-      [1.12, -0.88, 0.31, 0.09, -0.14, 0, 0],
-      [0.27, 0.19, 0.44, 0.62, 0.81, 0, 0],
-    ]
-    for (let w = 0; w < 5; w++) for (let d = 0; d < 7; d++) data.push([w, d, vals[w][d]])
+    // 本月收益热力：5周 x 7日 网格，支持后端 props 传入 dataset；否则保持占位 synthetic 保真
+    const days = props.heatmapDays ?? ["周一","周二","周三","周四","周五","周六","周日"]
+    const weeks = props.heatmapWeeks ?? ["W1","W2","W3","W4","W5"]
+    let data: [number, number, number][]
+    if (props.heatmapDataset && props.heatmapDataset.length > 0) {
+      data = props.heatmapDataset
+    } else {
+      const vals = [
+        [0.32, -0.12, 0.55, 0.08, 0.91, 0, 0],
+        [-0.45, 0.22, 0.11, -0.67, 0.34, 0, 0],
+        [0.18, 0.42, -0.21, 0.73, 0.05, 0, 0],
+        [1.12, -0.88, 0.31, 0.09, -0.14, 0, 0],
+        [0.27, 0.19, 0.44, 0.62, 0.81, 0, 0],
+      ]
+      data = []
+      for (let w = 0; w < 5; w++) for (let d = 0; d < 7; d++) data.push([w, d, vals[w][d]])
+    }
     return {
       backgroundColor: "transparent",
       tooltip: { position: "top" as const, formatter: (p: { data: [number, number, number] }) => {
@@ -132,7 +149,7 @@ export default function Research() {
       },
       series: [{ name: "本月收益热力", type: "heatmap" as const, data, label: { show: false }, emphasis: { itemStyle: { shadowBlur: 12, shadowColor: "rgba(245,158,11,0.5)" } } }]
     }
-  }, [])
+  }, [props.heatmapDataset, props.heatmapDays, props.heatmapWeeks])
 
   const drawdownOption = useMemo(() => ({
     backgroundColor: "transparent",

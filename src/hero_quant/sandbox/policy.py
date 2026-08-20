@@ -6,12 +6,16 @@ VALID_MODES = {"read-only", "workspace-write", "danger-full-access"}
 
 
 def canonical_path(p: str) -> str:
-    """Return real canonical path (resolves symlinks)."""
-    # realpath is the true source; resolve as fallback
+    """Return real canonical path (resolves symlinks) via Path.resolve()."""
     try:
-        return os.path.realpath(p)
-    except Exception:
+        # Path.resolve() is the canonical per spec (not just realpath)
+        # resolve strict=False to avoid ENOENT on missing paths
         return str(Path(p).resolve())
+    except Exception:
+        try:
+            return os.path.realpath(p)
+        except Exception:
+            return str(Path(p).resolve())
 
 
 def resolve_policy(mode: str, workspace_root: str | None = None) -> dict:
@@ -19,8 +23,9 @@ def resolve_policy(mode: str, workspace_root: str | None = None) -> dict:
     Resolve sandbox policy.
 
     - mode: read-only | workspace-write | danger-full-access
-    - workspace_root: host path for workspace; canonicalized via realpath
+    - workspace_root: host path for workspace; canonicalized via Path.resolve()
     - writableRoots = {workspaceRoot, /tmp} for workspace-write
+    - exposes workspaceRoot canonical, canonicalPath, writableRoots, mode, enforcement
     """
     if mode not in VALID_MODES:
         raise ValueError(f"invalid mode: {mode}, expected one of {VALID_MODES}")
@@ -42,9 +47,8 @@ def resolve_policy(mode: str, workspace_root: str | None = None) -> dict:
         roots = []
         if workspace_root is not None:
             roots.append(policy["workspaceRoot"])
-        # spec says /tmp is always writable
+        # spec says /tmp is always writable — include literal /tmp plus canonical
         tmp_canonical = canonical_path("/tmp") if os.path.exists("/tmp") else "/tmp"
-        # ensure /tmp literal is included even on Windows where /tmp may not exist
         if tmp_canonical not in roots:
             roots.append(tmp_canonical)
         if "/tmp" not in roots:
@@ -65,12 +69,23 @@ def resolve_policy(mode: str, workspace_root: str | None = None) -> dict:
         if len(policy["writableRoots"]) == 2 and policy["writableRoots"][0] == policy["writableRoots"][1]:
             policy["writableRoots"] = ["/tmp"]
         policy["enforcement"] = "full"
+        # ensure canonicalPath exists even when workspace_root not provided for read-only
+        if "canonicalPath" not in policy:
+            # default to cwd canonical for consistency
+            try:
+                policy["canonicalPath"] = str(Path.cwd().resolve())
+            except Exception:
+                policy["canonicalPath"] = str(Path(".").resolve())
     else:  # danger-full-access
         policy["writableRoots"] = ["/"]
         policy["enforcement"] = "partial"
         if "workspaceRoot" not in policy and workspace_root is None:
             # provide a default canonical for consistency
-            pass
+            if "canonicalPath" not in policy:
+                try:
+                    policy["canonicalPath"] = str(Path.cwd().resolve())
+                except Exception:
+                    policy["canonicalPath"] = str(Path(".").resolve())
 
     return policy
 

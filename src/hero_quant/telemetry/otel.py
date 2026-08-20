@@ -2,26 +2,39 @@
 
 Modes:
 - disabled: no export, sharing == disabled
-- enabled / sampling / internal: placeholder for metrics-only
-- full: placeholder for traces+metrics export
+- shared: anonymized metrics export (legacy enabled/sampling/internal/minimal/anonymous map here)
+- private: full traces+metrics export (legacy full map here)
 
-Env gate uses os.environ.get to satisfy config gate (no raw env access outside config).
+Env gates use os.environ.get (config gate pattern). Offline stays green via try/except.
 """
 
 from __future__ import annotations
 
 import os
 
-# Valid modes — normalized lower-case
-_VALID_MODES = {"disabled", "enabled", "sampling", "minimal", "full", "internal", "anonymous"}
+# Valid modes — normalized lower-case; includes legacy aliases for backwards compat
+_VALID_MODES = {"disabled", "shared", "private", "enabled", "sampling", "minimal", "full", "internal", "anonymous"}
 _DEFAULT_MODE = "disabled"
+
+# sharing mapping to canonical three gears
+_SHARING_MAP = {
+    "disabled": "disabled",
+    "shared": "shared",
+    "private": "private",
+    # legacy aliases
+    "enabled": "shared",
+    "sampling": "shared",
+    "minimal": "shared",
+    "internal": "shared",
+    "anonymous": "shared",
+    "full": "private",
+}
 
 
 def _normalize_mode(raw: str | None) -> str:
     if not raw:
         return _DEFAULT_MODE
     m = raw.strip().lower()
-    # map aliases: anonymous -> enabled, internal/minimal/sampling -> enabled
     if m in _VALID_MODES:
         return m
     return _DEFAULT_MODE
@@ -33,7 +46,6 @@ def get_otel_mode() -> str:
     # empty string should fallback to disabled
     if raw is None or raw == "":
         return _DEFAULT_MODE
-    # keep raw value if valid, else disabled; preserve original case normalized
     norm = raw.strip().lower()
     if norm in _VALID_MODES:
         return norm
@@ -53,17 +65,31 @@ class SessionTelemetryCoordinator:
     def sharing(self) -> str:
         """Return sharing level for current mode.
 
-        Minimal mapping: disabled -> disabled, otherwise return normalized mode.
-        This satisfies three-gear contract while keeping placeholder export.
+        Canonical three gears: disabled / shared / private.
+        Legacy modes map via _SHARING_MAP.
         """
-        return self.mode
+        return _SHARING_MAP.get(self.mode, "disabled" if self.mode == "disabled" else "shared")
 
-    # Placeholder for future otel export
     def export(self, payload: dict | None = None) -> None:
-        """No-op export placeholder — real exporter wired in infra layer."""
+        """Export stub: if mode != disabled tries OTLP endpoint, else no-op. Offline-safe."""
         if self.mode == "disabled":
             return
-        # In enabled/full modes, would push to OTel Collector; currently no-op
+        endpoint = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT")
+        if not endpoint:
+            return
+        try:
+            # Best-effort OTLP HTTP export; must not break offline/tests
+            import json
+            import urllib.request
+
+            data = json.dumps(payload or {}).encode("utf-8")
+            req = urllib.request.Request(endpoint, data=data, headers={"Content-Type": "application/json"})
+            # short timeout to keep offline green and not block request path
+            with urllib.request.urlopen(req, timeout=0.5) as _resp:  # noqa: S310
+                pass
+        except Exception:
+            # offline / no collector / network error -> silent no-op
+            return
         return
 
     def is_enabled(self) -> bool:

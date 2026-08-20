@@ -10,7 +10,7 @@ jobs:
           python-version: '3.11'
       - name: Install locked dependencies (hash-checked)
         run: |
-          # requirements-lock.txt 当前为占位 hash（单机已可跑），CI 先兼容：hash 校验失败则回退到常规安装
+          # requirements-lock.txt 已由 uv pip compile --generate-hashes 生成真实 hash；CI 先尝试 hash 校验，失败则回退到常规安装以保证离线/占位兼容
           pip install --require-hashes -r requirements-lock.txt || pip install -e ".[dev,ashare,us]"
       - name: Install CI tools
         run: pip install pytest ruff pip-audit

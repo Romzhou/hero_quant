@@ -36,24 +36,36 @@ async def add_request_id_and_otel(request: Request, call_next):
     request_id = request.headers.get("X-Request-ID")
     if not request_id:
         request_id = str(uuid.uuid4())
-    # Bind to contextvars for downstream structured logs
-    structlog.contextvars.bind_contextvars(request_id=request_id)
+    # Bind to contextvars for downstream structured logs; trace_id = request_id per spec
+    trace_id = request_id
+    structlog.contextvars.bind_contextvars(request_id=request_id, trace_id=trace_id)
     # OTel export placeholder: read mode lazily to avoid import cycle at module load
     try:
-        from hero_quant.telemetry.otel import get_otel_mode
+        from hero_quant.telemetry.otel import SessionTelemetryCoordinator
 
-        otel_mode = get_otel_mode()
-        # No-op export; placeholder keeps collector wiring point
+        coord = SessionTelemetryCoordinator()
+        otel_mode = coord.mode
+        sharing = coord.sharing()
         if otel_mode != "disabled":
-            logger.debug("otel.export.placeholder", mode=otel_mode, path=request.url.path)
+            # logs with trace_id = request_id; export stub is offline-safe
+            logger.debug(
+                "otel.export.placeholder", mode=otel_mode, sharing=sharing, path=request.url.path, trace_id=trace_id
+            )
+            # best-effort export (no-op offline)
+            try:
+                coord.export({"path": request.url.path, "trace_id": trace_id, "request_id": request_id})
+            except Exception:
+                pass
     except Exception:
         # Telemetry must not break request path
         pass
 
-    logger.info("request.start", method=request.method, path=request.url.path, request_id=request_id)
+    logger.info(
+        "request.start", method=request.method, path=request.url.path, request_id=request_id, trace_id=trace_id
+    )
     response = await call_next(request)
     response.headers["X-Request-ID"] = request_id
-    logger.info("request.end", status_code=response.status_code, request_id=request_id)
+    logger.info("request.end", status_code=response.status_code, request_id=request_id, trace_id=trace_id)
     structlog.contextvars.clear_contextvars()
     return response
 
