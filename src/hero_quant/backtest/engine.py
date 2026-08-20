@@ -25,7 +25,10 @@ class BacktestEngine:
     """
 
     def __init__(self, initial_capital: float = 1.0):
-        self.initial_capital = float(initial_capital)
+        cap = float(initial_capital)
+        if not np.isfinite(cap) or cap <= 0:
+            raise ValueError(f"initial_capital must be >0 and finite, got {initial_capital!r}")
+        self.initial_capital = cap
         self.historical_base_price: float | None = None
 
     # ------------------------------------------------------------------ helpers
@@ -61,27 +64,16 @@ class BacktestEngine:
 
     def _execute_bars(
         self,
-        target_positions: pd.Series | pd.DataFrame | np.ndarray | list,
+        target_positions: pd.Series | np.ndarray | list,
         available_capital: float,
     ) -> pd.Series:
-        """Capital pre-check proportional scaling.
+        """Capital pre-check proportional scaling (Series | ndarray | list only).
 
         If sum|target| > available_capital, scale down proportionally to preserve weight ratios.
-        Returns Series (for DataFrame input, flattened sum scaled per column preserved).
+        DataFrame input is intentionally unsupported (YAGNI) — use Series per-bar.
         """
-        # Normalize to Series
-        if isinstance(target_positions, pd.DataFrame):
-            # sum across columns not needed; we scale per-element proportionally based on total gross
-            # Convert to Series of column totals? Better scale element-wise preserving shape but returned as Series flattened?
-            # For event loop we treat each row Series; DataFrame here means single-row? Scale all values.
-            # Flatten to Series of values
-            flat = target_positions.iloc[0] if len(target_positions) == 1 else target_positions.sum()
-            # Actually if DataFrame with multiple rows, treat total gross sum
-            if isinstance(flat, pd.Series):
-                s = flat
-            else:
-                s = pd.Series([flat])
-        elif isinstance(target_positions, pd.Series):
+        # Normalize to Series (Series | ndarray | list only)
+        if isinstance(target_positions, pd.Series):
             s = target_positions.copy()
         else:
             arr = np.asarray(target_positions, dtype=float)
@@ -112,27 +104,28 @@ class BacktestEngine:
         w: np.ndarray | None = None,
         leverage: float | None = None,
     ) -> dict:
-        """Process single bar (event-driven).
+        """Process single bar (event-driven) — ExtensionPoint.
 
-        Args:
-            bar: current bar Series (row)
-            idx: bar index in prices
-            prices: full prices DataFrame for _align lookup
-            equity_prev: previous equity (for scaling context)
-            w: normalized weights vector
-            leverage: sum(w)
+        ExtensionPoint: on_bar is intentionally not wired to equity calculation in
+        the current vectorized run loop. It returns ``aligned_price`` (next-day
+        open via _align) for PIT-safe execution, but ``run`` computes equity from
+        ``close`` pct_change and does NOT use aligned_price for pricing. This is
+        explicit to avoid dead-hook confusion. Wiring aligned_price into execution
+        is deferred to Task17 (streaming on_tick).
 
         Returns:
-            dict with 'bar', 'aligned_price' (next-day open), 'idx'
+            dict with 'bar', 'aligned_price' (next-day open), 'idx', 'equity_prev'
         """
         # PIT / validation is handled at run level; on_bar is pure per-bar logic
         try:
             aligned_price = self._align(prices, idx)
-        except Exception:
-            # fallback to bar close
+        except ValidationError:
+            raise
+        except (ValueError, TypeError, KeyError, IndexError, AttributeError):
+            # fallback to bar close — narrow, not broad Exception
             try:
                 aligned_price = float(bar.get("close", bar.iloc[0]))
-            except Exception:
+            except (ValueError, TypeError, KeyError, IndexError, AttributeError):
                 aligned_price = float(self.historical_base_price) if self.historical_base_price else 0.0
 
         # Signal placeholder: weight vector is signal; execution will be handled by _execute_bars in run loop
@@ -150,6 +143,9 @@ class BacktestEngine:
         weights_on: str | pd.Timestamp | None = None,
         price_date: str | pd.Timestamp | None = None,
     ) -> dict:
+        # M3 guard: initial_capital must be >0 and finite at run entry
+        if not np.isfinite(self.initial_capital) or self.initial_capital <= 0:
+            raise ValueError(f"initial_capital must be >0 and finite, got {self.initial_capital!r}")
         # --- Input validation: empty / invalid prices ---
         if not isinstance(prices, pd.DataFrame):
             raise TypeError("prices must be a pandas DataFrame")
@@ -171,12 +167,7 @@ class BacktestEngine:
             pd_date = price_date
             if pd_date is None and isinstance(prices.index, pd.DatetimeIndex) and len(prices.index) > 0:
                 pd_date = prices.index[0]
-            try:
-                validate(prices, weights_on=weights_on, price_date=pd_date)
-            except ValidationError:
-                raise
-            except Exception:
-                pass
+            validate(prices, weights_on=weights_on, price_date=pd_date)
 
         # Normalize weights -> vector
         if weights is None:
@@ -243,9 +234,9 @@ class BacktestEngine:
         raw_positions_rows: list[pd.Series] = []
         for i in range(len(prices)):
             bar = prices.iloc[i]
-            # event hook: Bar -> Signal -> Execution alignment
-            self.on_bar(bar, i, prices, equity_prev=(equity_vals[-1] if equity_vals else self.initial_capital), w=w, leverage=leverage)
-            # aligned price not used for equity calc here but ensures _align is exercised (PIT-safe execution price)
+            # event hook: Bar -> Signal -> Execution alignment (ExtensionPoint)
+            bar_result = self.on_bar(bar, i, prices, equity_prev=(equity_vals[-1] if equity_vals else self.initial_capital), w=w, leverage=leverage)
+            _aligned_price = bar_result["aligned_price"]  # returned but not used for equity; TODO(Task17) wire into execution when streaming on_tick
             # compute equity iteratively from net_ret
             try:
                 ret_i = float(net_ret.iloc[i])

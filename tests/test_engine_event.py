@@ -62,3 +62,38 @@ def test_engine_align_and_execute():
     target2 = pd.Series([30.0, 20.0])
     scaled2 = e._execute_bars(target2, available_capital=100.0)
     assert float(scaled2.sum()) == pytest.approx(50.0)
+
+
+def test_engine_zero_capital_guard():
+    """M3: initial_capital must be >0 and finite — guard at __init__ and run."""
+    from hero_quant.backtest.engine import BacktestEngine
+
+    # __init__ guard
+    with pytest.raises(ValueError):
+        BacktestEngine(initial_capital=0)
+    with pytest.raises(ValueError):
+        BacktestEngine(initial_capital=-1)
+    with pytest.raises(ValueError):
+        BacktestEngine(initial_capital=float("nan"))
+    with pytest.raises(ValueError):
+        BacktestEngine(initial_capital=float("inf"))
+
+    # run entry guard — mutated capital
+    import pandas as pd
+
+    e = BacktestEngine(initial_capital=100.0)
+    e.initial_capital = 0  # simulate mis-config after construction
+    prices = pd.DataFrame({"close": [100, 101]}, index=pd.date_range("2026-08-01", periods=2))
+    with pytest.raises(ValueError):
+        e.run(prices)
+
+
+def test_engine_invalid_date_raises():
+    """M2: invalid date format must raise ValidationError, not be silently swallowed."""
+    from hero_quant.backtest.engine import BacktestEngine
+    from hero_quant.backtest.validation import ValidationError
+    import pandas as pd
+
+    prices = pd.DataFrame({"close": [100, 101]}, index=pd.date_range("2026-08-01", periods=2))
+    with pytest.raises(ValidationError):
+        BacktestEngine().run(prices, weights_on="not-a-date", price_date="2026-08-01")
