@@ -66,6 +66,8 @@ class MarketDataRegistry:
                 cls_name = loader.__class__.__name__.lower()
                 if "tencent" in cls_name:
                     source = "tencent"
+                elif "yahoo" in cls_name:
+                    source = "yahoo"
                 else:
                     source = getattr(loader, "source", cls_name)
                 prov = Provenance(source=source, unit=unit, symbol=symbol)
