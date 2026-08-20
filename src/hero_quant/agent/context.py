@@ -1,4 +1,9 @@
 from dataclasses import dataclass
+from pathlib import Path as _Path
+from typing import TYPE_CHECKING, List as _List
+
+if TYPE_CHECKING:
+    from hero_quant.skills.loader import SkillsLoader
 
 
 @dataclass
@@ -69,3 +74,37 @@ class ContextManager:
 
         banner = "TRUNCATED: context folded 保留首2+尾2，中间用 [SUMMARY] 占位"
         return CompactResult(truncated=True, banner=banner, text=folded_text)
+
+    # --- Skills two-phase helpers (Wave B3) ---
+    def skills_digest(self, loader: "SkillsLoader") -> str:
+        """First phase: short digest for context injection (<500)."""
+        try:
+            return loader.get_descriptions()
+        except Exception:
+            return ""
+
+    def inject_skill_content(self, loader: "SkillsLoader", name: str) -> str:
+        """Second phase: full <skill_content> on demand via skill tool trigger."""
+        try:
+            content = loader.get_content(name)
+            # Wrap as <skill_content> for agent injection (placeholder)
+            return f"<skill_content name=\"{name}\">\n{content}\n</skill_content>"
+        except Exception:
+            return ""
+
+
+# Module-level helpers for snapshot + fs/observed sync
+def skills_snapshot(loader: "SkillsLoader") -> str:
+    """Return digest snapshot (hash) for change detection."""
+    try:
+        return loader.snapshot()
+    except Exception:
+        return ""
+
+
+def skills_observed_invalidate(loader: "SkillsLoader", path: str) -> None:
+    """Observed sync invalidation hook — delegates to loader."""
+    try:
+        loader.observed_invalidate(path)
+    except Exception:
+        pass
