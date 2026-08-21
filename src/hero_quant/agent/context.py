@@ -92,6 +92,46 @@ class ContextManager:
             return ""
 
 
+# --- BuildSystemPrompt integration (Task 10) ---
+    def build_system_prompt(
+        self,
+        skill_count: int = 5,
+        grounding_block: str = "",
+        *,
+        ledger=None,
+        extra_rules: str = "",
+    ) -> str:
+        """Delegate to hero_quant.agent.prompt.build_system_prompt.
+
+        Keeps ContextManager as integration point for system prompt construction
+        with grounding injection. Lazy import avoids circular deps.
+        """
+        try:
+            from .prompt import build_system_prompt as _bsp
+
+            return _bsp(
+                skill_count=skill_count,
+                grounding_block=grounding_block,
+                ledger=ledger,
+                skills_digest="",
+                extra_rules=extra_rules,
+            )
+        except Exception:
+            # Fallback minimal prompt preserving invariants
+            block = grounding_block or (ledger.render_block() if ledger is not None and hasattr(ledger, "render_block") else "")
+            return f"## Grounding\n{block}\n## HARD RULE\nHARD RULE: Never quote price not in evidence."
+
+    def get_system_prompt(
+        self,
+        skill_count: int = 5,
+        grounding_block: str = "",
+        *,
+        ledger=None,
+    ) -> str:
+        """Alias for build_system_prompt."""
+        return self.build_system_prompt(skill_count=skill_count, grounding_block=grounding_block, ledger=ledger)
+
+
 # Module-level helpers for snapshot + fs/observed sync
 def skills_snapshot(loader: "SkillsLoader") -> str:
     """Return digest snapshot (hash) for change detection."""
@@ -107,3 +147,25 @@ def skills_observed_invalidate(loader: "SkillsLoader", path: str) -> None:
         loader.observed_invalidate(path)
     except Exception:
         pass
+
+
+def build_system_prompt(
+    skill_count: int = 5,
+    grounding_block: str = "",
+    *,
+    ledger=None,
+    extra_rules: str = "",
+) -> str:
+    """Module-level convenience — delegates to prompt.build_system_prompt."""
+    try:
+        from .prompt import build_system_prompt as _bsp
+
+        return _bsp(
+            skill_count=skill_count,
+            grounding_block=grounding_block,
+            ledger=ledger,
+            extra_rules=extra_rules,
+        )
+    except Exception:
+        block = grounding_block or (ledger.render_block() if ledger is not None and hasattr(ledger, "render_block") else "")
+        return f"## Grounding\n{block}\n## HARD RULE\nHARD RULE: Never quote price not in evidence."

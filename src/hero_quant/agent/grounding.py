@@ -47,6 +47,12 @@ class GroundingLedger:
         raise GroundingError(f"not in evidence: price {price} for {symbol} not in [{ev['low']}, {ev['high']}] closes={ev['closes']}")
 
     def render_block(self) -> str:
+        """Render Ground Truth block for prompt injection — L3 of 三级校验.
+
+        Always returns a string starting with '## Ground Truth' so
+        build_system_prompt can inject it verbatim. Empty ledger returns
+        header only (keeps prompt valid).
+        """
         lines = ["## Ground Truth"]
         for symbol, ev in self._evidence.items():
             for bar in ev["bars"]:
