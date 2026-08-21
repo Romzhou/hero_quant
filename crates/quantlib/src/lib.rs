@@ -168,7 +168,7 @@ fn quantlib(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(max_drawdown, m)?)?;
     m.add_function(wrap_pyfunction!(bollinger, m)?)?;
     m.add_function(wrap_pyfunction!(macd, m)?)?;
-    m.add("__version__", "0.1.0")?;
+    m.add("__version__", "0.2.0")?;
     Ok(())
 }
 

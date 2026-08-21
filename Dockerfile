@@ -46,7 +46,7 @@ FROM python:3.11-slim@sha256:e031123e3d85762b141ad1cbc56452ba69c6e722ebf2f042cc0
 
 LABEL org.opencontainers.image.title="hero-quant" \
     org.opencontainers.image.description="hero-quant - minimal quant research agent (single-machine Docker)" \
-    org.opencontainers.image.version="0.1.0" \
+    org.opencontainers.image.version="0.2.0" \
     org.opencontainers.image.source="https://github.com/your-org/hero-quant" \
     org.opencontainers.image.licenses="MIT"
 

@@ -302,3 +302,49 @@ C7 Memory/Skills/Ledger ─> D2
 
 选哪种？
 
+---
+
+## Wave G — Release Harness Polish（本批次收口，0.1.0 → 0.2.0）
+
+> **Goal:** 以 `0.2.0` 为首个可上线 Tag，补齐 `CHANGELOG` + `version bump` + `git tag` 交付物，保持 `173 tests` 绿与 wall-time/metrics/guardrails 门禁。
+> **Files:** `pyproject.toml`, `docs/plans/*.md`（本文档追加 Wave G）, `CHANGELOG.md`（新建，Keep a Changelog）, `src/hero_quant/__init__.py` + 同步 `frontend/package.json` / `crates/quantlib/Cargo.toml` / `Dockerfile` OCI label。
+
+### Task G1: 版本号单真相源 bump
+
+**Files:** Modify `pyproject.toml:version`, `src/hero_quant/__init__.py:__version__`, `frontend/package.json`, `frontend/package-lock.json`, `crates/quantlib/Cargo.toml`, `crates/quantlib/src/lib.rs`, `Dockerfile:49 LABEL`, `frontend/src/App.tsx:30`, `src/hero_quant/quantlib/rust.py:29`, `tests/test_bootstrap.py:4`, `README.md:87-88`
+
+**Step 1: Write failing test (already exists)**
+```python
+# tests/test_bootstrap.py
+def test_package_importable():
+    import hero_quant
+    assert hero_quant.__version__ == "0.2.0"
+```
+
+**Step 2: Run** `pytest tests/test_bootstrap.py -v` → FAIL until bump.
+
+**Step 3: Implement** `__version__ = "0.2.0"` + `pyproject.toml = "0.2.0"` 及其余镜像位点同值。
+
+**Step 4: Pass** `pytest tests/test_bootstrap.py` + `pytest -q` 173 green + `import hero_quant; print(hero_quant.__version__)` visible `0.2.0`.
+
+**Step 5: Commit** `chore(release): bump 0.1.0 → 0.2.0 (Wave G)`
+
+### Task G2: CHANGELOG 归档
+
+**Files:** Create `CHANGELOG.md`（Keep a Changelog, `## [0.2.0] - 2026-08-21`）
+
+**Content:** 汇总 29 commits ahead of `origin/master`：Agent/Graph/Vector/Rust/Stream/Billing/Scheduled/Shadow/Frontend/Telemetry/Governance/Memory 等见 `CHANGELOG.md: Added/Changed/Fixed/Security/Verification`。
+
+**Verify:** `Test-Path CHANGELOG.md` + `Select-String "## \[0.2.0\]"` + `grep "173 passed"` 文案可见。
+
+### Task G3: Release Tag 产出
+
+**Command:** `git tag -a v0.2.0 -m "hero-quant v0.2.0 — deploy-ready + 173 tests green" && git tag --list`
+
+**Gate:** `git describe --tags` → `v0.2.0`，`pyproject.toml` / `__init__.py` / `CHANGELOG.md` 三处版本一致，`pytest -q` 绿为合并门禁。
+
+**Constraints:** 尊重 `wall-time/metrics/guardrails`（`tests/test_*wall*`, `tests/test_metrics*` 不跳）、`ruff check` 0 error、`docker compose config` 校验。
+
+**Verify:** `pytest -q` green, `python -c "import hero_quant; print(hero_quant.__version__)"` → `0.2.0`, `git tag --list | grep v0.2.0` visible.
+
+

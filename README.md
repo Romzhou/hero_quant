@@ -84,8 +84,8 @@ docker compose up --build
 # 硬化：cap_drop ALL + SETUID/SETGID(供沙箱) + no-new-privileges + read_only + tmpfs /tmp
 
 # 仅构建镜像
-docker build -t hero-quant:0.1.0 .
-docker run -p 127.0.0.1:8899:8899 --env-file .env hero-quant:0.1.0
+docker build -t hero-quant:0.2.0 .
+docker run -p 127.0.0.1:8899:8899 --env-file .env hero-quant:0.2.0
 ```
 
 `Dockerfile` 3 阶段：`node:22-slim` 前端构建 → `python:3.11-slim` builder(`venv+hash-lock`) → `runtime`(无编译器，`vibe:vibe-sandbox 10001` 非 root)。

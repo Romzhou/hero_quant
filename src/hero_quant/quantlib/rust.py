@@ -26,7 +26,7 @@ except Exception:
     _RUST_MOD = None
     IS_RUST = False
 
-__version__ = getattr(_RUST_MOD, "__version__", "0.1.0-py-fallback") if _RUST_MOD else "0.1.0-py-fallback"
+__version__ = getattr(_RUST_MOD, "__version__", "0.2.0-py-fallback") if _RUST_MOD else "0.2.0-py-fallback"
 
 
 def is_rust_available() -> bool:
