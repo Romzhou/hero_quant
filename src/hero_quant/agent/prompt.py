@@ -131,9 +131,9 @@ def build_system_prompt(
 
     # Defensive: guarantee invariants for tests & audits
     # 1) grounding_block substring must appear verbatim when provided
-    if grounding_block and grounding_block not in prompt:
+    if block and block not in prompt:
         # fallback injection if templating failed (should not happen)
-        prompt += f"\n{grounding_block}\n"
+        prompt += f"\n{block}\n"
     # 2) HARD RULE must appear
     if "HARD RULE" not in prompt:
         prompt += "\n" + HARD_RULE
