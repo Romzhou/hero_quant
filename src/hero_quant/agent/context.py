@@ -31,14 +31,70 @@ class ContextManager:
         lines = [f"{m['role']}: {m['content']}" for m in self._messages]
         text = "\n".join(lines)
         total_chars = len(text)
+        threshold = self.max_chars * 0.8
 
-        if total_chars <= self.max_chars:
+        if total_chars <= threshold:
             return CompactResult(truncated=False, banner="OK", text=text)
 
-        # 需要截断折叠：保留首2+尾2，中间用 [SUMMARY] 占位
+        # 阈值80%触发向量折叠 — embedding摘要替代首2尾2（Task 12）
+        # 若 embedding 失败则 fallback 到原 head2+tail2 [SUMMARY]
+        n = len(self._messages)
+
+        # Try vector folding via embedding summary
+        try:
+            from .embed import embedding_summary  # lazy import
+
+            if n <= 4:
+                summary = embedding_summary(self._messages)
+                banner = "TRUNCATED: embedding vector folding 80% threshold"
+                # 向量摘要 + 原文（保证信息不丢）
+                folded_text = summary + "\n" + text
+                # 截断控制
+                if len(folded_text) > self.max_chars:
+                    # 优先保留 summary (embedding) + 尾部
+                    head_text = lines[0] if lines else ""
+                    remaining = self.max_chars - len(summary) - 1
+                    if remaining > 0:
+                        folded_text = summary + "\n" + text[-remaining:]
+                return CompactResult(truncated=True, banner=banner, text=folded_text)
+
+            head = self._messages[:2]
+            tail = self._messages[-2:]
+            middle = self._messages[2:-2]
+
+            lines_head = [f"{m['role']}: {m['content']}" for m in head]
+            lines_tail = [f"{m['role']}: {m['content']}" for m in tail]
+
+            # embedding摘要基于 middle（分级记忆：head/tail 保留 recent，middle 向量化）
+            summary = embedding_summary(middle)
+
+            folded_text = "\n".join(lines_head + [summary] + lines_tail)
+
+            if len(folded_text) > self.max_chars:
+                head_text = "\n".join(lines_head)
+                tail_text = "\n".join(lines_tail)
+                reserved = len(head_text) + 1 + len(tail_text) + 1
+                remaining = self.max_chars - reserved
+                if remaining >= len("[EMBEDDING_SUMMARY"):
+                    if len(summary) > remaining:
+                        summary = summary[:remaining]
+                        folded_text = "\n".join(lines_head + [summary] + lines_tail)
+
+            banner = "TRUNCATED: embedding vector folding 80% threshold"
+            return CompactResult(truncated=True, banner=banner, text=folded_text)
+        except Exception:
+            # fallback 保留原首2尾2逻辑
+            pass
+
+        # Fallback: 原首2尾2逻辑（保持兼容）
+        if total_chars <= self.max_chars:
+            # 80%~100% 区间但 embedding 失败，仍按原逻辑不折叠（兼容）
+            # 但已过 threshold，按原逻辑应标记 truncated 用 head2 tail2
+            # 为兼容旧 test，直接走 head2 tail2 折叠
+            pass
+
         n = len(self._messages)
         if n <= 4:
-            # 消息过少无法折叠，直接标记截断
             banner = "TRUNCATED: context folded 保留首2+尾2，中间用 [SUMMARY] 占位"
             return CompactResult(truncated=True, banner=banner, text=text)
 
@@ -52,21 +108,14 @@ class ContextManager:
 
         folded_text = "\n".join(lines_head + [summary] + lines_tail)
 
-        # 若折叠后仍超 max_chars，截断中间 summary 长度但首尾必须完整
         if len(folded_text) > self.max_chars:
-            # 尝试缩短 summary，首尾完整保留
-            # 计算首尾占用长度
             head_text = "\n".join(lines_head)
             tail_text = "\n".join(lines_tail)
-            # 可用给 summary 的剩余空间
-            # 至少保留 "[SUMMARY]" 前缀
-            reserved = len(head_text) + 1 + len(tail_text) + 1  # 加换行符
+            reserved = len(head_text) + 1 + len(tail_text) + 1
             remaining = self.max_chars - reserved
             if remaining < len("[SUMMARY]"):
-                # 即使 summary 最小化仍超长，仍返回折叠文本（允许 >max_chars，关键是保留首尾）
                 pass
             else:
-                # 截断 summary 到 remaining 长度
                 if len(summary) > remaining:
                     summary = summary[:remaining]
                     folded_text = "\n".join(lines_head + [summary] + lines_tail)
