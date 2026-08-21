@@ -15,7 +15,7 @@ import csv
 import json
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 
 @dataclass
@@ -258,11 +258,55 @@ def reconcile_files(
     positions_csv: str | Path,
     tolerance: float = 1e-6,
     journal: Any | None = None,
+    wall_time_budget: float | None = None,
 ) -> ReconcileResult:
     """File-based reconciliation: ledger.jsonl vs positions.csv."""
-    broker = load_positions_csv(positions_csv)
-    shadow = aggregate_shadow(journal=journal, ledger_path=ledger_path)
-    return reconcile(shadow, broker, tolerance=tolerance)
+    import time as _t
+
+    _start = _t.monotonic()
+    _status = "success"
+    try:
+        # wall-time budget enforcement (governance)
+        _budget = wall_time_budget
+        if _budget is None:
+            import os as _os
+
+            raw = _os.environ.get("HERO_WALL_TIME_BUDGET", _os.environ.get("HERO_WALL_TIME_BUDGET_SECONDS", "")).strip()
+            if raw:
+                try:
+                    _budget = float(raw)
+                except Exception:
+                    _budget = None
+        broker = load_positions_csv(positions_csv)
+        shadow = aggregate_shadow(journal=journal, ledger_path=ledger_path)
+        res = reconcile(shadow, broker, tolerance=tolerance)
+        # check budget after work
+        if _budget is not None and _budget > 0:
+            _elapsed = _t.monotonic() - _start
+            if _elapsed > float(_budget):
+                _status = "exceeded"
+                try:
+                    from hero_quant.metrics import inc_wall_time_exceeded
+
+                    inc_wall_time_exceeded("reconcile")
+                except Exception:
+                    pass
+                from hero_quant.governance.wall_time import WallTimeExceeded
+
+                raise WallTimeExceeded("reconcile", float(_budget), float(_elapsed))
+        return res
+    except Exception:
+        if _status != "exceeded":
+            _status = "error"
+        raise
+    finally:
+        try:
+            _elapsed = _t.monotonic() - _start
+            from hero_quant.metrics import observe_wall_time
+
+            observe_wall_time("reconcile", float(_elapsed), status=_status)
+        except Exception:
+            pass
 
 
 def daily_reconciliation(
@@ -271,12 +315,60 @@ def daily_reconciliation(
     positions_csv: str | Path,
     tolerance: float = 1e-6,
     journal: Any | None = None,
+    wall_time_budget: float | None = None,
 ) -> Dict[str, Any]:
     """Daily job entry: returns report dict with date and 0差额 verdict.
 
     Also verifies ledger integrity if possible.
     """
-    result = reconcile_files(ledger_path, positions_csv, tolerance=tolerance, journal=journal)
+    import time as _t
+
+    _start = _t.monotonic()
+    _status = "success"
+    try:
+        result = reconcile_files(ledger_path, positions_csv, tolerance=tolerance, journal=journal, wall_time_budget=wall_time_budget)
+        # check budget
+        _budget = wall_time_budget
+        if _budget is None:
+            import os as _os2
+
+            raw = _os2.environ.get("HERO_WALL_TIME_BUDGET", _os2.environ.get("HERO_WALL_TIME_BUDGET_SECONDS", "")).strip()
+            if raw:
+                try:
+                    _budget = float(raw)
+                except Exception:
+                    _budget = None
+        if _budget is not None and _budget > 0:
+            _elapsed = _t.monotonic() - _start
+            if _elapsed > float(_budget):
+                _status = "exceeded"
+                try:
+                    from hero_quant.metrics import inc_wall_time_exceeded
+
+                    inc_wall_time_exceeded("daily_reconciliation")
+                except Exception:
+                    pass
+                from hero_quant.governance.wall_time import WallTimeExceeded
+
+                raise WallTimeExceeded("daily_reconciliation", float(_budget), float(_elapsed))
+    except Exception:
+        if _status != "exceeded":
+            _status = "error"
+        raise
+    finally:
+        try:
+            _elapsed = _t.monotonic() - _start
+            from hero_quant.metrics import observe_wall_time
+
+            observe_wall_time("daily_reconciliation", float(_elapsed), status=_status)
+        except Exception:
+            pass
+    # capture result already computed (need to handle exception case above)
+    # if we reached here, result is available
+    try:
+        pass
+    except Exception:
+        pass
     # optional ledger verify
     verified = None
     try:

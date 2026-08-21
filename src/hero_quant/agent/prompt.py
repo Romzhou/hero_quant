@@ -22,7 +22,6 @@ Usage:
 
 from __future__ import annotations
 
-from typing import Optional
 
 # ---------------------------------------------------------------------------
 # Section templates — kept concise but explicit for tests & audit

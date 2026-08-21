@@ -1,4 +1,4 @@
-"""MemoryStore - file+sqlite FTS5+dedup minimal implementation with vector hybrid."""
+"""MemoryStore - file+sqlite FTS5+dedup minimal implementation with vector hybrid + pgvector sidecar."""
 
 from __future__ import annotations
 
@@ -22,8 +22,429 @@ def _content_hash(name: str, content: str) -> str:
     return hashlib.sha256(f"{name}:{content}".lower().strip().encode()).hexdigest()[:12]
 
 
+# ---- pgvector sidecar hardening (Wave E3) ----
+# Env gate consolidated in Settings; thin wrappers here delegate to single sources.
+_PG_PREFIXES = ("postgresql://", "postgres://", "postgresql+psycopg://")
+
+
+def _pgvector_dsn() -> str | None:
+    """Resolve pgvector DSN via Settings (single env gate)."""
+    try:
+        from hero_quant.config.settings import Settings
+
+        s = Settings()
+        dsn = s.vector_dsn
+        if dsn and isinstance(dsn, str) and dsn.strip().startswith(_PG_PREFIXES):
+            return dsn.strip()
+        return None
+    except Exception:
+        return None
+
+
+def is_pgvector_configured() -> bool:
+    """Whether pgvector sidecar should be attempted (env gate via Settings)."""
+    try:
+        from hero_quant.config.settings import Settings
+
+        s = Settings()
+        store = (s.vector_store or "").strip().lower() if s.vector_store else ""
+        if store in ("local", "sqlite", "memory", "none", "offline", "disable", "disabled"):
+            return False
+        return _pgvector_dsn() is not None
+    except Exception:
+        return False
+
+
+def get_vector_dim() -> int:
+    """Single source: delegate to hero_quant.agent.embed.get_vector_dim."""
+    try:
+        from hero_quant.agent.embed import get_vector_dim as _embed_dim
+
+        return _embed_dim()
+    except Exception:
+        return 32
+
+
+def _vector_to_literal(vec) -> str:
+    """Serialize vector to pgvector literal '[0.1,0.2]' for TEXT fallback or vector type."""
+    try:
+        from hero_quant.agent.embed import to_pgvector_literal  # type: ignore
+
+        return to_pgvector_literal(vec)  # type: ignore
+    except Exception:
+        try:
+            return "[" + ",".join(f"{float(x):.6f}" for x in vec) + "]"
+        except Exception:
+            return "[" + ",".join(str(x) for x in vec) + "]"
+
+
+class PgVectorSidecar:
+    """Postgres pgvector sidecar — first-class when configured, graceful fallback to local.
+
+    - DDL: CREATE EXTENSION vector + memory_vectors(key PK, content, embedding vector(dim), namespace)
+    - UPSERT via INSERT ... ON CONFLICT (key) DO UPDATE
+    - SEARCH via embedding <=> query::vector (cosine distance) with namespace filter
+    - If psycopg not installed or connection fails, _enabled=False and all ops no-op.
+    - Timeout hardening: connection timeout 5s, statement timeout 5s.
+    """
+
+    def __init__(self, dsn: str | None = None, dim: int | None = None) -> None:
+        self.dsn: str = (dsn or _pgvector_dsn() or "").strip()
+        self.dim: int = int(dim) if dim is not None else get_vector_dim()
+        if self.dim < 8 or self.dim > 2048:
+            self.dim = get_vector_dim()
+        self._pool = None  # type: ignore
+        self._enabled: bool = False
+        self._last_error: str | None = None
+        self._is_async: bool = False
+        if self.dsn and self.dsn.startswith(_PG_PREFIXES):
+            self._init_pool()
+
+    def _init_pool(self) -> None:
+        if not self.dsn:
+            return
+        # lazy import pool; fallback to direct psycopg if pool unavailable
+        Pool = None  # type: ignore
+        try:
+            try:
+                from psycopg_pool import AsyncConnectionPool as _AsyncPool  # type: ignore
+
+                Pool = _AsyncPool  # type: ignore
+            except Exception:
+                from psycopg_pool import ConnectionPool as _SyncPool  # type: ignore
+
+                Pool = _SyncPool  # type: ignore
+        except Exception:
+            Pool = None  # type: ignore
+        if Pool is None:
+            # check psycopg availability
+            try:
+                import importlib.util as _ilu
+
+                if _ilu.find_spec("psycopg") is None:
+                    self._last_error = "psycopg not installed"
+                    return
+                # no pool, will use direct connect per operation — still enabled
+                self._enabled = True
+                return
+            except Exception as e:
+                self._last_error = str(e)
+                return
+        try:
+            try:
+                self._pool = Pool(conninfo=self.dsn, min_size=1, max_size=5, timeout=5, kwargs={"connect_timeout": 5})  # type: ignore
+            except TypeError:
+                try:
+                    self._pool = Pool(conninfo=self.dsn, min_size=1, max_size=5)  # type: ignore
+                except TypeError:
+                    self._pool = Pool(self.dsn)  # type: ignore  # type: ignore
+            # detect async
+            try:
+                import inspect as _ins
+
+                self._is_async = "Async" in type(self._pool).__name__ or _ins.iscoroutinefunction(getattr(self._pool, "open", None))
+            except Exception:
+                self._is_async = False
+            self._enabled = True
+            # try ensure schema sync only if not async (async will do lazy)
+            if not self._is_async:
+                self._ensure_schema_sync()
+        except Exception as e:
+            self._last_error = str(e)
+            self._pool = None
+            self._enabled = False
+
+    def _ensure_schema_sync(self) -> None:
+        if not self._enabled or self._is_async:
+            return
+        # DDL guarded — extension + table + index (best effort)
+        try:
+            if self._pool is not None and hasattr(self._pool, "connection"):
+                with self._pool.connection() as conn:  # type: ignore
+                    try:
+                        conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
+                    except Exception:
+                        pass
+                    # try vector type, fallback to TEXT
+                    created = False
+                    try:
+                        conn.execute(
+                            f"CREATE TABLE IF NOT EXISTS memory_vectors (key TEXT PRIMARY KEY, content TEXT, embedding vector({self.dim}), namespace TEXT, created TIMESTAMPTZ DEFAULT now())"
+                        )
+                        created = True
+                    except Exception:
+                        try:
+                            conn.execute(
+                                "CREATE TABLE IF NOT EXISTS memory_vectors (key TEXT PRIMARY KEY, content TEXT, embedding TEXT, namespace TEXT, created TIMESTAMPTZ DEFAULT now())"
+                            )
+                            created = True
+                        except Exception:
+                            created = False
+                    # best-effort index (ivfflat requires vector)
+                    if created:
+                        try:
+                            # only if vector type succeeded
+                            conn.execute(
+                                "CREATE INDEX IF NOT EXISTS idx_memory_vectors_embedding ON memory_vectors USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100)"
+                            )
+                        except Exception:
+                            pass
+                        try:
+                            conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_vectors_ns ON memory_vectors (namespace)")
+                        except Exception:
+                            pass
+                    try:
+                        conn.commit()  # type: ignore
+                    except Exception:
+                        pass
+            elif self._pool is not None and hasattr(self._pool, "getconn"):
+                conn = self._pool.getconn()  # type: ignore
+                try:
+                    with conn.cursor() as cur:
+                        try:
+                            cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
+                        except Exception:
+                            pass
+                        try:
+                            cur.execute(
+                                f"CREATE TABLE IF NOT EXISTS memory_vectors (key TEXT PRIMARY KEY, content TEXT, embedding vector({self.dim}), namespace TEXT, created TIMESTAMPTZ DEFAULT now())"
+                            )
+                        except Exception:
+                            cur.execute(
+                                "CREATE TABLE IF NOT EXISTS memory_vectors (key TEXT PRIMARY KEY, content TEXT, embedding TEXT, namespace TEXT, created TIMESTAMPTZ DEFAULT now())"
+                            )
+                        try:
+                            cur.execute("CREATE INDEX IF NOT EXISTS idx_memory_vectors_ns ON memory_vectors (namespace)")
+                        except Exception:
+                            pass
+                    conn.commit()
+                finally:
+                    try:
+                        self._pool.putconn(conn)  # type: ignore
+                    except Exception:
+                        pass
+            else:
+                # direct psycopg path — try one-off connection
+                try:
+                    import psycopg  # type: ignore
+
+                    with psycopg.connect(self.dsn, connect_timeout=5) as conn:  # type: ignore
+                        with conn.cursor() as cur:
+                            try:
+                                cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
+                            except Exception:
+                                pass
+                            try:
+                                cur.execute(
+                                    f"CREATE TABLE IF NOT EXISTS memory_vectors (key TEXT PRIMARY KEY, content TEXT, embedding vector({self.dim}), namespace TEXT, created TIMESTAMPTZ DEFAULT now())"
+                                )
+                            except Exception:
+                                cur.execute(
+                                    "CREATE TABLE IF NOT EXISTS memory_vectors (key TEXT PRIMARY KEY, content TEXT, embedding TEXT, namespace TEXT, created TIMESTAMPTZ DEFAULT now())"
+                                )
+                        conn.commit()
+                except Exception:
+                    pass
+        except Exception as e:
+            self._last_error = str(e)
+            pass
+
+    def ping(self) -> bool:
+        if not self._enabled:
+            return False
+        try:
+            if self._pool is not None and hasattr(self._pool, "connection") and not self._is_async:
+                with self._pool.connection() as conn:  # type: ignore
+                    try:
+                        cur = conn.execute("SELECT 1")  # type: ignore
+                        cur.fetchone()  # type: ignore
+                    except Exception:
+                        with conn.cursor() as cur:  # type: ignore
+                            cur.execute("SELECT 1")
+                            cur.fetchone()
+                return True
+            elif self._pool is not None and hasattr(self._pool, "getconn"):
+                conn = self._pool.getconn()  # type: ignore
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT 1")
+                        cur.fetchone()
+                    return True
+                finally:
+                    try:
+                        self._pool.putconn(conn)  # type: ignore
+                    except Exception:
+                        pass
+            else:
+                import psycopg  # type: ignore
+
+                with psycopg.connect(self.dsn, connect_timeout=5) as conn:  # type: ignore
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT 1")
+                        cur.fetchone()
+                return True
+        except Exception:
+            return False
+
+    def upsert(self, key: str, content: str, embedding: list[float], namespace: str | None = None) -> bool:
+        if not self._enabled or not key:
+            return False
+        lit = _vector_to_literal(embedding)
+        ns = namespace or ""
+        # try sync pool path; async pool will fallback to False (caller fallback to local)
+        if self._is_async:
+            return False
+        try:
+            if self._pool is not None and hasattr(self._pool, "connection"):
+                with self._pool.connection() as conn:  # type: ignore
+                    # try vector::vector insertion, fallback to TEXT
+                    try:
+                        conn.execute(
+                            "INSERT INTO memory_vectors (key, content, embedding, namespace) VALUES (%s, %s, %s::vector, %s) ON CONFLICT (key) DO UPDATE SET content=EXCLUDED.content, embedding=EXCLUDED.embedding, namespace=EXCLUDED.namespace",
+                            (key, content, lit, ns),
+                        )
+                    except Exception:
+                        # fallback TEXT column
+                        with conn.cursor() as cur:  # type: ignore
+                            cur.execute(
+                                "INSERT INTO memory_vectors (key, content, embedding, namespace) VALUES (%s, %s, %s, %s) ON CONFLICT (key) DO UPDATE SET content=EXCLUDED.content, embedding=EXCLUDED.embedding, namespace=EXCLUDED.namespace",
+                                (key, content, lit, ns),
+                            )
+                    try:
+                        conn.commit()  # type: ignore
+                    except Exception:
+                        pass
+                return True
+            elif self._pool is not None and hasattr(self._pool, "getconn"):
+                conn = self._pool.getconn()  # type: ignore
+                try:
+                    with conn.cursor() as cur:
+                        try:
+                            cur.execute(
+                                "INSERT INTO memory_vectors (key, content, embedding, namespace) VALUES (%s, %s, %s::vector, %s) ON CONFLICT (key) DO UPDATE SET content=EXCLUDED.content, embedding=EXCLUDED.embedding, namespace=EXCLUDED.namespace",
+                                (key, content, lit, ns),
+                            )
+                        except Exception:
+                            cur.execute(
+                                "INSERT INTO memory_vectors (key, content, embedding, namespace) VALUES (%s, %s, %s, %s) ON CONFLICT (key) DO UPDATE SET content=EXCLUDED.content, embedding=EXCLUDED.embedding, namespace=EXCLUDED.namespace",
+                                (key, content, lit, ns),
+                            )
+                    conn.commit()
+                finally:
+                    try:
+                        self._pool.putconn(conn)  # type: ignore
+                    except Exception:
+                        pass
+                return True
+            else:
+                import psycopg  # type: ignore
+
+                with psycopg.connect(self.dsn, connect_timeout=5) as conn:  # type: ignore
+                    with conn.cursor() as cur:
+                        try:
+                            cur.execute(
+                                "INSERT INTO memory_vectors (key, content, embedding, namespace) VALUES (%s, %s, %s::vector, %s) ON CONFLICT (key) DO UPDATE SET content=EXCLUDED.content, embedding=EXCLUDED.embedding, namespace=EXCLUDED.namespace",
+                                (key, content, lit, ns),
+                            )
+                        except Exception:
+                            cur.execute(
+                                "INSERT INTO memory_vectors (key, content, embedding, namespace) VALUES (%s, %s, %s, %s) ON CONFLICT (key) DO UPDATE SET content=EXCLUDED.content, embedding=EXCLUDED.embedding, namespace=EXCLUDED.namespace",
+                                (key, content, lit, ns),
+                            )
+                    conn.commit()
+                return True
+        except Exception as e:
+            self._last_error = str(e)
+            return False
+
+    def search(self, query_vec: list[float], top_k: int = 5, namespace: str | None = None) -> list[dict]:
+        if not self._enabled or not query_vec:
+            return []
+        lit = _vector_to_literal(query_vec)
+        ns = namespace or ""
+        top_k = max(1, min(int(top_k), 100))
+        try:
+            rows: list[tuple] = []
+            if self._pool is not None and hasattr(self._pool, "connection") and not self._is_async:
+                with self._pool.connection() as conn:  # type: ignore
+                    try:
+                        # cosine distance: 1 - cosine => ORDER BY embedding <=> query asc
+                        if ns:
+                            cur = conn.execute(  # type: ignore
+                                "SELECT key, content, embedding FROM memory_vectors WHERE namespace=%s ORDER BY embedding <=> %s::vector LIMIT %s",
+                                (ns, lit, top_k),
+                            )
+                            rows = cur.fetchall()  # type: ignore
+                        else:
+                            cur = conn.execute(  # type: ignore
+                                "SELECT key, content, embedding FROM memory_vectors ORDER BY embedding <=> %s::vector LIMIT %s",
+                                (lit, top_k),
+                            )
+                            rows = cur.fetchall()  # type: ignore
+                    except Exception:
+                        with conn.cursor() as cur:  # type: ignore
+                            if ns:
+                                cur.execute(
+                                    "SELECT key, content, embedding FROM memory_vectors WHERE namespace=%s ORDER BY embedding <=> %s::vector LIMIT %s",
+                                    (ns, lit, top_k),
+                                )
+                            else:
+                                cur.execute(
+                                    "SELECT key, content, embedding FROM memory_vectors ORDER BY embedding <=> %s::vector LIMIT %s",
+                                    (lit, top_k),
+                                )
+                            rows = cur.fetchall()
+            elif self._pool is not None and hasattr(self._pool, "getconn"):
+                conn = self._pool.getconn()  # type: ignore
+                try:
+                    with conn.cursor() as cur:
+                        if ns:
+                            cur.execute(
+                                "SELECT key, content, embedding FROM memory_vectors WHERE namespace=%s ORDER BY embedding <=> %s::vector LIMIT %s",
+                                (ns, lit, top_k),
+                            )
+                        else:
+                            cur.execute(
+                                "SELECT key, content, embedding FROM memory_vectors ORDER BY embedding <=> %s::vector LIMIT %s",
+                                (lit, top_k),
+                            )
+                        rows = cur.fetchall()
+                finally:
+                    try:
+                        self._pool.putconn(conn)  # type: ignore
+                    except Exception:
+                        pass
+            else:
+                import psycopg  # type: ignore
+
+                with psycopg.connect(self.dsn, connect_timeout=5) as conn:  # type: ignore
+                    with conn.cursor() as cur:
+                        if ns:
+                            cur.execute(
+                                "SELECT key, content, embedding FROM memory_vectors WHERE namespace=%s ORDER BY embedding <=> %s::vector LIMIT %s",
+                                (ns, lit, top_k),
+                            )
+                        else:
+                            cur.execute(
+                                "SELECT key, content, embedding FROM memory_vectors ORDER BY embedding <=> %s::vector LIMIT %s",
+                                (lit, top_k),
+                            )
+                        rows = cur.fetchall()
+            out: list[dict] = []
+            for r in rows:
+                try:
+                    k, c, emb = r[0], r[1], r[2]
+                    out.append({"key": k, "content": c})
+                except Exception:
+                    continue
+            return out
+        except Exception as e:
+            self._last_error = str(e)
+            return []
+
+
 class MemoryStore:
-    """File storage with SQLite FTS5 and 30s dedup + optional tenant/thread namespace isolation + vector hybrid."""
+    """File storage with SQLite FTS5 and 30s dedup + optional tenant/thread namespace isolation + vector hybrid + pgvector sidecar."""
 
     def __init__(self, base_path: Path | str, namespace: str | None = None):
         self.base = Path(base_path)
@@ -42,6 +463,38 @@ class MemoryStore:
             self.hierarchy = MemoryHierarchy(self.base)
         except Exception:
             self.hierarchy = None  # type: ignore
+        # pgvector sidecar — first-class when configured, fallback to local hybrid if unavailable
+        self._pgvector: PgVectorSidecar | None = None
+        self._pgvector_enabled: bool = False
+        try:
+            if is_pgvector_configured():
+                # dim may be overridden via env; use get_vector_dim()
+                self._pgvector = PgVectorSidecar(dim=get_vector_dim())
+                # _enabled may be False if pool fails; still keep object for diagnostics
+                self._pgvector_enabled = bool(getattr(self._pgvector, "_enabled", False))
+                # vector hybrid remains enabled even if pg not reachable (local fallback)
+                if self._pgvector_enabled:
+                    self._vector_enabled = True
+            else:
+                self._pgvector = None
+                self._pgvector_enabled = False
+        except Exception:
+            self._pgvector = None
+            self._pgvector_enabled = False
+
+    @property
+    def vector_backend(self) -> str:
+        """Return 'pgvector' if sidecar enabled and reachable, else 'local'."""
+        if self._pgvector is not None and getattr(self._pgvector, "_enabled", False):
+            # optional ping check (best effort, not blocking search)
+            return "pgvector"
+        return "local"
+
+    def get_vector_backend(self) -> str:
+        return self.vector_backend
+
+    def is_pgvector_enabled(self) -> bool:
+        return bool(self._pgvector_enabled and self._pgvector is not None and getattr(self._pgvector, "_enabled", False))
 
     def _ns_key(self, key: str) -> str:
         """Prefix key with namespace if set: f"{namespace}:{key}" else key."""
@@ -149,7 +602,11 @@ class MemoryStore:
             return dot / (na * nb)
 
     def _load_vector_for_key(self, key: str):
-        """Load stored vector JSON for key if column exists, else None."""
+        """Load stored vector JSON for key if column exists, else None.
+
+        Handles dim drift: if stored vector length mismatches current
+        get_vector_dim(), treat as stale and return None to trigger re-embed.
+        """
         try:
             cur = self._conn.cursor()
             # check column exists first
@@ -163,13 +620,85 @@ class MemoryStore:
                 raw = row[0]
                 if isinstance(raw, str):
                     try:
-                        return json.loads(raw)
+                        parsed = json.loads(raw)
                     except Exception:
                         return None
-                return raw
+                else:
+                    parsed = raw
+                # dim drift check: single source via embed.get_vector_dim
+                try:
+                    from hero_quant.agent.embed import get_vector_dim as _gvd
+
+                    expected = int(_gvd())
+                    if isinstance(parsed, list) and len(parsed) != expected:
+                        return None
+                except Exception:
+                    pass
+                return parsed
         except Exception:
             return None
         return None
+
+    def _ensure_vector_dim(self, vec, content: str):
+        """Re-embed if vec is None or dim mismatches current dim."""
+        try:
+            from hero_quant.agent.embed import get_vector_dim as _gvd
+
+            expected = int(_gvd())
+            if vec is None or not isinstance(vec, list) or len(vec) != expected:
+                return self._embed_text(content)
+            return vec
+        except Exception:
+            return vec if vec is not None else self._embed_text(content)
+
+    # ---- pgvector sidecar helpers ----
+    def _pgvector_upsert(self, ns_key: str, content: str, vec) -> None:
+        """Best-effort upsert into pgvector sidecar — never raises, falls back silently."""
+        if not self._pgvector_enabled or self._pgvector is None or vec is None:
+            return
+        try:
+            # namespace isolation: sidecar stores namespace separately for filtered search
+            ns = self.namespace or ""
+            ok = self._pgvector.upsert(ns_key, content, vec, namespace=ns)
+            if not ok:
+                # do not disable permanently; keep enabled flag for next try
+                pass
+        except Exception:
+            pass
+
+    def _pgvector_search(self, query: str, top_k: int = 5) -> list[dict]:
+        """Try pgvector sidecar search — returns [] on any failure to trigger local fallback."""
+        if not self._pgvector_enabled or self._pgvector is None:
+            return []
+        if not query:
+            return []
+        try:
+            qvec = self._embed_text(query)
+            if qvec is None:
+                return []
+            ns = self.namespace or "" if self.namespace else None
+            # search sidecar
+            pg_hits = self._pgvector.search(qvec, top_k=top_k, namespace=ns)
+            # pg_hits are [{"key":..., "content":...}] already namespace-filtered if backend supports it
+            # ensure prefix filtering for safety when namespace is set but sidecar stored with prefix
+            if self._ns_prefix() is not None and pg_hits:
+                prefix = self._ns_prefix()
+                pg_hits = [h for h in pg_hits if h.get("key", "").startswith(prefix or "")]
+            # attach score via cosine for hybrid re-rank (compute locally if not returned)
+            out: list[dict] = []
+            for h in pg_hits:
+                # compute cosine on the fly for hybrid (pg distance not exposed, so recompute)
+                try:
+                    cvec = self._load_vector_for_key(h["key"])
+                    if cvec is None:
+                        cvec = self._embed_text(h["content"])
+                    score = self._cosine_sim(qvec, cvec) if cvec is not None else 0.0
+                except Exception:
+                    score = 0.0
+                out.append({"key": h["key"], "content": h["content"], "score": score})
+            return out
+        except Exception:
+            return []
 
     def write(self, key: str, content: str, memory_type: str | None = None) -> None:
         now = time.time()
@@ -298,6 +827,25 @@ class MemoryStore:
                     except Exception:
                         pass
             self._conn.commit()
+            # pgvector sidecar upsert (best-effort, never breaks local write)
+            try:
+                if vector_json is not None:
+                    try:
+                        vec_obj = json.loads(vector_json) if isinstance(vector_json, str) else vector_json
+                    except Exception:
+                        vec_obj = None
+                    if vec_obj is not None:
+                        self._pgvector_upsert(ns_key, content, vec_obj)
+                else:
+                    # fallback: compute vec again for pg if needed (dim-consistent)
+                    try:
+                        vec2 = self._embed_text(content)
+                        if vec2 is not None:
+                            self._pgvector_upsert(ns_key, content, vec2)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
         except Exception:
             try:
                 self._conn.rollback()
@@ -353,17 +901,29 @@ class MemoryStore:
     def vector_search(self, query: str, top_k: int = 5) -> list[dict]:
         """Pure vector cosine topK search — hybrid component.
 
-        Uses stored vector column if available, otherwise computes on-the-fly.
-        Namespace-aware filtering.
+        Uses pgvector sidecar first-class when configured, fallback to stored vector column
+        or on-the-fly local cosine. Namespace-aware filtering.
         """
         if not query:
             return []
+        # pgvector sidecar first-class: try PG before local (hybrid fallback)
+        try:
+            pg_hits = self._pgvector_search(query, top_k=top_k)
+            if pg_hits:
+                # if pg returned enough hits, return directly; else supplement with local
+                if len(pg_hits) >= max(1, int(top_k)):
+                    return pg_hits[: max(1, int(top_k))]
+                # will merge later — keep pg_hits for union
+            else:
+                pg_hits = []
+        except Exception:
+            pg_hits = []
         prefix = self._ns_prefix()
         # embed query
         try:
             qvec = self._embed_text(query)
         except Exception:
-            return []
+            return pg_hits  # fallback to whatever pg gave
         # fetch all notes with vector
         candidates: list[dict] = []
         try:
@@ -385,12 +945,8 @@ class MemoryStore:
                             note_vec = json.loads(v) if isinstance(v, str) else v
                         except Exception:
                             note_vec = None
-                    if note_vec is None:
-                        # compute on fly fallback
-                        try:
-                            note_vec = self._embed_text(c)
-                        except Exception:
-                            note_vec = None
+                    # dim drift: re-embed if stored vector length mismatches current dim
+                    note_vec = self._ensure_vector_dim(note_vec, c)
                     if note_vec is None:
                         continue
                     sim = self._cosine_sim(qvec, note_vec)
@@ -438,6 +994,30 @@ class MemoryStore:
                     continue
         # sort by cosine desc
         candidates.sort(key=lambda x: x.get("_score", 0.0), reverse=True)
+        # merge pgvector sidecar hits (first-class) with local candidates — hybrid fallback
+        # pg_hits already filtered by namespace and scored; union dedup by key keeps best score
+        if pg_hits:
+            # build map from local candidates for quick score lookup
+            local_by_key = {c["key"]: c for c in candidates}
+            # start with pg hits (preserve order by pg score)
+            merged: dict[str, dict] = {}
+            for h in pg_hits:
+                merged[h["key"]] = {"key": h["key"], "content": h["content"], "_score": float(h.get("score", 0.0))}
+            # add local candidates that are not already in pg
+            for c in candidates:
+                if c["key"] not in merged:
+                    merged[c["key"]] = c
+                else:
+                    # keep higher score if duplicate (max of pg vs local)
+                    if float(c.get("_score", 0.0)) > float(merged[c["key"]].get("_score", 0.0)):
+                        merged[c["key"]]["_score"] = float(c.get("_score", 0.0))
+            # re-sort merged by score desc
+            all_items = list(merged.values())
+            all_items.sort(key=lambda x: float(x.get("_score", 0.0)), reverse=True)
+            out: list[dict] = []
+            for it in all_items[: max(0, top_k)]:
+                out.append({"key": it["key"], "content": it["content"], "score": float(it.get("_score", 0.0))})
+            return out
         # strip internal _score before return? Keep for hybrid but expose without
         out: list[dict] = []
         for it in candidates[: max(0, top_k)]:

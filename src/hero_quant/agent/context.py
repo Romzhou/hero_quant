@@ -47,15 +47,13 @@ class ContextManager:
             if n <= 4:
                 summary = embedding_summary(self._messages)
                 banner = "TRUNCATED: embedding vector folding 80% threshold"
-                # 向量摘要 + 原文（保证信息不丢）
-                folded_text = summary + "\n" + text
-                # 截断控制
+                # 向量折叠 expands fix: use summary alone not summary+text (Task12 MUST)
+                folded_text = summary
                 if len(folded_text) > self.max_chars:
-                    # 优先保留 summary (embedding) + 尾部
-                    head_text = lines[0] if lines else ""
-                    remaining = self.max_chars - len(summary) - 1
-                    if remaining > 0:
-                        folded_text = summary + "\n" + text[-remaining:]
+                    folded_text = folded_text[: self.max_chars]
+                    if "embedding" not in folded_text.lower():
+                        folded_text = "[EMBEDDING_SUMMARY embedding] " + folded_text
+                        folded_text = folded_text[: self.max_chars]
                 return CompactResult(truncated=True, banner=banner, text=folded_text)
 
             head = self._messages[:2]

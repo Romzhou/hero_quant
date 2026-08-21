@@ -15,10 +15,10 @@ export default function Dashboard() {
           { k: "今日收益", v: "+0.82%", sub: "+¥10,530" },
           { k: "年化", v: "18.4%", sub: "sharpe 1.62" },
           { k: "最大回撤", v: "-3.2%", sub: "近30日" },
-        ].map((c) => (
-          <div key={c.k} className="rounded-2xl border border-white/10 bg-white/[0.04] p-4 backdrop-blur">
+        ].map((c, i) => (
+          <div key={c.k} style={{ animationDelay: `${i * 80}ms` }} className="group rounded-2xl border border-white/10 bg-white/[0.04] p-4 backdrop-blur transition hover:bg-white/[0.06] hover:border-white/15 animate-[fadeIn_0.5s_ease_both]">
             <div className="text-[11px] tracking-[0.14em] text-slate-400">{c.k}</div>
-            <div className="mt-1 font-display text-xl font-semibold text-mist">{c.v}</div>
+            <div className="mt-1 font-display text-xl font-semibold text-mist group-hover:text-white transition">{c.v}</div>
             <div className="font-mono text-[11px] text-slate-500">{c.sub}</div>
           </div>
         ))}

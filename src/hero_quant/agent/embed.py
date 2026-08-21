@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import hashlib
 import math
-import os
 import re
 from typing import Dict, List
 
@@ -21,6 +20,63 @@ from typing import Dict, List
 _DEFAULT_DIM = 32
 _OFFLINE_DIM = 32
 _SEMANTIC_DIM = 32
+
+# single source dim resolver via Settings (env gate)
+
+
+def get_vector_dim(default: int | None = None) -> int:
+    """Resolve pgvector/embedding dim via Settings (single source), clamped [8,2048]."""
+    try:
+        from hero_quant.config.settings import Settings
+
+        v = int(Settings().vector_dim)
+        if 8 <= v <= 2048:
+            return v
+    except Exception:
+        pass
+    if default is not None:
+        try:
+            iv = int(default)
+            if 8 <= iv <= 2048:
+                return iv
+        except Exception:
+            pass
+    return _DEFAULT_DIM
+
+
+def get_dim() -> int:
+    return get_vector_dim()
+
+
+def to_pgvector_literal(vec: List[float]) -> str:
+    """Serialize vector for pgvector TEXT literal: '[0.1,0.2,...]'."""
+    try:
+        return "[" + ",".join(f"{float(x):.6f}" for x in vec) + "]"
+    except Exception:
+        return "[" + ",".join(str(x) for x in vec) + "]"
+
+
+def from_pgvector_literal(s: str | List[float]) -> List[float]:
+    """Parse pgvector literal back to list[float]; passthrough if already list."""
+    if isinstance(s, list):
+        return [float(x) for x in s]
+    if not isinstance(s, str):
+        return []
+    txt = s.strip()
+    if txt.startswith("[") and txt.endswith("]"):
+        txt = txt[1:-1]
+    if not txt:
+        return []
+    out: List[float] = []
+    for part in txt.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            out.append(float(part))
+        except Exception:
+            continue
+    return out
 
 _PROVIDER_ALIASES = {
     "openai": "openai",
@@ -35,13 +91,18 @@ _PROVIDER_ALIASES = {
 
 
 def _active_provider_name() -> str:
-    raw = os.environ.get("HERO_EMBED_PROVIDER", "offline")
+    try:
+        from hero_quant.config.settings import Settings
+
+        raw = Settings().embed_provider
+    except Exception:
+        raw = "offline"
     if raw is None:
         raw = "offline"
     key = str(raw).strip().lower()
     if not key:
         return "offline"
-    # normalize aliases
+    # normalize aliases (single source alias map in settings)
     if key in _PROVIDER_ALIASES:
         return _PROVIDER_ALIASES[key]
     # allow 'openai' substring etc
@@ -143,7 +204,12 @@ def _try_sentence_transformers(text: str, dim: int) -> List[float] | None:
         # Attempt to load cached model if available, else fallback quickly
         from sentence_transformers import SentenceTransformer  # type: ignore
 
-        model_name = os.environ.get("HERO_SBERT_MODEL", "all-MiniLM-L6-v2")
+        try:
+            from hero_quant.config.settings import Settings
+
+            model_name = Settings().sbert_model
+        except Exception:
+            model_name = "all-MiniLM-L6-v2"
         # This may attempt download; wrap with timeout not available -> fallback if not cached
         # We try to load but if fails, return None
         try:
@@ -166,7 +232,15 @@ def _try_sentence_transformers(text: str, dim: int) -> List[float] | None:
 
 def _try_openai(text: str, dim: int) -> List[float] | None:
     # Try real OpenAI API if key available; otherwise None to use semantic stub
-    api_key = os.environ.get("OPENAI_API_KEY", "")
+    try:
+        from hero_quant.config.settings import Settings
+
+        _s = Settings()
+        api_key = _s.openai_api_key or ""
+        model = _s.openai_embed_model
+    except Exception:
+        api_key = ""
+        model = "text-embedding-3-small"
     if not api_key:
         return None
     try:
@@ -177,7 +251,6 @@ def _try_openai(text: str, dim: int) -> List[float] | None:
         from openai import OpenAI  # type: ignore
 
         client = OpenAI(api_key=api_key)
-        model = os.environ.get("HERO_OPENAI_EMBED_MODEL", "text-embedding-3-small")
         # OpenAI returns variable dim; we truncate/pad to requested dim then normalize
         resp = client.embeddings.create(input=text, model=model)  # type: ignore
         vec = resp.data[0].embedding  # type: ignore
@@ -190,22 +263,35 @@ def _try_openai(text: str, dim: int) -> List[float] | None:
         return None
 
 
+def embed_batch(texts: List[str], dim: int | None = None) -> List[List[float]]:
+    """Batch embed helper — maps embed over texts with same provider/dim."""
+    if not texts:
+        return []
+    eff_dim = dim if dim is not None else get_vector_dim()
+    return [embed(t, dim=eff_dim) for t in texts]
+
+
 def embed(text: str, dim: int | None = None) -> List[float]:
     """Pluggable embed: dispatch by HERO_EMBED_PROVIDER.
 
     - openai: try OpenAI API then semantic stub
     - sentence-transformers: try SBERT then semantic stub
     - offline: deterministic SHA256 hash (legacy style but denser)
-    dim: requested dimension; if None uses provider default (32).
+    dim: requested dimension; if None uses provider default (env HERO_VECTOR_DIM or 32).
     """
     provider = _active_provider_name()
     # resolve dim
     if dim is None:
-        dim = _DEFAULT_DIM
+        dim = get_vector_dim()
     else:
-        dim = int(dim)
+        try:
+            dim = int(dim)
+        except Exception:
+            dim = get_vector_dim()
         if dim <= 0:
-            dim = _DEFAULT_DIM
+            dim = get_vector_dim()
+        if dim < 8 or dim > 2048:
+            dim = get_vector_dim()
     if provider == "openai":
         # try real API, else semantic stub (guaranteed >0.8 for paraphrases)
         v = _try_openai(text, dim)
@@ -288,4 +374,17 @@ def embedding_summary(messages: List[Dict] | List[str], max_chars: int = 200) ->
     return summary
 
 
-__all__ = ["embed", "cosine_sim", "centroid", "embedding_summary", "get_provider_name", "get_provider", "get_active_provider"]
+__all__ = [
+    "embed",
+    "embed_batch",
+    "cosine_sim",
+    "centroid",
+    "embedding_summary",
+    "get_provider_name",
+    "get_provider",
+    "get_active_provider",
+    "get_vector_dim",
+    "get_dim",
+    "to_pgvector_literal",
+    "from_pgvector_literal",
+]

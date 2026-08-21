@@ -19,6 +19,10 @@ body {
   font-family: "Space Grotesk", system-ui, sans-serif;
 }
 
+@keyframes fadeIn { from { opacity: 0; transform: translateY(6px) } to { opacity: 1; transform: translateY(0) } }
+.scrollbar-none::-webkit-scrollbar { display: none; }
+.scrollbar-none { scrollbar-width: none; }
+
 /* grain overlay */
 body::before {
   content: "";

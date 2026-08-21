@@ -87,9 +87,9 @@ class BillingService:
         # also count from ledger if available and purchases empty fallback
         if self.ledger is not None:
             try:
-                entries = self.ledger.query(tenant=None) if hasattr(self.ledger, "_read_all") else []  # placeholder
+                _entries = self.ledger.query(tenant=None) if hasattr(self.ledger, "_read_all") else []  # placeholder
             except Exception:
-                entries = []
+                _entries = []  # noqa: F841 - placeholder for future use
             # ledger-based counting as fallback: scan ledger for purchase_factor
             # we already have _purchases, but if ledger has extra entries not in memory (e.g., restarted service),
             # include them

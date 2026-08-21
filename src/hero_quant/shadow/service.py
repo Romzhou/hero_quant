@@ -7,7 +7,6 @@ Minimal, uses existing governance/ledger + telemetry/circuit.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from hero_quant.telemetry.circuit import CircuitBreaker
@@ -194,6 +193,9 @@ class ShadowJournal:
 
         Deterministic distribution ensuring each category >0 even with few trades.
         """
+        # TODO: shadow attribution fake coverage — currently deterministic epsilon/base
+        # distribution for empty/few trades to satisfy coverage>0; replace with real
+        # PnL attribution (missed/noise/early/late/overtrade) from execution data when available.
         if not self._records:
             # still 5 >0 with epsilon for empty case
             return {k: 0.01 for k in ATTRIBUTION_CATEGORIES}

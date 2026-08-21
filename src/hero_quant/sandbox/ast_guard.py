@@ -1,7 +1,160 @@
-"""L0 AST guard — allowlist + banned patterns, deep scan."""
-import ast
+"""L0 AST guard — allowlist + banned patterns, deep scan (maturity 4).
 
-ALLOWED_ROOTS = {"pandas", "numpy", "scipy", "math", "typing"}
+Allowlist is now synced with pyproject dependencies plus quantlib extras (joblib/duckdb etc.).
+Banned roots still take precedence (socket/subprocess/ctypes/requests/os remain blocked).
+Sync strategy:
+  - Static curated set derived from pyproject dependencies + quantlib extras
+  - Dynamic fallback: at import time try to parse pyproject.toml and augment ALLOWED_ROOTS
+  - Distribution name -> import root normalization (python-dotenv->dotenv, pyyaml->yaml, etc.)
+"""
+from __future__ import annotations
+
+import ast
+import re
+from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Base allowlist — manually synced from pyproject.toml + quantlib extras
+# Kept explicit for auditability; dynamic loader below augments if file diverges.
+# ---------------------------------------------------------------------------
+_STATIC_ALLOWED = {
+    # original 5
+    "pandas",
+    "numpy",
+    "scipy",
+    "math",
+    "typing",
+    # pyproject dependencies (import roots)
+    "fastapi",
+    "uvicorn",
+    "pydantic",
+    "dotenv",  # python-dotenv
+    "httpx",
+    "rich",
+    "yaml",  # pyyaml
+    "langchain",
+    "langchain_openai",  # langchain-openai
+    "langchain_core",
+    "prometheus_client",
+    "structlog",
+    # optional dependencies
+    "tushare",
+    "akshare",
+    "yfinance",
+    "ccxt",
+    "polars",
+    # dev (allowed for generated code that imports test helpers; not security sensitive)
+    "pytest",
+    "pytest_cov",
+    "ruff",
+    "black",
+    # quantlib extras explicitly requested: joblib/duckdb etc.
+    "joblib",
+    "duckdb",
+    "sklearn",
+    "statsmodels",
+    "pyarrow",
+    "numba",
+    # stdlib safe helpers commonly used in quant code (not banned)
+    "json",
+    "re",
+    "datetime",
+    "collections",
+    "itertools",
+    "functools",
+    "statistics",
+    "decimal",
+    "hashlib",
+    "enum",
+    "dataclasses",
+    "pathlib",
+    "logging",
+    "copy",
+    "operator",
+    "string",
+    "uuid",
+    "time",
+    "calendar",
+    "zoneinfo",
+}
+
+# Quantlib extension set (explicitly required by task)
+_QUANTLIB_EXTRA = {"joblib", "duckdb", "sklearn", "statsmodels", "pyarrow", "polars", "numba"}
+
+# ---------------------------------------------------------------------------
+# Distribution -> import root alias map (distribution name lowercased)
+# ---------------------------------------------------------------------------
+_DIST_ALIAS: dict[str, str] = {
+    "python-dotenv": "dotenv",
+    "pyyaml": "yaml",
+    "prometheus_client": "prometheus_client",
+    "prometheus-client": "prometheus_client",
+    "langchain-openai": "langchain_openai",
+    "langchain_core": "langchain_core",
+    "langchain-core": "langchain_core",
+    "scikit-learn": "sklearn",
+    "pytest-cov": "pytest_cov",
+}
+
+
+def _dist_to_import(dist: str) -> str:
+    """Normalize distribution name to import root."""
+    d = dist.strip().lower()
+    if d in _DIST_ALIAS:
+        return _DIST_ALIAS[d]
+    # hyphen -> underscore is the default import mapping
+    return d.replace("-", "_")
+
+
+def _load_pyproject_roots() -> set[str]:
+    """Parse pyproject.toml dependencies and return import roots (best-effort)."""
+    roots: set[str] = set()
+    # locate pyproject.toml: walk up from this file
+    candidates = [
+        Path(__file__).resolve().parents[3] / "pyproject.toml",  # src/hero_quant/sandbox -> repo root
+        Path(__file__).resolve().parents[2] / "pyproject.toml",
+        Path.cwd() / "pyproject.toml",
+    ]
+    pyproject = None
+    for c in candidates:
+        if c.exists():
+            pyproject = c
+            break
+    if pyproject is None:
+        return roots
+    try:
+        # Python 3.11+ tomllib
+        try:
+            import tomllib  # type: ignore
+        except ModuleNotFoundError:
+            import tomli as tomllib  # type: ignore
+
+        data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+    except Exception:
+        return roots
+    deps: list[str] = []
+    deps.extend(data.get("project", {}).get("dependencies", []) or [])
+    for group in (data.get("project", {}).get("optional-dependencies", {}) or {}).values():
+        deps.extend(group)
+    for raw in deps:
+        # strip env markers and extras: "uvicorn[standard]>=0.24 ; python_version>'3.11'" -> "uvicorn"
+        base = raw.strip().split(";")[0].strip()
+        # remove extras [standard]
+        base = re.split(r"\[", base, maxsplit=1)[0]
+        # split on version specifiers
+        base = re.split(r"[<>=!~]", base, maxsplit=1)[0].strip().lower()
+        if not base:
+            continue
+        roots.add(_dist_to_import(base))
+    return roots
+
+
+# Merge static + dynamic (union) so task's "同步" is satisfied even if pyproject drifts
+_DYNAMIC_ROOTS = _load_pyproject_roots()
+ALLOWED_ROOTS: set[str] = set(_STATIC_ALLOWED) | set(_DYNAMIC_ROOTS) | set(_QUANTLIB_EXTRA)
+
+# Ensure quantlib extras are always present even if pyproject lacks them
+ALLOWED_ROOTS.update(_QUANTLIB_EXTRA)
 
 # Explicit bans per spec: socket / subprocess / ctypes / requests / eval / __import__
 # os.system is banned via attribute check; os import itself is treated as banned
@@ -45,6 +198,7 @@ def check_import_allowlist(code: str) -> bool:
     """
     Return True if code only uses allowlisted imports and no banned patterns.
     Deep scans nested functions/classes via ast.walk.
+    Banned roots take precedence over allowlist.
     """
     if not code or not code.strip():
         return True
@@ -80,10 +234,6 @@ def check_import_allowlist(code: str) -> bool:
             if isinstance(func, ast.Attribute):
                 if _is_banned_attribute(func):
                     return False
-                # also ban ctypes.*() calls generically
-                # _is_banned_attribute already covers; extra guard for nested: e.g., os.system
-                # check chained attribute like os.path? os.path not banned, so ignore
-                pass
         elif isinstance(node, ast.Attribute):
             # bare attribute access without call (e.g., x = os.system) should also be banned
             if _is_banned_attribute(node):
@@ -96,3 +246,15 @@ def assert_allowlist(code: str) -> None:
     """Raise ValueError if not allowlisted."""
     if not check_import_allowlist(code):
         raise ValueError("import allowlist violation or banned pattern detected")
+
+
+def get_allowed_roots() -> set[str]:
+    """Return a copy of the current allowlist (for introspection / tests)."""
+    return set(ALLOWED_ROOTS)
+
+
+def is_allowlist_synced_with_pyproject() -> tuple[bool, list[str]]:
+    """Check sync status: returns (ok, missing)."""
+    dynamic = _load_pyproject_roots()
+    missing = [r for r in dynamic if r not in ALLOWED_ROOTS]
+    return (len(missing) == 0, missing)

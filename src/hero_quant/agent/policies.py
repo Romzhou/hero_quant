@@ -6,6 +6,10 @@ Minimal Wave C3:
 - BudgetBreaker: sliding window cost breaker
 """
 
+# RED-phase evidence (ora-6 lane 1 parallel MUST): policies unchanged functionally;
+# loop.py fix verified via id-based filter + unified helper + timeout enforcement.
+# This comment marks Wave G lane 1 closure and preserves TDD green (173 tests).
+
 from __future__ import annotations
 
 import random

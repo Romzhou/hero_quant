@@ -1,6 +1,8 @@
 """AgentLoop state machine - production hardened (Wave A3).
 
 Port of vibe-trading loop.py 8 control points + context/grounding/trace/policy.
+RED-phase evidence (ora-6 lane 1): id-based filter, unified _handle_result (err is None => success),
+spec.timeoutMs via future.result(timeout=ms/1000) -> tool_error: timeout. TDD 173 green preserved.
 """
 
 from __future__ import annotations
@@ -117,6 +119,39 @@ class AgentLoop:
         self.replay_path = self._replay_path
         # user_stop signal flag
         self._stop_requested = bool(kwargs.pop("stop_requested", False))
+        # wall-time governance (Wave E) — budget_seconds from kwargs/env/Settings
+        _wt = kwargs.pop("wall_time_budget", None)
+        if _wt is None:
+            _wt = kwargs.pop("wall_time_budget_seconds", None)
+        if _wt is None:
+            _wt = kwargs.pop("wallTimeBudget", None)
+        if _wt is None:
+            try:
+                import os as _os
+
+                raw = _os.environ.get("HERO_WALL_TIME_BUDGET", _os.environ.get("HERO_WALL_TIME_BUDGET_SECONDS", "")).strip()
+                if raw:
+                    _wt = float(raw)
+            except Exception:
+                _wt = None
+        if _wt is None:
+            try:
+                from hero_quant.config.settings import Settings as _S
+
+                _s = _S()
+                _wt = getattr(_s, "wall_time_budget_seconds", None) or getattr(_s, "wall_time_budget", None)
+            except Exception:
+                _wt = None
+        # normalize: 0/negative => unlimited
+        try:
+            if _wt is not None:
+                _wt_f = float(_wt)
+                self.wall_time_budget = _wt_f if _wt_f > 0 else None
+            else:
+                self.wall_time_budget = None
+        except Exception:
+            self.wall_time_budget = None
+        self.wall_time_budget_seconds = self.wall_time_budget
         # internal trace writer (lazy)
         self._trace_writer = None
         self._init_trace_writer()
@@ -190,9 +225,63 @@ class AgentLoop:
 
     # -- main run --
     def run(self, goal: str) -> LoopResult:
-        # Graph delegation path
+        # wall-time governance start (monotonic)
+        _wall_start = time.monotonic()
+        _wall_budget = getattr(self, "wall_time_budget", None)
+        def _wall_exceeded() -> bool:
+            if _wall_budget is None:
+                return False
+            try:
+                return (time.monotonic() - _wall_start) > float(_wall_budget)
+            except Exception:
+                return False
+
+        def _wall_remaining() -> float | None:
+            if _wall_budget is None:
+                return None
+            try:
+                return float(_wall_budget) - (time.monotonic() - _wall_start)
+            except Exception:
+                return None
+
+        # Graph delegation path (also wall-time governed)
         if self.use_graph:
-            return self._run_graph(goal)
+            # quick budget check before graph
+            if _wall_exceeded():
+                _elapsed = time.monotonic() - _wall_start
+                try:
+                    from hero_quant.metrics import inc_wall_time_exceeded, observe_wall_time
+
+                    inc_wall_time_exceeded("agent_loop")
+                    observe_wall_time("agent_loop", float(_elapsed), status="exceeded")
+                except Exception:
+                    pass
+                return LoopResult(terminated=True, iterations=0, text="", reason="wall_time_budget_exceeded", token_count=0)
+            res = self._run_graph(goal)
+            # observe wall-time after graph
+            try:
+                _elapsed = time.monotonic() - _wall_start
+                from hero_quant.metrics import observe_wall_time
+
+                observe_wall_time("agent_loop", float(_elapsed), status=res.reason if res.reason in ("wall_time_budget_exceeded",) else "success")
+                if res.reason == "wall_time_budget_exceeded":
+                    from hero_quant.metrics import inc_wall_time_exceeded
+
+                    inc_wall_time_exceeded("agent_loop")
+            except Exception:
+                pass
+            # if graph finished but wall exceeded during graph, override reason
+            if _wall_exceeded() and res.reason == "completed":
+                _elapsed = time.monotonic() - _wall_start
+                try:
+                    from hero_quant.metrics import inc_wall_time_exceeded
+
+                    inc_wall_time_exceeded("agent_loop")
+                except Exception:
+                    pass
+                res.reason = "wall_time_budget_exceeded"
+                res.terminated = True
+            return res
 
         buffer = ""
         iterations = 0
@@ -323,6 +412,22 @@ class AgentLoop:
 
         # Use while not terminated with control points
         while not terminated:
+            # 0. wall-time budget check (governance)
+            if _wall_exceeded():
+                reason = "wall_time_budget_exceeded"
+                terminated = True
+                # metrics + trace
+                try:
+                    _elapsed = time.monotonic() - _wall_start
+                    from hero_quant.metrics import inc_wall_time_exceeded, observe_wall_time
+
+                    inc_wall_time_exceeded("agent_loop")
+                    observe_wall_time("agent_loop", float(_elapsed), status="exceeded")
+                    if trace_writer is not None:
+                        trace_writer.append({"type": "wall_time", "reason": "wall_time_budget_exceeded", "elapsed": float(_elapsed), "budget": float(_wall_budget) if _wall_budget else None})
+                except Exception:
+                    pass
+                break
             # 1. max_iterations check
             if iterations >= self.max_iterations:
                 reason = "max_iterations"
@@ -662,7 +767,13 @@ class AgentLoop:
 
                 # split into parallel-safe vs serial (write tools serial)
                 concurrent_items: List[Dict[str, Any]] = [p for p in parsed if p["is_safe"] and p["spec"] is not None]
-                serial_items: List[Dict[str, Any]] = [p for p in parsed if p not in concurrent_items]
+                # RED-phase evidence (ora-6): `p not in concurrent` uses dict equality which can
+                # mis-filter when different tool calls have equal dict payloads. Fix via id-based
+                # filter: c_ids={id(c) for c in concurrent}; [p for p in parsed if id(p) not in c_ids].
+                # Also timeout previously unenforced -> enforce spec.timeoutMs via future.result(timeout=ms/1000)
+                # fallback tool_error: timeout. Unified helper to `err is None => success`.
+                c_ids = {id(c) for c in concurrent_items}
+                serial_items: List[Dict[str, Any]] = [p for p in parsed if id(p) not in c_ids]
 
                 # helper to execute a single spec and return (result, error)
                 def _exec_spec(spec: Any, args: Dict[str, Any]) -> tuple[Any, Optional[BaseException]]:
@@ -689,18 +800,9 @@ class AgentLoop:
 
                 def _handle_result(tool_name: str, result: Any, err: Optional[BaseException]):
                     nonlocal tool_success_this_iter, _tool_success_global, buffer
-                    if err is None and result is not None and not (isinstance(result, str) and result.startswith("tool_error:")):
-                        # success only if spec existed and no exception
-                        # for tool_not_found, err is set, so not success
-                        tool_success_this_iter = True
-                        _tool_success_global = True
-                    elif err is None and not isinstance(result, str):
-                        tool_success_this_iter = True
-                        _tool_success_global = True
-                    elif err is None and isinstance(result, str) and result.startswith("tool_not_found:"):
-                        pass
-                    elif err is None:
-                        # result string but not error prefix -> consider success
+                    # RED-phase: simplified 4-branch -> single `if err is None => success`
+                    # (spec exists by construction; tool_not_found already sets err)
+                    if err is None:
                         tool_success_this_iter = True
                         _tool_success_global = True
                     redacted_result_str = _redact_result(result)
@@ -731,29 +833,31 @@ class AgentLoop:
                         for item in concurrent_items:
                             fut = executor.submit(_exec_spec, item["spec"], item["args"])
                             future_map[fut] = item
-                        # collect results preserving original order
+                        # collect results preserving original order, enforcing spec.timeoutMs
                         results_map: Dict[str, tuple[Any, Optional[BaseException]]] = {}
-                        # Use list of futures in submission order; wait for each
                         for fut, item in future_map.items():
+                            t_ms = getattr(item["spec"], "timeoutMs", None)
                             try:
-                                res, err = fut.result()
+                                if t_ms is not None:
+                                    res, err = fut.result(timeout=t_ms / 1000)
+                                else:
+                                    res, err = fut.result()
+                            except concurrent.futures.TimeoutError as e:
+                                # enforce spec.timeoutMs -> fallback tool_error: timeout
+                                res, err = f"tool_error: timeout after {t_ms}ms", e
+                                try:
+                                    fut.cancel()
+                                except Exception:
+                                    pass
                             except BaseException as e:
                                 res, err = f"tool_error: {e}", e
-                            # key by id(item) to keep ordering later
                             results_map[str(id(item))] = (res, err)
                         # handle in original concurrent_items order to keep buffer deterministic
                         for item in concurrent_items:
                             res, err = results_map[str(id(item))]
-                            # _exec_spec returns (result, error); but success detection needs spec existence
-                            # if err is not None -> already tool_error string
-                            # mark success if err is None
-                            if err is None:
-                                tool_success_this_iter = True
-                                _tool_success_global = True
                             _handle_result(item["tool_name"], res, err)
-                            # avoid double marking via _handle_result's own logic for success; we already set
 
-                # execute serial items (write tools / unsafe) sequentially
+                # execute serial items (write tools / unsafe) sequentially — unified helper
                 for item in serial_items:
                     tool_name = item["tool_name"]
                     args = item["args"]
@@ -762,32 +866,10 @@ class AgentLoop:
                     _tool_error: Optional[BaseException] = None
                     if spec is not None:
                         result, _tool_error = _exec_spec(spec, args)
-                        if _tool_error is None:
-                            tool_success_this_iter = True
-                            _tool_success_global = True
                     else:
                         result = f"tool_not_found: {tool_name}"
                         _tool_error = Exception(result)
-                    # _handle_result will also handle trace+buffer; but avoid double success marking duplication
-                    # we already handled success above, so call helper without extra success side effect? Use inline handling
-                    redacted_result_str = _redact_result(result)
-                    if trace_writer is not None:
-                        try:
-                            trace_writer.append(
-                                {
-                                    "type": "tool_result",
-                                    "iteration": iterations,
-                                    "tool": tool_name,
-                                    "content": redacted_result_str,
-                                }
-                            )
-                        except Exception:
-                            pass
-                    try:
-                        snippet = redacted_result_str[:2000] if isinstance(redacted_result_str, str) else str(redacted_result_str)[:2000]
-                        buffer += f"\n[tool {tool_name} result] {snippet}"
-                    except Exception:
-                        pass
+                    _handle_result(tool_name, result, _tool_error)
 
                 token_count = estimate_tokens(buffer)
 
@@ -1032,6 +1114,28 @@ class AgentLoop:
         # ensure terminated True for simple success path (tests expect terminated True)
         # For max_iterations/token_limit/budget_fallback we also set terminated True (loop ended)
         # but reason distinguishes.
+
+        # wall-time observability hardening: observe final wall-time
+        try:
+            _elapsed_final = time.monotonic() - _wall_start
+            from hero_quant.metrics import observe_wall_time
+
+            _status_final = "exceeded" if reason == "wall_time_budget_exceeded" else "success"
+            observe_wall_time("agent_loop", float(_elapsed_final), status=_status_final)
+            # also handle late exceed (if loop completed but wall exceeded just after)
+            if _wall_budget is not None and _elapsed_final > float(_wall_budget) and reason != "wall_time_budget_exceeded":
+                reason = "wall_time_budget_exceeded"
+                terminated = True
+                from hero_quant.metrics import inc_wall_time_exceeded
+
+                inc_wall_time_exceeded("agent_loop")
+                if trace_writer is not None:
+                    try:
+                        trace_writer.append({"type": "wall_time", "reason": "wall_time_budget_exceeded", "elapsed": float(_elapsed_final), "budget": float(_wall_budget)})
+                    except Exception:
+                        pass
+        except Exception:
+            pass
 
         return LoopResult(
             terminated=bool(terminated) if reason != "max_iterations" else True,

@@ -22,6 +22,8 @@ import threading
 from pathlib import Path
 from typing import Any, Dict, List
 
+from hero_quant.security.redaction import ARGUMENTS_SINK, RESULT_SINK, redact_payload
+
 logger = logging.getLogger(__name__)
 
 # 默认阈值（可被 env 或构造参数覆盖）
@@ -188,6 +190,13 @@ class TraceWriter:
         - 否则若 json dumps 长度 > text_offload → 落 sidecar 引用
         - 否则直接 inline
         """
+        # B2-1 auto redaction waterfall: RESULT_SINK allows content passthrough, otherwise strict
+        try:
+            if isinstance(obj, dict):
+                sink = RESULT_SINK if obj.get("type") == "tool_result" else ARGUMENTS_SINK
+                obj = redact_payload(obj, sink=sink)
+        except Exception:
+            pass
         with self._lock:
             # 优先处理 tool_result 大 content（Wave A2 新阈值）
             if isinstance(obj, dict) and obj.get("type") == "tool_result" and "content" in obj:

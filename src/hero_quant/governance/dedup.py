@@ -20,6 +20,29 @@ import time
 from pathlib import Path
 from typing import Any
 
+
+# observability hardening helpers (offline-safe, no hard dependency)
+def _dedup_observe(op: str, start: float, status: str = "success") -> None:
+    try:
+        elapsed = time.monotonic() - start
+        try:
+            from hero_quant.metrics import DEDUP_OP_TOTAL, observe_wall_time
+
+            if DEDUP_OP_TOTAL is not None:
+                try:
+                    DEDUP_OP_TOTAL.labels(op=op, status=status).inc()
+                except Exception:
+                    pass
+            if observe_wall_time is not None:
+                try:
+                    observe_wall_time(f"dedup_{op}", elapsed, status=status)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    except Exception:
+        pass
+
 DEFAULT_TTL_SECONDS = 7 * 24 * 3600
 
 _PG_PREFIXES = ("postgresql://", "postgres://", "postgresql+psycopg://")
@@ -48,6 +71,30 @@ CREATE TABLE IF NOT EXISTS tool_call_dedup (
 );
 CREATE INDEX IF NOT EXISTS idx_tool_status ON tool_call_dedup(status);
 """
+
+# ---- RLS true policy DDL (DB layer) ----
+# App-layer RLS already filters WHERE tenant == current_tenant; DB layer adds DDL guard.
+# Keys are {tenant}:{workflowId}:{stepId}:{tool}:{businessId} so tenant is prefix before first colon.
+DDL_RLS_PG = """
+ALTER TABLE dedup ENABLE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON dedup USING (tenant = current_setting('app.current_tenant', true) OR current_setting('app.current_tenant', true) = '');
+CREATE POLICY tenant_isolation_insert ON dedup FOR INSERT WITH CHECK (tenant = current_setting('app.current_tenant', true) OR current_setting('app.current_tenant', true) = '');
+
+ALTER TABLE tool_call_dedup ENABLE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON tool_call_dedup USING (
+  split_part(idempotency_key, ':', 1) = current_setting('app.current_tenant', true)
+  OR current_setting('app.current_tenant', true) = ''
+  OR current_setting('app.current_tenant', true) IS NULL
+);
+CREATE POLICY tenant_isolation_insert ON tool_call_dedup FOR INSERT WITH CHECK (
+  split_part(idempotency_key, ':', 1) = current_setting('app.current_tenant', true)
+  OR current_setting('app.current_tenant', true) = ''
+  OR current_setting('app.current_tenant', true) IS NULL
+);
+"""
+
+DDL_RLS_DEDUP = DDL_RLS_PG
+DDL_RLS_TOOL_CALL = DDL_RLS_PG
 
 # Optional PG pool
 try:
@@ -154,6 +201,15 @@ class DedupStore:
                     except Exception:
                         with conn.cursor() as cur:  # type: ignore
                             cur.execute(DDL_DEDUP_PG)
+                    # DB-level RLS true policy
+                    try:
+                        conn.execute(DDL_RLS_PG)  # type: ignore
+                    except Exception:
+                        try:
+                            with conn.cursor() as cur:  # type: ignore
+                                cur.execute(DDL_RLS_PG)
+                        except Exception:
+                            pass
                     try:
                         conn.commit()  # type: ignore
                     except Exception:
@@ -163,6 +219,10 @@ class DedupStore:
                 try:
                     with conn.cursor() as cur:
                         cur.execute(DDL_DEDUP_PG)
+                        try:
+                            cur.execute(DDL_RLS_PG)
+                        except Exception:
+                            pass
                     conn.commit()
                 finally:
                     try:
@@ -436,188 +496,228 @@ class DedupStore:
         except Exception:
             return False
 
-    # ---- public API ----
+    # ---- public API (wall-time & dedup observability hardened) ----
     def insert_pending(self, key: str, tool: str) -> bool:
         """INSERT ON CONFLICT WAIT placeholder — returns True if inserted, False if exists."""
-        now = time.time()
-        # PG branch first when available
-        if self._is_pg:
-            pg_res = self._pg_insert_pending_sync(key, tool)
-            if pg_res is not None:
-                # keep mem in sync for fallback reads
-                if pg_res:
-                    self._mem[key] = {"key": key, "tool": tool, "status": "PENDING", "result": None, "updated_at": now}
-                    self._mem_ts[key] = now
-                else:
-                    # existing: ensure mem reflects PG state if not yet
-                    if key not in self._mem:
-                        pg_rec = self._pg_get_sync(key)
-                        if pg_rec:
-                            self._mem[key] = pg_rec
-                            self._mem_ts[key] = now
-                return bool(pg_res)
-            # PG unavailable -> fallback to mem/SQLite below
+        _start = time.monotonic()
+        _status = "success"
+        try:
+            now = time.time()
+            # PG branch first when available
+            if self._is_pg:
+                pg_res = self._pg_insert_pending_sync(key, tool)
+                if pg_res is not None:
+                    # keep mem in sync for fallback reads
+                    if pg_res:
+                        self._mem[key] = {"key": key, "tool": tool, "status": "PENDING", "result": None, "updated_at": now}
+                        self._mem_ts[key] = now
+                    else:
+                        # existing: ensure mem reflects PG state if not yet
+                        if key not in self._mem:
+                            pg_rec = self._pg_get_sync(key)
+                            if pg_rec:
+                                self._mem[key] = pg_rec
+                                self._mem_ts[key] = now
+                    return bool(pg_res)
+                # PG unavailable -> fallback to mem/SQLite below
 
-        # SQLite path
-        if self.db_path is not None:
-            con = self._connect()
-            try:
-                # TTL-aware: if expired, allow re-insert by deleting expired row first
-                if self.ttl_seconds > 0:
-                    try:
-                        con.execute("DELETE FROM tool_call_dedup WHERE idempotency_key=? AND updated_at < ?", (key, now - self.ttl_seconds))
-                    except Exception:
-                        pass
-                cur = con.execute("SELECT status FROM tool_call_dedup WHERE idempotency_key=?", (key,))
-                row = cur.fetchone()
-                if row is not None:
-                    # also update mem for consistency
-                    self._mem[key] = {"key": key, "tool": tool, "status": row[0], "result": None, "updated_at": now}
-                    self._mem_ts[key] = now
-                    return False
+            # SQLite path
+            if self.db_path is not None:
+                con = self._connect()
                 try:
-                    con.execute(
-                        "INSERT INTO tool_call_dedup (idempotency_key, status, tool, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-                        (key, "PENDING", tool, now, now),
-                    )
-                    self._mem[key] = {"key": key, "tool": tool, "status": "PENDING", "result": None, "updated_at": now}
-                    self._mem_ts[key] = now
-                    return True
-                except sqlite3.IntegrityError:
-                    return False
-            finally:
-                con.close()
-        # pure memory dict fallback (single-process)
-        self._mem_cleanup(key)
-        if key in self._mem:
-            return False
-        self._mem[key] = {"key": key, "tool": tool, "status": "PENDING", "result": None, "updated_at": now}
-        self._mem_ts[key] = now
-        return True
+                    # TTL-aware: if expired, allow re-insert by deleting expired row first
+                    if self.ttl_seconds > 0:
+                        try:
+                            con.execute("DELETE FROM tool_call_dedup WHERE idempotency_key=? AND updated_at < ?", (key, now - self.ttl_seconds))
+                        except Exception:
+                            pass
+                    cur = con.execute("SELECT status FROM tool_call_dedup WHERE idempotency_key=?", (key,))
+                    row = cur.fetchone()
+                    if row is not None:
+                        # also update mem for consistency
+                        self._mem[key] = {"key": key, "tool": tool, "status": row[0], "result": None, "updated_at": now}
+                        self._mem_ts[key] = now
+                        return False
+                    try:
+                        con.execute(
+                            "INSERT INTO tool_call_dedup (idempotency_key, status, tool, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+                            (key, "PENDING", tool, now, now),
+                        )
+                        self._mem[key] = {"key": key, "tool": tool, "status": "PENDING", "result": None, "updated_at": now}
+                        self._mem_ts[key] = now
+                        return True
+                    except sqlite3.IntegrityError:
+                        return False
+                finally:
+                    con.close()
+            # pure memory dict fallback (single-process)
+            self._mem_cleanup(key)
+            if key in self._mem:
+                return False
+            self._mem[key] = {"key": key, "tool": tool, "status": "PENDING", "result": None, "updated_at": now}
+            self._mem_ts[key] = now
+            return True
+        except Exception:
+            _status = "error"
+            raise
+        finally:
+            _dedup_observe("insert_pending", _start, _status)
 
     def mark_success(self, key: str, result: Any) -> None:
-        now = time.time()
-        result_json = json.dumps(result, ensure_ascii=False) if not isinstance(result, str) else result
-        # PG branch
-        if self._is_pg:
-            if self._pg_mark_sync(key, "SUCCESS", result=result, error=None):
-                self._mem[key] = {"key": key, "tool": self._mem.get(key, {}).get("tool"), "status": "SUCCESS", "result": result, "updated_at": now}
-                self._mem_ts[key] = now
-                # also try sqlite alias if exists? not needed for PG
-                return
-            # fallback to mem/sqlite on PG failure
-        if self.db_path is not None:
-            con = self._connect()
-            try:
-                con.execute(
-                    "UPDATE tool_call_dedup SET status=?, result=?, updated_at=? WHERE idempotency_key=?",
-                    ("SUCCESS", result_json, now, key),
-                )
-                if con.total_changes == 0:
+        _start = time.monotonic()
+        _status = "success"
+        try:
+            now = time.time()
+            result_json = json.dumps(result, ensure_ascii=False) if not isinstance(result, str) else result
+            # PG branch
+            if self._is_pg:
+                if self._pg_mark_sync(key, "SUCCESS", result=result, error=None):
+                    self._mem[key] = {"key": key, "tool": self._mem.get(key, {}).get("tool"), "status": "SUCCESS", "result": result, "updated_at": now}
+                    self._mem_ts[key] = now
+                    # also try sqlite alias if exists? not needed for PG
+                    return
+                # fallback to mem/sqlite on PG failure
+            if self.db_path is not None:
+                con = self._connect()
+                try:
                     con.execute(
-                        "INSERT OR IGNORE INTO tool_call_dedup (idempotency_key, status, result, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-                        (key, "SUCCESS", result_json, now, now),
+                        "UPDATE tool_call_dedup SET status=?, result=?, updated_at=? WHERE idempotency_key=?",
+                        ("SUCCESS", result_json, now, key),
                     )
-            finally:
-                con.close()
-        # mem sync
-        rec = self._mem.get(key, {})
-        self._mem[key] = {"key": key, "tool": rec.get("tool"), "status": "SUCCESS", "result": result, "updated_at": now}
-        self._mem_ts[key] = now
+                    if con.total_changes == 0:
+                        con.execute(
+                            "INSERT OR IGNORE INTO tool_call_dedup (idempotency_key, status, result, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+                            (key, "SUCCESS", result_json, now, now),
+                        )
+                finally:
+                    con.close()
+            # mem sync
+            rec = self._mem.get(key, {})
+            self._mem[key] = {"key": key, "tool": rec.get("tool"), "status": "SUCCESS", "result": result, "updated_at": now}
+            self._mem_ts[key] = now
+        except Exception:
+            _status = "error"
+            raise
+        finally:
+            _dedup_observe("mark_success", _start, _status)
 
     def mark_failed(self, key: str, error: str) -> None:
-        now = time.time()
-        if self._is_pg:
-            if self._pg_mark_sync(key, "FAILED", result=None, error=error):
-                self._mem[key] = {"key": key, "tool": self._mem.get(key, {}).get("tool"), "status": "FAILED", "error": str(error), "updated_at": now}
-                self._mem_ts[key] = now
-                return
-        if self.db_path is not None:
-            con = self._connect()
-            try:
-                con.execute(
-                    "UPDATE tool_call_dedup SET status=?, error=?, updated_at=? WHERE idempotency_key=?",
-                    ("FAILED", str(error), now, key),
-                )
-                if con.total_changes == 0:
+        _start = time.monotonic()
+        _status = "success"
+        try:
+            now = time.time()
+            if self._is_pg:
+                if self._pg_mark_sync(key, "FAILED", result=None, error=error):
+                    self._mem[key] = {"key": key, "tool": self._mem.get(key, {}).get("tool"), "status": "FAILED", "error": str(error), "updated_at": now}
+                    self._mem_ts[key] = now
+                    return
+            if self.db_path is not None:
+                con = self._connect()
+                try:
                     con.execute(
-                        "INSERT OR IGNORE INTO tool_call_dedup (idempotency_key, status, error, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-                        (key, "FAILED", str(error), now, now),
+                        "UPDATE tool_call_dedup SET status=?, error=?, updated_at=? WHERE idempotency_key=?",
+                        ("FAILED", str(error), now, key),
                     )
-            finally:
-                con.close()
-        rec = self._mem.get(key, {})
-        self._mem[key] = {"key": key, "tool": rec.get("tool"), "status": "FAILED", "error": str(error), "updated_at": now}
-        self._mem_ts[key] = now
+                    if con.total_changes == 0:
+                        con.execute(
+                            "INSERT OR IGNORE INTO tool_call_dedup (idempotency_key, status, error, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+                            (key, "FAILED", str(error), now, now),
+                        )
+                finally:
+                    con.close()
+            rec = self._mem.get(key, {})
+            self._mem[key] = {"key": key, "tool": rec.get("tool"), "status": "FAILED", "error": str(error), "updated_at": now}
+            self._mem_ts[key] = now
+        except Exception:
+            _status = "error"
+            raise
+        finally:
+            _dedup_observe("mark_failed", _start, _status)
 
     def get(self, key: str) -> dict[str, Any] | None:
-        # PG branch first (with TTL via PG query)
-        if self._is_pg:
-            pg_rec = self._pg_get_sync(key)
-            if pg_rec is not None:
-                # keep mem warm
-                self._mem[key] = pg_rec
-                self._mem_ts[key] = time.time()
-                # normalize result JSON
-                if pg_rec.get("result") is not None and isinstance(pg_rec["result"], str):
-                    try:
-                        pg_rec["result"] = json.loads(pg_rec["result"])
-                    except Exception:
-                        pass
-                return pg_rec
-            # if PG miss, fall through to sqlite/mem (could be recently written to mem before PG commit)
-        if self.db_path is not None:
-            con = self._connect()
-            try:
-                cur = con.execute(
-                    "SELECT idempotency_key, status, tool, result, error, created_at, updated_at FROM tool_call_dedup WHERE idempotency_key=?",
-                    (key,),
-                )
-                row = cur.fetchone()
-                if row is not None:
-                    col_names = [d[0] for d in cur.description]
-                    rec = dict(zip(col_names, row))
-                    # TTL check (updated_at is REAL seconds)
-                    if self.ttl_seconds > 0 and rec.get("updated_at") is not None:
+        _start = time.monotonic()
+        _status = "success"
+        try:
+            # PG branch first (with TTL via PG query)
+            if self._is_pg:
+                pg_rec = self._pg_get_sync(key)
+                if pg_rec is not None:
+                    # keep mem warm
+                    self._mem[key] = pg_rec
+                    self._mem_ts[key] = time.time()
+                    # normalize result JSON
+                    if pg_rec.get("result") is not None and isinstance(pg_rec["result"], str):
                         try:
-                            if time.time() - float(rec["updated_at"]) > self.ttl_seconds:
-                                # expired: delete and return None, also clear mem
-                                try:
-                                    con.execute("DELETE FROM tool_call_dedup WHERE idempotency_key=?", (key,))
-                                except Exception:
-                                    pass
-                                self._mem.pop(key, None)
-                                self._mem_ts.pop(key, None)
-                                return None
+                            pg_rec["result"] = json.loads(pg_rec["result"])
                         except Exception:
                             pass
-                    if rec.get("result") is not None:
-                        try:
-                            rec["result"] = json.loads(rec["result"])
-                        except Exception:
-                            pass
-                    # sync mem
-                    self._mem[key] = rec
-                    self._mem_ts[key] = rec.get("updated_at", time.time())
-                    return rec
-            finally:
-                con.close()
-        # fallback memory
-        mem_rec = self._mem_get(key)
-        if mem_rec is not None and mem_rec.get("result") is not None and isinstance(mem_rec["result"], str):
-            try:
-                mem_rec["result"] = json.loads(mem_rec["result"])
-            except Exception:
-                pass
-        return mem_rec
+                    return pg_rec
+                # if PG miss, fall through to sqlite/mem (could be recently written to mem before PG commit)
+            if self.db_path is not None:
+                con = self._connect()
+                try:
+                    cur = con.execute(
+                        "SELECT idempotency_key, status, tool, result, error, created_at, updated_at FROM tool_call_dedup WHERE idempotency_key=?",
+                        (key,),
+                    )
+                    row = cur.fetchone()
+                    if row is not None:
+                        col_names = [d[0] for d in cur.description]
+                        rec = dict(zip(col_names, row))
+                        # TTL check (updated_at is REAL seconds)
+                        if self.ttl_seconds > 0 and rec.get("updated_at") is not None:
+                            try:
+                                if time.time() - float(rec["updated_at"]) > self.ttl_seconds:
+                                    # expired: delete and return None, also clear mem
+                                    try:
+                                        con.execute("DELETE FROM tool_call_dedup WHERE idempotency_key=?", (key,))
+                                    except Exception:
+                                        pass
+                                    self._mem.pop(key, None)
+                                    self._mem_ts.pop(key, None)
+                                    return None
+                            except Exception:
+                                pass
+                        if rec.get("result") is not None:
+                            try:
+                                rec["result"] = json.loads(rec["result"])
+                            except Exception:
+                                pass
+                        # sync mem
+                        self._mem[key] = rec
+                        self._mem_ts[key] = rec.get("updated_at", time.time())
+                        return rec
+                finally:
+                    con.close()
+            # fallback memory
+            mem_rec = self._mem_get(key)
+            if mem_rec is not None and mem_rec.get("result") is not None and isinstance(mem_rec["result"], str):
+                try:
+                    mem_rec["result"] = json.loads(mem_rec["result"])
+                except Exception:
+                    pass
+            return mem_rec
+        except Exception:
+            _status = "error"
+            raise
+        finally:
+            _dedup_observe("get", _start, _status)
 
     def wait_for(self, key: str, timeout: float = 5.0) -> dict[str, Any] | None:
         """Polling WAIT placeholder for ON CONFLICT WAIT semantics."""
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            rec = self.get(key)
-            if rec is not None and rec.get("status") in ("SUCCESS", "FAILED"):
-                return rec
-            # PG branch additional WAIT using SELECT FOR UPDATE? Polling is fallback
-            time.sleep(0.05)
-        return self.get(key)
+        _start = time.monotonic()
+        _status = "success"
+        try:
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                rec = self.get(key)
+                if rec is not None and rec.get("status") in ("SUCCESS", "FAILED"):
+                    return rec
+                # PG branch additional WAIT using SELECT FOR UPDATE? Polling is fallback
+                time.sleep(0.05)
+            return self.get(key)
+        except Exception:
+            _status = "error"
+            raise
+        finally:
+            _dedup_observe("wait_for", _start, _status)

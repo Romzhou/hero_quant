@@ -33,6 +33,9 @@ class State(TypedDict, total=False):
         intermediate_results: results from parallel subagents
         verification: verification output
         subagent_outputs: outputs from leaf subagents (parallel placeholder)
+        pros: lightweight bull case list from verify (B4-2)
+        cons: lightweight bear case list from verify (B4-2)
+        confidence: 0.x confidence from single-pass pros/cons synthesis
     """
 
     messages: Annotated[List[Dict[str, Any]], _add_messages]
@@ -41,3 +44,6 @@ class State(TypedDict, total=False):
     intermediate_results: Annotated[List[Dict[str, Any]], _add_list]
     verification: str
     subagent_outputs: Annotated[List[Dict[str, Any]], _add_list]
+    pros: Annotated[List[str], _add_list]
+    cons: Annotated[List[str], _add_list]
+    confidence: float

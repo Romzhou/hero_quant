@@ -4,6 +4,8 @@ from __future__ import annotations
 import importlib
 from typing import Any, Dict, List
 
+from hero_quant.tools.registry import TOOL_REGISTRY, get_definitions, tool
+
 # Ensure core tools are loaded so TOOL_REGISTRY populated
 for _mod in (
     "hero_quant.tools.market_data",
@@ -14,8 +16,6 @@ for _mod in (
         importlib.import_module(_mod)
     except Exception:
         pass
-
-from hero_quant.tools.registry import TOOL_REGISTRY, tool, get_definitions
 
 # --- 3 additional curated read-only tools to reach 20 (options wrappers) ---
 if "get_option_price" not in TOOL_REGISTRY:
