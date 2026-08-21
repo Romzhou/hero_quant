@@ -2,11 +2,20 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import sqlite3
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+
+
+def _content_hash(name: str, content: str) -> str:
+    """vibe persistent.py:35-39 思路 content_hash，去重哈希.
+
+    sha256((f"{name}:{content}").lower().strip().encode()).hexdigest()[:12]
+    """
+    return hashlib.sha256(f"{name}:{content}".lower().strip().encode()).hexdigest()[:12]
 
 
 class MemoryStore:
@@ -16,7 +25,7 @@ class MemoryStore:
         self.base = Path(base_path)
         self.base.mkdir(parents=True, exist_ok=True)
         self.namespace = namespace
-        self._last_write: dict[str, tuple[str, float]] = {}
+        self._recent_hashes: dict[str, float] = {}
         self._fts_enabled = False
         self.db_path = self.base / "memory.db"
         self._init_db()
@@ -71,12 +80,17 @@ class MemoryStore:
     def write(self, key: str, content: str) -> None:
         now = time.time()
         ns_key = self._ns_key(key)
-        # 30s dedup same namespaced key+content
-        if ns_key in self._last_write:
-            last_content, last_ts = self._last_write[ns_key]
-            if last_content == content and (now - last_ts) < 30:
-                return
-        self._last_write[ns_key] = (content, now)
+        # 30s sliding window content_hash dedup (cross-key, case/whitespace normalized)
+        # 过期清理：移除 >30s 的哈希
+        self._recent_hashes = {h: ts for h, ts in self._recent_hashes.items() if now - ts < 30}
+        # 内容归一哈希（跨 key 去重核心，大小写/空白归一）
+        content_hash = hashlib.sha256(content.lower().strip().encode()).hexdigest()[:12]
+        # 完整 name:content 哈希（vibe 兼容，满足 spec _content_hash 要求）
+        full_hash = _content_hash(ns_key, content)
+        if content_hash in self._recent_hashes or full_hash in self._recent_hashes:
+            return
+        self._recent_hashes[content_hash] = now
+        self._recent_hashes[full_hash] = now
 
         # atomic file write: tmp -> fsync -> os.replace, 0600, flock compat
         safe_name = self._safe_filename(ns_key)
