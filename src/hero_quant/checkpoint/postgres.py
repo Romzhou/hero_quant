@@ -493,7 +493,8 @@ class PostgresSaver(AsyncPostgresSaver):
 def get_saver(dsn: str | None = None, ttl_seconds: int | None = None, **kwargs: Any) -> AsyncPostgresSaver:
     """工厂：根据 DSN 返回 saver，自动 setup.
 
-    - ``memory://`` 前缀走内存（单测友好）
+    - ``memory://`` 前缀走内存（单测友好, Task 9 fallback）
+    - 真实 ``postgresql://`` 分支使用 ``psycopg_pool`` ConnectionPool + setup()
     - 其他 DSN 尝试 ``ConnectionPool``，失败回退内存
     - 校验三段式 thread_id 在 put/get 时执行
     """
