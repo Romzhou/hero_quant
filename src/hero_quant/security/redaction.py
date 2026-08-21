@@ -42,12 +42,20 @@ _LONG_TOKEN_RE = re.compile(r"[A-Za-z0-9_\-]{32,}")
 _REDACTED = "***"
 
 
+# llm_usage VCR keys should not be redacted (C1-2)
+_ALLOW_TOKENS = {"input_tokens", "output_tokens", "prompt_tokens", "completion_tokens", "prompttokens", "completiontokens", "generated_tokens"}
+
+
 def _is_sensitive_key(key: str) -> bool:
     lk = key.lower()
+    if lk in _ALLOW_TOKENS:
+        return False
     if lk in _SENSITIVE_KEYS:
         return True
     for sub in _SENSITIVE_SUBSTRINGS:
         if sub in lk:
+            # but allow llm_usage token keys (exact allowlist handled above, keep substring allow)
+            # e.g., "input_tokens" already returned False, so remaining token matches are true secrets like "access_token"
             return True
     return False
 

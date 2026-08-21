@@ -19,6 +19,26 @@ except Exception:  # pragma: no cover
     _RetryPolicy = None  # type: ignore
 
 
+def estimate_tokens(text: Any) -> int:
+    """Rough token estimate (~4 chars/token), vibe同款 json//4 粗估.
+
+    Accepts str or list[message dict] (json dumps //4) or any.
+    """
+    if isinstance(text, list):
+        import json
+
+        try:
+            return len(json.dumps(text, ensure_ascii=False, default=str)) // 4
+        except Exception:
+            return len(str(text)) // 4
+    if isinstance(text, str):
+        return len(text) // 4
+    try:
+        return len(text) // 4  # type: ignore[arg-type]
+    except Exception:
+        return len(str(text)) // 4
+
+
 @dataclass
 class LoopResult:
     terminated: bool
@@ -36,7 +56,7 @@ class AgentLoop:
 
     Control points (while not terminated):
       1. max_iterations check -> reason="max_iterations"
-      2. token_limit check via len(buffer) or context char count -> reason="token_limit" + TRUNCATED banner
+      2. token_limit check via estimate_tokens(buffer) or context estimate -> reason="token_limit" + TRUNCATED banner
       3. user_stop placeholder (signal)
       4. llm.stream_chat with try/except -> retry via RetryPolicy.should_retry + exponential backoff
       5. accumulate text deltas, update token_count
@@ -83,6 +103,18 @@ class AgentLoop:
             self.budget_breaker = kwargs.pop("budgetBreaker")
         if self.retry_policy is None and "retryPolicy" in kwargs:
             self.retry_policy = kwargs.pop("retryPolicy")
+        # replay VCR compat: pop replay_path/replay_from/replay_file + replay flag (C1-2)
+        _replay_path = kwargs.pop("replay_path", None)
+        if _replay_path is None:
+            _replay_path = kwargs.pop("replay_from", None)
+        if _replay_path is None:
+            _replay_path = kwargs.pop("replay_file", None)
+        _replay_flag = kwargs.pop("replay", None)
+        if _replay_path is None and isinstance(_replay_flag, (str, Path)):
+            _replay_path = _replay_flag
+        # replay=True with replay_from already handled; bare replay=True leaves path None
+        self._replay_path = Path(_replay_path) if _replay_path is not None else None
+        self.replay_path = self._replay_path
         # user_stop signal flag
         self._stop_requested = bool(kwargs.pop("stop_requested", False))
         # internal trace writer (lazy)
@@ -170,8 +202,111 @@ class AgentLoop:
         reason = "completed"
         terminated = False
         _tool_success_global = False
+        # VCR llm_usage accumulator (C1-2)
+        _llm_usage_input = 0
+        _llm_usage_output = 0
 
         trace_writer = self._ensure_trace_writer()
+
+        # -- VCR replay short-circuit (C1-2) --
+        replay_path = getattr(self, "_replay_path", None)
+        if replay_path is not None:
+            try:
+                import json as _replay_json
+
+                rp = Path(replay_path)
+                if rp.is_dir():
+                    cand = rp / "llm_usage.json"
+                    if cand.exists():
+                        rp = cand
+                if rp.exists():
+                    try:
+                        data = _replay_json.loads(rp.read_text(encoding="utf-8"))
+                    except Exception:
+                        data = {}
+                    if isinstance(data, dict):
+                        _ru = data.get("llm_usage")
+                        if not isinstance(_ru, dict):
+                            if "input_tokens" in data or "output_tokens" in data or "prompt_tokens" in data:
+                                _ru = data
+                            else:
+                                _ru = {}
+                        # normalize with compat keys
+                        def _to_int(v):
+                            try:
+                                return int(v)
+                            except Exception:
+                                return 0
+
+                        _ri = _ru.get("input_tokens")
+                        if _ri is None:
+                            _ri = _ru.get("prompt_tokens", _ru.get("promptTokens", 0))
+                        _ro = _ru.get("output_tokens")
+                        if _ro is None:
+                            _ro = _ru.get("completion_tokens", _ru.get("generated_tokens", 0))
+                        _norm = {"input_tokens": _to_int(_ri), "output_tokens": _to_int(_ro)}
+                        # extract replay text
+                        _rtext = data.get("text", "") or ""
+                        if not _rtext and isinstance(data.get("chunks"), list):
+                            _parts: list[str] = []
+                            for _c in data.get("chunks", []):
+                                if isinstance(_c, dict):
+                                    _parts.append(_c.get("text", "") or _c.get("content", "") or "")
+                                elif isinstance(_c, str):
+                                    _parts.append(_c)
+                            _rtext = "".join(_parts)
+                        buffer = str(_rtext)
+                        token_count = estimate_tokens(buffer)
+                        if trace_writer is not None:
+                            try:
+                                trace_writer.append({"type": "llm_usage", "llm_usage": _norm, "iteration": 0})
+                            except Exception:
+                                pass
+                        # persist llm_usage.json to dest trace dir if different
+                        try:
+                            dest_dir = None
+                            if trace_writer is not None and hasattr(trace_writer, "dir_path"):
+                                dest_dir = Path(trace_writer.dir_path)
+                            elif trace_writer is not None and hasattr(trace_writer, "path"):
+                                dest_dir = Path(trace_writer.path).parent
+                            elif isinstance(self.trace, (str, Path)):
+                                _pp = Path(self.trace)
+                                dest_dir = _pp.parent if _pp.suffix == ".jsonl" else _pp
+                            if dest_dir is not None:
+                                dest_dir.mkdir(parents=True, exist_ok=True)
+                                out_path = dest_dir / "llm_usage.json"
+                                try:
+                                    same = rp.resolve() == out_path.resolve()
+                                except Exception:
+                                    same = False
+                                if not same:
+                                    _replay_json_out = {"text": buffer, "llm_usage": _norm, "chunks": data.get("chunks", []) if isinstance(data, dict) else []}
+                                    out_path.write_text(_replay_json.dumps(_replay_json_out, ensure_ascii=False), encoding="utf-8")
+                        except Exception:
+                            pass
+                        # trace_path for result
+                        trace_path_str_r: str | None = None
+                        if trace_writer is not None:
+                            try:
+                                _p = getattr(trace_writer, "path", None)
+                                if _p is not None:
+                                    trace_path_str_r = str(_p)
+                            except Exception:
+                                pass
+                        elif isinstance(self.trace, (str, Path)):
+                            trace_path_str_r = str(self.trace)
+                        return LoopResult(
+                            terminated=True,
+                            iterations=1,
+                            text=buffer,
+                            reason="completed",
+                            metrics=None,
+                            grounding_verified=True,
+                            trace_path=trace_path_str_r,
+                            token_count=token_count,
+                        )
+            except Exception:
+                pass
 
         # lazy init retry_policy if not set (uses pre-imported _RetryPolicy for speed)
         retry_policy = self.retry_policy
@@ -194,9 +329,9 @@ class AgentLoop:
                 terminated = True
                 break
 
-            # 2. token_limit check via len(buffer) or context char count
+            # 2. token_limit check via estimate_tokens(buffer) or context estimate
             if self.token_limit is not None:
-                cur_len = len(buffer)
+                cur_len = estimate_tokens(buffer)
                 # also check context char count if available
                 ctx_len = 0
                 if self.context_manager is not None:
@@ -206,7 +341,7 @@ class AgentLoop:
                         if isinstance(msgs, list):
                             # estimate from messages
                             ctx_text = "\n".join(str(m.get("content", "")) for m in msgs)
-                            ctx_len = len(ctx_text)
+                            ctx_len = estimate_tokens(ctx_text)
                         elif hasattr(self.context_manager, "max_chars"):
                             # fallback use buffer len
                             pass
@@ -220,7 +355,7 @@ class AgentLoop:
                         # truncate buffer to limit and add banner
                         limit = int(self.token_limit)
                         buffer = buffer[:limit] + f"\n[{banner}]"
-                    token_count = len(buffer)
+                    token_count = estimate_tokens(buffer)
                     reason = "token_limit"
                     terminated = True
                     if trace_writer is not None:
@@ -302,7 +437,7 @@ class AgentLoop:
                         except Exception:
                             pass
                     buffer += f"\n[ERROR: {last_exc}]"
-                    token_count = len(buffer)
+                    token_count = estimate_tokens(buffer)
                     reason = "llm_error"
                     # For backward compat simple case, if buffer has text prior, we still mark completed?
                     # But if never succeeded, mark llm_error and terminate
@@ -350,6 +485,32 @@ class AgentLoop:
                             for tc in chunk.get("calls", []):
                                 if isinstance(tc, dict):
                                     tool_calls_this_iter.append(tc)
+                        # -- llm_usage accumulation (C1-2 compat usage_metadata/usage/prompt_tokens) --
+                        try:
+                            _um = None
+                            if chunk.get("usage_metadata") is not None and isinstance(chunk.get("usage_metadata"), dict):
+                                _um = chunk.get("usage_metadata")
+                            elif chunk.get("usage") is not None and isinstance(chunk.get("usage"), dict):
+                                _um = chunk.get("usage")
+                            elif "input_tokens" in chunk or "prompt_tokens" in chunk or "output_tokens" in chunk:
+                                _um = chunk
+                            if isinstance(_um, dict):
+                                _iv = _um.get("input_tokens")
+                                if _iv is None:
+                                    _iv = _um.get("prompt_tokens", _um.get("promptTokens", 0))
+                                _ov = _um.get("output_tokens")
+                                if _ov is None:
+                                    _ov = _um.get("completion_tokens", _um.get("generated_tokens", 0))
+                                try:
+                                    _llm_usage_input += int(_iv) if _iv is not None else 0
+                                except Exception:
+                                    pass
+                                try:
+                                    _llm_usage_output += int(_ov) if _ov is not None else 0
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
                     elif isinstance(chunk, str):
                         buffer += chunk
                     else:
@@ -359,7 +520,7 @@ class AgentLoop:
                         except Exception:
                             pass
 
-                    token_count = len(buffer)
+                    token_count = estimate_tokens(buffer)
 
                     # trace each chunk (with size limit to avoid blowup)
                     if trace_writer is not None:
@@ -371,11 +532,11 @@ class AgentLoop:
                             pass
 
                     # mid-stream token_limit check
-                    if self.token_limit is not None and len(buffer) >= int(self.token_limit):
+                    if self.token_limit is not None and estimate_tokens(buffer) >= int(self.token_limit):
                         banner = "TRUNCATED: token_limit exceeded"
                         if "TRUNCATED" not in buffer:
                             buffer = buffer[: int(self.token_limit)] + f"\n[{banner}]"
-                        token_count = len(buffer)
+                        token_count = estimate_tokens(buffer)
                         reason = "token_limit"
                         terminated = True
                         if trace_writer is not None:
@@ -415,12 +576,12 @@ class AgentLoop:
                         except Exception:
                             pass
                     buffer += f"\n[ERROR: {e}]"
-                    token_count = len(buffer)
+                    token_count = estimate_tokens(buffer)
                     reason = "llm_error"
                     terminated = True
                     break
 
-            token_count = len(buffer)
+            token_count = estimate_tokens(buffer)
 
             # 6. tool_calls execution via TOOL_REGISTRY (parallel readonly pool)
             tool_success_this_iter = False
@@ -563,8 +724,6 @@ class AgentLoop:
 
                 # execute concurrent pool via ThreadPoolExecutor
                 if concurrent_items:
-                    # store futures in order
-                    futures: List[tuple[Dict[str, Any], Any]] = []
                     # use max_workers = number of concurrent items (capped)
                     max_workers = min(len(concurrent_items), 8)
                     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -630,7 +789,7 @@ class AgentLoop:
                     except Exception:
                         pass
 
-                token_count = len(buffer)
+                token_count = estimate_tokens(buffer)
 
             # 7. grounding_check
             if self.grounding is not None:
@@ -705,14 +864,14 @@ class AgentLoop:
                             pass
                     except Exception:
                         pass
-                    if len(buffer) > int(self.token_limit) * 0.8:
+                    if estimate_tokens(buffer) > int(self.token_limit) * 0.8:
                         # call compact
                         cr = self.context_manager.compact()
                         if getattr(cr, "truncated", False):
                             banner = getattr(cr, "banner", "TRUNCATED: context folded")
                             if "TRUNCATED" not in buffer:
                                 buffer = f"[{banner}]\n" + buffer
-                            token_count = len(buffer)
+                            token_count = estimate_tokens(buffer)
                             if trace_writer is not None:
                                 try:
                                     trace_writer.append({"type": "context_compact", "iteration": iterations, "banner": banner, "truncated": True})
@@ -750,11 +909,11 @@ class AgentLoop:
                     pass
 
             # post-iteration token_limit guard (if buffer grew after tools/compact)
-            if self.token_limit is not None and len(buffer) >= int(self.token_limit):
+            if self.token_limit is not None and estimate_tokens(buffer) >= int(self.token_limit):
                 banner = "TRUNCATED: token_limit exceeded"
                 if "TRUNCATED" not in buffer:
                     buffer = buffer[: int(self.token_limit)] + f"\n[{banner}]"
-                token_count = len(buffer)
+                token_count = estimate_tokens(buffer)
                 reason = "token_limit"
                 terminated = True
                 if trace_writer is not None:
@@ -806,7 +965,38 @@ class AgentLoop:
             terminated = True
 
         # ensure token_count consistent
-        token_count = len(buffer)
+        token_count = estimate_tokens(buffer)
+
+        # -- C1-2 VCR: write llm_usage trace + llm_usage.json (if accumulated) --
+        try:
+            if (_llm_usage_input or _llm_usage_output):
+                _llm_usage_dict = {"input_tokens": int(_llm_usage_input), "output_tokens": int(_llm_usage_output)}
+                if trace_writer is not None:
+                    try:
+                        trace_writer.append({"type": "llm_usage", "llm_usage": _llm_usage_dict})
+                    except Exception:
+                        pass
+                # write llm_usage.json alongside trace dir
+                try:
+                    import json as _vcr_json
+
+                    _dest_dir = None
+                    if trace_writer is not None and hasattr(trace_writer, "dir_path"):
+                        _dest_dir = Path(trace_writer.dir_path)
+                    elif trace_writer is not None and hasattr(trace_writer, "path"):
+                        _dest_dir = Path(trace_writer.path).parent
+                    elif isinstance(self.trace, (str, Path)):
+                        _pp2 = Path(self.trace)
+                        _dest_dir = _pp2.parent if _pp2.suffix == ".jsonl" else _pp2
+                    if _dest_dir is not None:
+                        _dest_dir.mkdir(parents=True, exist_ok=True)
+                        _out2 = _dest_dir / "llm_usage.json"
+                        _payload2 = {"llm_usage": _llm_usage_dict, "text": buffer}
+                        _out2.write_text(_vcr_json.dumps(_payload2, ensure_ascii=False), encoding="utf-8")
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
         # grounding_verified final: if grounding is None, True else last value
         if self.grounding is None:
@@ -926,7 +1116,7 @@ class AgentLoop:
             except Exception:
                 pass
 
-        token_count = len(text)
+        token_count = estimate_tokens(text)
         # grounding_verified if graph grounding passed
         grounding_verified = True
         if self.grounding is not None and text:
