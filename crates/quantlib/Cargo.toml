@@ -1,0 +1,22 @@
+[package]
+name = "quantlib"
+version = "0.1.0"
+edition = "2021"
+description = "hero-quant Rust core - vectorized kernels (stub for open-source extraction)"
+license = "MIT"
+readme = "README.md"
+keywords = ["quant", "trading", "pyo3"]
+homepage = "https://github.com/your-org/hero-quant"
+
+[lib]
+name = "quantlib"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.21", features = ["extension-module"] }
+
+[dev-dependencies]
+
+[profile.release]
+lto = true
+opt-level = 3
