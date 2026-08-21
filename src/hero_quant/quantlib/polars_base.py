@@ -9,7 +9,21 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
-import polars as pl
+
+try:
+    import polars as pl
+except ImportError as _e:  # lazy optional dep: pip install hero-quant[vector]
+    pl = None  # type: ignore[assignment]
+    _polars_import_error = _e
+else:
+    _polars_import_error = None
+
+
+def _require_polars() -> None:
+    if pl is None:
+        raise ImportError(
+            "polars is required for vectorized indicators. Install with: pip install hero-quant[vector]"
+        ) from _polars_import_error
 
 
 def _validate_window(window, default: int = 20) -> int:
@@ -67,6 +81,8 @@ def sma_polars(series, window: int = 20, *args, **kwargs) -> pd.Series:
 
     if s.empty:
         return s
+
+    _require_polars()
 
     idx = s.index
     orig_name = s.name
