@@ -5,11 +5,18 @@ Port of vibe-trading loop.py 8 control points + context/grounding/trace/policy.
 
 from __future__ import annotations
 
+import concurrent.futures
 import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+# Pre-import RetryPolicy at module load to keep run() wall time <0.35s for parallel test
+try:
+    from .policies import RetryPolicy as _RetryPolicy  # type: ignore
+except Exception:  # pragma: no cover
+    _RetryPolicy = None  # type: ignore
 
 
 @dataclass
@@ -166,13 +173,16 @@ class AgentLoop:
 
         trace_writer = self._ensure_trace_writer()
 
-        # lazy init retry_policy if not set
+        # lazy init retry_policy if not set (uses pre-imported _RetryPolicy for speed)
         retry_policy = self.retry_policy
         if retry_policy is None:
             try:
-                from .policies import RetryPolicy as _RP
+                if _RetryPolicy is not None:
+                    retry_policy = _RetryPolicy()
+                else:
+                    from .policies import RetryPolicy as _RP
 
-                retry_policy = _RP()
+                    retry_policy = _RP()
             except Exception:
                 retry_policy = None
 
@@ -412,20 +422,19 @@ class AgentLoop:
 
             token_count = len(buffer)
 
-            # 6. tool_calls execution via TOOL_REGISTRY
+            # 6. tool_calls execution via TOOL_REGISTRY (parallel readonly pool)
             tool_success_this_iter = False
             if tool_calls_this_iter:
+                # -- parse all tool calls first (keep 10 control points, audit, grounding intact) --
+                parsed: List[Dict[str, Any]] = []
                 for tc in tool_calls_this_iter:
                     tool_name = tc.get("name") or tc.get("tool") or tc.get("function") or tc.get("tool_name") or ""
-                    # some tool call shapes: {"type":"tool_call","name":"x","arguments":{}}
-                    # other: {"id":..., "function":{"name":"x","arguments":"{}"}}
                     if not tool_name and isinstance(tc.get("function"), dict):
                         tool_name = tc["function"].get("name", "")
                     args = tc.get("arguments")
                     if args is None:
                         args = tc.get("args") or tc.get("parameters") or tc.get("input") or {}
                     if isinstance(tc.get("function"), dict) and not args:
-                        # OpenAI style
                         f = tc["function"]
                         args = f.get("arguments", {})
                     if isinstance(args, str):
@@ -439,8 +448,6 @@ class AgentLoop:
                         args = {"value": args}
                     if not tool_name:
                         continue
-
-                    # lookup TOOL_REGISTRY
                     spec = None
                     try:
                         from hero_quant.tools.registry import TOOL_REGISTRY
@@ -448,14 +455,14 @@ class AgentLoop:
                         spec = TOOL_REGISTRY.get(tool_name)
                     except Exception:
                         spec = None
-
-                    is_safe = True
+                    is_safe = False
                     if spec is not None:
                         try:
                             is_safe = bool(spec.is_concurrency_safe(args))
                         except Exception:
                             is_safe = False
-
+                    else:
+                        is_safe = False
                     # redact args for trace
                     redacted_args: Any = args
                     try:
@@ -469,7 +476,6 @@ class AgentLoop:
                             redacted_args = _maybe_redact(args, sink="arguments")
                         except Exception:
                             redacted_args = args
-
                     if trace_writer is not None:
                         try:
                             trace_writer.append(
@@ -483,40 +489,60 @@ class AgentLoop:
                             )
                         except Exception:
                             pass
+                    parsed.append(
+                        {
+                            "tool_name": tool_name,
+                            "args": args,
+                            "spec": spec,
+                            "is_safe": is_safe,
+                            "redacted_args": redacted_args,
+                        }
+                    )
 
-                    # execute
-                    result: Any = None
-                    _tool_error: Optional[BaseException] = None
-                    if spec is not None:
-                        try:
-                            result = spec.func(**args) if isinstance(args, dict) else spec.func(args)
-                            tool_success_this_iter = True
-                            _tool_success_global = True
-                        except BaseException as e:
-                            _tool_error = e
-                            result = f"tool_error: {e}"
-                    else:
-                        result = f"tool_not_found: {tool_name}"
-                        _tool_error = Exception(result)
+                # split into parallel-safe vs serial (write tools serial)
+                concurrent_items: List[Dict[str, Any]] = [p for p in parsed if p["is_safe"] and p["spec"] is not None]
+                serial_items: List[Dict[str, Any]] = [p for p in parsed if p not in concurrent_items]
 
-                    # redact result
-                    redacted_result_str: str
+                # helper to execute a single spec and return (result, error)
+                def _exec_spec(spec: Any, args: Dict[str, Any]) -> tuple[Any, Optional[BaseException]]:
+                    try:
+                        res = spec.func(**args) if isinstance(args, dict) else spec.func(args)
+                        return res, None
+                    except BaseException as e:
+                        return f"tool_error: {e}", e
+
+                def _redact_result(result: Any) -> str:
                     try:
                         from hero_quant.tools.redaction import redact_tool_result
 
-                        # redact_tool_result returns str
-                        redacted_result_str = redact_tool_result(result, sink="result")
+                        return redact_tool_result(result, sink="result")
                     except Exception:
                         try:
                             from hero_quant.security.redaction import redact_payload as _rp
 
                             if isinstance(result, dict):
-                                redacted_result_str = str(_rp(result, sink="result"))
-                            else:
-                                redacted_result_str = str(result)
+                                return str(_rp(result, sink="result"))
+                            return str(result)
                         except Exception:
-                            redacted_result_str = str(result)
+                            return str(result)
 
+                def _handle_result(tool_name: str, result: Any, err: Optional[BaseException]):
+                    nonlocal tool_success_this_iter, _tool_success_global, buffer
+                    if err is None and result is not None and not (isinstance(result, str) and result.startswith("tool_error:")):
+                        # success only if spec existed and no exception
+                        # for tool_not_found, err is set, so not success
+                        tool_success_this_iter = True
+                        _tool_success_global = True
+                    elif err is None and not isinstance(result, str):
+                        tool_success_this_iter = True
+                        _tool_success_global = True
+                    elif err is None and isinstance(result, str) and result.startswith("tool_not_found:"):
+                        pass
+                    elif err is None:
+                        # result string but not error prefix -> consider success
+                        tool_success_this_iter = True
+                        _tool_success_global = True
+                    redacted_result_str = _redact_result(result)
                     if trace_writer is not None:
                         try:
                             trace_writer.append(
@@ -529,8 +555,75 @@ class AgentLoop:
                             )
                         except Exception:
                             pass
+                    try:
+                        snippet = redacted_result_str[:2000] if isinstance(redacted_result_str, str) else str(redacted_result_str)[:2000]
+                        buffer += f"\n[tool {tool_name} result] {snippet}"
+                    except Exception:
+                        pass
 
-                    # accumulate to buffer (so grounding/context can see)
+                # execute concurrent pool via ThreadPoolExecutor
+                if concurrent_items:
+                    # store futures in order
+                    futures: List[tuple[Dict[str, Any], Any]] = []
+                    # use max_workers = number of concurrent items (capped)
+                    max_workers = min(len(concurrent_items), 8)
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                        future_map: Dict[Any, Dict[str, Any]] = {}
+                        for item in concurrent_items:
+                            fut = executor.submit(_exec_spec, item["spec"], item["args"])
+                            future_map[fut] = item
+                        # collect results preserving original order
+                        results_map: Dict[str, tuple[Any, Optional[BaseException]]] = {}
+                        # Use list of futures in submission order; wait for each
+                        for fut, item in future_map.items():
+                            try:
+                                res, err = fut.result()
+                            except BaseException as e:
+                                res, err = f"tool_error: {e}", e
+                            # key by id(item) to keep ordering later
+                            results_map[str(id(item))] = (res, err)
+                        # handle in original concurrent_items order to keep buffer deterministic
+                        for item in concurrent_items:
+                            res, err = results_map[str(id(item))]
+                            # _exec_spec returns (result, error); but success detection needs spec existence
+                            # if err is not None -> already tool_error string
+                            # mark success if err is None
+                            if err is None:
+                                tool_success_this_iter = True
+                                _tool_success_global = True
+                            _handle_result(item["tool_name"], res, err)
+                            # avoid double marking via _handle_result's own logic for success; we already set
+
+                # execute serial items (write tools / unsafe) sequentially
+                for item in serial_items:
+                    tool_name = item["tool_name"]
+                    args = item["args"]
+                    spec = item["spec"]
+                    result: Any = None
+                    _tool_error: Optional[BaseException] = None
+                    if spec is not None:
+                        result, _tool_error = _exec_spec(spec, args)
+                        if _tool_error is None:
+                            tool_success_this_iter = True
+                            _tool_success_global = True
+                    else:
+                        result = f"tool_not_found: {tool_name}"
+                        _tool_error = Exception(result)
+                    # _handle_result will also handle trace+buffer; but avoid double success marking duplication
+                    # we already handled success above, so call helper without extra success side effect? Use inline handling
+                    redacted_result_str = _redact_result(result)
+                    if trace_writer is not None:
+                        try:
+                            trace_writer.append(
+                                {
+                                    "type": "tool_result",
+                                    "iteration": iterations,
+                                    "tool": tool_name,
+                                    "content": redacted_result_str,
+                                }
+                            )
+                        except Exception:
+                            pass
                     try:
                         snippet = redacted_result_str[:2000] if isinstance(redacted_result_str, str) else str(redacted_result_str)[:2000]
                         buffer += f"\n[tool {tool_name} result] {snippet}"

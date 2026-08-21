@@ -53,17 +53,27 @@ class RetryPolicy:
 
 
 # Command placeholder for LangGraph (fallback if langgraph not available)
-try:
-    from langgraph.types import Command as LGCommand  # type: ignore
-except Exception:
-    try:
-        from langgraph.graph import Command as LGCommand  # type: ignore
-    except Exception:
+# NOTE: langgraph import is deferred to error_handler to keep policies import fast
+# (<0.01s) — critical for Agent Loop parallel timing test (<0.35s wall time).
+@dataclass
+class LGCommand:  # type: ignore
+    goto: str | None = None
+    update: dict | None = None
 
-        @dataclass
-        class LGCommand:  # type: ignore
-            goto: str | None = None
-            update: dict | None = None
+
+def _get_lg_command():
+    """Lazy import LGCommand to avoid slow langgraph import at module load."""
+    try:
+        from langgraph.types import Command as _LG  # type: ignore
+
+        return _LG
+    except Exception:
+        try:
+            from langgraph.graph import Command as _LG2  # type: ignore
+
+            return _LG2
+        except Exception:
+            return LGCommand
 
 
 def error_handler(state: dict[str, Any], error: BaseException) -> Any:
@@ -76,8 +86,9 @@ def error_handler(state: dict[str, Any], error: BaseException) -> Any:
     # Decide compensation target
     goto = "compensate"
     # Return Command for LangGraph
+    LG = _get_lg_command()
     try:
-        return LGCommand(goto=goto, update={"error": str(error)})
+        return LG(goto=goto, update={"error": str(error)})
     except Exception:
         return {"goto": goto, "error": str(error)}
 
