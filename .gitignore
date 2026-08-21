@@ -14,3 +14,11 @@ node_modules/
 frontend/dist/
 .mypy_cache/
 .ruff_cache/
+# local plans not for github
+docs/plans/
+docs/plan/
+# local logs / tmp
+forward-*.log
+forward-*.js
+opencode-web*.log
+test-results/
