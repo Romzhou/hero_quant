@@ -1,8 +1,11 @@
 import { Suspense, lazy } from "react"
 import { NavLink, Route, Routes, Navigate } from "react-router-dom"
 
-const Chat = lazy(() => import("./pages/Chat"))
+const Dashboard = lazy(() => import("./pages/Dashboard"))
 const Research = lazy(() => import("./pages/Research"))
+const Chat = lazy(() => import("./pages/Chat"))
+const Live = lazy(() => import("./pages/Live"))
+const Risk = lazy(() => import("./pages/Risk"))
 const Settings = lazy(() => import("./pages/Settings"))
 
 function Shell() {
@@ -28,9 +31,11 @@ function Shell() {
           </div>
 
           <nav className="flex items-center gap-1.5 rounded-2xl border border-white/10 bg-white/[0.04] p-1 backdrop-blur">
-            <NavLink to="/chat" className={linkCls}>对话</NavLink>
+            <NavLink to="/dashboard" className={linkCls}>看板</NavLink>
             <NavLink to="/research" className={linkCls}>研究</NavLink>
-            <NavLink to="/settings" className={linkCls}>设置</NavLink>
+            <NavLink to="/backtest" className={linkCls}>回测</NavLink>
+            <NavLink to="/live" className={linkCls}>实盘</NavLink>
+            <NavLink to="/risk" className={linkCls}>风控</NavLink>
           </nav>
 
           <div className="hidden items-center gap-2 md:flex">
@@ -43,9 +48,13 @@ function Shell() {
       <main className="mx-auto max-w-7xl min-h-[calc(100vh-64px)]">
         <Suspense fallback={<div className="p-8 text-sm text-slate-400">加载中…</div>}>
           <Routes>
-            <Route path="/" element={<Navigate to="/chat" replace />} />
-            <Route path="/chat" element={<Chat />} />
+            <Route path="/" element={<Navigate to="/dashboard" replace />} />
+            <Route path="/dashboard" element={<Dashboard />} />
             <Route path="/research" element={<Research />} />
+            <Route path="/backtest" element={<Chat />} />
+            <Route path="/chat" element={<Chat />} />
+            <Route path="/live" element={<Live />} />
+            <Route path="/risk" element={<Risk />} />
             <Route path="/settings" element={<Settings />} />
           </Routes>
         </Suspense>
