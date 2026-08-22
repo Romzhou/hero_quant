@@ -610,6 +610,20 @@ class AgentLoop:
                                     _llm_usage_output += int(_ov) if _ov is not None else 0
                                 except Exception:
                                     pass
+                                # 同步计费：调用 BudgetBreaker.record_usage
+                                try:
+                                    bb = getattr(self, "budget_breaker", None)
+                                    if bb is not None and hasattr(bb, "record_usage"):
+                                        # 仅记录本次增量，避免对 None 的重复累计
+                                        _iv_int = int(_iv) if _iv is not None else 0
+                                        _ov_int = int(_ov) if _ov is not None else 0
+                                        if _iv_int or _ov_int:
+                                            try:
+                                                bb.record_usage({"input_tokens": _iv_int, "output_tokens": _ov_int})
+                                            except Exception:
+                                                pass
+                                except Exception:
+                                    pass
                         except Exception:
                             pass
                     elif isinstance(chunk, str):
@@ -758,6 +772,39 @@ class AgentLoop:
                         }
                     )
 
+                # 批冻结身份：批前授权快照
+                authorized_snapshot = None
+                try:
+                    if self.grounding is not None and hasattr(self.grounding, "_evidence"):
+                        ev = getattr(self.grounding, "_evidence", {})
+                        if isinstance(ev, dict):
+                            authorized_snapshot = frozenset(ev.keys())
+                        else:
+                            authorized_snapshot = frozenset()
+                except Exception:
+                    authorized_snapshot = None
+                if authorized_snapshot is not None:
+                    for _it in parsed:
+                        _spec = _it.get("spec")
+                        if _spec is None:
+                            continue
+                        try:
+                            import inspect as _ins2
+
+                            sig2 = getattr(_spec, "signature", None)
+                            if sig2 is None:
+                                try:
+                                    sig2 = _ins2.signature(_spec.func)
+                                except Exception:
+                                    sig2 = None
+                            if sig2 is not None and "authorized" in sig2.parameters:
+                                # 注入快照
+                                _args2 = dict(_it.get("args", {}))
+                                _args2["authorized"] = authorized_snapshot
+                                _it["args"] = _args2
+                        except Exception:
+                            pass
+
                 # 拆分为可并发与需串行两组
                 concurrent_items: List[Dict[str, Any]] = [p for p in parsed if p["is_safe"] and p["spec"] is not None]
                 # 使用 id 去重避免相同 payload 的字典相等误判；并发执行受 spec.timeoutMs 约束
@@ -872,31 +919,77 @@ class AgentLoop:
                             symbols = list(ev.keys())
                     except Exception:
                         symbols = []
-                    nums = re.findall(r"\d+\.?\d*", buffer)
+                    # 优先使用结构化 claim 提取（8 类掩码），仅价格类参与校验
+                    nums: List[str] = []
+                    _claims_for_grounding: List[Dict[str, Any]] = []
+                    _extract_ok = False
+                    try:
+                        from .grounding import extract_claims as _extract_claims  # type: ignore
+
+                        _claims_for_grounding = _extract_claims(buffer)
+                        _extract_ok = True
+                        for _c in _claims_for_grounding:
+                            _t = _c.get("type", "")
+                            # 仅价格相关 masks 参与 grounding 校验（percent/quantity/range/date 排除）
+                            if _t in ("price", "thousand", "currency", "negative"):
+                                _v = _c.get("value")
+                                if isinstance(_v, list):
+                                    for _vv in _v:
+                                        nums.append(str(_vv))
+                                elif isinstance(_v, (int, float)):
+                                    nums.append(str(_v))
+                                else:
+                                    # 回退 raw 中的数字
+                                    _raw = str(_c.get("raw", ""))
+                                    _m = re.search(r"[-+]?[0-9,]*\.?[0-9]+", _raw)
+                                    if _m:
+                                        nums.append(_m.group(0))
+                            # date/percent/quantity/range 跳过，不作为价格候选
+                    except Exception:
+                        _claims_for_grounding = []
+                        _extract_ok = False
+                    # 仅当 extract_claims 异常时回退正则，避免 percent/quantity/date/range 误入校验
+                    if not _extract_ok:
+                        try:
+                            nums = re.findall(r"\d+\.?\d*", buffer)
+                        except Exception:
+                            nums = []
                     verified = False
                     if symbols:
                         for sym in symbols:
                             if sym in buffer:
                                 for n in nums:
                                     try:
-                                        price = float(n)
-                                        self.grounding.assert_price(sym, price)
+                                        # grounding 已归一千分位/货币符号，故直接透传原始字符串
+                                        self.grounding.assert_price(sym, n)
                                         verified = True
                                         break
                                     except Exception:
-                                        continue
+                                        # 尝试 float 归一再次
+                                        try:
+                                            price2 = float(str(n).replace(",", "").replace("$", "").replace("¥", "").replace("￥", ""))
+                                            self.grounding.assert_price(sym, price2)
+                                            verified = True
+                                            break
+                                        except Exception:
+                                            continue
                                 if verified:
                                     break
                         # 回退：数字存在但未显式提及 symbol 时尝试首个 symbol
                         if not verified and nums:
                             for n in nums:
                                 try:
-                                    price = float(n)
-                                    self.grounding.assert_price(symbols[0], price)
+                                    self.grounding.assert_price(symbols[0], n)
                                     verified = True
                                     break
                                 except Exception:
-                                    continue
+                                    try:
+                                        price2 = float(str(n).replace(",", "").replace("$", "").replace("¥", "").replace("￥", ""))
+                                        self.grounding.assert_price(symbols[0], price2)
+                                        verified = True
+                                        break
+                                    except Exception:
+                                        continue
                     else:
                         # no evidence yet -> consider not verified
                         verified = False
@@ -954,13 +1047,52 @@ class AgentLoop:
                         except Exception:
                             pass
 
-            # 9) 预算熔断检查
+            # 9) 预算熔断检查：真实 usage 优先，fallback 旧公式
             if self.budget_breaker is not None:
                 try:
-                    # 简易成本估算：token 与轮次共同决定
-                    estimated = token_count / 10000.0 + iterations * 0.05
-                    if hasattr(self.budget_breaker, "should_fallback"):
-                        if self.budget_breaker.should_fallback(cost=estimated):
+                    # 若有真实 usage，优先按定价计算；否则回退旧公式
+                    _should_fallback = False
+                    estimated: float = 0.0
+                    if (_llm_usage_input or _llm_usage_output):
+                        try:
+                            if hasattr(self.budget_breaker, "estimate_cost"):
+                                estimated = float(self.budget_breaker.estimate_cost({"input_tokens": _llm_usage_input, "output_tokens": _llm_usage_output}))
+                            else:
+                                import os as _os2
+
+                                _pi = float(_os2.environ.get("HERO_LLM_PRICE_IN", "0.15") or "0.15")
+                                _po = float(_os2.environ.get("HERO_LLM_PRICE_OUT", "0.60") or "0.60")
+                                estimated = _llm_usage_input * _pi / 1_000_000 + _llm_usage_output * _po / 1_000_000
+                        except Exception:
+                            import os as _os3
+
+                            try:
+                                _pi = float(_os3.environ.get("HERO_LLM_PRICE_IN", "0.15") or "0.15")
+                            except Exception:
+                                _pi = 0.15
+                            try:
+                                _po = float(_os3.environ.get("HERO_LLM_PRICE_OUT", "0.60") or "0.60")
+                            except Exception:
+                                _po = 0.60
+                            estimated = _llm_usage_input * _pi / 1_000_000 + _llm_usage_output * _po / 1_000_000
+                        # 真实 usage 已通过 record_usage 累计，直接以累计状态判定，避免重复计算
+                        try:
+                            if hasattr(self.budget_breaker, "should_fallback"):
+                                _should_fallback = bool(self.budget_breaker.should_fallback(cost=0))
+                            else:
+                                _should_fallback = False
+                        except Exception:
+                            _should_fallback = False
+                    else:
+                        estimated = token_count / 10000.0 + iterations * 0.05
+                        try:
+                            if hasattr(self.budget_breaker, "should_fallback"):
+                                _should_fallback = bool(self.budget_breaker.should_fallback(cost=estimated))
+                            else:
+                                _should_fallback = False
+                        except Exception:
+                            _should_fallback = False
+                    if _should_fallback:
                             reason = "budget_fallback"
                             terminated = True
                             if trace_writer is not None:
@@ -1186,25 +1318,92 @@ class AgentLoop:
                 pass
 
         token_count = estimate_tokens(text)
-        # 图结果的接地性校验：若包含价格则尝试校验
+        # 图结果的接地性校验：与主循环共用 extract_claims 规则，避免行为分叉
         grounding_verified = True
         if self.grounding is not None and text:
             try:
-                nums = re.findall(r"\d+\.?\d*", text)
-                if nums:
+                from .grounding import extract_claims as _extract_claims_graph  # type: ignore
+
+                _claims_g = _extract_claims_graph(text)
+                nums: List[str] = []
+                for _c in _claims_g:
+                    _t = _c.get("type", "")
+                    if _t in ("price", "thousand", "currency", "negative"):
+                        _v = _c.get("value")
+                        if isinstance(_v, list):
+                            for _vv in _v:
+                                nums.append(str(_vv))
+                        elif isinstance(_v, (int, float)):
+                            nums.append(str(_v))
+                        else:
+                            _raw = str(_c.get("raw", ""))
+                            _m = re.search(r"[-+]?[0-9,]*\.?[0-9]+", _raw)
+                            if _m:
+                                nums.append(_m.group(0))
+                if not nums:
+                    grounding_verified = True
+                else:
                     ev = getattr(self.grounding, "_evidence", {})
                     if isinstance(ev, dict) and ev:
-                        sym = list(ev.keys())[0]
-                        for n in nums:
-                            try:
-                                self.grounding.assert_price(sym, float(n))
-                                grounding_verified = True
-                                break
-                            except Exception:
-                                grounding_verified = False
-                                continue
+                        # 复用主循环的符号匹配逻辑：优先含符号的文本，未命中则首个证据
+                        symbols_g = list(ev.keys())
+                        verified_g = False
+                        for sym in symbols_g:
+                            if sym in text:
+                                for n in nums:
+                                    try:
+                                        self.grounding.assert_price(sym, n)
+                                        verified_g = True
+                                        break
+                                    except Exception:
+                                        try:
+                                            price2 = float(str(n).replace(",", "").replace("$", "").replace("¥", "").replace("￥", ""))
+                                            self.grounding.assert_price(sym, price2)
+                                            verified_g = True
+                                            break
+                                        except Exception:
+                                            continue
+                                if verified_g:
+                                    break
+                        if not verified_g:
+                            for n in nums:
+                                try:
+                                    self.grounding.assert_price(symbols_g[0], n)
+                                    verified_g = True
+                                    break
+                                except Exception:
+                                    try:
+                                        price2 = float(str(n).replace(",", "").replace("$", "").replace("¥", "").replace("￥", ""))
+                                        self.grounding.assert_price(symbols_g[0], price2)
+                                        verified_g = True
+                                        break
+                                    except Exception:
+                                        continue
+                            grounding_verified = verified_g
+                        else:
+                            grounding_verified = True
+                    else:
+                        grounding_verified = False
             except Exception:
-                grounding_verified = False
+                # extract 异常时回退旧正则，保持鲁棒性
+                try:
+                    nums_fb = re.findall(r"\d+\.?\d*", text)
+                    if nums_fb:
+                        ev = getattr(self.grounding, "_evidence", {})
+                        if isinstance(ev, dict) and ev:
+                            sym = list(ev.keys())[0]
+                            for n in nums_fb:
+                                try:
+                                    self.grounding.assert_price(sym, float(n))
+                                    grounding_verified = True
+                                    break
+                                except Exception:
+                                    grounding_verified = False
+                                    continue
+                    else:
+                        grounding_verified = True
+                except Exception:
+                    grounding_verified = False
 
         # 提取指标
         metrics = None

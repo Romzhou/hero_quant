@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import os
 import random
 import time
 from dataclasses import dataclass, field
@@ -97,6 +98,62 @@ class BudgetBreaker:
     window_seconds: int = 86400
     _costs: list[tuple[float, float]] = field(default_factory=list)  # (ts, cost)
 
+    # 默认定价（per 1M tokens）
+    DEFAULT_PRICE_IN: float = 0.15
+    DEFAULT_PRICE_OUT: float = 0.60
+
+    def _get_prices(self) -> tuple[float, float]:
+        """读取定价，环境变量 HERO_LLM_PRICE_IN/OUT 覆盖默认值."""
+        try:
+            raw_in = os.environ.get("HERO_LLM_PRICE_IN", "").strip()
+            price_in = float(raw_in) if raw_in else self.DEFAULT_PRICE_IN
+        except Exception:
+            price_in = self.DEFAULT_PRICE_IN
+        try:
+            raw_out = os.environ.get("HERO_LLM_PRICE_OUT", "").strip()
+            price_out = float(raw_out) if raw_out else self.DEFAULT_PRICE_OUT
+        except Exception:
+            price_out = self.DEFAULT_PRICE_OUT
+        return price_in, price_out
+
+    def estimate_cost(self, usage: dict) -> float:
+        """按 usage 估算成本，兼容多种字段名."""
+        if not isinstance(usage, dict):
+            return 0.0
+        iv = usage.get("input_tokens")
+        if iv is None:
+            iv = usage.get("prompt_tokens", usage.get("promptTokens", 0))
+        ov = usage.get("output_tokens")
+        if ov is None:
+            ov = usage.get("completion_tokens", usage.get("generated_tokens", 0))
+        try:
+            iv_f = float(iv) if iv is not None else 0.0
+        except Exception:
+            iv_f = 0.0
+        try:
+            ov_f = float(ov) if ov is not None else 0.0
+        except Exception:
+            ov_f = 0.0
+        price_in, price_out = self._get_prices()
+        return iv_f * price_in / 1_000_000 + ov_f * price_out / 1_000_000
+
+    def record_usage(self, usage: dict) -> float:
+        """记录 usage 并累计成本，返回本次成本."""
+        cost = self.estimate_cost(usage)
+        # 零成本不追加 _costs，避免无界增长
+        if cost is not None:
+            try:
+                if float(cost) <= 0:
+                    return float(cost)
+            except Exception:
+                # 非数值则按原逻辑处理
+                pass
+        try:
+            self.add_cost(cost)
+        except Exception:
+            pass
+        return cost
+
     def _prune(self) -> None:
         now = time.time()
         cutoff = now - self.window_seconds
@@ -110,12 +167,16 @@ class BudgetBreaker:
         self._prune()
         return sum(c for _, c in self._costs)
 
-    def should_fallback(self, cost: float) -> bool:
-        """滑动窗口熔断：单次或累计超阈即需降级."""
-        if float(cost) > self.daily_limit:
+    def should_fallback(self, cost: float = 0.0) -> bool:
+        """滑动窗口熔断：单次或累计超阈即需降级。cost 默认为 0 便于查询累计状态."""
+        try:
+            c = float(cost) if cost is not None else 0.0
+        except Exception:
+            c = 0.0
+        if c > self.daily_limit:
             return True
         self._prune()
-        if self.total_cost() + float(cost) > self.daily_limit:
+        if self.total_cost() + c > self.daily_limit:
             return True
         return False
 
