@@ -41,17 +41,14 @@ services:
 
   otel-collector:
     image: otel/opentelemetry-collector-contrib:0.128.0
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    volumes:
+      - ./deploy/otel-collector-config.yaml:/etc/otelcol-contrib/config.yaml:ro
     ports:
       - "127.0.0.1:4317:4317"
       - "127.0.0.1:4318:4318"
       - "127.0.0.1:8889:8889"
       - "127.0.0.1:13133:13133"
-    healthcheck:
-      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:13133/ || exit 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 10s
     restart: unless-stopped
 
   hero-quant:
@@ -61,14 +58,14 @@ services:
         condition: service_healthy
       temporal:
         condition: service_healthy
-      otel-collector:
-        condition: service_healthy
     ports:
       - "127.0.0.1:8899:8899"
     env_file:
       - .env
     environment:
       HERO_CHECKPOINT_DSN: postgresql://heroquant:heroquant@postgres:5432/heroquant
+      HERO_OTEL_MODE: shared
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318/v1/logs
     volumes:
       - hero-runs:/app/agent/runs
       - hero-sessions:/app/agent/sessions

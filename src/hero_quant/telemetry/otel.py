@@ -183,7 +183,20 @@ class SessionTelemetryCoordinator:
             import json
             import urllib.request
 
-            data = json.dumps(payload or {}).encode("utf-8")
+            data = json.dumps(
+                {
+                    "resourceLogs": [
+                        {
+                            "scopeLogs": [
+                                {
+                                    "scope": {"name": "hero_quant.telemetry"},
+                                    "logRecords": [{"body": {"stringValue": json.dumps(payload or {})}}],
+                                }
+                            ]
+                        }
+                    ]
+                }
+            ).encode("utf-8")
             req = urllib.request.Request(endpoint, data=data, headers={"Content-Type": "application/json"})
             with urllib.request.urlopen(req, timeout=0.5) as _resp:  # noqa: S310
                 pass
