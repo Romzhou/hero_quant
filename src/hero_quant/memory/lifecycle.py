@@ -1,13 +1,15 @@
 """记忆生命周期：Ebbinghaus 衰减与 GC 回收。
 
 职责：为 MemoryStore 提供重要性评估与过期归档能力；上游由 store/调度触发，下游落盘到文件归档与 gc.log。
-设计要点：半衰期 14 天（λ=ln2/14），重要性=quality*(exp(-λ*days)+min(0.3,access*0.1))；GC 阈值 archive 0.15 / delete 0.05，年龄门限 7 天，上限 500，默认仅归档不删除。
+设计要点：半衰期 14 天（λ=ln2/14），重要性=quality*(exp(-λ*days)+min(0.3,access*0.1))；GC 阈值 archive 0.15 / delete 0.05，年龄门限 7 天，上限 500，默认启用足龄删除。
 """
 from __future__ import annotations
 
 import logging
 import math
+import re
 import time
+from collections import Counter
 from pathlib import Path
 from types import MappingProxyType
 
@@ -17,12 +19,14 @@ HALF_LIFE_DAYS = 14.0
 _DECAY_LAMBDA = math.log(2) / HALF_LIFE_DAYS  # 衰减系数 λ，决定半衰期
 _ACCESS_BOOST = 0.1  # 每次访问的增益，封顶 0.3
 
-# GC 阈值：archive 0.15 为归档线，delete 0.05 为删除线（当前仅归档）
+# GC 阈值：archive 0.15 为归档线，delete 0.05 为删除线。
 ARCHIVE_THRESHOLD = 0.15
 DELETE_THRESHOLD = 0.05
 MIN_AGE_DAYS = 7  # 仅对 7 天以上条目做 GC，避免新记忆被误回收
+MAX_AGE_DAYS = 30  # 删除线还需要达到最大保留年龄
+MAX_AGE = MAX_AGE_DAYS  # 兼容计划与调用方使用的简短名称
 MAX_MEMORY_COUNT = 500  # 容量上限，触发上游限流/归档
-ENABLE_DELETE = False  # 一阶段仅归档，删除能力预留
+ENABLE_DELETE = True  # 默认启用删除；实例可覆写，仍受年龄门禁保护
 
 
 def _now_iso() -> str:
@@ -46,6 +50,8 @@ class MemoryLifecycle:
     ARCHIVE_THRESHOLD = ARCHIVE_THRESHOLD
     DELETE_THRESHOLD = DELETE_THRESHOLD
     MIN_AGE_DAYS = MIN_AGE_DAYS
+    MAX_AGE_DAYS = MAX_AGE_DAYS
+    MAX_AGE = MAX_AGE
     MAX_MEMORY_COUNT = MAX_MEMORY_COUNT
     ENABLE_DELETE = ENABLE_DELETE
 
@@ -100,6 +106,24 @@ class MemoryLifecycle:
     def _resolve_meta(self, file_path: Path) -> tuple[float, int, float]:
         """按文件反查 _meta，拿不到则回退到 frontmatter 或默认值。"""
         qs, ac, last = 0.5, 0, time.time()
+
+        def apply_meta(value) -> None:
+            nonlocal qs, ac, last
+            if not isinstance(value, dict):
+                return
+            try:
+                qs = float(value.get("quality_score", qs))
+            except (TypeError, ValueError):
+                pass
+            try:
+                ac = int(value.get("access_count", ac))
+            except (TypeError, ValueError):
+                pass
+            try:
+                last = float(value.get("last_accessed", last))
+            except (TypeError, ValueError):
+                pass
+
         meta_dict = getattr(self._memory, "_meta", None)
         if isinstance(meta_dict, dict) and meta_dict:
             # 通过安全文件名精确匹配
@@ -111,17 +135,13 @@ class MemoryLifecycle:
                 except Exception:
                     safe = f"{k}.md"
                 if safe == fname:
-                    qs = float(v.get("quality_score", qs))
-                    ac = int(v.get("access_count", ac))
-                    last = float(v.get("last_accessed", last))
+                    apply_meta(v)
                     return qs, ac, last
             # 回退：按 stem 模糊匹配
             stem = file_path.stem
             for k, v in meta_dict.items():
                 if stem == k or stem.endswith(k) or k.endswith(stem):
-                    qs = float(v.get("quality_score", qs))
-                    ac = int(v.get("access_count", ac))
-                    last = float(v.get("last_accessed", last))
+                    apply_meta(v)
                     return qs, ac, last
             # 层次文件需处理 namespace 前缀替换，未命中则保留默认值
         # 回退解析 frontmatter 中的质量分
@@ -165,9 +185,9 @@ class MemoryLifecycle:
             imp = compute_importance(qs, ac, days_since)
             action = None
             reason = ""
-            if imp < self.DELETE_THRESHOLD and self.ENABLE_DELETE:
+            if imp < self.DELETE_THRESHOLD and self.ENABLE_DELETE and age_days >= self.MAX_AGE:
                 action = "delete"
-                reason = f"importance {imp:.3f} < delete threshold"
+                reason = f"importance {imp:.3f} < delete threshold and age {age_days:.1f}d >= max age"
             elif imp < self.ARCHIVE_THRESHOLD:
                 action = "archive"
                 reason = f"importance {imp:.3f} < archive threshold"
@@ -235,6 +255,143 @@ class MemoryLifecycle:
                 f.write("\n".join(lines))
         except OSError:
             pass
+
+    @staticmethod
+    def _read_compressible(file_path: Path) -> str | None:
+        """Read one text record; malformed and empty records are not compressible."""
+        try:
+            content = file_path.read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeError):
+            return None
+        return content or None
+
+    @staticmethod
+    def _summary_sentences(content: str) -> list[str]:
+        """Split a record into short sentence-like units without NLP dependencies."""
+        sentences = re.split(r"(?:\r?\n+|[.!?。！？]+\s*)", content.strip())
+        return [sentence.strip() for sentence in sentences if sentence.strip()]
+
+    @staticmethod
+    def _tokens(sentence: str) -> list[str]:
+        return re.findall(r"\w+", sentence.lower(), flags=re.UNICODE)
+
+    @classmethod
+    def _tfidf_summary(cls, records: list[tuple[str, str]], limit: int = 3) -> str:
+        """Return an extractive TF-IDF summary, retaining source order for readability."""
+        candidates: list[tuple[int, str, list[str]]] = []
+        document_frequency: Counter[str] = Counter()
+        for source, content in records:
+            for sentence in cls._summary_sentences(content):
+                tokens = cls._tokens(sentence)
+                if not tokens:
+                    continue
+                candidates.append((len(candidates), source, sentence))
+                document_frequency.update(set(tokens))
+        if not candidates:
+            return ""
+
+        total = len(candidates)
+        scored: list[tuple[float, int, str, str]] = []
+        for index, source, sentence in candidates:
+            tokens = cls._tokens(sentence)
+            score = sum(math.log((1 + total) / (1 + document_frequency[token])) + 1 for token in tokens)
+            score /= len(tokens)
+            scored.append((score, index, source, sentence))
+        scored.sort(key=lambda item: (-item[0], item[1]))
+        selected = sorted(scored[: max(1, limit)], key=lambda item: item[1])
+        return "\n".join(f"- {sentence} [{source}]" for _, _, source, sentence in selected)
+
+    def _compressed_archive(self, file_path: Path, stage: str) -> None:
+        """Keep compressed sources out of active scans while preserving their contents."""
+        archive_dir = self.memory_dir / "archive" / "compressed" / stage
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        relative = file_path.relative_to(self.memory_dir)
+        safe_name = "__".join(relative.parts)
+        destination = archive_dir / safe_name
+        counter = 1
+        while destination.exists():
+            destination = archive_dir / f"{safe_name}.{counter}"
+            counter += 1
+        try:
+            file_path.rename(destination)
+        except OSError as exc:
+            logger.warning("Compression source archive failed for %s: %s", file_path, exc)
+
+    def _index_compression(self, stage: str, period: str, summary: str) -> None:
+        """Best-effort index of a written compression summary."""
+        try:
+            index_external = getattr(self._memory, "index_external", None)
+            if not callable(index_external):
+                return
+            index_external(f"compression:{stage}:{period}", summary)
+        except Exception as exc:
+            logger.warning("Compression external index failed for %s:%s: %s", stage, period, exc)
+
+    def _compression_sources(self, now: float) -> list[tuple[str, str, list[Path]]]:
+        """Collect eligible raw and daily groups as ``(stage, period, sources)``."""
+        groups: dict[tuple[str, str], list[Path]] = {}
+        for file_path in self._scan_entries():
+            if file_path.parent.name in {"archive", "daily", "digest"}:
+                continue
+            try:
+                age_days = (now - file_path.stat().st_mtime) / 86400.0
+            except OSError:
+                continue
+            if age_days < self.MIN_AGE_DAYS or self._read_compressible(file_path) is None:
+                continue
+            stage = "digest" if age_days >= self.MAX_AGE else "daily"
+            period = time.strftime("%Y-%m" if stage == "digest" else "%Y-%m-%d", time.gmtime(file_path.stat().st_mtime))
+            groups.setdefault((stage, period), []).append(file_path)
+
+        daily_dir = self.memory_dir / "daily"
+        if daily_dir.is_dir():
+            for file_path in sorted(daily_dir.glob("*.md")):
+                try:
+                    age_days = (now - file_path.stat().st_mtime) / 86400.0
+                except OSError:
+                    continue
+                if age_days < self.MAX_AGE or self._read_compressible(file_path) is None:
+                    continue
+                period = time.strftime("%Y-%m", time.gmtime(file_path.stat().st_mtime))
+                groups.setdefault(("digest", period), []).append(file_path)
+
+        return [(stage, period, sources) for (stage, period), sources in sorted(groups.items())]
+
+    def compress(self, dry_run: bool = True, now: float | None = None) -> list[dict]:
+        """Compress eligible raw records to daily summaries and daily records to digests."""
+        current_time = time.time() if now is None else now
+        actions: list[dict] = []
+        for stage, period, sources in self._compression_sources(current_time):
+            target = self.memory_dir / stage / f"{period}.md"
+            records: list[tuple[str, str]] = []
+            for source in sources:
+                content = self._read_compressible(source)
+                if content is not None:
+                    records.append((source.stem, content))
+            summary = self._tfidf_summary(records)
+            if not summary:
+                continue
+            action = {
+                "name": target.stem,
+                "action": "compress",
+                "stage": stage,
+                "source_count": len(records),
+                "target": str(target),
+            }
+            actions.append(action)
+            if dry_run:
+                continue
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(summary + "\n", encoding="utf-8")
+            except OSError as exc:
+                logger.warning("Compression write failed for %s: %s", target, exc)
+                continue
+            self._index_compression(stage, period, summary)
+            for source in sources:
+                if self._read_compressible(source) is not None:
+                    self._compressed_archive(source, stage)
+        return actions
 
     # 预留接口：与上游事件体系对齐
     def reinforce(self, name: str, event: str, source: str = "system") -> bool:
