@@ -38,74 +38,55 @@ class ContextManager:
         chars = len(f"{role}: {content}")
         self._messages.append({"role": role, "content": content, "chars": chars})
 
-    def compact(self) -> CompactResult:
-        """按阈值折叠上下文，优先向量摘要，失败回落首尾截断."""
-        lines = [f"{m['role']}: {m['content']}" for m in self._messages]
-        text = "\n".join(lines)
-        total_chars = len(text)
-        threshold = self.max_chars * 0.8
+    @staticmethod
+    def _render_messages(messages: list[dict]) -> str:
+        return "\n".join(f"{message['role']}: {message['content']}" for message in messages)
 
-        if total_chars <= threshold:
-            return CompactResult(truncated=False, banner="OK", text=text)
+    @staticmethod
+    def _microcompact(messages: list[dict]) -> tuple[list[dict], bool]:
+        """折叠旧工具结果，但保留最近三条工具结果供后续推理使用."""
+        tool_positions = [index for index, message in enumerate(messages) if message.get("role") == "tool"]
+        folded_positions = set(tool_positions[:-3])
+        if not folded_positions:
+            return messages, False
 
-        n = len(self._messages)
+        folded = []
+        marker_added = False
+        marker = f"[MICROCOMPACT] {len(folded_positions)} older tool results folded"
+        for index, message in enumerate(messages):
+            if index in folded_positions:
+                if not marker_added:
+                    folded.append({"role": "system", "content": marker, "chars": len(f"system: {marker}")})
+                    marker_added = True
+                continue
+            folded.append(message)
+        return folded, True
 
-        try:
-            from .embed import embedding_summary  # 懒加载避免循环依赖
+    def _embedding_compact(self, messages: list[dict]) -> CompactResult:
+        """保留原有 embedding summary 的首尾保护行为."""
+        from .embed import embedding_summary  # 懒加载避免循环依赖
 
-            if n <= 4:
-                summary = embedding_summary(self._messages)
-                banner = "TRUNCATED: embedding vector folding 80% threshold"
-                folded_text = summary
-                if len(folded_text) > self.max_chars:
-                    folded_text = folded_text[: self.max_chars]
-                    if "embedding" not in folded_text.lower():
-                        folded_text = "[EMBEDDING_SUMMARY embedding] " + folded_text
-                        folded_text = folded_text[: self.max_chars]
-                return CompactResult(truncated=True, banner=banner, text=folded_text)
-
-            head = self._messages[:2]
-            tail = self._messages[-2:]
-            middle = self._messages[2:-2]
-
-            lines_head = [f"{m['role']}: {m['content']}" for m in head]
-            lines_tail = [f"{m['role']}: {m['content']}" for m in tail]
-
-            summary = embedding_summary(middle)
-
-            folded_text = "\n".join(lines_head + [summary] + lines_tail)
-
-            if len(folded_text) > self.max_chars:
-                head_text = "\n".join(lines_head)
-                tail_text = "\n".join(lines_tail)
-                reserved = len(head_text) + 1 + len(tail_text) + 1
-                remaining = self.max_chars - reserved
-                if remaining >= len("[EMBEDDING_SUMMARY"):
-                    if len(summary) > remaining:
-                        summary = summary[:remaining]
-                        folded_text = "\n".join(lines_head + [summary] + lines_tail)
-
-            banner = "TRUNCATED: embedding vector folding 80% threshold"
-            return CompactResult(truncated=True, banner=banner, text=folded_text)
-        except Exception:
-            pass
-
-        if total_chars <= self.max_chars:
-            pass
-
-        n = len(self._messages)
+        n = len(messages)
         if n <= 4:
-            banner = "TRUNCATED: context folded 保留首2+尾2，中间用 [SUMMARY] 占位"
-            return CompactResult(truncated=True, banner=banner, text=text)
+            summary = embedding_summary(messages)
+            folded_text = summary
+            if len(folded_text) > self.max_chars:
+                folded_text = folded_text[: self.max_chars]
+                if "embedding" not in folded_text.lower():
+                    folded_text = "[EMBEDDING_SUMMARY embedding] " + folded_text
+                    folded_text = folded_text[: self.max_chars]
+            return CompactResult(
+                truncated=True,
+                banner="TRUNCATED: embedding vector folding 80% threshold",
+                text=folded_text,
+            )
 
-        head = self._messages[:2]
-        tail = self._messages[-2:]
-        middle_count = n - 4
-
-        lines_head = [f"{m['role']}: {m['content']}" for m in head]
-        lines_tail = [f"{m['role']}: {m['content']}" for m in tail]
-        summary = f"[SUMMARY] {middle_count} messages folded"
-
+        head = messages[:2]
+        tail = messages[-2:]
+        middle = messages[2:-2]
+        lines_head = [f"{message['role']}: {message['content']}" for message in head]
+        lines_tail = [f"{message['role']}: {message['content']}" for message in tail]
+        summary = embedding_summary(middle)
         folded_text = "\n".join(lines_head + [summary] + lines_tail)
 
         if len(folded_text) > self.max_chars:
@@ -113,15 +94,84 @@ class ContextManager:
             tail_text = "\n".join(lines_tail)
             reserved = len(head_text) + 1 + len(tail_text) + 1
             remaining = self.max_chars - reserved
-            if remaining < len("[SUMMARY]"):
-                pass
-            else:
-                if len(summary) > remaining:
-                    summary = summary[:remaining]
-                    folded_text = "\n".join(lines_head + [summary] + lines_tail)
+            if remaining >= len("[EMBEDDING_SUMMARY") and len(summary) > remaining:
+                summary = summary[:remaining]
+                folded_text = "\n".join(lines_head + [summary] + lines_tail)
 
-        banner = "TRUNCATED: context folded 保留首2+尾2，中间用 [SUMMARY] 占位"
-        return CompactResult(truncated=True, banner=banner, text=folded_text)
+        return CompactResult(
+            truncated=True,
+            banner="TRUNCATED: embedding vector folding 80% threshold",
+            text=folded_text,
+        )
+
+    @staticmethod
+    def _collapse(text: str, max_chars: int | None = None) -> str:
+        """保留首尾窗口，并在小预算下收缩窗口以适配 max_chars."""
+        if max_chars is None:
+            if len(text) <= 900 + 500:
+                return text
+            return f"{text[:900]}\n[COLLAPSED head=900 tail=500]\n{text[-500:]}"
+
+        budget = max(0, int(max_chars))
+        if len(text) <= 900 + 500 and len(text) <= budget:
+            return text
+
+        head_len = min(900, len(text))
+        tail_len = min(500, max(0, len(text) - head_len))
+        if tail_len == 0 and len(text) > 1:
+            tail_len = min(500, len(text) // 2)
+            head_len = min(900, len(text) - tail_len)
+
+        marker = f"[COLLAPSED head={head_len} tail={tail_len}]"
+        while head_len + tail_len + len(marker) + 2 > budget:
+            if head_len >= tail_len and head_len:
+                head_len -= 1
+            elif tail_len:
+                tail_len -= 1
+            else:
+                return marker[:budget]
+            marker = f"[COLLAPSED head={head_len} tail={tail_len}]"
+
+        parts = []
+        if head_len:
+            parts.append(text[:head_len])
+        parts.append(marker)
+        if tail_len:
+            parts.append(text[-tail_len:])
+        return "\n".join(parts)
+
+    def compact(self) -> CompactResult:
+        """按 L1/L2/L3 阈值折叠上下文，保持既有 embedding summary 兼容."""
+        text = self._render_messages(self._messages)
+        total_chars = len(text)
+        if total_chars <= self.max_chars * 0.5:
+            return CompactResult(truncated=False, banner="OK", text=text)
+
+        messages, microcompacted = self._microcompact(self._messages)
+        working_text = self._render_messages(messages)
+
+        # L3 remains the existing vector folding path at the old 80% threshold.
+        if total_chars > self.max_chars * 0.8:
+            try:
+                return self._embedding_compact(messages)
+            except Exception:
+                pass
+
+        if total_chars > self.max_chars * 0.7:
+            return CompactResult(
+                truncated=True,
+                banner="TRUNCATED: L2 context collapse head900 tail500",
+                text=self._collapse(working_text, self.max_chars),
+            )
+
+        if microcompacted:
+            return CompactResult(
+                truncated=True,
+                banner="TRUNCATED: L1 microcompact older tool results",
+                text=working_text,
+            )
+
+        return CompactResult(truncated=False, banner="OK", text=text)
 
     def skills_digest(self, loader: "SkillsLoader") -> str:
         """首阶段：返回技能短摘要，用于上下文注入."""

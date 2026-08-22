@@ -303,6 +303,18 @@ class AgentLoop:
 
         trace_writer = self._ensure_trace_writer()
 
+        def _context_tokens() -> int:
+            if self.context_manager is None:
+                return 0
+            try:
+                msgs = getattr(self.context_manager, "_messages", None)
+                if isinstance(msgs, list):
+                    ctx_text = "\n".join(str(m.get("content", "")) for m in msgs)
+                    return estimate_tokens(ctx_text)
+            except Exception:
+                pass
+            return 0
+
         # 回放短路：若提供回放路径则直接复用历史结果，避免真实 LLM 调用
         replay_path = getattr(self, "_replay_path", None)
         if replay_path is not None:
@@ -444,17 +456,7 @@ class AgentLoop:
             if self.token_limit is not None:
                 cur_len = estimate_tokens(buffer)
                 # 同时估算上下文长度，避免上下文膨胀绕过限制
-                ctx_len = 0
-                if self.context_manager is not None:
-                    try:
-                        msgs = getattr(self.context_manager, "_messages", None)
-                        if isinstance(msgs, list):
-                            ctx_text = "\n".join(str(m.get("content", "")) for m in msgs)
-                            ctx_len = estimate_tokens(ctx_text)
-                        elif hasattr(self.context_manager, "max_chars"):
-                            pass
-                    except Exception:
-                        ctx_len = 0
+                ctx_len = _context_tokens()
                 effective = max(cur_len, ctx_len)
                 if effective >= int(self.token_limit):
                     banner = "TRUNCATED: token_limit exceeded"
@@ -1022,7 +1024,8 @@ class AgentLoop:
                             pass
                     except Exception:
                         pass
-                    if estimate_tokens(buffer) > int(self.token_limit) * 0.8:
+                    current_ctx_len = _context_tokens()
+                    if max(estimate_tokens(buffer), current_ctx_len) > int(self.token_limit) * 0.5:
                         cr = self.context_manager.compact()
                         if getattr(cr, "truncated", False):
                             banner = getattr(cr, "banner", "TRUNCATED: context folded")
@@ -1424,4 +1427,3 @@ class AgentLoop:
             trace_path=trace_path_str,
             token_count=token_count,
         )
-
