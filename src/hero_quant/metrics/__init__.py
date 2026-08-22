@@ -7,7 +7,6 @@
 
 from __future__ import annotations
 
-import time
 from typing import Any
 
 try:
@@ -42,7 +41,7 @@ def _get_or_create_histogram(name: str, doc: str, labels: list[str], buckets=Non
             kw["buckets"] = buckets
         h = Histogram(name, doc, **kw)
         return h
-    except Exception as e:
+    except Exception:
         # 已注册（重载/测试场景）—— 从 REGISTRY 复用既有收集器
         try:
             if REGISTRY is not None:
@@ -70,7 +69,7 @@ def _get_or_create_counter(name: str, doc: str, labels: list[str]):
     try:
         c = Counter(name, doc, labels)
         return c
-    except Exception as e:
+    except Exception:
         try:
             if REGISTRY is not None and name in getattr(REGISTRY, "_names_to_collectors", {}):
                 return REGISTRY._names_to_collectors[name]  # type: ignore[attr-defined]
@@ -89,7 +88,7 @@ def _get_or_create_gauge(name: str, doc: str, labels: list[str] | None = None):
         else:
             g = Gauge(name, doc)
         return g
-    except Exception as e:
+    except Exception:
         try:
             if REGISTRY is not None and name in getattr(REGISTRY, "_names_to_collectors", {}):
                 return REGISTRY._names_to_collectors[name]  # type: ignore[attr-defined]

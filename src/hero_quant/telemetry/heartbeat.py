@@ -7,7 +7,6 @@
 
 from __future__ import annotations
 
-import os
 import threading
 import time
 import warnings
@@ -204,8 +203,6 @@ class HeartbeatTimer:
                 # 读看门狗占位：可在此触发熔断（当前仅占位，避免引入循环依赖）
                 if self.read_watchdog_circuit:
                     try:
-                        from hero_quant.telemetry.circuit import CircuitBreaker as _CB  # lazy
-
                         pass
                     except Exception:
                         pass

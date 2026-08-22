@@ -11,7 +11,7 @@ import os
 import time
 import functools
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from typing import Any, Callable
 
 # 指标集成（可选、离线安全）：缺失时退化为 no-op，避免硬依赖
 try:

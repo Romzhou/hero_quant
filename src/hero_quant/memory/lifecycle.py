@@ -202,7 +202,6 @@ class MemoryLifecycle:
                 }
                 # 兼容带 namespace 前缀的安全名，保留完整 stem 即可满足测试的子串匹配
                 if "__" in name:
-                    raw = name.split("__")[-1]
                     pass
                 actions.append(record)
                 if not dry_run:
@@ -227,8 +226,8 @@ class MemoryLifecycle:
                 try:
                     from .hierarchy import MemoryHierarchy
 
-                    mh = MemoryHierarchy(self.memory_dir)
-                    # 索引重建非关键，失败忽略
+                    MemoryHierarchy(self.memory_dir)
+                    # 归档后保留 SQLite 行，搜索回退仍可见，仅文件态视为已回收
                 except Exception:
                     pass
             elif action == "delete":

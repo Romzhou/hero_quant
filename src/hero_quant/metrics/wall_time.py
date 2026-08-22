@@ -4,11 +4,6 @@
 """
 
 from . import (
-    DEDUP_OP_TOTAL,
-    LEDGER_APPEND_DURATION,
-    LEDGER_APPEND_TOTAL,
-    REQUEST_COUNTER,
-    REQUEST_DURATION,
     WALL_TIME_BUDGET_EXCEEDED,
     WALL_TIME_SECONDS,
     inc_wall_time_exceeded,

@@ -15,7 +15,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .lifecycle import HALF_LIFE_DAYS, _DECAY_LAMBDA, compute_importance
+from .lifecycle import compute_importance
 
 
 def _content_hash(name: str, content: str) -> str:
@@ -443,7 +443,7 @@ class PgVectorSidecar:
             out: list[dict] = []
             for r in rows:
                 try:
-                    k, c, emb = r[0], r[1], r[2]
+                    k, c, _emb = r[0], r[1], r[2]
                     out.append({"key": k, "content": c})
                 except Exception:
                     continue
@@ -1110,7 +1110,6 @@ class MemoryStore:
         # 融合侧车与本地结果：按 key 去重，保留更高分数
         if pg_hits:
             # 以本地候选建表便于分数对比
-            local_by_key = {c["key"]: c for c in candidates}
             # 以侧车结果为基准，保留其排序
             merged: dict[str, dict] = {}
             for h in pg_hits:
@@ -1260,7 +1259,6 @@ class MemoryStore:
         """混合检索：BM25 召回 + 向量余弦重排 + Ebbinghaus 衰减加权。"""
         if not query:
             return []
-        prefix = self._ns_prefix()
         # 文本召回候选
         bm25_candidates = self._search_bm25_raw(query)
         # 向量召回候选

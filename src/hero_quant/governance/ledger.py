@@ -13,7 +13,7 @@ import os
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, BinaryIO, Iterable, Mapping
+from typing import Any, BinaryIO, Mapping
 
 from hero_quant.security.redaction import ARGUMENTS_SINK, RESULT_SINK, redact_payload
 

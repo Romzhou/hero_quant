@@ -7,7 +7,6 @@
 
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse, FileResponse, PlainTextResponse
-from fastapi.staticfiles import StaticFiles
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
 
 import structlog
@@ -320,7 +319,7 @@ def _get_backtest_bundle():
             tearsheet = """<!doctype html><html><head><meta charset="utf-8"><title>Tearsheet</title></head><body><h1>Tearsheet — Production Core</h1><p>Sharpe 1.62 | Annual 18.4%</p><table><tr><th>Month</th><th>Return</th></tr><tr><td>2026-08</td><td>+0.82%</td></tr></table></body></html>"""
         _backtest_cache = {"metrics": metrics_data, "positions": positions, "csv": csv_text, "tearsheet": tearsheet}
         return _backtest_cache
-    except Exception as e:
+    except Exception:
         # 静态兜底，保证接口始终可用
         _backtest_cache = {
             "metrics": {"sharpe": 1.62, "annual_return": 0.184, "max_drawdown": -0.032, "turnover": 0.42, "volatility": 0.18, "cumulative_return": 0.06},
@@ -394,7 +393,7 @@ def trace_events(request: Request, offset: int = 0):
             try:
                 if p.is_file():
                     txt = p.read_text(encoding="utf-8", errors="ignore")
-                    lines = [l.strip() for l in txt.splitlines() if l.strip()]
+                    lines = [line.strip() for line in txt.splitlines() if line.strip()]
                     # 按 offset 切片
                     sliced = lines[offset: offset + 50]
                     for line in sliced:
@@ -486,7 +485,6 @@ if _dist_path is not None:
     def serve_root(request: Request):
         accept = request.headers.get("accept", "")
         # 客户端显式要求 JSON 时返回 JSON，避免误判为页面
-        host = request.headers.get("host", "")
         # SPA 始终在 GET / 返回 index.html（测试以 Accept: text/html 校验）
         if "application/json" in accept and "text/html" not in accept:
             return JSONResponse(content={"status": "ok", "frontend": "mounted", "path": "/"})

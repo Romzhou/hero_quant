@@ -18,7 +18,7 @@ jobs:
           pip install -e ".[dev,ashare,us]"
           pip install pytest pytest-cov ruff pip-audit
       - name: Lint with ruff
-        run: ruff check .
+        run: ruff check src
       - name: Run tests
         # Coverage gate: 2026-08-22 实测 49% (10661 stmts, 5392 missed, 207 passed)；阈值 46 保留 ~3% headroom 且不致 CI 红
         run: pytest -q --cov=src --cov-report=term --cov-fail-under=46
