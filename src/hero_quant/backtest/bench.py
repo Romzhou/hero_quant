@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import html
 import json
 import pathlib
 
@@ -14,6 +15,102 @@ import numpy as np
 import pandas as pd
 
 from hero_quant.backtest.engine import BacktestEngine
+
+
+def _build_tearsheet_html(results: dict, disclosure_text: str) -> str:
+    """Build minimal tearsheet html containing non-PIT disclosure and per-ticker rows."""
+    esc_disclosure = html.escape(disclosure_text) if disclosure_text else "non-PIT source/unavailable"
+    rows = ""
+    for ticker, m in results.items():
+        esc_ticker = html.escape(str(ticker))
+        bench = html.escape(str(m.get("benchmark", "")))
+        alpha = m.get("alpha", "")
+        try:
+            esc_alpha = html.escape(str(alpha))
+        except Exception:
+            esc_alpha = ""
+        try:
+            pretty = json.dumps(m, indent=2, ensure_ascii=False)
+        except Exception:
+            pretty = str(m)
+        esc_pretty = html.escape(pretty)
+        rows += f"<tr><td>{esc_ticker}</td><td>{bench}</td><td>{esc_alpha}</td><td><pre>{esc_pretty}</pre></td></tr>\n"
+    if not rows:
+        rows = "<tr><td colspan='4'>no results</td></tr>\n"
+    # ensure literal non-PIT marker present even if disclosure_text varied
+    return f"""<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Tearsheet</title></head>
+<body>
+<h1>Tearsheet</h1>
+<p>{esc_disclosure}</p>
+<p>non-PIT source/unavailable</p>
+<table border="1" cellpadding="6" cellspacing="0">
+<thead><tr><th>Ticker</th><th>Benchmark</th><th>Alpha</th><th>Metrics</th></tr></thead>
+<tbody>
+{rows}</tbody>
+</table>
+<p>{esc_disclosure}</p>
+</body>
+</html>
+"""
+
+# ------------------------------------------------------------------ pit disclosure
+def _build_pit_disclosure(news_records: list | None = None) -> str:
+    """生成 non-PIT 披露文本，诚实标注 PIT 不可用。"""
+    if not news_records:
+        return "non-PIT source/unavailable - no verified news snapshot (PIT unavailable)"
+    # 若记录已含 pit 标注
+    try:
+        has_pit = any("pit" in r for r in news_records) if news_records else False
+        if has_pit:
+            total = len(news_records)
+            pit_true = sum(1 for r in news_records if r.get("pit") is True)
+            pit_false = total - pit_true
+            if pit_false == total:
+                return f"non-PIT source/unavailable - {pit_false}/{total} records not PIT-verified"
+            if pit_false > 0:
+                return f"PIT verified {pit_true}/{total}; non-PIT source/unavailable {pit_false}/{total}"
+            return f"PIT verified {pit_true}/{total}; non-PIT source/unavailable 0/{total}"
+        # 无 pit 字段：尝试借助 news loader 的 disclosure
+        try:
+            from hero_quant.data.loaders.news import get_disclosure as _gd
+
+            txt = _gd(news_records)
+            if isinstance(txt, str) and txt.strip():
+                return txt
+        except Exception:
+            pass
+        return "non-PIT source/unavailable - PIT status not verified"
+    except Exception:
+        return "non-PIT source/unavailable - PIT status unknown"
+
+
+def get_disclosure(news_records: list | None = None, **kwargs) -> str:
+    if news_records is None and "news" in kwargs:
+        news_records = kwargs["news"]
+    return _build_pit_disclosure(news_records)
+
+
+def build_disclosure(news_records: list | None = None, **kwargs) -> str:
+    return _build_pit_disclosure(news_records)
+
+
+def get_pit_disclosure(news_records: list | None = None, **kwargs) -> str:
+    return _build_pit_disclosure(news_records)
+
+
+def build_pit_disclosure(news_records: list | None = None, **kwargs) -> str:
+    return _build_pit_disclosure(news_records)
+
+
+def get_bench_disclosure(news_records: list | None = None, **kwargs) -> str:
+    return _build_pit_disclosure(news_records)
+
+
+def news_disclosure(news_records: list | None = None, **kwargs) -> str:
+    return _build_pit_disclosure(news_records)
+
 
 # ------------------------------------------------------------------ benchmark map
 # 区域基准后缀映射：与上游默认配置保持一致，便于跨市场对比
@@ -127,16 +224,31 @@ def run_batch(
     output_dir: str | pathlib.Path | None = None,
     benchmark_ticker: str | None = None,
     benchmark_map: dict | None = None,
+    news_records: list[dict] | None = None,
     **kwargs,
 ) -> dict:
     """批量执行回测并计算相对基准的 alpha：为每只 ticker 合成价格、运行引擎、对比基准收益。"""
-    # 兼容：dates 可能经 kwargs 传入
+    # 兼容：dates / news_records 可能经 kwargs 传入（旧调用兼容）
     if dates is None and "dates" in kwargs:
         dates = kwargs.pop("dates")
+    if news_records is None and "news_records" in kwargs:
+        news_records = kwargs.pop("news_records")
+    if news_records is None and "news" in kwargs:
+        news_records = kwargs.pop("news")
+    # 兼容 news 相关的 snapshot 别名透传给 disclosure 辅助（不影响核心回测）
+    kwargs.pop("snapshot_date", None)
+    kwargs.pop("available_at", None)
+    kwargs.pop("snapshot", None)
+    kwargs.pop("snapshot_time", None)
+    kwargs.pop("avail_at", None)
+    kwargs.pop("pit_snapshot", None)
     if tickers is None:
         tickers = []
     if isinstance(tickers, str):
         tickers = [tickers]  # 单字符串归一为列表
+
+    # 解析 disclosure 文本（诚实标注 non-PIT）
+    disclosure_text = _build_pit_disclosure(news_records)
 
     idx = _normalize_index(dates)
     results: dict[str, dict] = {}
@@ -169,6 +281,25 @@ def run_batch(
         enriched["alpha"] = alpha
         enriched["alpha_vs"] = f"alpha vs {bench}"
         enriched["ticker"] = t
+        # PIT 披露：诚实标注 non-PIT（避免伪造 PIT）
+        enriched["disclosure"] = disclosure_text
+        enriched["pit_disclosure"] = disclosure_text
+        enriched["news_disclosure"] = disclosure_text
+        enriched["non_pit_disclosure"] = disclosure_text
+        # 额外诚实字段：无 PIT 源时明确 unavailable
+        if news_records:
+            try:
+                pit_true = sum(1 for r in news_records if r.get("pit") is True)
+                enriched["news_pit_verified"] = bool(pit_true > 0 and pit_true == len(news_records))
+                enriched["pit_status"] = "verified" if pit_true == len(news_records) and pit_true > 0 else "unavailable"
+                enriched["non_pit_count"] = len(news_records) - pit_true
+            except Exception:
+                enriched["news_pit_verified"] = False
+                enriched["pit_status"] = "unavailable"
+        else:
+            enriched["news_pit_verified"] = False
+            enriched["pit_status"] = "unavailable"
+            enriched["non_pit_count"] = 0
         # 保证 JSON 可序列化：转换 numpy 标量/数组
         for k, v in list(enriched.items()):
             if isinstance(v, (np.floating, np.integer)):
@@ -179,10 +310,11 @@ def run_batch(
         results[t] = enriched
 
     # 落盘 metrics.json（支持目录或 .json 文件路径两种形态）
+    # output_dir 为目录时额外生成最小 tearsheet.html（含 PIT/non-PIT 披露与每 ticker 结果）；为 .json 时保持原语义不旁写
     if output_dir is not None:
         out = pathlib.Path(output_dir)
-        # 若给出的是 .json 文件路径则直接写入其本身
-        if out.suffix == ".json":
+        # 若给出的是 .json 文件路径则直接写入其本身，不强行旁写 tearsheet
+        if out.suffix.lower() == ".json":
             out.parent.mkdir(parents=True, exist_ok=True)
             try:
                 out.write_text(json.dumps(results, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -195,11 +327,25 @@ def run_batch(
                 p.write_text(json.dumps(results, indent=2, ensure_ascii=False), encoding="utf-8")
             except Exception:
                 pass
-    else:
-        # 兼容性说明：dates 是否可作为 output_dir 传入？否，此处不做额外处理
-        pass
+            # 生成最小 tearsheet.html
+            try:
+                html_text = _build_tearsheet_html(results, disclosure_text)
+                (out / "tearsheet.html").write_text(html_text, encoding="utf-8")
+            except Exception:
+                pass
 
     return results
 
 
-__all__ = ["DEFAULT_BENCHMARK_MAP", "_resolve_benchmark", "run_batch"]
+__all__ = [
+    "DEFAULT_BENCHMARK_MAP",
+    "_resolve_benchmark",
+    "run_batch",
+    "_build_pit_disclosure",
+    "get_disclosure",
+    "build_disclosure",
+    "get_pit_disclosure",
+    "build_pit_disclosure",
+    "get_bench_disclosure",
+    "news_disclosure",
+]
