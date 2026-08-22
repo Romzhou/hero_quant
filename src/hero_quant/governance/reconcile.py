@@ -1,13 +1,8 @@
-"""Daily shadow ledger vs positions reconciliation — 资金影子对账日跑.
+"""reconcile — 影子账本与券商持仓日终对账。
 
-Minimal daily reconciliation using existing ledger and shadow journal.
-- load_positions_csv: parse broker positions.csv (symbol, qty/quantity)
-- aggregate_shadow: collect shadow positions from ShadowJournal or ledger.jsonl
-- reconcile: diff shadow vs broker with tolerance, 0差额 check
-- reconcile_files: file-based entry point
-- daily_reconciliation: daily job report (date + 0差额)
-
-Uses existing governance/Ledger and shadow/service ShadowJournal.
+职责：以影子流水为基准，比对券商 positions.csv，输出 0 差额校验与差异明细。
+架构位置：治理层离线对账，复用 Ledger 与 ShadowJournal 聚合持仓。
+关键设计：按 symbol 聚合净持仓（含买卖方向符号）、CSV 表头兼容多别名、重复 symbol 累加；以 tolerance 判定零差额，total_diff 为绝对差之和；文件入口同时校验 ledger 完整性并受 wall-time budget 约束。
 """
 from __future__ import annotations
 
@@ -20,6 +15,8 @@ from typing import Any, Dict, List
 
 @dataclass
 class ReconcileResult:
+    """对账结果：影子/券商持仓快照、逐 symbol 差异、是否零差额及总绝对差。"""
+
     shadow: Dict[str, float]
     positions: Dict[str, float]
     diffs: List[Dict[str, Any]]
@@ -31,6 +28,7 @@ class ReconcileResult:
 
 
 def _normalize_qty(value: Any) -> float:
+    """数量归一化：非数值按 0 处理，避免脏数据中断对账。"""
     try:
         return float(value)
     except Exception:
@@ -38,11 +36,7 @@ def _normalize_qty(value: Any) -> float:
 
 
 def load_positions_csv(path: str | Path) -> Dict[str, float]:
-    """Parse broker positions.csv.
-
-    Supports headers: symbol/instrument/code + qty/quantity/position/amount/shares.
-    Returns dict symbol -> qty (float).
-    """
+    """解析券商 positions.csv，兼容多表头别名并对重复 symbol 累加。"""
     p = Path(path)
     if not p.exists():
         raise FileNotFoundError(f"positions.csv not found: {p}")
@@ -83,6 +77,7 @@ def load_positions_csv(path: str | Path) -> Dict[str, float]:
 
 
 def _shadow_qty_from_trade(trade: Dict[str, Any]) -> tuple[str, float]:
+    """从单笔影子交易提取 (symbol, signed_qty)，卖出记为负以保留净持仓语义。"""
     sym = str(trade.get("symbol", trade.get("instrument", trade.get("code", "")))).strip()
     if not sym:
         return "", 0.0
@@ -90,15 +85,8 @@ def _shadow_qty_from_trade(trade: Dict[str, Any]) -> tuple[str, float]:
     q = _normalize_qty(qty)
     side = str(trade.get("side", "buy")).lower()
     if side in ("sell", "short", "ask"):
-        # sell reduces position; keep signed for diff
-        # but for daily 0差额 with pure buys, this is negative
-        # we keep as signed so broker long vs shadow net matches
-        # For minimal, treat sell as -qty only if broker tracks net
-        # Tests use buy only, so no impact
+        # 卖出以负数计入净持仓，便于与券商净持仓直接比对
         q = -abs(q) if q > 0 else q
-        # Alternatively for pure long check, we sum abs? Use signed.
-        # Keep signed for now
-        # If we want abs aggregation, comment next line
         pass
     return sym, q
 
@@ -108,11 +96,7 @@ def aggregate_shadow(
     ledger_path: str | Path | None = None,
     ledger: Any | None = None,
 ) -> Dict[str, float]:
-    """Aggregate shadow positions from journal and/or ledger file.
-
-    Priority: journal.records + ledger.jsonl shadow_record entries.
-    Returns dict symbol -> net qty.
-    """
+    """聚合影子持仓：优先 journal.records，其次 Ledger/文件中的 shadow_record，自动去重共用账本的重复计数。"""
     out: Dict[str, float] = {}
 
     def add(sym: str, q: float):
@@ -120,7 +104,7 @@ def aggregate_shadow(
             return
         out[sym] = out.get(sym, 0) + float(q)
 
-    # from journal
+    # 来自内存 journal：兼容 records 属性/_records/list/dict 多形态
     if journal is not None:
         records = []
         if hasattr(journal, "records"):
@@ -137,12 +121,9 @@ def aggregate_shadow(
         for tr in records:
             if isinstance(tr, dict):
                 sym, q = _shadow_qty_from_trade(tr)
-                # for buy-only test, sell negative would mismatch; but we keep signed
-                # To keep 0差额 with buy-only both sides, no conversion needed
-                # Recover abs for buy side: if side is buy, q positive; if sell negative later
                 add(sym, q)
 
-    # from ledger object directly
+    # 来自 Ledger 对象：解析 shadow_record/trade 与直接 symbol 记录
     if ledger is not None and hasattr(ledger, "_read_all"):
         try:
             entries = ledger._read_all()
@@ -153,19 +134,11 @@ def aggregate_shadow(
                     if isinstance(trade, dict):
                         sym, q = _shadow_qty_from_trade(trade)
                         add(sym, q)
-                # also support direct shadow trades stored as record with symbol
                 elif "symbol" in rec and ("qty" in rec or "quantity" in rec):
                     sym, q = _shadow_qty_from_trade(rec)
                     add(sym, q)
-            # if we already aggregated from journal that shares ledger, avoid double count
-            # journal with ledger will have duplicate entries (journal + ledger same trades)
-            # Detect: if journal was provided and ledger is same as journal.ledger, we already counted twice
-            # So if journal is not None and ledger is journal.ledger, skip ledger to avoid double
+            # 去重：journal 与 Ledger 为同一实例时已重复计数，需回退到仅 journal
             if journal is not None and getattr(journal, "ledger", None) is ledger:
-                # we double counted — revert ledger part, keep only journal
-                # easiest: recompute from journal only
-                # but we already added both; subtract ledger contribution
-                # Instead, rebuild from journal only when both point same ledger
                 out = {}
                 for tr in records:
                     if isinstance(tr, dict):
@@ -208,17 +181,12 @@ def aggregate_shadow(
             except Exception:
                 pass
 
-    # Normalize: if any negative due to sell, keep as is; but for display round small floats
-    # Convert to float with cleanup
+    # 归一化：消除 -0.0 并保留净持仓符号
     cleaned: Dict[str, float] = {}
     for k, v in out.items():
-        # if value is -0.0, convert to 0
         fv = float(v)
         if abs(fv) < 1e-9:
             fv = 0.0
-        # remove negative zero edge handled; keep signed
-        # For tests that only use buys, this is fine
-        # If we want absolute holdings (long only), use abs; but diff logic expects signed net
         cleaned[k] = fv
     return cleaned
 
@@ -228,13 +196,7 @@ def reconcile(
     broker: Dict[str, float],
     tolerance: float = 1e-6,
 ) -> ReconcileResult:
-    """Compare shadow vs broker positions.
-
-    - tolerance: absolute diff <= tolerance considered 0
-    - diffs: list of {symbol, shadow, broker, diff}
-    - zero_diff: True if all diffs within tolerance
-    - total_diff: sum abs(diff)
-    """
+    """逐 symbol 比对影子与券商持仓，容差内视为零差额，total_diff 为绝对差之和。"""
     all_syms = set(shadow.keys()) | set(broker.keys())
     diffs: List[Dict[str, Any]] = []
     total = 0.0
@@ -260,7 +222,7 @@ def reconcile_files(
     journal: Any | None = None,
     wall_time_budget: float | None = None,
 ) -> ReconcileResult:
-    """File-based reconciliation: ledger.jsonl vs positions.csv."""
+    """文件级对账：ledger.jsonl（或 journal） vs positions.csv，超时受 wall-time budget 约束。"""
     import time as _t
 
     _start = _t.monotonic()
@@ -317,10 +279,7 @@ def daily_reconciliation(
     journal: Any | None = None,
     wall_time_budget: float | None = None,
 ) -> Dict[str, Any]:
-    """Daily job entry: returns report dict with date and 0差额 verdict.
-
-    Also verifies ledger integrity if possible.
-    """
+    """日终对账作业：返回含 date/zero_diff/diffs/verified 的报告，并校验账本完整性。"""
     import time as _t
 
     _start = _t.monotonic()

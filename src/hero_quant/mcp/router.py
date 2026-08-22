@@ -1,14 +1,10 @@
-"""Vector router TopK5 — BM25真召回 + 向量混合召回 + 双桶限流 (Wave E1/E3).
+"""mcp.router — 向量路由 TopK5：BM25 召回与向量混合重排 + 双桶限流。
 
-双桶限流: 集成 telemetry.circuit.DualBucketRateLimiter + CircuitBreaker
-  - route 前 try_acquire 双桶 token，fallback 仍返回但记录限流状态
-  - 不破坏 BM25 召回与 Ebbinghaus，仅在限流阈值下熔断
-向量混合 (E3 hardening):
-  - BM25 first-class, vector hybrid via embed cosine when available
-  - pgvector sidecar if HERO_VECTOR_DSN configured uses Postgres, fallback to local embed
-  - Hybrid score = 0.6*normalized_BM25 + 0.4*cosine (re-rank), preserving BM25 guarantees
-  - Never breaks on embed/pg failures — falls back to pure BM25
+职责：为自然语言查询返回最相关的 TopK 工具；以 BM25 为主、向量余弦为辅做混合重排。
+架构位置：MCP 工具选型的路由层，上游为 Agent，下游为 TOOL_REGISTRY 与可选的向量侧车。
+关键设计：BM25（K1=1.5, B=0.75）基于全量 tool.description 预计算 IDF/平均文档长度；混合分 0.6*归一化 BM25 + 0.4*cosine，失败回退纯 BM25；双桶限流与熔断（try_acquire 计数、OPEN 时短路返回 curated 列表）不破坏召回可用性。
 """
+
 from __future__ import annotations
 
 import math
@@ -21,11 +17,11 @@ from typing import Dict, List
 try:
     from hero_quant.mcp.server import CURATED_TOOLS
 except Exception:
-    CURATED_TOOLS = None  # fallback lazy
+    CURATED_TOOLS = None  # 惰性回退
 
 from hero_quant.tools.registry import TOOL_REGISTRY
 
-# 双桶限流集成 (lazy import to avoid circular)
+# 双桶限流与熔断组件（惰性导入，避免循环依赖）
 _ROUTER_RATE_LIMITER = None  # type: ignore
 _ROUTER_CIRCUIT = None  # type: ignore
 _RATE_LIMITED_COUNT = 0
@@ -33,6 +29,7 @@ _LAST_LIMITED_TS: float | None = None
 
 
 def _get_router_circuit():
+    """获取路由熔断器，失败返回 None。"""
     global _ROUTER_CIRCUIT
     if _ROUTER_CIRCUIT is None:
         try:
@@ -45,6 +42,7 @@ def _get_router_circuit():
 
 
 def _get_rate_limiter():
+    """获取双桶限流器，默认大容量以避免误限流；测试可注入小容量实例。"""
     global _ROUTER_RATE_LIMITER
     if _ROUTER_RATE_LIMITER is None:
         try:
@@ -58,20 +56,23 @@ def _get_rate_limiter():
 
 
 def get_router_limiter():
+    """返回当前限流器实例（供测试/观测）。"""
     return _get_rate_limiter()
 
 
 def set_router_limiter(limiter) -> None:
+    """注入自定义限流器（测试用）。"""
     global _ROUTER_RATE_LIMITER
     _ROUTER_RATE_LIMITER = limiter
 
 
 def reset_router_limiter() -> None:
+    """重置限流器与计数，同时重建熔断器以避免限流后持续熔断影响召回。"""
     global _ROUTER_RATE_LIMITER, _RATE_LIMITED_COUNT, _LAST_LIMITED_TS, _ROUTER_CIRCUIT
     _ROUTER_RATE_LIMITER = None
     _RATE_LIMITED_COUNT = 0
     _LAST_LIMITED_TS = None
-    # 同时重置 circuit，避免限流后熔断影响后续 BM25
+    # 同时重置熔断，避免限流后熔断影响后续 BM25
     try:
         from hero_quant.telemetry.circuit import CircuitBreaker
 
@@ -81,6 +82,7 @@ def reset_router_limiter() -> None:
 
 
 def reset_router_circuit() -> None:
+    """重建熔断器为初始状态。"""
     global _ROUTER_CIRCUIT
     try:
         from hero_quant.telemetry.circuit import CircuitBreaker
@@ -91,8 +93,8 @@ def reset_router_circuit() -> None:
 
 
 def is_rate_limited() -> bool:
-    """检查是否刚被双桶限流."""
-    # 通过 limiter token 可用性判断
+    """判断是否处于限流状态（任一桶 token <1 即视为受限）。"""
+    # 通过桶可用 token 判断
     limiter = _get_rate_limiter()
     if limiter is None:
         return False
@@ -104,7 +106,7 @@ def is_rate_limited() -> bool:
 
 
 def _try_acquire_or_record() -> bool:
-    """尝试双桶 acquire，失败则记录限流计数并返回 False."""
+    """尝试获取双桶令牌，失败则计数并返回 False；异常时放行以保证召回可用。"""
     global _RATE_LIMITED_COUNT, _LAST_LIMITED_TS
     limiter = _get_rate_limiter()
     if limiter is None:
@@ -114,12 +116,11 @@ def _try_acquire_or_record() -> bool:
         if not ok:
             _RATE_LIMITED_COUNT += 1
             _LAST_LIMITED_TS = time.time()
-            # 记录限流但不直接触发 slow 熔断 (避免误伤 BM25)
-            # 如需联动，可记录 fast 路径 (duration < TIME 30s) 不进 slow bucket
+            # 仅计数，不直接触发慢路径熔断，避免误伤 BM25 召回
             try:
                 circ = _get_router_circuit()
                 if circ is not None:
-                    # 轻量记录，不进 slow bucket，仅计数
+                    # 轻量记录，不进慢桶，仅计数
                     pass
             except Exception:
                 pass
@@ -128,29 +129,31 @@ def _try_acquire_or_record() -> bool:
     except Exception:
         return True
 
-# BM25 constants aligned with vibe-trading semantic_links.py
+# BM25 常量与语料统计（基于 TOOL_REGISTRY 全量 tool.description）
 _BM25_K1 = 1.5
 _BM25_B = 0.75
 
-# precomputed corpus stats over TOOL_REGISTRY全量 tool.description
+# 基于全量描述预计算的语料统计
 _IDF: Dict[str, float] = {}
 _AVG_DL: float = 0.0
 _N: int = 0
 _DOC_TOKENS: Dict[str, List[str]] = {}
 _last_registry_size: int = -1
 
-# aliases for test compatibility
+# 测试兼容别名
 _avg_dl = _AVG_DL
 _idf = _IDF
 
 
 def _tokenize(text: str) -> List[str]:
+    """按非字母数字切分并小写归一化。"""
     return [t for t in re.split(r"[^a-z0-9]+", text.lower()) if t]
 
 
 def _ensure_corpus() -> None:
+    """按需构建/刷新 BM25 语料统计（N、avg_dl、df、idf），注册表大小不变时跳过。"""
     global _IDF, _AVG_DL, _N, _DOC_TOKENS, _last_registry_size, _avg_dl, _idf
-    # ensure tools are loaded
+    # 确保工具已加载
     try:
         import hero_quant.mcp.server  # noqa: F401
     except Exception:
@@ -176,12 +179,12 @@ def _ensure_corpus() -> None:
         _idf = _IDF
         return
     avg_dl = sum(len(d) for d in corpus) / N if N else 0.0
-    # df
+    # 统计文档频率 df
     df: Counter = Counter()
     for doc in corpus:
         for term in set(doc):
             df[term] += 1
-    # idf log((N - n +0.5)/(n+0.5)+1)
+    # IDF = log((N - n +0.5)/(n+0.5)+1)
     idf: Dict[str, float] = {}
     for term, freq in df.items():
         idf[term] = math.log((N - freq + 0.5) / (freq + 0.5) + 1)
@@ -195,18 +198,10 @@ def _ensure_corpus() -> None:
 
 
 def _score_tool(query_tokens: List[str], query_lower: str, tool_name: str, description: str) -> float:
-    """BM25 score over tool.description corpus.
-
-    Formula per term t:
-        score += IDF(t) * (tf * (K1+1)) / (tf + K1*(1-B + B*dl/avgdl))
-    where IDF = log((N-n+0.5)/(n+0.5)+1), K1=1.5 B=0.75
-    Corpus is TOOL_REGISTRY全量 tool.description, precomputed N, avg_dl, df, idf.
-    Returns 0.0 for empty docs or unknown terms.
-    Keeps signature compatible with old keyword scorer for tests.
-    """
-    # query_lower kept for signature compat (not used for boosting)
+    """对单个工具计算 BM25 分数；空文档或未知词返回 0.0，保留旧签名兼容测试。"""
+    # query_lower 保留以兼容历史签名（不参与额外加权）
     _ensure_corpus()
-    # use cached doc tokens if available, else tokenize provided description
+    # 优先使用缓存的分词，否则对传入描述分词
     doc_tokens = _DOC_TOKENS.get(tool_name)
     if doc_tokens is None:
         doc_tokens = _tokenize(description or "")
@@ -232,22 +227,22 @@ def _score_tool(query_tokens: List[str], query_lower: str, tool_name: str, descr
     return score
 
 
-# ---- Vector hybrid hardening (E3) ----
+# ---- 向量混合重排：失败回退纯 BM25 ----
 
 def _is_router_vector_enabled() -> bool:
-    """Whether vector hybrid re-rank should be attempted."""
+    """向量混合重排是否启用，受环境变量开关控制。"""
     if (os.environ.get("HERO_VECTOR_ROUTER_DISABLE", "") or "").strip().lower() in ("1", "true", "yes", "on", "disable"):
         return False
     if (os.environ.get("HERO_ROUTER_HYBRID", "") or "").strip().lower() in ("0", "false", "no", "off", "disable"):
         return False
-    # also respect explicit vector store disable
+    # 显式禁用向量存储时同步禁用
     if (os.environ.get("HERO_VECTOR_STORE", "") or "").strip().lower() in ("none", "disable", "disabled"):
         return False
     return True
 
 
 def _get_query_embedding(query: str):
-    """Best-effort embed query — returns vector or None."""
+    """尽力获取查询向量，失败返回 None。"""
     if not query or not _is_router_vector_enabled():
         return None
     try:
@@ -259,6 +254,7 @@ def _get_query_embedding(query: str):
 
 
 def _cosine(a, b) -> float:
+    """计算余弦相似度，优先复用 embed 模块实现，失败则本地计算。"""
     try:
         from hero_quant.agent.embed import cosine_sim  # type: ignore
 
@@ -276,15 +272,14 @@ def _cosine(a, b) -> float:
 
 
 def _vector_score_for_tool(query_vec, tool_name: str, description: str) -> float:
-    """Cosine similarity between query embedding and tool description embedding."""
+    """计算查询向量与工具描述向量的余弦相似度。"""
     if query_vec is None:
         return 0.0
     try:
         from hero_quant.agent.embed import embed  # type: ignore
 
-        # Use tool description as corpus doc; cache could be added but embed is cheap for small K
+        # 以工具描述为文档，复用与查询相同的嵌入提供方/维度
         desc = description or ""
-        # For stability, use same provider/dim as query
         dvec = embed(desc)
         return _cosine(query_vec, dvec)
     except Exception:
@@ -292,7 +287,7 @@ def _vector_score_for_tool(query_vec, tool_name: str, description: str) -> float
 
 
 def is_pgvector_router_configured() -> bool:
-    """Whether pgvector sidecar is configured for router (reuse memory pgvector DSN)."""
+    """是否配置了 pgvector 侧车（复用 memory 侧车的 DSN 判断）。"""
     try:
         from hero_quant.memory.store import is_pgvector_configured  # type: ignore
 
@@ -302,8 +297,9 @@ def is_pgvector_router_configured() -> bool:
 
 
 def get_router_vector_backend() -> str:
+    """返回当前向量后端：pgvector 或 local。"""
     if is_pgvector_router_configured():
-        # try to ping sidecar via memory store helper
+        # 尝试探测侧车可用性
         try:
             from hero_quant.memory.store import PgVectorSidecar  # type: ignore
 
@@ -317,15 +313,12 @@ def get_router_vector_backend() -> str:
 
 
 def router_hybrid_scores(query: str, candidates: List[str]) -> Dict[str, float]:
-    """Compute hybrid scores (BM25 + vector cosine) for candidates — for testing/inspection.
-
-    Returns dict tool_name -> hybrid score (0..1+). BM25 normalized by max, then hybrid = 0.6*norm_bm25 + 0.4*cosine.
-    """
+    """为候选工具计算混合分数（0.6*归一化 BM25 + 0.4*cosine），供测试/观测使用。"""
     if not candidates:
         return {}
     query_lower = (query or "").lower()
     query_tokens = _tokenize(query_lower)
-    # BM25 raw
+    # BM25 原始分
     bm25_raw: Dict[str, float] = {}
     for name in candidates:
         spec = TOOL_REGISTRY.get(name)
@@ -341,7 +334,7 @@ def router_hybrid_scores(query: str, candidates: List[str]) -> Dict[str, float]:
             spec = TOOL_REGISTRY.get(name)
             desc = getattr(spec, "description", "") if spec else ""
             vscore = _vector_score_for_tool(qvec, name, desc)
-            # clamp cosine from [-1,1] to [0,1] for hybrid (negative -> 0)
+            # 将余弦从 [-1,1] 截断到 [0,1]
             if vscore < 0:
                 vscore = 0.0
             if vscore > 1:
@@ -352,47 +345,40 @@ def router_hybrid_scores(query: str, candidates: List[str]) -> Dict[str, float]:
 
 
 def route(query: str, k: int = 5) -> List[str]:
-    """Route query to top-k tool names via BM25 scoring + 双桶限流.
+    """按 BM25（+ 可选向量混合）返回 TopK 工具名；限流/熔断时仍保证可用性。
 
-    Args:
-        query: natural language query e.g. "find momentum factors for 600519"
-        k: number of tools to return (default 5)
-
-    Returns:
-        List of tool names length k, containing best matches. Guarantees
-        `compute_factor` appears for momentum/factor queries even on tie.
-        双桶限流: 当桶空时仍返回结果但记录限流计数，circuit 会逐步 OPEN.
+    不变量：双桶限流仅计数不阻塞召回；熔断 OPEN 时短路返回 curated 前 k；含 momentum/factor 的查询保证 compute_factor 在结果中且优先首位。
     """
     if k <= 0:
         return []
-    # 双桶限流预检 (不阻塞召回，仅计数)
+    # 双桶限流预检（仅计数，不阻塞召回）
     _try_acquire_or_record()
-    # circuit 熔断检查: 若 OPEN 则直接 fallback curated TopK (不做 BM25 耗时)
+    # 熔断检查：OPEN 时直接返回 curated 前 k，避免 BM25 耗时
     try:
         circ = _get_router_circuit()
         if circ is not None and not circ.allow():
-            # 熔断时短路返回 curated 前 k (保证可用性)
+            # 熔断时短路返回 curated 前 k，保证可用性
             curated = CURATED_TOOLS if isinstance(CURATED_TOOLS, list) and len(CURATED_TOOLS) else sorted(TOOL_REGISTRY.keys())
             return [n for n in curated if n in TOOL_REGISTRY][:k]
     except Exception:
         pass
-    # ensure tools loaded (server imports them)
+    # 确保工具已加载
     try:
         import hero_quant.mcp.server  # noqa: F401
     except Exception:
         pass
     _ensure_corpus()
-    # curated list fallback
+    # curated 候选集回退
     curated = CURATED_TOOLS if isinstance(CURATED_TOOLS, list) and len(CURATED_TOOLS) else sorted(TOOL_REGISTRY.keys())
-    # Filter to existing registry (curated may contain names not yet registered fallback)
+    # 仅保留已注册的 curated 工具
     candidates = [n for n in curated if n in TOOL_REGISTRY]
-    # if less than k, extend with remaining registry sorted
+    # 数量不足 k 时用注册表剩余项补齐
     if len(candidates) < k:
         extra = [n for n in sorted(TOOL_REGISTRY.keys()) if n not in candidates]
         candidates = candidates + extra
     query_lower = (query or "").lower()
     query_tokens = _tokenize(query_lower)
-    # Hybrid BM25+vector rerank (E3) — best-effort, never breaks BM25 recall
+    # 向量混合重排（尽力而为，异常回退纯 BM25）
     qvec = None
     try:
         if _is_router_vector_enabled():
@@ -401,8 +387,8 @@ def route(query: str, k: int = 5) -> List[str]:
         qvec = None
     scored: List[tuple[float, str]] = []
     if qvec is not None:
-        # Use normalized BM25 + cosine hybrid to preserve exact-match recall while adding semantic
-        # First compute raw BM25 to get max for normalization
+        # 使用归一化 BM25 + 余弦混合，兼顾精确匹配与语义
+        # 先计算原始 BM25 以得最大值做归一化
         bm25_raw: Dict[str, float] = {}
         for name in candidates:
             spec = TOOL_REGISTRY.get(name)
@@ -417,14 +403,13 @@ def route(query: str, k: int = 5) -> List[str]:
             bm25 = bm25_raw.get(name, 0.0)
             norm_bm25 = bm25 / max_bm25 if max_bm25 > 0 else 0.0
             vscore = _vector_score_for_tool(qvec, name, desc)
-            # clamp cosine [-1,1] -> [0,1]
+            # 将余弦截断到 [0,1]
             if vscore < 0:
                 vscore = 0.0
             elif vscore > 1:
                 vscore = 1.0
             hybrid = 0.6 * norm_bm25 + 0.4 * vscore
-            # Boost stability: if BM25 is strong (>0.5 normalized), keep BM25 dominance
-            # hybrid already weights BM25 60%
+            # 混合权重已让 BM25 占 60%，保持精确匹配主导
             scored.append((hybrid, name))
     else:
         for name in candidates:
@@ -432,26 +417,25 @@ def route(query: str, k: int = 5) -> List[str]:
             desc = getattr(spec, "description", "") if spec else ""
             s = _score_tool(query_tokens, query_lower, name, desc)
             scored.append((s, name))
-    # sort by score desc, then name asc for stability
+    # 按分数降序、名称升序稳定排序
     scored.sort(key=lambda x: (-x[0], x[1]))
     top = [name for _, name in scored[:k]]
-    # hard guarantee: if momentum/factor in query, ensure compute_factor in top
+    # 兜底保证：含 momentum/factor 的查询确保 compute_factor 入选
     if ("momentum" in query_lower or "factor" in query_lower) and "compute_factor" not in top:
-        # replace lowest scoring entry with compute_factor if available
+        # 用最低位替换为 compute_factor
         if "compute_factor" in candidates:
             if len(top) >= k:
                 top[-1] = "compute_factor"
             else:
                 top.append("compute_factor")
-    # ensure exact length k (if registry has fewer than k, pad not needed; but we ensure curated 20)
-    # dedupe and preserve order
+    # 去重保序
     seen = set()
     out: List[str] = []
     for n in top:
         if n not in seen:
             seen.add(n)
             out.append(n)
-    # if still <k due to dedupe, fill next best
+    # 去重后不足 k 时顺延补齐
     idx = k
     while len(out) < k and idx < len(scored):
         cand = scored[idx][1]
@@ -459,7 +443,7 @@ def route(query: str, k: int = 5) -> List[str]:
             seen.add(cand)
             out.append(cand)
         idx += 1
-    # final hard guarantee: for momentum/factor queries ensure compute_factor is首位
+    # 最终保证：含 momentum/factor 的查询将 compute_factor 置于首位
     if ("momentum" in query_lower or "factor" in query_lower) and out and out[0] != "compute_factor":
         if "compute_factor" in out:
             out.remove("compute_factor")
@@ -470,6 +454,7 @@ def route(query: str, k: int = 5) -> List[str]:
     return out[:k]
 
 
-# alias for vector-style naming
+# 向量风格别名
 def vector_route(query: str, k: int = 5) -> List[str]:
+    """vector_route 别名，等价于 route。"""
     return route(query, k=k)

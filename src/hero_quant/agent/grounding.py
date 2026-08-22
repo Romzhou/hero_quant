@@ -1,12 +1,25 @@
+"""证据账本：Ground Truth 三级校验的事实源。
+
+职责：以 symbol 为键聚合行情证据，提供价格幻觉阻断与 prompt 注入块。
+架构位置：agent 层事实底座，被 prompt/ContextManager 引用，构成 ingest→assert→render 闭环。
+关键设计：
+- ingest 归一 close/low/high 边界，容忍缺失字段以 close 回落
+- assert 优先精确 close 命中，其次区间校验，越界抛 GroundingError
+- render_block 始终以 '## Ground Truth' 起始，空账本亦返回表头保 prompt 合法
+"""
+
 class GroundingError(Exception):
-    pass
+    """证据缺失或越界时抛出的校验异常."""
 
 
 class GroundingLedger:
+    """证据账本，维护 symbol 级收盘价与区间证据."""
+
     def __init__(self):
-        self._evidence = {}  # symbol -> {closes:set, low:float, high:float, bars:list}
+        self._evidence = {}  # symbol -> {closes:set, low, high, bars}
 
     def ingest(self, symbol: str, bars: list[dict]):
+        """摄入行情 bars，聚合 closes/low/high 作为证据."""
         closes = set()
         lows = []
         highs = []
@@ -16,7 +29,6 @@ class GroundingLedger:
                 closes.add(float(close))
             low = bar.get("low", close)
             high = bar.get("high", close)
-            # fallback to close if missing
             if low is None:
                 low = close
             if high is None:
@@ -35,24 +47,18 @@ class GroundingLedger:
         }
 
     def assert_price(self, symbol: str, price: float):
+        """校验价格是否在证据内，越界则抛 GroundingError."""
         if symbol not in self._evidence:
             raise GroundingError(f"not in evidence: unknown symbol {symbol}")
         ev = self._evidence[symbol]
-        # exact close hit
         if float(price) in ev["closes"]:
             return
-        # within [min_low, max_high]
         if ev["low"] <= float(price) <= ev["high"]:
             return
         raise GroundingError(f"not in evidence: price {price} for {symbol} not in [{ev['low']}, {ev['high']}] closes={ev['closes']}")
 
     def render_block(self) -> str:
-        """Render Ground Truth block for prompt injection — L3 of 三级校验.
-
-        Always returns a string starting with '## Ground Truth' so
-        build_system_prompt can inject it verbatim. Empty ledger returns
-        header only (keeps prompt valid).
-        """
+        """渲染 Ground Truth 证据块，供 System Prompt 注入（L3）."""
         lines = ["## Ground Truth"]
         for symbol, ev in self._evidence.items():
             for bar in ev["bars"]:

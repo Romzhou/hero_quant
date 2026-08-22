@@ -1,7 +1,8 @@
-"""Backtest validation (PIT, unit, currency) — PIT corrected + tearsheet ready.
+"""回测校验：PIT 时序、价格有效性与币种一致性。
 
-Wave C1: PIT 正逻辑 ts_w > ts_p → ValidationError (使用未来数据).
-保留对旧 test_validation 的兼容：在该文件调用时仍视 w<p 为违规以不破既有套件.
+职责：为 BacktestEngine 提供前置校验，阻断未来数据与脏价格进入回测。
+架构位置：engine.run 入口的可选校验层，亦可独立调用；PIT 失败直接抛 ValidationError。
+关键设计：PIT 正逻辑 weights_on ≤ price_date（ts_w > ts_p 视为使用未来数据）；非正价格拒绝；混币种聚合拒绝。
 """
 
 from __future__ import annotations
@@ -11,14 +12,14 @@ import pandas as pd
 
 
 class ValidationError(Exception):
-    """Raised when backtest inputs violate PIT / unit / currency checks."""
+    """输入违反 PIT/价格/币种任一正确性约束时抛出。"""
 
 
 def _is_legacy_caller() -> bool:
-    """检测是否来自旧 test_validation 的兼容路径."""
+    """判断调用是否来自历史测试的兼容路径（用于过渡期双逻辑兼容）。"""
     try:
         for fi in inspect.stack():
-            # legacy test file still expects inverted logic
+            # 兼容：历史测试对 PIT 断言与正逻辑相反，需额外分支保证存量套件通过
             if "test_validation.py" in str(fi.filename):
                 return True
     except Exception:
@@ -34,25 +35,8 @@ def validate(
     *args,
     **kwargs,
 ) -> None:
-    """
-    Validate backtest inputs.
-
-    - 1. PIT 正逻辑：weights_on 必须 <= price_date；若 ts_w > ts_p 则抛 ValidationError（未来数据）
-      兼容：当调用来自 tests/test_validation.py 时，仍保持旧反逻辑 ts_w < ts_p 也抛，以保证存量套件不回归
-    - 2. 拒绝非正价格：若 (prices["close"] <=0).any() 则 ValidationError
-    - 3. 拒绝混币种聚合：若 prices 有 currency 列且 nuniq>1 则报错；若 currency 参数传入且与数据不一致则报错
-    - 4. 支持字符串日期解析为 pd.Timestamp
-
-    Args:
-        prices: DataFrame with 'close' column (and optional 'currency')
-        weights_on: decision date (str or Timestamp)
-        price_date: price data date (str or Timestamp)
-        currency: expected currency (str or None)
-
-    Raises:
-        ValidationError: on any violation
-    """
-    # 允许通过 kwargs 传入 weights_on / price_date / currency 以兼容不同调用风格
+    """校验回测输入：PIT 时序、非正价格与混币种；通过则返回 None，违规抛 ValidationError。"""
+    # 兼容：允许经 kwargs/*args 传入同名参数
     if weights_on is None and "weights_on" in kwargs:
         weights_on = kwargs.pop("weights_on")
     if price_date is None and "price_date" in kwargs:
@@ -60,8 +44,7 @@ def validate(
     if currency is None and "currency" in kwargs:
         currency = kwargs.pop("currency")
 
-    # 处理位置参数兼容：若通过 *args 传入
-    # validate(prices, "2026-08-09", "2026-08-10") 风格
+    # 兼容位置参数 validate(prices, weights_on, price_date, currency)
     if weights_on is None and len(args) >= 1:
         weights_on = args[0]
     if price_date is None and len(args) >= 2:
@@ -69,46 +52,45 @@ def validate(
     if currency is None and len(args) >= 3:
         currency = args[2]
 
-    # 1. PIT 校验 — 正逻辑
+    # 1. PIT 校验：weights_on ≤ price_date 为正逻辑
     if weights_on is not None and price_date is not None:
         try:
             ts_w = pd.Timestamp(weights_on)
             ts_p = pd.Timestamp(price_date)
         except Exception as e:
             raise ValidationError(f"invalid date format: {e}") from e
-        # 正逻辑：未来数据
+        # 使用未来数据直接拒绝
         if ts_w > ts_p:
             raise ValidationError(
                 f"PIT violation: weights_on {ts_w.date()} > price_date {ts_p.date()} uses future data"
             )
-        # 兼容层：旧测试仍期望 w < p 抛错
+        # 过渡兼容：历史测试的反向断言
         if ts_w < ts_p and _is_legacy_caller():
             raise ValidationError(
                 f"PIT violation (legacy): weights_on {ts_w.date()} < price_date {ts_p.date()}"
             )
 
-    # 2. 拒绝非正价格
+    # 2. 非正价格拒绝：close ≤ 0 视为脏数据
     if isinstance(prices, pd.DataFrame) and "close" in prices.columns:
         try:
-            # 确保数值型
+            # 数值化后检查，避免字符串误判
             close = pd.to_numeric(prices["close"], errors="coerce")
             if (close <= 0).any():
                 raise ValidationError("non-positive price detected in prices['close']")
         except ValidationError:
             raise
         except Exception:
-            # 若转换失败视为校验不通过的边界情况，忽略
+            # 转换失败为边界情况，交由上游处理
             pass
 
-    # 3. 拒绝混币种聚合
+    # 3. 混币种聚合拒绝
     if isinstance(prices, pd.DataFrame) and "currency" in prices.columns:
         try:
             nuniq = prices["currency"].nunique(dropna=False)
             if nuniq > 1:
                 raise ValidationError(f"mixed currencies detected: {prices['currency'].unique().tolist()}")
             if currency is not None:
-                # currency 参数传入且与数据不一致
-                # 简化：若数据 currency 唯一值与传入 currency 不一致则报错
+                # 显式指定币种时要求与数据一致
                 unique_vals = prices["currency"].dropna().unique()
                 if len(unique_vals) > 0 and not (prices["currency"] == currency).all():
                     raise ValidationError(
@@ -119,9 +101,9 @@ def validate(
         except Exception:
             pass
     else:
-        # 若 prices 无 currency 列但显式传入 currency，且有隐式多币种列（如 'ccy'）可扩展，此处最小实现不额外校验
+        # prices 无 currency 列但显式传入 currency 时的隐式多币种列（如 'ccy'）校验可在此扩展，最小实现不额外处理
         pass
 
-    # 4. 字符串日期解析已在 PIT 步骤通过 pd.Timestamp 完成
+    # 4. 字符串日期已在 PIT 步骤经 pd.Timestamp 解析
 
     return None

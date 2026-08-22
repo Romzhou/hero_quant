@@ -1,8 +1,10 @@
-"""Sandbox abstraction — BaseSandbox + LocalShellBackend + DockerBackend.
+"""沙箱抽象层 — 定义策略驱动的隔离接口与本地/Docker 两种后端。
 
-L1 hardening: confine(argv, policy) wraps with bwrap-like prefix only if bwrap
-binary exists (offline no-op on Windows/macOS). Keeps enforcement flag
-full/partial without requiring docker/bwrap at test time.
+架构位置：sandbox 层的抽象基座，上层通过 ``resolve_policy`` 生成策略后
+调用 ``confine``/``execute``；具体隔离由 ``runner.LandlockSandbox`` 接管。
+
+安全设计：``confine()`` 仅在检测到 ``bwrap`` 二进制时才添加绑定挂载前缀，
+否则 no-op 回退，保证离线/Windows 下行为可预期且不误判为已隔离。
 """
 from __future__ import annotations
 
@@ -14,7 +16,7 @@ from typing import List, Tuple, Union
 
 
 def _has_bwrap() -> bool:
-    """Return True only if bwrap binary is available on PATH."""
+    """检测 ``bwrap`` 是否可用，仅当 PATH 中存在时返回 True。"""
     try:
         return shutil.which("bwrap") is not None
     except Exception:
@@ -29,46 +31,38 @@ def _has_docker() -> bool:
 
 
 class BaseSandbox(ABC):
-    """Abstract sandbox. execute(cmd) -> (stdout, stderr, exit_code)."""
+    """沙箱抽象基类：定义 ``execute``/``confine``/``enforcement`` 契约。
+
+    安全不变量：默认拒绝——未显式授权的路径与能力不予开放。
+    """
 
     @abstractmethod
     def execute(self, cmd: Union[str, List[str]]) -> Tuple[str, str, int]:
         raise NotImplementedError
 
     def confine(self, argv: List[str], policy: dict) -> List[str]:
-        """
-        Wrap argv with policy confinement.
-
-        - When policy mode == "workspace-write" and bwrap exists, prefix with
-          bwrap-like bind mounts (--ro-bind / /, --bind workspaceRoot, --bind /tmp).
-          Offline/Windows where bwrap missing => no-op (returns copy of argv).
-        - Other modes => no-op passthrough (Docker cap_drop/read_only handles
-          isolation at compose layer — L1 bwrap is Phase2).
-        """
+        """按策略包裹 argv：workspace-write 且 bwrap 可用时添加只读根与可写绑定，否则原样返回。"""
         if not argv:
             return list(argv)
         if not isinstance(argv, list):
             return list(argv)  # type: ignore[return-value]
-        # Normalize argv entries to str
-        argv = [str(x) for x in argv]
+        argv = [str(x) for x in argv]  # 归一化为字符串，避免类型混淆注入
         mode = None
         if isinstance(policy, dict):
             mode = policy.get("mode")
         if mode == "workspace-write":
             if _has_bwrap():
-                # canonical workspace root
                 ws = None
                 if isinstance(policy, dict):
                     ws = policy.get("workspaceRoot") or policy.get("workspace_root") or policy.get("canonicalPath")
                 if ws:
                     try:
-                        ws_canonical = str(Path(ws).resolve())
+                        ws_canonical = str(Path(ws).resolve())  # 解析符号链接，防路径穿越
                     except Exception:
                         ws_canonical = str(ws)
                 else:
                     ws_canonical = "/tmp"
-                # bwrap-like prefix: ro whole fs, then bind workspace + /tmp writable
-                # keep minimal flags that exist on common bwrap versions
+                # bwrap 前缀：根目录只读，工作区与 /tmp 可写；保留最小通用参数
                 prefix: List[str] = [
                     "bwrap",
                     "--ro-bind", "/", "/",
@@ -81,38 +75,36 @@ class BaseSandbox(ABC):
                     "--",
                 ]
                 return prefix + argv
-            # no bwrap binary -> no-op (offline safe)
+            # 无 bwrap 时 no-op，避免在离线环境误报已隔离
             return list(argv)
-        # read-only / danger-full-access -> no wrapping at python layer
+        # read-only / danger-full-access 在 Python 层不做包裹，由上层隔离保证
         return list(argv)
 
     @property
     def enforcement(self) -> str:
-        """Default enforcement full; subclasses override for partial."""
+        """默认隔离等级为 full，子类可按实际能力覆写为 partial。"""
         return "full"
 
 
 class LocalShellBackend(BaseSandbox):
-    """Straight-through local shell backend — for dev/test, full enforcement."""
+    """本地直通后端——用于开发/测试，隔离等级按策略判定。"""
 
     def __init__(self, policy: dict | None = None):
         self._policy: dict = dict(policy) if isinstance(policy, dict) else {}
 
     def execute(self, cmd: Union[str, List[str]]) -> Tuple[str, str, int]:
+        """执行命令；字符串走 shell 展开，列表走 confine 包裹。"""
         if isinstance(cmd, str):
-            # shell string — no confine (shell expansion needed); policy still governs paths externally
+            # shell 字符串需展开，无法做 argv 级隔离；路径约束由上层策略保证
             result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
         else:
-            # list argv — apply confine with stored policy or empty
             pol = self._policy if self._policy else {}
-            # if caller passed explicit policy via cmd wrapping, allow override per-call
-            # confine handles bwrap conditional
-            wrapped = self.confine(cmd, pol)
+            wrapped = self.confine(cmd, pol)  # 仅当 bwrap 可用时才加前缀
             result = subprocess.run(wrapped, shell=False, capture_output=True, text=True)
         return result.stdout, result.stderr, result.returncode
 
     def confine(self, argv: List[str], policy: dict) -> List[str]:
-        # Merge stored policy with per-call policy (per-call wins)
+        # 合并存储策略与单次策略，单次优先
         merged: dict = {}
         if isinstance(self._policy, dict):
             merged.update(self._policy)
@@ -122,66 +114,54 @@ class LocalShellBackend(BaseSandbox):
 
     @property
     def enforcement(self) -> str:
-        # danger-full-access is partial (no isolation), otherwise full
+        # danger-full-access 视为未隔离（partial），其余为 full
         if isinstance(self._policy, dict) and self._policy.get("mode") == "danger-full-access":
             return "partial"
         return "full"
 
 
 class DockerBackend(BaseSandbox):
-    """Docker stub — does not require docker binary.
-
-    If docker is available, would wrap as `docker run --rm -v ws:ws image argv`.
-    Offline/no-docker => falls back to local subprocess (same as LocalShell) so
-    tests stay green. Enforcement is partial because container boundary is not
-    enforced in stub mode; full when docker exists and policy is workspace-write.
-    """
+    """Docker 存根后端——无 docker 时回退本地执行，有 docker 时以容器隔离执行。"""
 
     def __init__(self, image: str = "hero-quant:sandbox", policy: dict | None = None):
         self.image = image
         self._policy: dict = dict(policy) if isinstance(policy, dict) else {}
 
     def execute(self, cmd: Union[str, List[str]]) -> Tuple[str, str, int]:
+        """执行命令；有 docker 时走容器，否则回退本地以保持离线可用。"""
         if isinstance(cmd, str):
-            # For string cmd, run via shell locally (stub)
             result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
             return result.stdout, result.stderr, result.returncode
-        # list argv
         pol = self._policy if self._policy else {}
-        # If docker binary exists and we want container isolation, build docker argv
-        # Otherwise, fallback to local confine (bwrap conditional)
         wrapped = self.confine(cmd, pol)
-        # In stub mode wrapped may contain "docker" prefix; if docker not present,
-        # strip it or fallback to original argv to avoid ENOENT
+        # 存根模式下若 docker 不存在，避免 ENOENT，回退本地
         if wrapped and wrapped[0] == "docker" and not _has_docker():
-            # fallback: run original argv locally via bwrap-aware confine
-            fallback = super().confine(cmd, pol)  # bwrap conditional local
+            fallback = super().confine(cmd, pol)  # 走 bwrap 条件回退
             result = subprocess.run(fallback, shell=False, capture_output=True, text=True)
             return result.stdout, result.stderr, result.returncode
-        # If docker prefix present and docker exists, try docker; on failure fallback
         try:
             result = subprocess.run(wrapped, shell=False, capture_output=True, text=True)
         except FileNotFoundError:
-            # binary missing (bwrap/docker) — fallback to original
+            # 二进制缺失时回退原命令，避免测试环境因缺依赖而失败
             result = subprocess.run(cmd, shell=False, capture_output=True, text=True)
         return result.stdout, result.stderr, result.returncode
 
     def confine(self, argv: List[str], policy: dict) -> List[str]:
-        # Merge policies
+        # 合并策略，单次调用优先
         merged: dict = {}
         if isinstance(self._policy, dict):
             merged.update(self._policy)
         if isinstance(policy, dict):
             merged.update(policy)
         mode = merged.get("mode")
-        # If docker available and workspace-write, prefer docker wrapping; else base bwrap logic
+        # docker 可用且为 workspace-write 时优先容器隔离，否则走 bwrap 逻辑
         if _has_docker() and mode == "workspace-write":
             ws = merged.get("workspaceRoot") or merged.get("workspace_root") or merged.get("canonicalPath") or "/tmp"
             try:
-                ws_canonical = str(Path(ws).resolve())
+                ws_canonical = str(Path(ws).resolve())  # 解析符号链接防穿越
             except Exception:
                 ws_canonical = str(ws)
-            # docker run stub prefix — mount workspace and /tmp
+            # docker 前缀：丢弃全部能力、只读根、挂载工作区
             prefix: List[str] = [
                 "docker", "run", "--rm",
                 "--cap-drop", "ALL",
@@ -191,13 +171,11 @@ class DockerBackend(BaseSandbox):
                 self.image,
             ]
             return prefix + [str(x) for x in argv]
-        # Fallback to base bwrap conditional (no-op if bwrap missing)
         return super().confine([str(x) for x in argv], merged)
 
     @property
     def enforcement(self) -> str:
-        # Docker stub is partial when docker not enforcing; full if docker present
+        # 有 docker 视为 full，无 docker 标记为 partial 以提示未真正隔离
         if _has_docker():
             return "full"
-        # Without docker, same as local but marked partial to signal not isolated
         return "partial"

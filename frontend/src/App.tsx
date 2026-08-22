@@ -1,3 +1,9 @@
+/**
+ * 应用装配（App）
+ * - Shell 承载全局布局：顶部导航 + 路由内容区 + 底部声明
+ * - 路由结构：/ → /dashboard；/research 研究；/backtest 与 /chat 复用 Chat（回测对话）；/live 实盘；/risk 风控；/settings 设置
+ * - 页面均懒加载，Suspense 提供加载态，首屏轻量
+ */
 import { Suspense, lazy } from "react"
 import { NavLink, Route, Routes, Navigate } from "react-router-dom"
 
@@ -9,6 +15,7 @@ const Risk = lazy(() => import("./pages/Risk"))
 const Settings = lazy(() => import("./pages/Settings"))
 
 function Shell() {
+  // 导航激活态：选中用白底深字突出，未选中用半透明文字 + hover 提亮，保持深墨基底对比
   const linkCls = ({ isActive }: { isActive: boolean }) =>
     isActive
       ? "rounded-xl bg-white text-ink-900 px-3.5 py-2 text-sm font-semibold shadow"
@@ -16,7 +23,7 @@ function Shell() {
 
   return (
     <div className="min-h-screen">
-      {/* top nav */}
+      {/* 顶部导航：品牌标识 + 主导航 + 状态/设置入口 */}
       <header className="sticky top-0 z-20 border-b border-white/10 bg-ink-900/75 backdrop-blur-xl">
         <div className="mx-auto flex max-w-7xl items-center justify-between gap-3 px-4 py-3 md:px-6">
           <div className="flex items-center gap-3 shrink-0">
@@ -47,11 +54,13 @@ function Shell() {
       </header>
 
       <main className="mx-auto max-w-7xl min-h-[calc(100vh-64px)]">
+        {/* 懒加载兜底：页面分包加载时的轻量占位，避免白屏 */}
         <Suspense fallback={<div className="p-8 text-sm text-slate-400">加载中…</div>}>
           <Routes>
             <Route path="/" element={<Navigate to="/dashboard" replace />} />
             <Route path="/dashboard" element={<Dashboard />} />
             <Route path="/research" element={<Research />} />
+            {/* 回测与对话复用同一 Chat 组件，/backtest 为历史入口兼容 */}
             <Route path="/backtest" element={<Chat />} />
             <Route path="/chat" element={<Chat />} />
             <Route path="/live" element={<Live />} />

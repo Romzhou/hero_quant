@@ -1,14 +1,8 @@
-"""熔断双桶 circuit breaker + 双桶限流 (Dual-Bucket 限流).
+"""熔断与限流 — 双桶 circuit breaker + 双桶限流。
 
-双桶: failure bucket + slow bucket
-阈值: failure 50% / slow 50% / TIME 30s
-状态: CLOSED -> OPEN (HalfOpen) -> HALF_OPEN -> CLOSED
-时序: open 30s / half 5 calls
-
-限流双桶: token bucket 双桶 (burst + sustained) — 用于 router QPS 限流
-  丛桶冲4 (Wave E1): 提供 DualBucketRateLimiter(capacity, refill_per_sec, burst_*) 不破坏 trace/ledger
-
-Minimal implementation satisfying spec and test: CircuitBreaker(failure_threshold=0.5, window=1, open_duration=1)
+职责：为外部调用提供故障/慢调用熔断保护与 QPS 限流。
+架构位置：`telemetry` 韧性层，被 router/调用方在请求前后探查。
+关键设计：双桶统计（failure/slow 均 50% 阈值，慢调用阈值 30s）；滑动时间窗口；状态机 CLOSED→OPEN(30s)→HALF_OPEN(5 次探测)→CLOSED；限流采用 burst+sustained 双 token bucket 原子获取。
 """
 
 from __future__ import annotations
@@ -16,7 +10,7 @@ from __future__ import annotations
 import collections
 import time
 
-# B1-1 circuit_state gauge (stub — Prometheus Gauge, optional for 3分)
+# 熔断状态指标（Prometheus Gauge 可选，未安装时静默）
 try:
     from prometheus_client import Gauge
 
@@ -32,24 +26,16 @@ try:
 except Exception:  # prometheus_client not available
     CIRCUIT_STATE_GAUGE = None  # type: ignore
 
-# Alias for tests that import CIRCUIT_GAUGE
+# 兼容历史导入名
 CIRCUIT_GAUGE = CIRCUIT_STATE_GAUGE
 
 
 class CircuitBreaker:
-    """Double-bucket circuit breaker.
+    """双桶熔断器。
 
-    Buckets:
-        - failure_bucket: counts failures
-        - slow_bucket: counts slow calls (duration > TIME threshold 30s)
-
-    Args:
-        failure_threshold: failure rate threshold 0.5 (50%)
-        slow_threshold: slow rate threshold 0.5 (50%)
-        window: sliding window size in seconds (time window) or count window if small
-        open_duration: seconds to stay OPEN before moving to HALF_OPEN (open 30s)
-        half_open_max_calls: max probe calls in HALF_OPEN (half 5)
-        slow_duration_threshold: TIME threshold for slow (30s)
+    职责：基于滑动窗口内的失败率与慢调用率决定是否熔断。
+    状态机：CLOSED（正常）—失败/慢调用率≥阈值→ OPEN（拒流 30s）—超时→ HALF_OPEN（限 5 次探测）—连续成功→ CLOSED，任意失败→ OPEN。
+    不变量：`_events` 仅保留窗口内事件；`_half_open_calls` 仅在 HALF_OPEN 递增；状态读取时自动推进 OPEN→HALF_OPEN。
     """
 
     def __init__(
@@ -72,9 +58,8 @@ class CircuitBreaker:
         self._opened_at: float | None = None
         self._half_open_calls = 0
 
-        # deque of (timestamp, is_failure, is_slow)
+        # 滑动窗口事件队列：(timestamp, is_failure, is_slow)
         self._events: collections.deque[tuple[float, bool, bool]] = collections.deque()
-        # Use simple lock (fix dead _lock deque vs _mutex confusion: remove placeholder deque)
         import threading
 
         self._mutex = threading.Lock()
@@ -84,11 +69,12 @@ class CircuitBreaker:
             pass
 
     def _sync_gauge(self) -> None:
+        """同步 Prometheus 指标与当前状态（离线安全）。"""
         if CIRCUIT_STATE_GAUGE is None:
             return
         try:
             mapping = {"CLOSED": 0, "HALF_OPEN": 1, "OPEN": 2}
-            # state getter may transition; use raw _state after transition
+            # 通过 state 属性触发 OPEN→HALF_OPEN 的时效转换
             cur = self.state  # triggers OPEN->HALF_OPEN if due
             CIRCUIT_STATE_GAUGE.set(mapping.get(cur, 0))
         except Exception:
@@ -96,28 +82,28 @@ class CircuitBreaker:
 
     @property
     def state(self) -> str:
-        # auto transition OPEN -> HALF_OPEN after open_duration
+        """当前状态，读取时自动将超时 OPEN 推进为 HALF_OPEN。"""
+        # 到期自动半开，避免永久拒流
         if self._state == "OPEN" and self._opened_at is not None:
             if time.time() - self._opened_at >= self.open_duration:
-                # HalfOpen state as HALF_OPEN (spec mentions HalfOpen)
                 self._state = "HALF_OPEN"
                 self._half_open_calls = 0
-        # normalize HalfOpen alias? keep HALF_OPEN
         return self._state
 
-    # compatibility alias
+    # 兼容别名
     @property
     def _state_alias(self):
+        """历史别名，返回当前状态。"""
         return self.state
 
     def _prune(self, now: float):
-        # prune events outside window (time-based)
-        # window is seconds
+        """裁剪窗口外过期事件，保持滑动窗口语义。"""
         cutoff = now - self.window
         while self._events and self._events[0][0] < cutoff:
             self._events.popleft()
 
     def _evaluate(self):
+        """评估窗口内失败/慢调用率，必要时触发熔断。"""
         now = time.time()
         self._prune(now)
         total = len(self._events)
@@ -127,23 +113,25 @@ class CircuitBreaker:
         slows = sum(1 for _, _, s in self._events if s)
         failure_rate = failures / total if total else 0
         slow_rate = slows / total if total else 0
-        # CLOSED -> OPEN if failure 50% or slow 50% or TIME logic (slow already)
+        # CLOSED 态：任一桶超过阈值即熔断
         if self._state == "CLOSED":
             if failure_rate >= self.failure_threshold or slow_rate >= self.slow_threshold:
                 self._trip_open(now)
 
     def _trip_open(self, now: float | None = None):
+        """切至 OPEN 并记录开启时间，重置探测计数。"""
         self._state = "OPEN"
         self._opened_at = now if now is not None else time.time()
         self._half_open_calls = 0
         self._sync_gauge()
 
     def record_failure(self, duration: float | None = None):
+        """记录一次失败（可选携带耗时以判定慢调用）。"""
         with self._mutex:
-            # if already OPEN, stay OPEN (refresh not needed)
+            # OPEN 态拒流期间不重复计数
             if self.state == "OPEN":
                 return
-            # if HALF_OPEN, failure -> re-open
+            # HALF_OPEN 探测失败立即重熔断
             if self.state == "HALF_OPEN":
                 self._trip_open()
                 return
@@ -154,18 +142,18 @@ class CircuitBreaker:
             self._sync_gauge()
 
     def record_success(self, duration: float | None = None):
+        """记录一次成功，HALF_OPEN 下需累计探测后评估是否闭合。"""
         with self._mutex:
             if self.state == "OPEN":
                 return
             if self.state == "HALF_OPEN":
-                # half-open probe: require >= half_open_max_calls(5) continuous successes before CLOSED
+                # 半开探测：需连续 half_open_max_calls 次成功且双桶达标才闭合
                 self._half_open_calls += 1
                 now = time.time()
                 is_slow = duration is not None and duration >= self.slow_duration_threshold
                 self._events.append((now, False, bool(is_slow)))
-                # continuous success rate evaluation: only after 5 probes decide CLOSED else re-OPEN
                 if self._half_open_calls >= self.half_open_max_calls:
-                    # re-evaluate rates; if ok close else re-OPEN
+                    # 窗口重评估：双桶均低于阈值才闭合，否则重开
                     self._prune(now)
                     total = len(self._events)
                     failures = sum(1 for _, f, _ in self._events if f)
@@ -179,7 +167,7 @@ class CircuitBreaker:
                         self._sync_gauge()
                     else:
                         self._trip_open(now)
-                # else: not enough probes yet, remain HALF_OPEN for more probes
+                # 探测次数不足时保持 HALF_OPEN
                 return
             now = time.time()
             is_slow = duration is not None and duration >= self.slow_duration_threshold
@@ -188,11 +176,11 @@ class CircuitBreaker:
             self._sync_gauge()
 
     def record_slow(self, duration: float | None = None):
-        """Explicit slow record (counts as success but slow)."""
-        # slow bucket placeholder
+        """显式记录慢调用（计为成功但慢桶）。"""
         self.record_success(duration=duration if duration is not None else self.slow_duration_threshold + 1)
 
     def allow(self) -> bool:
+        """是否允许通过（CLOSED 放行，HALF_OPEN 限探测数，OPEN 拒绝）。"""
         self._sync_gauge()
         s = self.state
         if s == "CLOSED":
@@ -201,23 +189,27 @@ class CircuitBreaker:
             return self._half_open_calls < self.half_open_max_calls
         return False
 
-    # For spec: TIME 30s open30s half5 exposure
     def is_closed(self) -> bool:
+        """是否为 CLOSED。"""
         return self.state == "CLOSED"
 
     def is_open(self) -> bool:
+        """是否为 OPEN。"""
         return self.state == "OPEN"
 
-    # -- Maturity 4: 兼容 limiter 接口 --
+    # -- 兼容限流接口 --
     def try_acquire(self, tokens: int = 1) -> bool:  # type: ignore[override]
-        """兼容双桶限流接口: allow() 语义."""
+        """兼容限流接口，等价于 allow()。"""
         return self.allow()
 
 
-# -- 双桶限流 TokenBucket + DualBucketRateLimiter (Wave E1) --
+# -- 单桶与双桶限流 --
 
 class TokenBucket:
-    """单桶 token bucket."""
+    """单桶 token bucket。
+
+    职责：按速率补充 token，控制突发与持续 QPS。
+    """
 
     def __init__(self, capacity: int, refill_per_sec: float) -> None:
         self.capacity = float(capacity)
@@ -229,6 +221,7 @@ class TokenBucket:
         self._lock = _th.Lock()
 
     def _refill(self) -> None:
+        """按流逝时间补充 token，上限为 capacity。"""
         now = time.monotonic()
         elapsed = now - self._last
         if elapsed > 0:
@@ -236,6 +229,7 @@ class TokenBucket:
             self._last = now
 
     def try_acquire(self, tokens: int = 1) -> bool:
+        """尝试获取 token，成功则扣减。"""
         with self._lock:
             self._refill()
             if self.tokens >= tokens:
@@ -244,22 +238,23 @@ class TokenBucket:
             return False
 
     def available(self) -> float:
+        """当前可用 token 数（含补充后）。"""
         with self._lock:
             self._refill()
             return float(self.tokens)
 
     def reset(self) -> None:
+        """重置为满桶。"""
         with self._lock:
             self.tokens = float(self.capacity)
             self._last = time.monotonic()
 
 
 class DualBucketRateLimiter:
-    """双桶限流: burst + sustained 双 token bucket.
+    """双桶限流：burst + sustained 双 token bucket。
 
-    语义: try_acquire 需同时满足双桶有 token，才算成功（双条件限流）。
-    默认: capacity=10, refill_per_sec=5 (sustained), burst_capacity=20, burst_refill=10
-    兼容构造别名: qps/sustained_capacity 等均映射到 capacity/refill.
+    语义：try_acquire 需同时满足双桶有 token 才算成功。
+    默认：capacity=10, refill_per_sec=5（sustained），burst 默认为 2 倍。
     """
 
     def __init__(
@@ -274,7 +269,7 @@ class DualBucketRateLimiter:
         sustained_capacity: int | None = None,
         **kwargs,
     ) -> None:
-        # 别名归一化
+        # 别名归一化，保持向后兼容
         if qps is not None:
             refill_per_sec = float(qps)
         if sustained_capacity is not None:
@@ -285,7 +280,7 @@ class DualBucketRateLimiter:
             refill_per_sec = float(kwargs.pop("sustained_refill"))
         if "refill_rate" in kwargs:
             refill_per_sec = float(kwargs.pop("refill_rate"))
-        # burst 默认 2*capacity, refill 默认 2*refill
+        # burst 默认 2*capacity，refill 默认 2*refill
         if burst_capacity is None:
             burst_capacity = int(capacity * 2) if capacity else 20
         if burst_refill_per_sec is None:
@@ -298,28 +293,28 @@ class DualBucketRateLimiter:
         self.burst_refill_per_sec = float(burst_refill_per_sec)
 
     def try_acquire(self, tokens: int = 1) -> bool:
-        """双桶同时 acquire: 原子性尝试，失败则回滚."""
-        # 先检查 burst，再 sustained；需保证原子性 (两锁顺序: burst then sustained)
-        # 为避免死锁，先预 refill 并检查可用量，若不足直接 false
-        # 简单实现: 先 try burst, 若成功再 try sustained, 若 sustained 失败则回滚 burst
+        """双桶原子获取，失败时回滚已扣的 burst。"""
         burst_ok = self.burst.try_acquire(tokens)
         if not burst_ok:
             return False
         sustained_ok = self.sustained.try_acquire(tokens)
         if not sustained_ok:
-            # 回滚 burst: 补回 token (带锁直接加)
+            # 回滚 burst，保证原子性
             with self.burst._lock:
                 self.burst.tokens = min(self.burst.capacity, self.burst.tokens + tokens)
             return False
         return True
 
     def allow(self, tokens: int = 1) -> bool:
+        """allow 别名，等价 try_acquire。"""
         return self.try_acquire(tokens)
 
     def available_tokens(self) -> tuple[float, float]:
+        """返回 (sustained, burst) 可用 token。"""
         return (self.sustained.available(), self.burst.available())
 
     def get_state(self) -> dict:
+        """返回限流器状态快照。"""
         s, b = self.available_tokens()
         return {
             "sustained_tokens": s,
@@ -330,11 +325,12 @@ class DualBucketRateLimiter:
         }
 
     def reset(self) -> None:
+        """重置双桶为满。"""
         self.sustained.reset()
         self.burst.reset()
 
 
-# 别名供外部兼容
+# 兼容别名
 DualTokenBucket = DualBucketRateLimiter
 RateLimiter = DualBucketRateLimiter
 DualBucketLimiter = DualBucketRateLimiter

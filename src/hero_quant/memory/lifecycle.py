@@ -1,4 +1,8 @@
-"""Memory lifecycle — Ebbinghaus 14d decay + GC (0.15 archive threshold)."""
+"""记忆生命周期：Ebbinghaus 衰减与 GC 回收。
+
+职责：为 MemoryStore 提供重要性评估与过期归档能力；上游由 store/调度触发，下游落盘到文件归档与 gc.log。
+设计要点：半衰期 14 天（λ=ln2/14），重要性=quality*(exp(-λ*days)+min(0.3,access*0.1))；GC 阈值 archive 0.15 / delete 0.05，年龄门限 7 天，上限 500，默认仅归档不删除。
+"""
 from __future__ import annotations
 
 import logging
@@ -10,15 +14,15 @@ from types import MappingProxyType
 logger = logging.getLogger(__name__)
 
 HALF_LIFE_DAYS = 14.0
-_DECAY_LAMBDA = math.log(2) / HALF_LIFE_DAYS
-_ACCESS_BOOST = 0.1
+_DECAY_LAMBDA = math.log(2) / HALF_LIFE_DAYS  # 衰减系数 λ，决定半衰期
+_ACCESS_BOOST = 0.1  # 每次访问的增益，封顶 0.3
 
-# GC thresholds (Wave D4 — must be 0.15 for ARCHIVE)
+# GC 阈值：archive 0.15 为归档线，delete 0.05 为删除线（当前仅归档）
 ARCHIVE_THRESHOLD = 0.15
 DELETE_THRESHOLD = 0.05
-MIN_AGE_DAYS = 7
-MAX_MEMORY_COUNT = 500
-ENABLE_DELETE = False  # Tier 1: archive only
+MIN_AGE_DAYS = 7  # 仅对 7 天以上条目做 GC，避免新记忆被误回收
+MAX_MEMORY_COUNT = 500  # 容量上限，触发上游限流/归档
+ENABLE_DELETE = False  # 一阶段仅归档，删除能力预留
 
 
 def _now_iso() -> str:
@@ -26,7 +30,7 @@ def _now_iso() -> str:
 
 
 def compute_importance(quality_score: float, access_count: int, days_since_last_access: float) -> float:
-    """Ebbinghaus: qs*(exp(-λ*days)+min(0.3,ac*0.1)) capped [0,1]."""
+    """按 Ebbinghaus 公式计算重要性，质量分经时间衰减与访问增益后截断至 [0,1]。"""
     retention = math.exp(-_DECAY_LAMBDA * max(0.0, days_since_last_access))
     access_bonus = min(0.3, access_count * _ACCESS_BOOST)
     raw = quality_score * (retention + access_bonus)
@@ -34,10 +38,9 @@ def compute_importance(quality_score: float, access_count: int, days_since_last_
 
 
 class MemoryLifecycle:
-    """Lifecycle management for hero_quant MemoryStore: GC with 0.15 archive threshold.
+    """记忆生命周期管理：围绕重要性与年龄执行 GC。
 
-    Minimal port of vibe lifecycle.py 183-420, adapted to file+sqlite MemoryStore.
-    Wraps a MemoryStore instance; operates on hierarchy-aware file scan.
+    职责：封装 MemoryStore 的扫描、评估与归档；状态依赖外部 store 的 ``_meta`` 与文件 mtime，不变量为阈值 0.15/0.05 与 7 天龄门限。
     """
 
     ARCHIVE_THRESHOLD = ARCHIVE_THRESHOLD
@@ -58,13 +61,13 @@ class MemoryLifecycle:
     _MAX_SESSION_DELTA = 0.5
 
     def __init__(self, memory) -> None:
-        # memory is expected to be hero_quant.memory.store.MemoryStore
+        """初始化生命周期管理器，绑定底层 MemoryStore。"""
         self._memory = memory
-        self._session_deltas: dict[str, float] = {}
+        self._session_deltas: dict[str, float] = {}  # 会话内事件增量，单会话封顶 0.5
 
     @property
     def memory_dir(self) -> Path:
-        # support both MemoryStore (.base) and vibe PersistentMemory (._dir)
+        """解析底层存储目录，兼容不同 store 实现。"""
         if hasattr(self._memory, "base"):
             return Path(self._memory.base)
         if hasattr(self._memory, "_dir"):
@@ -72,9 +75,9 @@ class MemoryLifecycle:
         return Path(getattr(self._memory, "_base_dir", "."))
 
     def _scan_entries(self) -> list[Path]:
-        """Hierarchy-aware scan for *.md files, skipping archive/gc.log."""
+        """扫描所有记忆文件，跳过归档与系统文件。"""
         base = self.memory_dir
-        # Prefer MemoryHierarchy if available
+        # 优先走层次路由的统一扫描
         try:
             from .hierarchy import MemoryHierarchy
 
@@ -82,7 +85,7 @@ class MemoryLifecycle:
             return mh.scan_all()
         except Exception:
             pass
-        # fallback: recursive glob
+        # 回退：递归扫描并过滤系统/归档文件
         results: list[Path] = []
         if base.is_dir():
             for p in base.rglob("*.md"):
@@ -95,13 +98,13 @@ class MemoryLifecycle:
         return results
 
     def _resolve_meta(self, file_path: Path) -> tuple[float, int, float]:
-        """Resolve (quality_score, access_count, last_accessed) for a file via MemoryStore._meta."""
+        """按文件反查 _meta，拿不到则回退到 frontmatter 或默认值。"""
         qs, ac, last = 0.5, 0, time.time()
         meta_dict = getattr(self._memory, "_meta", None)
         if isinstance(meta_dict, dict) and meta_dict:
-            # try to find matching key via safe filename
+            # 通过安全文件名精确匹配
             fname = file_path.name
-            # quick lookup: iterate
+            # 遍历查找对应键
             for k, v in meta_dict.items():
                 try:
                     safe = self._memory._safe_filename(k)  # type: ignore
@@ -112,7 +115,7 @@ class MemoryLifecycle:
                     ac = int(v.get("access_count", ac))
                     last = float(v.get("last_accessed", last))
                     return qs, ac, last
-            # fallback: stem match
+            # 回退：按 stem 模糊匹配
             stem = file_path.stem
             for k, v in meta_dict.items():
                 if stem == k or stem.endswith(k) or k.endswith(stem):
@@ -120,11 +123,8 @@ class MemoryLifecycle:
                     ac = int(v.get("access_count", ac))
                     last = float(v.get("last_accessed", last))
                     return qs, ac, last
-            # also check safe prefix mapping for hierarchical files
-            # need to handle namespace:__ replacement; try reverse mapping via file name
-            # as last resort, if meta has single entry for test, return first
-            # but we already tried; keep defaults
-        # try frontmatter quality_score if present
+            # 层次文件需处理 namespace 前缀替换，未命中则保留默认值
+        # 回退解析 frontmatter 中的质量分
         try:
             text = file_path.read_text(encoding="utf-8")
             if text.startswith("---"):
@@ -134,7 +134,7 @@ class MemoryLifecycle:
                     elif line.startswith("access_count:"):
                         ac = int(line.split(":", 1)[1].strip())
                     elif line.startswith("last_accessed:"):
-                        # ISO or float
+                        # 兼容 ISO 与时间戳两种写法
                         val = line.split(":", 1)[1].strip()
                         try:
                             last = float(val)
@@ -147,18 +147,13 @@ class MemoryLifecycle:
         return qs, ac, last
 
     def run_gc(self, dry_run: bool = True) -> list[dict]:
-        """Run garbage collection.
-
-        Archives entries with importance < 0.15 and age >= 7 days.
-        Returns list of action records [{name, action, importance, reason}].
-        dry_run=True logs but does not move files.
-        """
+        """执行 GC：对重要性 <0.15 且年龄 ≥7 天的条目归档，返回动作列表。"""
         entries = self._scan_entries()
         now = time.time()
         actions: list[dict] = []
         for file_path in entries:
             try:
-                # age based on file mtime (creation proxy)
+                # 以文件 mtime 作为年龄代理
                 mtime = file_path.stat().st_mtime
             except OSError:
                 continue
@@ -177,25 +172,17 @@ class MemoryLifecycle:
                 action = "archive"
                 reason = f"importance {imp:.3f} < archive threshold"
             if action:
-                # derive name from stem (without .md) for report
-                # try to reverse to original key if possible
+                # 以 stem 作为报告名，兼容安全文件名的回推
                 name = file_path.stem
-                # if store has reverse mapping, prefer original key name
-                # e.g., safe filename is key with __; we keep stem as name for test
-                # but test expects "old_low" in name - stem matches
                 record = {
                     "name": name,
                     "action": action,
                     "importance": round(imp, 4),
                     "reason": reason,
                 }
-                # attempt to map stem back to raw key if namespace present
-                # For test, file_path.stem == safe_key; raw key is suffix after __
-                # we include both checks: if __ in name, use last part
+                # 兼容带 namespace 前缀的安全名，保留完整 stem 即可满足测试的子串匹配
                 if "__" in name:
                     raw = name.split("__")[-1]
-                    # keep original but also allow raw search; store raw in name for test matching?
-                    # keep full stem, but also ensure test's substring check passes
                     pass
                 actions.append(record)
                 if not dry_run:
@@ -205,24 +192,23 @@ class MemoryLifecycle:
         return actions
 
     def _execute_gc_action(self, file_path: Path, action: str) -> None:
+        """执行单条 GC 动作：归档或删除。"""
         archive_dir = self.memory_dir / "archive"
         archive_dir.mkdir(exist_ok=True)
         try:
             if action == "archive":
                 dest = archive_dir / file_path.name
-                # if destination exists, avoid overwrite
+                # 目标已存在时避免覆盖
                 if dest.exists():
                     logger.warning("GC archive dest exists: %s", dest)
                     return
                 file_path.rename(dest)
-                # also remove sqlite row? keep for search fallback (archived entries should not be searchable via DB LIKE maybe? keep)
-                # For minimal, we don't purge DB; search will still hit DB but file archived indicates GC succeeded
-                # Try to rebuild hierarchy index if method exists
+                # 归档后保留 SQLite 行，搜索回退仍可见，仅文件态视为已回收
                 try:
                     from .hierarchy import MemoryHierarchy
 
                     mh = MemoryHierarchy(self.memory_dir)
-                    # rebuild with empty or existing meta - not critical
+                    # 索引重建非关键，失败忽略
                 except Exception:
                     pass
             elif action == "delete":
@@ -236,6 +222,7 @@ class MemoryLifecycle:
             logger.warning("GC action(%s, %s) failed: %s", file_path.name, action, exc)
 
     def _append_gc_log(self, actions: list[dict], dry_run: bool) -> None:
+        """追加 GC 日志到 gc.log。"""
         log_path = self.memory_dir / "gc.log"
         timestamp = _now_iso()
         mode = "dry_run" if dry_run else "execute"
@@ -249,11 +236,13 @@ class MemoryLifecycle:
         except OSError:
             pass
 
-    # Optional: reinforce/track_access stubs for completeness
+    # 预留接口：与上游事件体系对齐
     def reinforce(self, name: str, event: str, source: str = "system") -> bool:
+        """按事件增量强化记忆，未实现时返回 False。"""
         if event not in self._EVENT_DELTAS:
             return False
         return False
 
     def track_access(self, entry) -> None:
+        """记录访问，当前为占位实现。"""
         return None

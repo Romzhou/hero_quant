@@ -1,3 +1,10 @@
+/**
+ * Research 研究页（回测 tearsheet 展示）
+ * - 职责：渲染回测核心产出——指标卡、净值曲线（累积收益 vs 沪深300 + 回撤阴影）、月度收益热力、回撤 TopN、positions.csv 预览与 tearsheet.html 嵌入
+ * - 数据流：优先使用父组件传入的 props（metrics/drawdowns/heatmapDataset/csvPreview），缺省则发请求拉取
+ *   /v1/backtest/metrics.json、positions.csv、tearsheet.html；失败静默回退 mock，保持 synthetic 保真
+ * - 图表：ECharts（line/heatmap/bar），useMemo 缓存 option 避免重复计算
+ */
 import { useEffect, useMemo, useState } from "react"
 import ReactECharts from "echarts-for-react"
 
@@ -31,10 +38,10 @@ export default function Research(props: ResearchProps) {
   const [tearsheetLoaded, setTearsheetLoaded] = useState(false)
   const [tearsheetHtml, setTearsheetHtml] = useState<string | null>(null)
 
-  // 尝试真渲染：positions.csv / metrics.json / tearsheet.html（无需后端也能构建）
+  // 拉取真实产物：父级已传 props 则跳过对应请求，tearsheet 始终尝试；用 aborted 防止卸载后 setState
   useEffect(() => {
     let aborted = false
-    // if props provided, skip fetch for those fields but still try tearsheet
+    // 通用文本产物拉取，截断至 4000 字符用于预览，失败静默保留 mock
     async function fetchArtifact(path: string, setter: (v: string) => void) {
       try {
         const r = await fetch(path, { cache: "no-store" })
@@ -42,11 +49,11 @@ export default function Research(props: ResearchProps) {
         const txt = await r.text()
         if (!aborted && txt) setter(txt.slice(0, 4000))
       } catch {
-        // 保持 mock，静默回退（符合 synthetic 保真）
+        // 保持 mock 占位，静默回退以保证无后端也能完整渲染
       }
     }
     async function fetchMetrics() {
-      // if parent passed metrics, don't override
+      // 父级已注入则不覆盖，保持受控数据优先
       if (props.metrics) return
       try {
         const r = await fetch("/v1/backtest/metrics.json", { cache: "no-store" })
@@ -58,11 +65,12 @@ export default function Research(props: ResearchProps) {
     }
     if (!props.csvPreview) fetchArtifact("/v1/backtest/positions.csv", setCsvPreview)
     fetchMetrics()
-    // tearsheet.html 真渲染
+    // tearsheet 尝试真渲染，成功则内嵌展示
     fetch("/v1/backtest/tearsheet.html", { cache: "no-store" })
       .then(r => r.ok ? r.text() : Promise.reject())
       .then(html => { if (!aborted) { setTearsheetHtml(html.slice(0, 8000)); setTearsheetLoaded(true) } })
       .catch(() => {})
+    // 卸载时标记 aborted，避免异步回调对已卸载组件 setState
     return () => { aborted = true }
   }, [props.metrics, props.csvPreview])
 
@@ -114,8 +122,8 @@ export default function Research(props: ResearchProps) {
     legend: { bottom: 0, textStyle: { color: "#CBD5E1", fontSize: 11 }, data: ["累积收益","沪深300"] }
   }), [])
 
+  // 月热力图：优先用后端 heatmapDataset，否则用 synthetic 占位保持视觉完整
   const heatmapOption = useMemo(() => {
-    // 本月收益热力：5周 x 7日 网格，支持后端 props 传入 dataset；否则保持占位 synthetic 保真
     const days = props.heatmapDays ?? ["周一","周二","周三","周四","周五","周六","周日"]
     const weeks = props.heatmapWeeks ?? ["W1","W2","W3","W4","W5"]
     let data: [number, number, number][]

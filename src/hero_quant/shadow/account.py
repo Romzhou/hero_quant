@@ -1,4 +1,4 @@
-"""Compatibility alias for service.py — exposes same Shadow 2.0 API."""
+"""兼容别名——重导出 service 的 Shadow 2.0 能力，保持历史导入路径可用。"""
 from .service import *  # noqa: F401,F403
 from .service import (
     ATTRIBUTION_CATEGORIES,

@@ -1,11 +1,9 @@
-"""L0 AST guard — allowlist + banned patterns, deep scan (maturity 4).
+"""L0 AST 安全守卫 — 白名单与黑名单深度扫描。
 
-Allowlist is now synced with pyproject dependencies plus quantlib extras (joblib/duckdb etc.).
-Banned roots still take precedence (socket/subprocess/ctypes/requests/os remain blocked).
-Sync strategy:
-  - Static curated set derived from pyproject dependencies + quantlib extras
-  - Dynamic fallback: at import time try to parse pyproject.toml and augment ALLOWED_ROOTS
-  - Distribution name -> import root normalization (python-dotenv->dotenv, pyyaml->yaml, etc.)
+职责：对 LLM/用户生成的 Python 代码做静态 AST 审查，是沙箱的第一道防线。
+安全设计：默认拒绝——白名单外一律拦截；黑名单（socket/subprocess/ctypes/
+requests/os 等）优先于白名单；深层遍历捕获嵌套函数/类中的违规导入与调用。
+白名单与 pyproject 依赖及 quantlib 扩展（joblib/duckdb 等）保持同步。
 """
 from __future__ import annotations
 
@@ -14,17 +12,17 @@ import re
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
-# Base allowlist — manually synced from pyproject.toml + quantlib extras
-# Kept explicit for auditability; dynamic loader below augments if file diverges.
+# 基础白名单 —— 基于 pyproject.toml 与 quantlib 扩展手工同步，保持显式可审计
+# 动态加载器会在导入时补充，避免文件漂移导致遗漏
 # ---------------------------------------------------------------------------
 _STATIC_ALLOWED = {
-    # original 5
+    # 核心科学计算（量化主依赖）
     "pandas",
     "numpy",
     "scipy",
     "math",
     "typing",
-    # pyproject dependencies (import roots)
+    # 项目依赖的导入根
     "fastapi",
     "uvicorn",
     "pydantic",
@@ -37,25 +35,25 @@ _STATIC_ALLOWED = {
     "langchain_core",
     "prometheus_client",
     "structlog",
-    # optional dependencies
+    # 可选数据源
     "tushare",
     "akshare",
     "yfinance",
     "ccxt",
     "polars",
-    # dev (allowed for generated code that imports test helpers; not security sensitive)
+    # 开发期辅助（生成代码可能引用，非安全敏感）
     "pytest",
     "pytest_cov",
     "ruff",
     "black",
-    # quantlib extras explicitly requested: joblib/duckdb etc.
+    # quantlib 扩展
     "joblib",
     "duckdb",
     "sklearn",
     "statsmodels",
     "pyarrow",
     "numba",
-    # stdlib safe helpers commonly used in quant code (not banned)
+    # 标准库中对量化常用的安全辅助模块
     "json",
     "re",
     "datetime",
@@ -78,11 +76,11 @@ _STATIC_ALLOWED = {
     "zoneinfo",
 }
 
-# Quantlib extension set (explicitly required by task)
+# quantlib 扩展集合——确保即使 pyproject 未声明也保持可用
 _QUANTLIB_EXTRA = {"joblib", "duckdb", "sklearn", "statsmodels", "pyarrow", "polars", "numba"}
 
 # ---------------------------------------------------------------------------
-# Distribution -> import root alias map (distribution name lowercased)
+# 发行包名 -> 导入根映射（统一小写处理，兼容 hyphen/underscore 差异）
 # ---------------------------------------------------------------------------
 _DIST_ALIAS: dict[str, str] = {
     "python-dotenv": "dotenv",
@@ -98,18 +96,18 @@ _DIST_ALIAS: dict[str, str] = {
 
 
 def _dist_to_import(dist: str) -> str:
-    """Normalize distribution name to import root."""
+    """将发行包名归一化为导入根（如 python-dotenv -> dotenv）。"""
     d = dist.strip().lower()
     if d in _DIST_ALIAS:
         return _DIST_ALIAS[d]
-    # hyphen -> underscore is the default import mapping
+    # 默认以 hyphen 转 underscore 作为导入映射
     return d.replace("-", "_")
 
 
 def _load_pyproject_roots() -> set[str]:
-    """Parse pyproject.toml dependencies and return import roots (best-effort)."""
+    """解析 pyproject.toml 依赖并返回导入根集合（尽力而为，失败返回空集）。"""
     roots: set[str] = set()
-    # locate pyproject.toml: walk up from this file
+    # 向上查找 pyproject.toml，兼容不同安装布局
     candidates = [
         Path(__file__).resolve().parents[3] / "pyproject.toml",  # src/hero_quant/sandbox -> repo root
         Path(__file__).resolve().parents[2] / "pyproject.toml",
@@ -123,11 +121,10 @@ def _load_pyproject_roots() -> set[str]:
     if pyproject is None:
         return roots
     try:
-        # Python 3.11+ tomllib
         try:
-            import tomllib  # type: ignore
+            import tomllib  # type: ignore  # Python 3.11+ 标准库
         except ModuleNotFoundError:
-            import tomli as tomllib  # type: ignore
+            import tomli as tomllib  # type: ignore  # 兼容低版本
 
         data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
     except Exception:
@@ -137,38 +134,34 @@ def _load_pyproject_roots() -> set[str]:
     for group in (data.get("project", {}).get("optional-dependencies", {}) or {}).values():
         deps.extend(group)
     for raw in deps:
-        # strip env markers and extras: "uvicorn[standard]>=0.24 ; python_version>'3.11'" -> "uvicorn"
+        # 去除环境标记与扩展： "uvicorn[standard]>=0.24 ; ..." -> "uvicorn"
         base = raw.strip().split(";")[0].strip()
-        # remove extras [standard]
-        base = re.split(r"\[", base, maxsplit=1)[0]
-        # split on version specifiers
-        base = re.split(r"[<>=!~]", base, maxsplit=1)[0].strip().lower()
+        base = re.split(r"\[", base, maxsplit=1)[0]  # 去除 [extra]
+        base = re.split(r"[<>=!~]", base, maxsplit=1)[0].strip().lower()  # 去除版本约束
         if not base:
             continue
         roots.add(_dist_to_import(base))
     return roots
 
 
-# Merge static + dynamic (union) so task's "同步" is satisfied even if pyproject drifts
+# 静态与动态白名单取并集，保证与 pyproject 同步且不因漂移丢失条目
 _DYNAMIC_ROOTS = _load_pyproject_roots()
 ALLOWED_ROOTS: set[str] = set(_STATIC_ALLOWED) | set(_DYNAMIC_ROOTS) | set(_QUANTLIB_EXTRA)
 
-# Ensure quantlib extras are always present even if pyproject lacks them
+# 再次确保 quantlib 扩展始终存在
 ALLOWED_ROOTS.update(_QUANTLIB_EXTRA)
 
-# Explicit bans per spec: socket / subprocess / ctypes / requests / eval / __import__
-# os.system is banned via attribute check; os import itself is treated as banned
-# when used with dangerous attrs, but also blocked if not in allowlist.
+# 显式黑名单：拦截可导致命令执行/网络外联/底层逃逸的根模块与调用
 BANNED_IMPORT_ROOTS = {"socket", "subprocess", "ctypes", "requests", "os"}
-BANNED_CALL_NAMES = {"eval", "exec", "__import__"}
-# attribute bans: (base, attr)
+BANNED_CALL_NAMES = {"eval", "exec", "__import__"}  # 动态执行与导入劫持
+# 属性级黑名单：(base, attr)，防止通过 os.system 等间接执行
 BANNED_ATTRS = {
-    ("os", "system"),
-    ("os", "popen"),
-    ("os", "execve"),
-    ("os", "spawnl"),
+    ("os", "system"),  # shell 命令执行
+    ("os", "popen"),  # 管道执行
+    ("os", "execve"),  # 进程替换
+    ("os", "spawnl"),  # 进程派生
     ("os", "spawnlp"),
-    ("subprocess", "Popen"),
+    ("subprocess", "Popen"),  # 子进程创建
     ("subprocess", "call"),
     ("subprocess", "run"),
     ("subprocess", "check_call"),
@@ -177,29 +170,24 @@ BANNED_ATTRS = {
 
 
 def _is_banned_attribute(node: ast.Attribute) -> bool:
-    """Check if attribute access matches banned list or is on banned root."""
-    # direct (os.system) check
+    """判定属性访问是否命中黑名单（直接执行能力或受限根模块的任意属性）。"""
     if isinstance(node.value, ast.Name):
         base = node.value.id
         attr = node.attr
         if (base, attr) in BANNED_ATTRS:
             return True
-        # any ctypes.* / socket.* / requests.* attribute is banned
+        # ctypes / socket / requests 的任意属性均视为高危（外联或底层操作）
         if base in {"ctypes", "socket", "requests"}:
             return True
         if base == "subprocess":
-            return True
+            return True  # subprocess 的任意方法均可能创建子进程
         if base == "os" and attr in {"system", "popen", "execve", "spawnl", "spawnlp", "execv", "execl"}:
             return True
     return False
 
 
 def check_import_allowlist(code: str) -> bool:
-    """
-    Return True if code only uses allowlisted imports and no banned patterns.
-    Deep scans nested functions/classes via ast.walk.
-    Banned roots take precedence over allowlist.
-    """
+    """检查代码是否仅使用白名单导入且无黑名单模式；深层遍历捕获嵌套作用域。"""
     if not code or not code.strip():
         return True
     try:
@@ -208,34 +196,31 @@ def check_import_allowlist(code: str) -> bool:
         return False
 
     for node in ast.walk(tree):
-        # Import: import X, import X.Y
         if isinstance(node, ast.Import):
             for alias in node.names:
                 root = alias.name.split(".")[0]
-                # banned roots always fail
+                # 黑名单优先于白名单
                 if root in BANNED_IMPORT_ROOTS:
                     return False
                 if root not in ALLOWED_ROOTS:
-                    # allowlist enforcement: any non-allowlisted root is denied
-                    return False
+                    return False  # 默认拒绝：非白名单一律拦截
         elif isinstance(node, ast.ImportFrom):
             if node.module is None:
-                return False
+                return False  # 相对导入无明确根，视为不安全
             root = node.module.split(".")[0]
             if root in BANNED_IMPORT_ROOTS:
                 return False
             if root not in ALLOWED_ROOTS:
                 return False
         elif isinstance(node, ast.Call):
-            # banned builtin calls: eval(...), exec(...), __import__(...)
             func = node.func
             if isinstance(func, ast.Name) and func.id in BANNED_CALL_NAMES:
-                return False
+                return False  # 拦截 eval/exec/__import__ 动态执行
             if isinstance(func, ast.Attribute):
                 if _is_banned_attribute(func):
                     return False
         elif isinstance(node, ast.Attribute):
-            # bare attribute access without call (e.g., x = os.system) should also be banned
+            # 即使未调用，单纯引用高危属性也应拦截（如 x = os.system）
             if _is_banned_attribute(node):
                 return False
 
@@ -243,18 +228,18 @@ def check_import_allowlist(code: str) -> bool:
 
 
 def assert_allowlist(code: str) -> None:
-    """Raise ValueError if not allowlisted."""
+    """断言代码通过白名单校验，否则抛 ValueError。"""
     if not check_import_allowlist(code):
         raise ValueError("import allowlist violation or banned pattern detected")
 
 
 def get_allowed_roots() -> set[str]:
-    """Return a copy of the current allowlist (for introspection / tests)."""
+    """返回当前白名单的拷贝，供测试与自检使用。"""
     return set(ALLOWED_ROOTS)
 
 
 def is_allowlist_synced_with_pyproject() -> tuple[bool, list[str]]:
-    """Check sync status: returns (ok, missing)."""
+    """检查白名单与 pyproject 的同步状态，返回 (是否同步, 缺失列表)。"""
     dynamic = _load_pyproject_roots()
     missing = [r for r in dynamic if r not in ALLOWED_ROOTS]
     return (len(missing) == 0, missing)

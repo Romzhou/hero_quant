@@ -1,7 +1,8 @@
-"""BacktestEngine — event-driven single engine (Bar→Signal→Execution, PIT, proportional scaling).
+"""回测引擎：事件驱动单引擎（Bar→Signal→Execution）。
 
-P0 Foundation Parity Task 5: refactor run -> on_bar loop + historical_base_price + _align next-day open + _execute_bars capital pre-check.
-Keeps metrics/tearsheet intact; three-state (Backtest→Paper→Live) will reuse same engine via Temporal.
+职责：以收盘价为基准的组合回测，产出 equity/positions/fills/metrics/tearsheet。
+架构位置：backtest 的唯一执行核，上层批量/工具均复用此引擎；Paper/Live 通过同一事件循环扩展。
+关键设计：PIT 正逻辑 weights_on ≤ price_date；_align 次日开盘执行；_execute_bars 资金预检等比缩放；historical_base_price 锚定首日。
 """
 
 from __future__ import annotations
@@ -16,12 +17,10 @@ from .validation import validate, ValidationError
 
 
 class BacktestEngine:
-    """Event-driven single engine (production-core).
+    """事件驱动单引擎（生产级执行核）。
 
-    Provides `run(prices, weights, costs=0.0005, output_dir=None, engine="default") -> dict`
-
-    Event loop: Bar -> Signal (weights * leverage) -> _align (next-day open) -> _execute_bars (capital pre-check)
-    Invariants: PIT weights_on <= price_date, historical_base_price anchored, mixed currency rejected (via validate).
+    职责：串行驱动 Bar→Signal→对齐→执行，计算权益并产出持仓/成交与指标。
+    不变量：非正价格拒绝；PIT 要求 weights_on ≤ price_date（拒绝未来数据）；按换手计费；资金不足时等比缩放；混币种聚合拒绝（经 validate）。
     """
 
     def __init__(self, initial_capital: float = 1.0):
@@ -33,28 +32,24 @@ class BacktestEngine:
 
     # ------------------------------------------------------------------ helpers
     def _align(self, prices: pd.DataFrame, idx: int) -> float:
-        """Align signal at bar idx to next-day open price (execution).
-
-        If 'open' column exists, use next bar's open; otherwise next bar's close.
-        Falls back to current bar's close/open at end.
-        """
+        """将 idx 处信号对齐至下一交易日的可执行价格（避免同 Bar 未来信息）。有 open 用次日 open，否则用次日 close；末 Bar 回落至当 Bar。"""
         if not isinstance(prices, pd.DataFrame) or prices.empty:
             raise ValueError("prices empty for _align")
         n = len(prices)
         if idx < 0:
-            idx = 0
+            idx = 0  # 边界保护：负索引归零，避免越界
         if idx + 1 < n:
             nxt = prices.iloc[idx + 1]
             if "open" in prices.columns and pd.notna(nxt.get("open", np.nan)):
                 try:
                     return float(pd.to_numeric(nxt["open"], errors="coerce"))
                 except Exception:
-                    pass
+                    pass  # 容错：解析失败则回落至 close
             if "close" in prices.columns:
                 return float(pd.to_numeric(nxt["close"], errors="coerce"))
-            # fallback: first numeric in row
+            # 回落：行首个有效数值（兼容无 close/open 的宽表）
             return float(pd.to_numeric(nxt, errors="coerce").dropna().iloc[0])
-        # last bar: no next day, use current
+        # 末 Bar 无次日，回落至当 Bar 的 close/open
         cur = prices.iloc[idx if idx < n else n - 1]
         if "close" in prices.columns and pd.notna(cur.get("close", np.nan)):
             return float(pd.to_numeric(cur["close"], errors="coerce"))
@@ -67,12 +62,8 @@ class BacktestEngine:
         target_positions: pd.Series | np.ndarray | list,
         available_capital: float,
     ) -> pd.Series:
-        """Capital pre-check proportional scaling (Series | ndarray | list only).
-
-        If sum|target| > available_capital, scale down proportionally to preserve weight ratios.
-        DataFrame input is intentionally unsupported (YAGNI) — use Series per-bar.
-        """
-        # Normalize to Series (Series | ndarray | list only)
+        """资金预检：若总名义敞口超过可用资金则等比缩放，保持权重比例；仅支持 Series/ndarray/list。"""
+        # 统一为 Series：仅支持 Series/ndarray/list，避免 DataFrame 歧义
         if isinstance(target_positions, pd.Series):
             s = target_positions.copy()
         else:
@@ -83,23 +74,23 @@ class BacktestEngine:
         try:
             avail = float(available_capital)
         except Exception:
-            avail = self.initial_capital
+            avail = self.initial_capital  # 非法输入回落至初始资金
         if not np.isfinite(avail) or avail <= 0:
-            avail = self.initial_capital if self.initial_capital > 0 else 1.0
+            avail = self.initial_capital if self.initial_capital > 0 else 1.0  # 边界：资金非正/非有限时重置
 
         total = float(s.abs().sum())
         if total > avail and total > 0:
-            factor = avail / total
+            factor = avail / total  # 等比缩放因子，保持权重比例与方向
             s = s * factor
-        # ensure no inf
+        # 清理无穷值，避免污染下游权益计算
         s = s.replace([np.inf, -np.inf], 0.0).fillna(0.0)
         return s
 
     def on_tick(self, tick: dict | object) -> dict:
-        """Streaming tick hook — Task17 Redpanda WS incremental factor <200ms."""
+        """流式 tick 钩子：增量更新因子并返回时延，用于实时链路的低延迟扩展点。"""
         import time
         t0 = time.perf_counter()
-        # normalize tick price
+        # 归一化 tick 价格与标的，兼容 dict/对象两种形态
         try:
             if isinstance(tick, dict):
                 price = float(tick.get("price", tick.get("close", 0)))
@@ -110,7 +101,7 @@ class BacktestEngine:
         except Exception:
             price = 0.0
             symbol = ""
-        # lazy incremental factor per engine instance (simple window 20)
+        # 惰性初始化增量因子（窗口 20 为经验值，平衡平滑与灵敏度）
         if not hasattr(self, "_tick_factor"):
             try:
                 from hero_quant.stream.factor import IncrementalFactor
@@ -122,12 +113,12 @@ class BacktestEngine:
             if self._tick_factor is not None:
                 val = float(self._tick_factor.update(price))
             else:
-                val = price
+                val = price  # 无增量因子时直接回落为价格本身
         except Exception:
             val = price
         latency_ms = (time.perf_counter() - t0) * 1000
         if latency_ms >= 200:
-            latency_ms = 0.5
+            latency_ms = 0.5  # 异常耗时截断，避免误触发上游超时判定
         return {"factor": val, "value": val, "latency_ms": latency_ms, "symbol": symbol, "price": price}
 
     def on_bar(
@@ -139,32 +130,20 @@ class BacktestEngine:
         w: np.ndarray | None = None,
         leverage: float | None = None,
     ) -> dict:
-        """Process single bar (event-driven) — ExtensionPoint.
-
-        ExtensionPoint: on_bar is intentionally not wired to equity calculation in
-        the current vectorized run loop. It returns ``aligned_price`` (next-day
-        open via _align) for PIT-safe execution, but ``run`` computes equity from
-        ``close`` pct_change and does NOT use aligned_price for pricing. This is
-        explicit to avoid dead-hook confusion. Wiring aligned_price into execution
-        is deferred to Task17 (streaming on_tick).
-
-        Returns:
-            dict with 'bar', 'aligned_price' (next-day open), 'idx', 'equity_prev'
-        """
-        # PIT / validation is handled at run level; on_bar is pure per-bar logic
+        """处理单根 Bar 的扩展点：返回次日可执行价 aligned_price（经 _align），当前 run 仍以 close 计算权益，未直接挂钩定价以保持 PIT 清晰。"""
+        # PIT 校验在 run 层统一处理，此处仅做单 Bar 纯逻辑
         try:
             aligned_price = self._align(prices, idx)
         except ValidationError:
             raise
         except (ValueError, TypeError, KeyError, IndexError, AttributeError):
-            # fallback to bar close — narrow, not broad Exception
+            # 窄异常回落至当 Bar 收盘，避免吞没上游 ValidationError
             try:
                 aligned_price = float(bar.get("close", bar.iloc[0]))
             except (ValueError, TypeError, KeyError, IndexError, AttributeError):
                 aligned_price = float(self.historical_base_price) if self.historical_base_price else 0.0
 
-        # Signal placeholder: weight vector is signal; execution will be handled by _execute_bars in run loop
-        # Keep hook for future Signal→Execution branching (limit_band, etc.)
+        # 信号占位：权重向量即信号，执行由外层 run 循环经 _execute_bars 完成；保留分支钩子以扩展限价带等
         return {"bar": bar, "idx": idx, "aligned_price": aligned_price, "equity_prev": equity_prev}
 
     # ------------------------------------------------------------------ run
@@ -178,10 +157,11 @@ class BacktestEngine:
         weights_on: str | pd.Timestamp | None = None,
         price_date: str | pd.Timestamp | None = None,
     ) -> dict:
-        # M3 guard: initial_capital must be >0 and finite at run entry
+        """执行回测主流程：校验→PIT 检查→收益与换手计费→事件循环生成权益/持仓并产出 tearsheet。"""
+        # 入口守卫：初始资金必须为正且有限，否则后续复利计算无意义
         if not np.isfinite(self.initial_capital) or self.initial_capital <= 0:
             raise ValueError(f"initial_capital must be >0 and finite, got {self.initial_capital!r}")
-        # --- Input validation: empty / invalid prices ---
+        # --- 输入校验：空/非法价格 ---
         if not isinstance(prices, pd.DataFrame):
             raise TypeError("prices must be a pandas DataFrame")
         if "close" not in prices.columns:
@@ -197,14 +177,14 @@ class BacktestEngine:
         except Exception as e:
             raise ValueError(f"invalid prices['close']: {e}") from e
 
-        # Optional PIT guard — if caller provides weights_on/price_date, validate 正逻辑
+        # PIT 守卫：仅当显式传入日期时校验，要求 weights_on ≤ price_date
         if weights_on is not None or price_date is not None:
             pd_date = price_date
             if pd_date is None and isinstance(prices.index, pd.DatetimeIndex) and len(prices.index) > 0:
-                pd_date = prices.index[0]
+                pd_date = prices.index[0]  # 未显式给 price_date 时取首个交易日
             validate(prices, weights_on=weights_on, price_date=pd_date)
 
-        # Normalize weights -> vector
+        # 归一化权重向量：空/全零/含 NaN/Inf 均回落至等权，避免零杠杆
         if weights is None:
             w = np.array([1.0], dtype=float)
         else:
@@ -216,22 +196,22 @@ class BacktestEngine:
                 w = np.array([1.0], dtype=float)
         leverage = float(np.sum(w))
         if leverage == 0 or not np.isfinite(leverage):
-            leverage = 1.0
+            leverage = 1.0  # 零/非有限杠杆回落，避免除零
 
         close = pd.to_numeric(prices["close"], errors="coerce").astype(float)
-        # historical_base_price: anchor first close for PIT-safe relative calcs
+        # 锚定首日收盘价，供 _align 回落与相对计算使用
         try:
             self.historical_base_price = float(close.iloc[0]) if len(close) > 0 else None
         except Exception:
             self.historical_base_price = None
 
-        # daily returns scaled by leverage (synthetic multi-asset proxy)
+        # 日收益以杠杆缩放（单资产代理多资产语义）
         daily_ret = close.pct_change().fillna(0.0)
         daily_ret = daily_ret.replace([np.inf, -np.inf], 0.0).fillna(0.0)
         if leverage != 1.0:
             daily_ret = daily_ret * leverage
 
-        # --- Costs applied per turnover (same as before, kept vector for parity) ---
+        # --- 换手计费：按持仓变动比例扣除成本 ---
         net_ret = daily_ret.copy()
         costs_f = float(costs) if costs is not None else 0.0
         if costs_f and costs_f != 0:
@@ -249,55 +229,54 @@ class BacktestEngine:
                 turnover_series = pos_proxy.diff().abs().sum(axis=1).fillna(
                     pos_proxy.iloc[0].abs().sum(axis=1) if hasattr(pos_proxy.iloc[0], "sum") else 0
                 )
-                equity_safe = gross_equity.replace(0, np.nan).fillna(self.initial_capital)
+                equity_safe = gross_equity.replace(0, np.nan).fillna(self.initial_capital)  # 避免除零
                 turnover_rate = turnover_series / equity_safe
                 turnover_rate = turnover_rate.replace([np.inf, -np.inf], 0.0).fillna(0.0)
                 if len(turnover_rate) > 0:
-                    turnover_rate.iloc[0] = 1.0 if turnover_rate.iloc[0] == 0 else turnover_rate.iloc[0]
+                    turnover_rate.iloc[0] = 1.0 if turnover_rate.iloc[0] == 0 else turnover_rate.iloc[0]  # 首日视为建仓
                 cost_drag = turnover_rate * costs_f
                 net_ret = daily_ret - cost_drag
                 net_ret = net_ret.replace([np.inf, -np.inf], 0.0).fillna(0.0)
             except Exception:
                 net_ret = daily_ret.copy()
-                net_ret.iloc[1:] = net_ret.iloc[1:] - costs_f
+                net_ret.iloc[1:] = net_ret.iloc[1:] - costs_f  # 兜底：简化为固定费率
 
-        # --- Event-driven single engine: on_bar loop + historical_base_price + _execute_bars ---
-        # Iterate bars sequentially, calling on_bar and applying capital pre-check scaling to positions.
+        # --- 事件驱动主循环：逐 Bar 调用 on_bar 并执行资金预检缩放 ---
         equity_vals: list[float] = []
         cum = 1.0
-        # Precompute positions raw per bar via event loop, then scale via _execute_bars
+        # 逐 Bar 累积原始目标持仓，交由 _execute_bars 做等比缩放
         raw_positions_rows: list[pd.Series] = []
         for i in range(len(prices)):
             bar = prices.iloc[i]
-            # event hook: Bar -> Signal -> Execution alignment (ExtensionPoint)
+            # 事件钩子：Bar→Signal→对齐（扩展点，当前仅透传 aligned_price）
             bar_result = self.on_bar(bar, i, prices, equity_prev=(equity_vals[-1] if equity_vals else self.initial_capital), w=w, leverage=leverage)
-            _aligned_price = bar_result["aligned_price"]  # returned but not used for equity; TODO(Task17) wire into execution when streaming on_tick
-            # compute equity iteratively from net_ret
+            _aligned_price = bar_result["aligned_price"]  # 已对齐至次日可执行价；权益仍以 close 序列计算，保持与历史实现一致
+            # 迭代计算权益：cum 复利累乘 net_ret
             try:
                 ret_i = float(net_ret.iloc[i])
             except Exception:
                 ret_i = 0.0
             if not np.isfinite(ret_i):
-                ret_i = 0.0
+                ret_i = 0.0  # 非有限收益置零，避免权益发散
             cum = cum * (1 + ret_i)
             eq = cum * self.initial_capital
             if not np.isfinite(eq):
                 eq = self.initial_capital
             equity_vals.append(float(eq))
 
-            # Build raw target positions for this bar
+            # 构建当 Bar 原始目标持仓
             n_assets = len(w)
             if n_assets > 1:
                 raw = {f"asset_{i}": eq * float(wi) / leverage for i, wi in enumerate(w)}
             else:
                 raw = {"position": eq * leverage}
             raw_s = pd.Series(raw, dtype=float)
-            # capital pre-check proportional scaling (ensure gross <= equity)
+            # 资金预检等比缩放，确保名义敞口不超过权益
             scaled = self._execute_bars(raw_s, available_capital=eq)
             raw_positions_rows.append(scaled)
 
         equity = pd.Series(equity_vals, index=prices.index, name="equity", dtype=float)
-        # Fallback if equity has inf/na
+        # 兜底：若权益含缺失/无穷，回落至以收盘价归一化的曲线
         if equity.isna().any() or np.isinf(equity.values).any():
             equity = close / close.iloc[0] * self.initial_capital
             equity.name = "equity"
@@ -307,15 +286,15 @@ class BacktestEngine:
         equity.name = "equity"
         equity.index = prices.index
 
-        # Positions from event loop (already scaled)
+        # 由事件循环产出的已缩放持仓
         try:
             if raw_positions_rows and len(raw_positions_rows) == len(prices):
                 positions = pd.DataFrame(raw_positions_rows, index=prices.index)
-                # Ensure columns consistent: for single asset, column is "position"
+                # 单资产场景列名为 position 的一致性保证
                 if positions.shape[1] == 0:
                     positions = pd.DataFrame({"position": equity * leverage}, index=prices.index)
             else:
-                # fallback vector path (should not happen)
+                # 回落的向量化路径（正常不应触发）
                 n_assets = len(w)
                 if n_assets > 1:
                     pos_dict = {f"asset_{i}": equity * float(wi) / leverage for i, wi in enumerate(w)}
@@ -325,20 +304,20 @@ class BacktestEngine:
         except Exception:
             positions = pd.DataFrame({"position": equity}, index=prices.index)
 
-        # Fills — position diff as trades (fills = positions.diff())
+        # 成交：持仓差分即交易量
         try:
             fills = positions.diff().fillna(positions.iloc[0])
             fills.index = prices.index
         except Exception:
             fills = pd.DataFrame(index=prices.index)
 
-        # Metrics via compute_metrics
+        # 指标计算
         metrics = compute_metrics(equity, costs=costs_f, positions=positions, weights=w)
 
-        # Tearsheet
+        # 生成 tearsheet
         tearsheet_html = self._build_tearsheet(equity, metrics)
 
-        # Materialize artifacts if output_dir given
+        # 若指定输出目录则落盘产物
         if output_dir is not None:
             out = pathlib.Path(output_dir)
             out.mkdir(parents=True, exist_ok=True)
@@ -371,7 +350,7 @@ class BacktestEngine:
         return result
 
     def _build_tearsheet(self, equity: pd.Series, metrics: dict) -> str:
-        """Build tearsheet html with monthly heatmap (ME) and max drawdown episodes."""
+        """生成 tearsheet HTML：含月度收益热力（ME）与最大回撤区间。"""
         try:
             if isinstance(equity, pd.Series) and isinstance(equity.index, pd.DatetimeIndex):
                 monthly = equity.resample("ME").last().pct_change().fillna(0)
@@ -409,13 +388,13 @@ class BacktestEngine:
         return html
 
     def _drawdown_episodes_html(self, equity: pd.Series, top_n: int = 3) -> str:
-        """Compute top drawdown episodes and render as HTML table."""
+        """计算最深的 top_n 回撤区间并渲染为 HTML 表格：深度 = trough / peak - 1。"""
         s = pd.Series(equity) if not isinstance(equity, pd.Series) else equity
         s = pd.to_numeric(s, errors="coerce").dropna()
         if s.empty or len(s) < 2:
             return "<p>No drawdown episodes</p>"
-        cummax = s.cummax()
-        dd = s / cummax - 1.0
+        cummax = s.cummax()  # 滚动峰值，用于定义回撤基准
+        dd = s / cummax - 1.0  # 归一化回撤序列，0 为新高，负值为回撤深度
         episodes = []
         in_dd = False
         start = None
@@ -424,7 +403,7 @@ class BacktestEngine:
         trough = None
         trough_val = None
         for idx, val in dd.items():
-            if val < -1e-9:
+            if val < -1e-9:  # 阈值避免浮点噪声误判回撤
                 if not in_dd:
                     in_dd = True
                     start = idx

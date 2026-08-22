@@ -1,4 +1,8 @@
-"""Backtest tools — production-core (Wave B5 hardened)."""
+"""回测工具集：PIT 正确性校验、引擎执行与指标计算。
+
+位于 tools 层回测分支，封装 BacktestEngine 的执行与校验逻辑；
+run_backtest/optimize_portfolio 涉及状态写，并发安全标 False，其余只读工具标 True。
+"""
 
 from __future__ import annotations
 
@@ -8,7 +12,7 @@ from hero_quant.tools.registry import tool
 
 
 def _fetch_bars_for_backtest(symbol: str, start: str, end: str):
-    """Fetch bars via MarketDataRegistry (Tencent+Yahoo) or synthetic."""
+    """为回测拉取行情，双源注册后回退至空列表由上层合成兜底。"""
     try:
         from hero_quant.data.registry import MarketDataRegistry
         from hero_quant.data.loaders.tencent import TencentLoader
@@ -24,7 +28,7 @@ def _fetch_bars_for_backtest(symbol: str, start: str, end: str):
         bars, _ = reg.get_bars(symbol, "1d", start, end)
         return bars
     except Exception:
-        # synthetic minimal closes
+        # 获取失败返回空，由调用方生成合成价格序列保证回测可执行
         return []
 
 
@@ -68,6 +72,7 @@ def run_backtest(
     engine: str = "default",
     interval: str = "1d",
 ) -> Dict[str, Any]:
+    """执行 PIT 正确回测，含交易成本与多引擎支持；无数据时使用合成序列。"""
     weights = weights or [0.5, 0.5]
     try:
         import pandas as pd
@@ -76,9 +81,10 @@ def run_backtest(
         bars = _fetch_bars_for_backtest(symbol, start, end)
         closes = [b.get("close", 100) for b in bars[:50]] if bars else []
         if not closes:
-            # synthetic price series anchored to start date
+            # 无真实行情时使用锚定起始日的合成价格，保证引擎可运行
             closes = [100, 101, 102]
-        # Build DatetimeIndex from start
+        # 以起始日为锚点构建 DatetimeIndex
+
         try:
             idx = pd.date_range(start, periods=len(closes), freq="D")
         except Exception:
@@ -119,6 +125,7 @@ def run_backtest(
     is_concurrency_safe=lambda args: True,
 )
 def validate_backtest(weights_on: str, price_date: str) -> Dict[str, Any]:
+    """校验回测 PIT 正确性（权重日期不得晚于行情日期）。"""
     try:
         from hero_quant.backtest.validation import validate
 
@@ -149,6 +156,7 @@ def validate_backtest(weights_on: str, price_date: str) -> Dict[str, Any]:
     is_concurrency_safe=lambda args: True,
 )
 def get_backtest_metrics(equity: list) -> Dict[str, Any]:
+    """基于净值曲线计算 Sharpe、回撤等回测指标。"""
     try:
         import pandas as pd
         from hero_quant.backtest.metrics import compute_metrics
@@ -173,6 +181,7 @@ def get_backtest_metrics(equity: list) -> Dict[str, Any]:
     is_concurrency_safe=lambda args: True,
 )
 def list_backtest_engines() -> Dict[str, Any]:
+    """列出可用回测引擎。"""
     return {"engines": ["default", "vectorized", "synthetic"], "ok": True}
 
 
@@ -197,6 +206,7 @@ def list_backtest_engines() -> Dict[str, Any]:
     is_concurrency_safe=lambda args: False,
 )
 def optimize_portfolio(symbols: list, method: str = "equal") -> Dict[str, Any]:
+    """投资组合权重优化占位：当前返回等权配置。"""
     n = len(symbols) if symbols else 1
     w = [1.0 / n] * n
     return {"weights": w, "ok": True, "method": method}

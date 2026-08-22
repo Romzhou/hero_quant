@@ -1,36 +1,8 @@
-"""Wall-time governance — budget enforcement + observability.
+"""wall_time — 壁钟时间预算治理。
 
-Wave E follow-up after E1 temporal heartbeat/circuit:
-- WallTimeExceeded: hard error when budget exceeded
-- WallTimeBudget: monotonic wall-time budget (budget_seconds, elapsed, remaining, check)
-- WallTimeGovernor: wraps callables / context manager with metrics hardening
-- with_wall_time_budget: decorator / context manager factory
-- enforce_wall_time: helper for sync call timing
-
-Metrics hardening:
-- hero_quant_wall_time_seconds histogram (operation/status) observed on every exit
-- hero_quant_governance_wall_time_exceeded_total counter incremented on exceed
-- Works offline (no prometheus_client required) -> no-op metrics fallback
-
-Budget source:
-- Explicit budget_seconds param
-- Env HERO_WALL_TIME_BUDGET (seconds) via Settings or os.environ
-- Default: 30.0s if not specified (conservative)
-
-Usage:
-    from hero_quant.governance.wall_time import WallTimeBudget, WallTimeGovernor, with_wall_time_budget
-
-    with WallTimeBudget(budget_seconds=0.5, operation="backtest") as b:
-        heavy_work()
-        b.check()  # raises WallTimeExceeded if > budget
-
-    @with_wall_time_budget(1.0, operation="ledger_append")
-    def do_append(...): ...
-
-    governor = WallTimeGovernor(budget_seconds=2.0, operation="agent_loop")
-    result = governor.enforce(lambda: loop.run(goal))
-
-Wall-time budget enforced via monotonic clock (time.monotonic), not wall clock.
+职责：以 monotonic 时钟度量 wall-time budget，对超时操作抛 WallTimeExceeded 并上报可观测指标。
+架构位置：治理层横切能力，被回测、账本追加、对账等耗时路径复用。
+关键设计：预算扣减模型为 deadline = start + budget_seconds，elapsed/remaining/exceeded 均基于 time.monotonic，避免 wall clock 回拨影响；预算来源优先级为显式参数 > 环境变量 HERO_WALL_TIME_BUDGET > Settings > 默认 30s；每次退出统一 observe_wall_time，超时递增 exceeded 计数，离线时静默降级。
 """
 
 from __future__ import annotations
@@ -41,7 +13,7 @@ import functools
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
-# metrics integration (optional, offline-safe)
+# 指标集成（可选、离线安全）：缺失时退化为 no-op，避免硬依赖
 try:
     from hero_quant.metrics import observe_wall_time as _observe_wall_time
     from hero_quant.metrics import inc_wall_time_exceeded as _inc_exceeded
@@ -50,11 +22,9 @@ except Exception:
     _inc_exceeded = None  # type: ignore
 
 
-# ---------------------------------------------------------------------------
-# Exceptions
-# ---------------------------------------------------------------------------
+# 异常
 class WallTimeExceeded(RuntimeError):
-    """Raised when wall-time budget is exceeded."""
+    """壁钟预算耗尽时抛出，携带 operation/budget/elapsed 以便上层决策重试或降级。"""
 
     def __init__(self, operation: str, budget_seconds: float, elapsed: float, detail: str | None = None):
         msg = f"wall-time budget exceeded for {operation!r}: budget={budget_seconds:.4f}s elapsed={elapsed:.4f}s"
@@ -68,16 +38,15 @@ class WallTimeExceeded(RuntimeError):
 
 
 class WallTimeBudgetExceeded(WallTimeExceeded):
-    """Alias for WallTimeExceeded (compat)."""
+    """WallTimeExceeded 别名，兼容旧导入路径。"""
 
 
-# ---------------------------------------------------------------------------
-# Budget
-# ---------------------------------------------------------------------------
+# 预算解析与数据结构
 _DEFAULT_BUDGET_SECONDS: float = 30.0
 
 
 def _resolve_default_budget(explicit: float | None = None) -> float | None:
+    """按 显式参数 > 环境变量 > Settings > 默认值 解析预算；0 或负数视为不限。"""
     if explicit is not None:
         try:
             v = float(explicit)
@@ -116,20 +85,9 @@ def _resolve_default_budget(explicit: float | None = None) -> float | None:
 
 @dataclass
 class WallTimeBudget:
-    """Monotonic wall-time budget.
+    """基于 monotonic 的壁钟预算；支持上下文管理与超时自动校验。
 
-    Args:
-        budget_seconds: max wall-time allowed; None or <=0 means unlimited
-        operation: label for metrics
-        start_time: monotonic start (auto)
-        deadline: monotonic deadline (start + budget)
-
-    Provides:
-        elapsed() -> float
-        remaining() -> float | None (None if unlimited)
-        exceeded() -> bool
-        check() -> raises WallTimeExceeded if exceeded
-        __enter__/__exit__ -> context manager with auto check + metrics
+    不变量：deadline = start + budget_seconds；remaining 可能为负表示已超时；check/exceeded 均以 monotonic 为准。
     """
 
     budget_seconds: float | None = field(default_factory=lambda: _resolve_default_budget())
@@ -139,7 +97,7 @@ class WallTimeBudget:
     _exceeded_recorded: bool = field(default=False, init=False, repr=False)
 
     def __post_init__(self):
-        # normalize budget
+        # 归一化预算并计算 deadline，0/负数按不限处理
         if self.budget_seconds is not None:
             try:
                 b = float(self.budget_seconds)
@@ -158,7 +116,7 @@ class WallTimeBudget:
         else:
             self._deadline = None
 
-    # -- timing helpers --
+    # 计时辅助：均以 monotonic 为时间源，避免 wall clock 跳变
     def elapsed(self) -> float:
         try:
             return float(time.monotonic() - float(self._start))
@@ -186,7 +144,7 @@ class WallTimeBudget:
         return self.exceeded()
 
     def check(self, detail: str | None = None) -> None:
-        """Raise WallTimeExceeded if budget exceeded, else no-op."""
+        """若已超时则抛 WallTimeExceeded 并记录 exceeded 指标，否则静默。"""
         if self.exceeded():
             el = self.elapsed()
             # metrics hardening: increment exceeded counter (once)
@@ -203,14 +161,13 @@ class WallTimeBudget:
             except Exception:
                 pass
             raise WallTimeExceeded(self.operation, float(self.budget_seconds or 0), float(el), detail=detail)
-
     def enforce(self) -> None:
-        """Alias for check()."""
+        """check 的别名。"""
+
         self.check()
 
-    # -- context manager --
+    # 上下文管理：进入时重置起点以精确度量 with 块内耗时
     def __enter__(self) -> "WallTimeBudget":
-        # reset start to entry time for precise measurement within context
         self._start = time.monotonic()
         if self.budget_seconds is not None:
             self._deadline = float(self._start) + float(self.budget_seconds)
@@ -257,9 +214,8 @@ class WallTimeBudget:
         # do not suppress exceptions
         return False
 
-    # -- helper: timed decorator compatibility --
     def time_call(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
-        """Time a callable within budget, raising if exceeded after call."""
+        """在预算内执行可调用对象，超时则抛 WallTimeExceeded 并上报耗时。"""
         start = time.monotonic()
         try:
             result = fn(*args, **kwargs)
@@ -281,18 +237,9 @@ class WallTimeBudget:
                     pass
 
 
-# ---------------------------------------------------------------------------
-# Governor (higher-level wrapper with enforce callable + metrics)
-# ---------------------------------------------------------------------------
+# 上层 Governor：封装任意可调用对象的预算执行与指标上报
 class WallTimeGovernor:
-    """Governor that enforces wall-time budget around arbitrary callables.
-
-    Provides:
-        enforce(fn, *args, **kwargs) -> result or raises WallTimeExceeded
-        wrap(fn) -> wrapped function with budget
-
-    Metrics: observes wall-time histogram and increments exceeded counter.
-    """
+    """壁钟预算执行器，围绕任意可调用对象强制超时并统一度量。"""
 
     def __init__(self, budget_seconds: float | None = None, operation: str = "generic", clock: Any = None):
         self.budget_seconds = _resolve_default_budget(budget_seconds) if budget_seconds is not None else _resolve_default_budget()
@@ -310,7 +257,7 @@ class WallTimeGovernor:
         return WallTimeBudget(budget_seconds=self.budget_seconds, operation=self.operation)
 
     def enforce(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
-        """Execute fn within wall-time budget; raise WallTimeExceeded if budget exceeded."""
+        """在预算内执行 fn，超时抛 WallTimeExceeded；始终上报 wall-time 直方图。"""
         budget = self._budget()
         start = time.monotonic()
         status = "success"
@@ -368,7 +315,7 @@ class WallTimeGovernor:
                     pass
 
     def wrap(self, fn: Callable[..., Any]) -> Callable[..., Any]:
-        """Return wrapped function that enforces budget."""
+        """返回带预算约束的包装函数。"""
         gov = self
 
         @functools.wraps(fn)
@@ -378,7 +325,7 @@ class WallTimeGovernor:
         return _wrapped
 
     def check_budget(self, elapsed: float) -> None:
-        """Check elapsed against budget and raise if exceeded."""
+        """校验已耗 elapsed 是否超预算，超则抛异常并计数。"""
         if self.budget_seconds is None:
             return
         if float(elapsed) > float(self.budget_seconds):
@@ -395,9 +342,7 @@ class WallTimeGovernor:
             raise WallTimeExceeded(self.operation, float(self.budget_seconds), float(elapsed))
 
 
-# ---------------------------------------------------------------------------
-# Helpers / decorators
-# ---------------------------------------------------------------------------
+# 快捷装饰器与辅助
 def with_wall_time_budget(
     budget_seconds: float | None = None,
     operation: str = "generic",
@@ -405,18 +350,9 @@ def with_wall_time_budget(
     budget: float | None = None,
     wall_time_budget: float | None = None,
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-    """Decorator factory to enforce wall-time budget.
+    """装饰器工厂：为函数附加壁钟预算，超时抛 WallTimeExceeded。
 
-    Supports aliases: budget, wall_time_budget for compat.
-    Usage:
-        @with_wall_time_budget(0.5)
-        def foo(): ...
-
-        @with_wall_time_budget(budget_seconds=1.0, operation="backtest")
-        def bar(): ...
-
-    If decorated function exceeds budget, WallTimeExceeded is raised.
-    Metrics hardened: observes wall-time and increments exceeded counter.
+    兼容 budget / wall_time_budget 别名参数。
     """
     # alias handling
     if budget is not None and budget_seconds is None:
@@ -446,18 +382,7 @@ def enforce_wall_time(
     operation: str = "generic",
     **kwargs: Any,
 ) -> Any:
-    """One-shot helper: enforce wall-time budget around a call.
-
-    Args:
-        fn: callable to invoke
-        *args, **kwargs: passed to fn
-        budget_seconds: budget in seconds (uses env/default if None)
-        operation: metric label
-    Returns:
-        fn(*args, **kwargs) result
-    Raises:
-        WallTimeExceeded if elapsed > budget_seconds
-    """
+    """一次性辅助：围绕单次调用强制壁钟预算。"""
     gov = WallTimeGovernor(budget_seconds=budget_seconds, operation=operation)
     return gov.enforce(fn, *args, **kwargs)
 
@@ -466,11 +391,11 @@ def wall_time_budget(
     budget_seconds: float | None = None,
     operation: str = "generic",
 ) -> WallTimeBudget:
-    """Factory for context manager: `with wall_time_budget(0.5): ...`"""
+    """上下文管理器工厂：`with wall_time_budget(0.5): ...`。"""
     return WallTimeBudget(budget_seconds=budget_seconds, operation=operation)
 
 
-# Convenience aliases for compat with potential test imports
+# 兼容别名：保留旧导入路径
 WallTimeBudgetEnforcer = WallTimeGovernor
 BudgetEnforcer = WallTimeGovernor
 GovernanceWallTimeBudget = WallTimeBudget

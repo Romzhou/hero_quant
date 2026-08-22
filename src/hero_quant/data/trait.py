@@ -1,7 +1,8 @@
-"""SourceTrait — micro-kernel data plugin boundary.
+"""数据源插件边界：定义 Loader 接入 Registry 的最小协议。
 
-每个 Loader 实现此协议以接入 MarketDataRegistry。
-Trait 边界在 Day1 定格：name/markets/unit + get_bars/health。
+每个 Loader 实现此 Trait 即可被 MarketDataRegistry 调度；
+约定 name/markets/unit 与 get_bars/health 为稳定边界，
+其中 unit 的 board_lots/shares 语义影响数量解读与后续换算。
 """
 
 from typing import Any, Literal, Protocol, runtime_checkable
@@ -11,13 +12,7 @@ import pandas as pd
 
 @runtime_checkable
 class SourceTrait(Protocol):
-    """Data source plugin trait.
-
-    Attributes:
-        name: 唯一标识，对应 VALID_SOURCES 元素，如 "akshare"。
-        markets: 支持的市场代码列表，如 ["CN"]。
-        unit: 数量单位 — "board_lots" (A股手) 或 "shares" (股/合约)。
-    """
+    """数据源插件 Trait：所有 Loader 的结构化契约。"""
 
     name: str
     markets: list[str]

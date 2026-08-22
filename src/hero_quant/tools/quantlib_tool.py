@@ -1,4 +1,10 @@
-"""QuantLib tools — production-core (Wave B5 hardened). Wraps quantlib/indicators with real pandas logic."""
+"""量化指标工具集：封装 quantlib 指标并以 pandas 为回退。
+
+位于 tools 层计算分支，通过 MarketDataRegistry 获取收盘价，优先调用
+Rust quantlib（sma/ema/rsi/bollinger/macd/max_drawdown），缺失时回退至
+pandas 实现；数据不可用时返回 20 点合成序列兜底。全部工具为只读计算，
+并发安全标记为 True。
+"""
 
 from __future__ import annotations
 
@@ -8,7 +14,7 @@ from hero_quant.tools.registry import tool
 
 
 def _fetch_closes(symbol: str, start: str = "2026-08-01", end: str = "2026-08-03"):
-    """Fetch closes via registry; fallback to synthetic series."""
+    """拉取收盘价序列，失败时回退至 20 点合成数据以保证指标可算。"""
     try:
         from hero_quant.data.registry import MarketDataRegistry
         from hero_quant.data.loaders.tencent import TencentLoader
@@ -27,7 +33,7 @@ def _fetch_closes(symbol: str, start: str = "2026-08-01", end: str = "2026-08-03
             return closes
     except Exception:
         pass
-    # synthetic fallback 20 points
+    # 无可用行情时提供 20 点等差序列，避免上层指标因空数据失败
     return [100 + i * 0.5 for i in range(20)]
 
 
@@ -61,6 +67,7 @@ def compute_indicator(
     start: str = "2026-08-01",
     end: str = "2026-08-20",
 ) -> Dict[str, Any]:
+    """计算技术指标（sma/ema/rsi/bollinger/macd/max_drawdown），quantlib 优先、pandas 兜底。"""
     try:
         import pandas as pd
 
@@ -68,7 +75,7 @@ def compute_indicator(
         s = pd.Series(closes, dtype=float)
         ind = (indicator or "sma").lower().strip()
         n = int(window) if window else 20
-        # wrap quantlib/indicators where available
+        # 优先使用 Rust quantlib，避免 Python 重复实现；缺失时走 pandas
         values: list[float] = []
         try:
             from hero_quant.quantlib.indicators import sma, ema, rsi, bollinger, macd
@@ -103,7 +110,7 @@ def compute_indicator(
         elif ind in ("bollinger", "bb", "boll"):
             if bollinger is not None:
                 mid, upper, lower = bollinger(s, n)
-                # return mid as primary; embed bands in values as dicts? keep values as mid
+                # 仅返回中轨作为主序列，保持返回结构统一
                 values = [float(x) if pd.notna(x) else 0.0 for x in mid.tolist()]
             else:
                 mid = s.rolling(n).mean()
@@ -114,7 +121,7 @@ def compute_indicator(
         elif ind in ("macd",):
             if macd is not None:
                 m_line, sig, hist = macd(s)
-                # return macd line as primary values
+                # 仅返回 MACD 线，保持与单值指标一致的 values 形态
                 values = [float(x) if pd.notna(x) else 0.0 for x in m_line.tolist()]
             else:
                 ef = s.ewm(span=12, adjust=False).mean()
@@ -135,7 +142,7 @@ def compute_indicator(
                 v = float(dd.min())
                 return {"values": [v], "ok": True, "symbol": symbol, "indicator": indicator}
         else:
-            # unknown indicator -> sma fallback
+            # 未知指标回退至 SMA，避免抛出异常影响 Agent 流程
             if sma is not None:
                 res = sma(s, n)
             else:
@@ -165,6 +172,7 @@ def compute_indicator(
     is_concurrency_safe=lambda args: True,
 )
 def compute_sharpe(prices: list) -> Dict[str, Any]:
+    """计算 Sharpe 比率，委托 backtest.metrics 实现。"""
     try:
         import pandas as pd
         from hero_quant.backtest.metrics import sharpe_ratio
@@ -194,6 +202,7 @@ def compute_sharpe(prices: list) -> Dict[str, Any]:
     is_concurrency_safe=lambda args: True,
 )
 def compute_drawdown(prices: list) -> Dict[str, Any]:
+    """计算最大回撤，委托 backtest.metrics 实现。"""
     try:
         import pandas as pd
         from hero_quant.backtest.metrics import max_drawdown
@@ -227,7 +236,7 @@ def compute_drawdown(prices: list) -> Dict[str, Any]:
     is_concurrency_safe=lambda args: True,
 )
 def compute_factor(factor: str, symbol: str = "600519.SH", window: int = 20) -> Dict[str, Any]:
-    # Wrap momentum as return over window using closes
+    """计算因子值；当前仅实现 momentum（N 日收益率），其余返回空占位。"""
     try:
         import pandas as pd
 
@@ -262,4 +271,5 @@ def compute_factor(factor: str, symbol: str = "600519.SH", window: int = 20) -> 
     is_concurrency_safe=lambda args: True,
 )
 def screen_factors(universe: list) -> Dict[str, Any]:
+    """因子筛选占位：返回空结果，保持 schema 兼容。"""
     return {"factors": [], "ok": True, "universe": universe}

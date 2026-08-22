@@ -1,11 +1,11 @@
-"""Research team graph — StateGraph(plan->execute->verify) + Subagents + Saga.
+"""研究团队调度图：StateGraph 编排 plan → 并行分析师 → verify。
 
-Wave B4 + C3:
-- StateGraph with plan -> fanout via Send -> verify -> END (true parallelism)
-- plan node returns Command(goto=[Send("market", state), ...]) for parallel analysts
-- verify merges via Annotated[list, add] reducer (State._add_list)
-- delegationDepth budget 5
-- Wave C3: RetryPolicy + error_handler Saga compensate + BudgetBreaker placeholder
+职责：将单轮研究请求分解为多分析师并行子任务并做轻量综合校验。
+架构位置：agent 层上层编排，基于 LangGraph StateGraph，State 为共享状态与归约容器。
+关键设计：
+- 真并行扇出：plan 节点返回 Command(goto=[Send(...)]) 驱动多 analyst 并发
+- 归约合并：verify 通过 Annotated[list, add] 归约多路输出，delegationDepth 限 5 防递归
+- 容错与预算：RetryPolicy/error_handler 的 Saga 补偿占位，BudgetBreaker 做成本熔断
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ except Exception:  # pragma: no cover - fallback for older import path
     START = "__start__"  # type: ignore
     END = "__end__"  # type: ignore
 
-# Send/Command for fanout — prefer langgraph.types, fallback to graph
+# Send/Command 扇出原语：优先 langgraph.types，回落 graph
 try:
     from langgraph.types import Command, Send  # type: ignore
 except Exception:
@@ -30,27 +30,27 @@ except Exception:
         Command = None  # type: ignore
         Send = None  # type: ignore
 
-# create_agent leaf semantics — optional import, fallback to placeholder
+# 叶节点语义：优先 LangChain create_agent，回落占位
 try:
     from langchain.agents import create_agent  # type: ignore  # LangChain 1.x
 except Exception:
     try:
         from langgraph.prebuilt import create_react_agent as create_agent  # type: ignore
     except Exception:
-        create_agent = None  # placeholder fallback
+        create_agent = None  # type: ignore
 
 from .state import State
 
-# Wave C3 policies — graceful degradation + cost breaker (import placeholder, not hard dep)
+# 策略占位：优雅降级与成本熔断，按需导入
 try:
     from .policies import BudgetBreaker, RetryPolicy, error_handler  # type: ignore
 except Exception:  # pragma: no cover
     BudgetBreaker = RetryPolicy = error_handler = None  # type: ignore
 
-# Budget for delegation depth — prevents infinite recursion
+# 委派深度上限，防无限递归
 MAX_DELEGATION_DEPTH = 5
 
-# Global breaker placeholder (sliding window)
+# 全局成本熔断器（滑动窗口）占位
 _breaker = None
 try:
     if BudgetBreaker is not None:
@@ -58,7 +58,7 @@ try:
 except Exception:
     _breaker = None
 
-# Analyst canonical set + alias resolution
+# 分析师正规范畴与别名归一
 _CANONICAL = ["market", "sentiment", "news", "fundamentals", "factor", "regime", "risk"]
 _ALIAS_MAP = {
     "market": "market",
@@ -74,7 +74,7 @@ _ALIAS_MAP = {
 
 
 def _resolve_targets_from_text(text: str) -> List[str]:
-    """Infer analyst targets from free text (plan/messages)."""
+    """从自由文本推断需扇出的分析师目标."""
     low = (text or "").lower()
     out: List[str] = []
     for kw, node in [
@@ -105,7 +105,7 @@ def _normalize_selected(selected: List[str] | None) -> List[str]:
 
 
 def _leaf_subagent(name: str):
-    """Factory for leaf subagent node — mimics create_agent leaf."""
+    """创建叶分析师节点，占位实现 create_agent 叶语义。"""
 
     def _run(state: State) -> Dict[str, Any]:
         depth = int(state.get("delegation_depth", 0))
@@ -114,11 +114,9 @@ def _leaf_subagent(name: str):
                 "messages": [{"role": "assistant", "content": f"{name}: delegation budget exceeded"}],
                 "subagent_outputs": [{"agent": name, "status": "budget_exceeded"}],
             }
-        # BudgetBreaker check placeholder — if cost too high, fallback
-        # (cost not tracked in state minimal; just consult breaker)
+        # 成本熔断占位：按固定成本探询是否需降级
         if _breaker is not None:
             try:
-                # placeholder cost 0.1 per leaf; check fallback
                 if _breaker.should_fallback(cost=0.1):
                     return {
                         "messages": [{"role": "assistant", "content": f"{name}: budget fallback"}],
@@ -136,7 +134,7 @@ def _leaf_subagent(name: str):
 
 
 def _lazy_command_send():
-    """Lazy import Command/Send to avoid import cost at module load."""
+    """懒加载 Command/Send，避免模块导入时拖慢启动."""
     try:
         from langgraph.types import Command as _C, Send as _S  # type: ignore
 
@@ -151,13 +149,7 @@ def _lazy_command_send():
 
 
 def plan_node(state: State):
-    """Plan phase — decompose query into subtasks and fan-out via Send.
-
-    Returns Command(goto=[Send("market", state), ...]) for true parallelism.
-    Respects delegationDepth budget 5; when depth>=5 returns budget message (no fanout).
-    Infers targets from state["plan"] + messages if plan contains market/sentiment/news keywords;
-    defaults to market+sentiment+news when no keywords found (ensures 3-way fanout).
-    """
+    """计划阶段：分解任务并通过 Send 扇出实现并行调度，超委派深度则直接返回预算提示."""
     depth = int(state.get("delegation_depth", 0))
     if depth >= MAX_DELEGATION_DEPTH:
         return {
@@ -177,12 +169,10 @@ def plan_node(state: State):
     combined = f"{plan_text_src} {last}"
     targets = _resolve_targets_from_text(combined)
     if not targets:
-        # default 3-core for B4-1 when no explicit keywords; keeps test deterministic
         targets = ["market", "sentiment", "news"]
     plan_text = f"plan for: {last[:80]}" if last else "plan: default research"
     Cmd, Snd = _lazy_command_send()
     if Cmd is None or Snd is None:
-        # fallback dict if Command unavailable (keeps import-safe)
         return {
             "messages": [{"role": "assistant", "content": "plan done"}],
             "plan": plan_text,
@@ -199,21 +189,12 @@ def plan_node(state: State):
 
 
 def execute_node(state: State) -> Dict[str, Any]:
-    """Execute phase — legacy sequential fan-out (kept for backward compat).
-
-    New graph uses plan->Send fanout directly; this node remains for non-Send paths
-    and for tests that import it directly.
-    Real impl would use Send() API for true parallelism:
-        return Command(goto=[Send("leaf_factor", state), ...])
-    Minimal merges sequentially to keep deterministic and testable.
-    Also wraps retry placeholder via RetryPolicy.
-    """
+    """执行阶段：旧式串行扇出，保留兼容；新图已由 plan→Send 直连并行."""
     depth = int(state.get("delegation_depth", 0))
     if depth >= MAX_DELEGATION_DEPTH:
         return {
             "messages": [{"role": "assistant", "content": "execute: budget exhausted"}],
         }
-    # RetryPolicy placeholder — not actually retrying here, just shows error_handler path
     subagents = ["factor", "regime", "risk"]
     outputs: list[Dict[str, Any]] = []
     msgs: list[Dict[str, Any]] = []
@@ -222,12 +203,9 @@ def execute_node(state: State) -> Dict[str, Any]:
         try:
             res = leaf(state)
         except Exception as e:
-            # Saga error_handler → compensate
             if error_handler is not None:
                 try:
                     _ = error_handler(state, e)
-                    # In real graph, would return Command(goto="compensate")
-                    # Minimal: record error and continue
                     msgs.append({"role": "assistant", "content": f"{name}: error {e} -> compensate"})
                     continue
                 except Exception:
@@ -244,26 +222,17 @@ def execute_node(state: State) -> Dict[str, Any]:
     }
 
 
-# 轻量 pros/cons 对抗 prompt — 单次生成，不引入 3 轮风险链
+# 轻量多空对抗 prompt：单次综合，避免多轮风险链
 _VERIFY_PROMPT = "请给出多空两面 pros/cons + 置信度"
 
 
 def verify_node(state: State) -> Dict[str, Any]:
-    """Verify phase — grounding / risk check + lightweight pros/cons synthesis.
+    """校验阶段：汇总子代理输出做 pros/cons 多空综合与置信度合成."""
+    prompt = _VERIFY_PROMPT  # noqa: F841
 
-    单次 LLM 式合成（无 3 轮风险链），提炼 TradingAgents 研究团队 pros/cons 思辨：
-    prompt 要求“请给出多空两面 pros/cons + 置信度”，以结构化字符串返回，含
-    pros:[...] cons:[...] confidence:0.x 字段，confidence ∈ [0,1]。
-    """
-    # prompt 占位 — 满足 B4-2 要求 verify prompt 含“请给出多空两面 pros/cons + 置信度”
-    prompt = _VERIFY_PROMPT  # noqa: F841 — prompt reference for inspection
-
-    # 轻量合成：基于 subagent_outputs / intermediate_results 数量给置信度微调，避免固定值显得虚假
     outputs = state.get("subagent_outputs") or state.get("intermediate_results") or []
     n = len(outputs) if isinstance(outputs, list) else 0
-    # 0.55 + 0.05*n capped at 0.85 — 确保 0.x 格式且随覆盖度微升
     confidence = round(min(0.85, 0.55 + 0.05 * max(1, n)), 2) if n else 0.65
-    # 最小可用 pros/cons — 多空两面各 2 条，体现对抗但保持轻量
     pros = [
         "多头: 趋势/动量延续或估值修复预期",
         "pros: positive momentum / sentiment support",
@@ -272,7 +241,6 @@ def verify_node(state: State) -> Dict[str, Any]:
         "空头: 回撤/波动或基本面证伪风险",
         "cons: pullback risk / valuation overhang",
     ]
-    # 结构化字符串 — 满足“以结构化字符串返回”且包含 confidence:0.x 字段
     verification = f"pros:{pros} cons:{cons} confidence:{confidence} | {prompt}"
     return {
         "messages": [{"role": "assistant", "content": verification}],
@@ -284,7 +252,7 @@ def verify_node(state: State) -> Dict[str, Any]:
 
 
 def compensate_node(state: State) -> Dict[str, Any]:
-    """Saga compensation — rollback placeholder."""
+    """Saga 补偿节点：回滚占位."""
     return {
         "messages": [{"role": "assistant", "content": "compensate done"}],
         "verification": "compensated",
@@ -292,18 +260,11 @@ def compensate_node(state: State) -> Dict[str, Any]:
 
 
 def build_research_graph(selected: List[str] | None = None):
-    """Build and compile the research team graph (plan -> Send fanout -> verify).
-
-    Args:
-        selected: optional list of analyst keys to fan-out. When None, defaults to
-            ["market","sentiment","news"]. Alias "social" maps to "sentiment".
-            Plan inference still works when called via bare plan_node (text-based).
-    """
+    """构建并编译研究团队图，selected 为空时默认扇出 market/sentiment/news."""
     normalized = _normalize_selected(selected) if selected is not None else ["market", "sentiment", "news"]
 
     graph = StateGraph(State)
 
-    # Closure plan node that captures selected for deterministic fanout
     def _plan(state: State):
         depth = int(state.get("delegation_depth", 0))
         if depth >= MAX_DELEGATION_DEPTH:
@@ -311,7 +272,6 @@ def build_research_graph(selected: List[str] | None = None):
                 "messages": [{"role": "assistant", "content": "plan: delegation budget exceeded"}],
                 "delegation_depth": depth,
             }
-        # Use captured normalized selected as targets (ensures 3 Sends when selected provided)
         targets = normalized if normalized else ["market", "sentiment", "news"]
         msgs = state.get("messages", [])
         last = ""
@@ -342,13 +302,12 @@ def build_research_graph(selected: List[str] | None = None):
     _plan.__name__ = "plan"
     graph.add_node("plan", _plan)
 
-    # Register leaf analyst nodes — include all canonical to avoid missing-node on Send
+    # 注册全部叶节点，避免 Send 目标缺失；执行边均汇至 verify
     all_nodes = set(normalized) | set(_CANONICAL)
     for name in all_nodes:
         graph.add_node(name, _leaf_subagent(name))
         graph.add_edge(name, "verify")
 
-    # Keep legacy execute node as optional (not on hot path) for backward compat
     graph.add_node("execute", execute_node)
     graph.add_node("verify", verify_node)
     graph.add_node("compensate", compensate_node)
@@ -356,12 +315,9 @@ def build_research_graph(selected: List[str] | None = None):
     try:
         graph.add_edge(START, "plan")
     except Exception:
-        graph.set_entry_point("plan")  # fallback for older API
-    # Note: plan -> analysts via Command(Send), analysts -> verify edges above
+        graph.set_entry_point("plan")
     graph.add_edge("verify", END)
-    # compensate is reachable via error_handler Command goto (Saga) — keep isolated for minimal
     graph.add_edge("compensate", END)
 
-    # Compile — no checkpointer for Wave B4 (PostgresSaver in C5)
     compiled = graph.compile()
     return compiled

@@ -1,3 +1,9 @@
+/**
+ * Monitor 运行态监控页（与 Live 同源，布局备份）
+ * - 职责：展示 events.jsonl 增量 tail、OTel 成本熔断、心跳与熔断双桶状态
+ * - 数据流：轮询 /v1/trace/events 等候选地址的 SSE 流，按 offset 增量追加；失败回退 EventSource，附 mock 心跳保活
+ * - 注意：effect 依赖包含 offset/cost/breakerState 以便 mock 能感知最新阈值，真实 SSE 侧以局部 curOffset 为增量游标
+ */
 import { useEffect, useRef, useState } from "react"
 
 type LiveEvent = { ts: string; offset: number; type: string; tool?: string; msg?: string; cost?: number }
@@ -18,14 +24,14 @@ export default function Monitor() {
   const listRef = useRef<HTMLDivElement>(null)
   const esRef = useRef<EventSource | null>(null)
 
-  // 实时 SSE：events.jsonl offset 增量拉取
+  // 订阅 events.jsonl：fetch 流式优先，失败回退 EventSource；paused 时暂停
   useEffect(() => {
     if (paused) return
     let aborted = false
     let curOffset = offset
 
     async function streamFetch() {
-      // 优先尝试 SSE 接口
+      // 按优先级尝试候选 SSE 地址，命中则进入帧解析循环
       const candidates = [
         `/v1/trace/events?offset=${curOffset}`,
         `/v1/events?offset=${curOffset}`,
@@ -68,12 +74,12 @@ export default function Monitor() {
               }
             }
           }
-          return // 成功则不再试下一候选
+          return // 已建立流则不再尝试其他候选
         } catch {
-          // try next
+          // 当前候选失败，静默尝试下一个
         }
       }
-      // 回退：EventSource
+      // fetch 候选均失败，回退 EventSource
       try {
         const es = new EventSource(`/v1/trace/events?offset=${curOffset}`)
         esRef.current = es
@@ -92,7 +98,7 @@ export default function Monitor() {
     }
 
     streamFetch()
-    // Mock 增量（当后端不可达时保持 live 感）
+    // 本地 mock 心跳：后端不可达时保持实时感，低概率追加避免刷屏
     const mock = setInterval(() => {
       if (aborted || paused) return
       // 30% 概率追加 mock
@@ -112,9 +118,11 @@ export default function Monitor() {
       }
     }, 1200)
 
+    // 清理定时器与 SSE，防止切页泄漏
     return () => { aborted = true; clearInterval(mock); esRef.current?.close() }
   }, [paused, offset, cost, breakerState])
 
+  // 事件追加后滚底，保持 tail -f 体验
   useEffect(() => {
     listRef.current?.scrollTo({ top: listRef.current.scrollHeight, behavior: "smooth" })
   }, [events])

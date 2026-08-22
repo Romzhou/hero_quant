@@ -1,31 +1,17 @@
-"""BuildSystemPrompt + Grounding 三级校验入 prompt.
+"""System Prompt 组装与 Grounding 三级校验注入。
 
-260 行简化版，保留 4 大段：
-  1. Output Principles — 输出规范
-  2. Tool / Skill      — 工具与技能声明
-  3. Grounding         — Ground Truth 注入（三级校验载体）
-  4. HARD RULE         — 不可违背硬规则
-
-Grounding 三级校验：
-  L1 ingest  — ledger.ingest(symbol, bars) 建证据
-  L2 assert  — ledger.assert_price(symbol, price) 阻断幻觉
-  L3 prompt  — render_block() 注入 system prompt，LLM 只能引用证据内价格
-
-Usage:
-    from hero_quant.agent.grounding import GroundingLedger
-    from hero_quant.agent.prompt import build_system_prompt
-
-    ledger = GroundingLedger()
-    ledger.ingest("600519.SH", [{"close": 1500.0, "date": "2026-08-19"}])
-    prompt = build_system_prompt(skill_count=5, grounding_block=ledger.render_block())
+职责：以固定四段式组装面向 LLM 的系统提示词，并将 Ground Truth 证据注入可审计位置。
+架构位置：agent 层 prompt 底座，被 ContextManager/Loop 调用，依赖 GroundingLedger 的证据块。
+关键设计：
+- 四段结构：Output Principles / Tool-Skill / Grounding / HARD RULE，保证审计与测试可校验
+- 三级校验：L1 ingest 建证据 → L2 assert 阻断幻觉 → L3 prompt 注入限定引用
+- 防御性保证：即使无证据也保留占位，HARD RULE 与 grounding_block 必出现于终稿
 """
 
 from __future__ import annotations
 
 
-# ---------------------------------------------------------------------------
-# Section templates — kept concise but explicit for tests & audit
-# ---------------------------------------------------------------------------
+# 段模板：保持简洁明确，便于测试与审计校验
 
 OUTPUT_PRINCIPLES = """## Output Principles
 - Be concise, precise, and actionable.
@@ -80,32 +66,16 @@ def build_system_prompt(
     skills_digest: str = "",
     extra_rules: str = "",
 ) -> str:
-    """Build system prompt with Grounding 三级校验 injection.
-
-    Args:
-        skill_count: number of skills available (injected into Tool/Skill section).
-        grounding_block: pre-rendered Ground Truth block (string). If empty and
-            ledger is provided, ledger.render_block() is used.
-        ledger: optional GroundingLedger instance — if given and grounding_block
-            is empty, render_block() is called automatically.
-        skills_digest: optional short skills digest to append under Tool/Skill.
-        extra_rules: optional extra rules appended before HARD RULE.
-
-    Returns:
-        Full system prompt string containing GND injection and HARD RULE.
-    """
-    # Resolve grounding block: explicit string wins, else ledger.render_block()
+    """组装含 Grounding 三级校验的 System Prompt，未提供证据时使用占位块."""
     block = grounding_block
     if not block and ledger is not None:
         try:
             block = ledger.render_block()  # type: ignore[union-attr]
         except Exception:
             block = ""
-    # Fallback placeholder keeps Grounding section valid even when empty
     if not block:
         block = "(no grounding evidence yet — any price quote must be blocked)"
 
-    # Ensure block is string
     if not isinstance(block, str):
         block = str(block)
 
@@ -128,20 +98,17 @@ def build_system_prompt(
 
     prompt = "\n".join(parts)
 
-    # Defensive: guarantee invariants for tests & audits
-    # 1) grounding_block substring must appear verbatim when provided
+    # 防御性：确保关键不变量必出现，便于审计
     if block and block not in prompt:
-        # fallback injection if templating failed (should not happen)
         prompt += f"\n{block}\n"
-    # 2) HARD RULE must appear
     if "HARD RULE" not in prompt:
         prompt += "\n" + HARD_RULE
 
     return prompt
 
 
-# Backwards compat alias — some callers expect build_prompt
 def build_prompt(*args, **kwargs) -> str:
+    """build_system_prompt 的兼容别名."""
     return build_system_prompt(*args, **kwargs)
 
 

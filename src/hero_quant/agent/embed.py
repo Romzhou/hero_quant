@@ -1,13 +1,11 @@
-"""Pluggable dense embedding for vector recall (D3).
+"""可插拔稠密向量嵌入，用于向量召回与上下文折叠。
 
-Replaces SHA256 pseudo 16-dim with dense插拔:
-- providers: sentence-transformers / openai (stub) + offline hash fallback
-- env HERO_EMBED_PROVIDER controls provider: openai | sentence-transformers | offline
-- offline fallback deterministic SHA256-based (no external deps)
-- openai/stubs use semantic token-sum embedding to achieve >0.8 paraphrase similarity
-- store hybrid uses cosine topK
-
-Keeps embedding_summary for ContextManager vector folding (must contain 'embedding').
+职责：为 ContextManager 与记忆检索提供定长 embedding，支持 pgvector 序列化。
+架构位置：agent 层向量底座，被 ContextManager/上层检索调用，维度由 Settings 统一配置。
+关键设计：
+- 多提供方分发：按 HERO_EMBED_PROVIDER 选择 openai/sentence-transformers/offline，无依赖时回落离线
+- 离线确定性：基于 SHA256 的零依赖回落与 token-sum 语义桩，保证近义文本余弦相似度稳定
+- 维度与归一：L2 归一化保证余弦可比，维度经 [8,2048] 夹逼，默认 32
 """
 from __future__ import annotations
 
@@ -16,16 +14,14 @@ import math
 import re
 from typing import Dict, List
 
-# Default dims — dense vector recall: 32 or 64 (higher than old 16)
+# 默认维度：稠密召回常用 32/64，此处统一 32
 _DEFAULT_DIM = 32
 _OFFLINE_DIM = 32
 _SEMANTIC_DIM = 32
 
-# single source dim resolver via Settings (env gate)
-
 
 def get_vector_dim(default: int | None = None) -> int:
-    """Resolve pgvector/embedding dim via Settings (single source), clamped [8,2048]."""
+    """解析向量维度，优先取 Settings.vector_dim 并夹逼到 [8,2048]."""
     try:
         from hero_quant.config.settings import Settings
 
@@ -49,7 +45,7 @@ def get_dim() -> int:
 
 
 def to_pgvector_literal(vec: List[float]) -> str:
-    """Serialize vector for pgvector TEXT literal: '[0.1,0.2,...]'."""
+    """序列化为 pgvector 文本字面量 '[0.1,0.2,...]'."""
     try:
         return "[" + ",".join(f"{float(x):.6f}" for x in vec) + "]"
     except Exception:
@@ -57,7 +53,7 @@ def to_pgvector_literal(vec: List[float]) -> str:
 
 
 def from_pgvector_literal(s: str | List[float]) -> List[float]:
-    """Parse pgvector literal back to list[float]; passthrough if already list."""
+    """解析 pgvector 字面量为 list[float]，已是列表则透传."""
     if isinstance(s, list):
         return [float(x) for x in s]
     if not isinstance(s, str):
@@ -102,10 +98,8 @@ def _active_provider_name() -> str:
     key = str(raw).strip().lower()
     if not key:
         return "offline"
-    # normalize aliases (single source alias map in settings)
     if key in _PROVIDER_ALIASES:
         return _PROVIDER_ALIASES[key]
-    # allow 'openai' substring etc
     if "openai" in key:
         return "openai"
     if "sentence" in key or "sbert" in key:
@@ -125,7 +119,7 @@ def get_active_provider() -> str:
     return _active_provider_name()
 
 
-# --- offline hash embedding (deterministic, no deps) ---
+# 离线 hash 嵌入：零依赖、确定性，基于 SHA256 扩展
 
 def _embed_offline(text: str, dim: int) -> List[float]:
     if not isinstance(text, str):
@@ -143,14 +137,14 @@ def _embed_offline(text: str, dim: int) -> List[float]:
     return vals[:dim]
 
 
-# --- semantic token-sum embedding (openai/sbert stub) ---
+# 语义 token-sum 桩：用于 openai/sbert 不可用时的近义相似度保障
 
 def _tokenize(text: str) -> List[str]:
     return [t for t in re.split(r"[^a-z0-9]+", text.lower()) if t]
 
 
 def _token_vector(token: str, dim: int) -> List[float]:
-    # deterministic per-token vector in [-1, 1] to give zero-mean
+    # 单 token 确定性向量，映射到 [-1,1] 以保证零均值
     h = hashlib.sha256(token.encode("utf-8")).digest()
     vals: List[float] = []
     counter = 0
@@ -159,30 +153,24 @@ def _token_vector(token: str, dim: int) -> List[float]:
         for b in chunk:
             if len(vals) >= dim:
                 break
-            vals.append(b / 127.5 - 1.0)  # map 0..255 -> -1..1
+            vals.append(b / 127.5 - 1.0)
         counter += 1
     return vals[:dim]
 
 
 def _embed_semantic(text: str, dim: int) -> List[float]:
-    """Semantic stub: sum of per-token vectors, L2 normalized.
-    Ensures paraphrases with same tokens have cosine ~1.0,
-    unrelated texts have near 0.
-    """
+    """语义桩：累加 token 向量并 L2 归一，近义文本余弦趋近 1."""
     if not isinstance(text, str):
         text = str(text)
     tokens = _tokenize(text)
     if not tokens:
-        # fallback to offline for empty
         v = _embed_offline(text, dim)
-        # center to [-1,1] then normalize?
         return _l2_normalize([x * 2 - 1 for x in v])
     agg = [0.0] * dim
     for tok in tokens:
         tv = _token_vector(tok, dim)
         for i, val in enumerate(tv):
             agg[i] += val
-    # L2 normalize to unit length for cosine stability
     return _l2_normalize(agg)
 
 
@@ -195,13 +183,10 @@ def _l2_normalize(vec: List[float]) -> List[float]:
 
 def _try_sentence_transformers(text: str, dim: int) -> List[float] | None:
     try:
-        # lazy import; if not installed, return None to fallback
         import importlib.util
 
         if importlib.util.find_spec("sentence_transformers") is None:
             return None
-        # Try actual model — but we don't want to download in CI
-        # Attempt to load cached model if available, else fallback quickly
         from sentence_transformers import SentenceTransformer  # type: ignore
 
         try:
@@ -210,18 +195,13 @@ def _try_sentence_transformers(text: str, dim: int) -> List[float] | None:
             model_name = Settings().sbert_model
         except Exception:
             model_name = "all-MiniLM-L6-v2"
-        # This may attempt download; wrap with timeout not available -> fallback if not cached
-        # We try to load but if fails, return None
         try:
-            # Use local_files_only=True to avoid network
+            # 仅使用本地缓存，避免 CI 触发网络下载
             model = SentenceTransformer(model_name, device="cpu", local_files_only=True)  # type: ignore
             vec = model.encode(text, normalize_embeddings=True).tolist()  # type: ignore
-            # adjust dim: truncate or pad
             if len(vec) >= dim:
-                # L2 already normalized
                 return vec[:dim] if len(vec) != dim else vec
             else:
-                # pad with zeros and renormalize
                 padded = vec + [0.0] * (dim - len(vec))
                 return _l2_normalize(padded)
         except Exception:
@@ -231,7 +211,6 @@ def _try_sentence_transformers(text: str, dim: int) -> List[float] | None:
 
 
 def _try_openai(text: str, dim: int) -> List[float] | None:
-    # Try real OpenAI API if key available; otherwise None to use semantic stub
     try:
         from hero_quant.config.settings import Settings
 
@@ -251,7 +230,6 @@ def _try_openai(text: str, dim: int) -> List[float] | None:
         from openai import OpenAI  # type: ignore
 
         client = OpenAI(api_key=api_key)
-        # OpenAI returns variable dim; we truncate/pad to requested dim then normalize
         resp = client.embeddings.create(input=text, model=model)  # type: ignore
         vec = resp.data[0].embedding  # type: ignore
         if len(vec) >= dim:
@@ -264,7 +242,7 @@ def _try_openai(text: str, dim: int) -> List[float] | None:
 
 
 def embed_batch(texts: List[str], dim: int | None = None) -> List[List[float]]:
-    """Batch embed helper — maps embed over texts with same provider/dim."""
+    """批量嵌入，对同一提供方/维度复用 embed."""
     if not texts:
         return []
     eff_dim = dim if dim is not None else get_vector_dim()
@@ -272,15 +250,8 @@ def embed_batch(texts: List[str], dim: int | None = None) -> List[List[float]]:
 
 
 def embed(text: str, dim: int | None = None) -> List[float]:
-    """Pluggable embed: dispatch by HERO_EMBED_PROVIDER.
-
-    - openai: try OpenAI API then semantic stub
-    - sentence-transformers: try SBERT then semantic stub
-    - offline: deterministic SHA256 hash (legacy style but denser)
-    dim: requested dimension; if None uses provider default (env HERO_VECTOR_DIM or 32).
-    """
+    """按提供方分发嵌入，失败自动回落到语义桩或离线 hash."""
     provider = _active_provider_name()
-    # resolve dim
     if dim is None:
         dim = get_vector_dim()
     else:
@@ -293,7 +264,6 @@ def embed(text: str, dim: int | None = None) -> List[float]:
         if dim < 8 or dim > 2048:
             dim = get_vector_dim()
     if provider == "openai":
-        # try real API, else semantic stub (guaranteed >0.8 for paraphrases)
         v = _try_openai(text, dim)
         if v is not None:
             return v
@@ -303,7 +273,6 @@ def embed(text: str, dim: int | None = None) -> List[float]:
         if v is not None:
             return v
         return _embed_semantic(text, dim)
-    # offline fallback
     return _embed_offline(text, dim)
 
 
@@ -328,13 +297,7 @@ def centroid(vectors: List[List[float]]) -> List[float]:
 
 
 def embedding_summary(messages: List[Dict] | List[str], max_chars: int = 200) -> str:
-    """Generate embedding summary for a list of messages.
-
-    Accepts list of dicts with 'content' key or list of strings.
-    Returns summary string that *must* contain 'embedding' keyword for audit.
-
-    分级记忆: summarize middle tier via centroid similarity, fallback to keyword.
-    """
+    """为消息列表生成含 'embedding' 关键词的向量摘要，用于上下文折叠。"""
     texts: List[str] = []
     for m in messages:
         if isinstance(m, dict):

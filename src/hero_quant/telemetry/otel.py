@@ -1,27 +1,24 @@
-"""OTel three-mode telemetry backbone.
+"""OTel 三档遥测中枢。
 
-Modes:
-- disabled: no export, sharing == disabled
-- shared: anonymized metrics export (legacy enabled/sampling/internal/minimal/anonymous map here)
-- private: full traces+metrics export (legacy full map here)
-
-Env gates use os.environ.get (config gate pattern). Offline stays green via try/except.
+职责：基于环境变量提供 disabled/shared/private 三档遥测与导出能力。
+架构位置：`telemetry` 入口，被会话与全局遥测协调器引用。
+关键设计：`HERO_OTEL_MODE` 与 `OTEL_EXPORTER_OTLP_ENDPOINT` 环境门控；离线安全（无 SDK/无网络静默）；SDK 优先 `LoggerProvider+BatchLogRecordProcessor`，缺失时回退 urllib。
 """
 
 from __future__ import annotations
 
 import os
 
-# Valid modes — normalized lower-case; includes legacy aliases for backwards compat
+# 合法模式（小写归一），含历史别名以保证兼容
 _VALID_MODES = {"disabled", "shared", "private", "enabled", "sampling", "minimal", "full", "internal", "anonymous"}
 _DEFAULT_MODE = "disabled"
 
-# sharing mapping to canonical three gears
+# 共享分级映射：历史别名统一收敛到三档
 _SHARING_MAP = {
     "disabled": "disabled",
     "shared": "shared",
     "private": "private",
-    # legacy aliases
+    # 历史别名
     "enabled": "shared",
     "sampling": "shared",
     "minimal": "shared",
@@ -32,6 +29,7 @@ _SHARING_MAP = {
 
 
 def _normalize_mode(raw: str | None) -> str:
+    """归一化模式字符串，非法回退 disabled。"""
     if not raw:
         return _DEFAULT_MODE
     m = raw.strip().lower()
@@ -41,56 +39,51 @@ def _normalize_mode(raw: str | None) -> str:
 
 
 def get_otel_mode() -> str:
-    """Return current OTel mode from env HERO_OTEL_MODE, default disabled."""
+    """返回当前 OTel 模式（取自 HERO_OTEL_MODE，默认 disabled）。"""
     raw = os.environ.get("HERO_OTEL_MODE", _DEFAULT_MODE)
-    # empty string should fallback to disabled
+    # 空字符串回退 disabled，避免误启用
     if raw is None or raw == "":
         return _DEFAULT_MODE
     norm = raw.strip().lower()
     if norm in _VALID_MODES:
         return norm
-    # Accept any non-empty as-is normalized (future-proof), but ensure disabled fallback for empty
+    # 非空未知值保留归一结果，未来扩展兼容
     return norm if norm else _DEFAULT_MODE
 
 
 class SessionTelemetryCoordinator:
-    """Per-session telemetry coordinator with sharing level."""
+    """会话级遥测协调器 — 封装分级与导出。"""
 
     def __init__(self, mode: str | None = None) -> None:
-        # If mode not provided, fallback to env
+        # 未显式传参时回退环境变量
         if mode is None:
             mode = get_otel_mode()
         self.mode = _normalize_mode(mode)
 
     def sharing(self) -> str:
-        """Return sharing level for current mode.
-
-        Canonical three gears: disabled / shared / private.
-        Legacy modes map via _SHARING_MAP.
-        """
+        """返回共享分级：disabled / shared / private。"""
         return _SHARING_MAP.get(self.mode, "disabled" if self.mode == "disabled" else "shared")
 
     def export(self, payload: dict | None = None) -> None:
-        """Export: LoggerProvider + BatchLogRecordProcessor minimal (fallback urllib). Offline-safe.
+        """按档位导出遥测，离线安全。
 
-        capture/export 分离: capture 侧仅决定是否导出与 payload，export 侧批处理/重试/丢失策略
-        交给 OTel SDK (BatchLogRecordProcessor). 无 SDK 时回退 urllib POST JSON stub.
-        任何路径均保留 try/except，离线不抛。
+        优先 OTel SDK 批量管线，缺失时回退 urllib；任意异常均静默。
         """
+
         if self.mode == "disabled":
             return
         endpoint = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT")
         if not endpoint:
             return
-        # --- try OTel SDK Batch path ---
+        # --- 尝试 OTel SDK 批量管线 ---
         _sdk_available = False
         try:
             try:
-                # capture/export 分离：LoggerProvider + BatchLogRecordProcessor 管线
+                # capture/export 分离：管线由 BatchLogRecordProcessor 负责批处理与重试
                 from opentelemetry.sdk._logs import LoggerProvider  # type: ignore
                 from opentelemetry.sdk._logs.export import BatchLogRecordProcessor  # type: ignore
 
-                # OTLPLogExporter 有多条导入路径，依次尝试
+                # OTLPLogExporter 多路径兼容
                 OTLPLogExporter = None
                 try:
                     from opentelemetry.exporter.otlp.proto.http._log_exporter import (  # type: ignore
@@ -110,20 +103,20 @@ class SessionTelemetryCoordinator:
                 if OTLPLogExporter is None:
                     raise ImportError("OTLPLogExporter not available")
             except ImportError:
-                # SDK / exporter not installed -> fallback to urllib below
+                # SDK / exporter 缺失 -> 回退 urllib
                 raise
             _sdk_available = True
             # 组装管线：LoggerProvider -> BatchLogRecordProcessor -> OTLPLogExporter
             try:
                 exporter = OTLPLogExporter(endpoint=endpoint)  # type: ignore[call-arg]
             except TypeError:
-                # 兼容不同签名：有的版本 endpoint 为位置参数
+                # 兼容不同签名：位置参数形式
                 exporter = OTLPLogExporter(endpoint)  # type: ignore[call-arg]
             processor = BatchLogRecordProcessor(exporter)  # type: ignore
             provider = LoggerProvider()  # type: ignore
             provider.add_log_record_processor(processor)  # type: ignore
 
-            # 获取 OTel logger (provider.get_logger 优先，回退 api get_logger)
+            # 获取 OTel logger（优先 provider，回退 api）
             otel_logger = None
             try:
                 otel_logger = provider.get_logger("hero_quant.telemetry")  # type: ignore
@@ -140,7 +133,7 @@ class SessionTelemetryCoordinator:
 
                 body = _json.dumps(payload or {})
                 try:
-                    # OTel Logs API 常见签名 emit(body=...) / emit(LogRecord)
+                    # 常见签名 emit(body=...) / emit(LogRecord)
                     otel_logger.emit(body=body)  # type: ignore
                 except TypeError:
                     try:
@@ -150,7 +143,7 @@ class SessionTelemetryCoordinator:
                 except Exception:
                     pass
 
-            # flush/shutdown，最小可用：尽力刷出，失败静默；shutdownTimeout 3000 可后补为可配置
+            # 尽力刷出与关闭，失败静默（shutdown/force_flush 兼容不同版本）
             try:
                 if hasattr(provider, "shutdown"):
                     try:
@@ -177,15 +170,15 @@ class SessionTelemetryCoordinator:
                 pass
             return
         except ImportError:
-            # SDK not available -> fallback to urllib
+            # SDK 不可用 -> 回退 urllib
             pass
         except Exception:
-            # SDK 路径任意异常均离线安全静默，若 SDK 已可用则不再回退 urllib
+            # SDK 路径任意异常离线静默；若已可用则不再回退避免重复发送
             if _sdk_available:
                 return
             pass
 
-        # --- fallback: urllib POST JSON stub (回退路径，保留离线安全) ---
+        # --- 回退：urllib 同步 POST JSON ---
         try:
             import json
             import urllib.request
@@ -199,4 +192,5 @@ class SessionTelemetryCoordinator:
         return
 
     def is_enabled(self) -> bool:
+        """是否启用遥测（非 disabled 即启用）。"""
         return self.mode != "disabled"

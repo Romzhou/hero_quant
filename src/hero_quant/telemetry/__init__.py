@@ -1,4 +1,9 @@
-"""hero_quant.telemetry — OTel + structlog + heartbeat + circuit."""
+"""telemetry — 可观测性与韧性控制。
+
+职责：提供 OTel 三档遥测、心跳探活、熔断/限流能力。
+架构位置：`hero_quant.telemetry`，贯穿调用链路与后台探活。
+关键设计：OTel 共享分级（disabled/shared/private）离线安全；心跳双看门狗 + Temporal 侧车；熔断双桶阈值驱动状态机。
+"""
 
 from .circuit import CircuitBreaker, DualBucketRateLimiter, TokenBucket
 from .heartbeat import (

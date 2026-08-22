@@ -1,3 +1,10 @@
+"""腾讯行情 Loader：CN 日线、board_lots 单位与合成回退。
+
+位于 data/loaders 层 CN 主源，markets=["CN"]、unit="board_lots"；
+live 下限流 1s 后请求腾讯 qfq 接口，任意异常回退合成；provenance
+的 unit 需与 A 股手语义一致。
+"""
+
 from datetime import datetime, timedelta
 import time
 import urllib.request
@@ -6,11 +13,15 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+
 class TencentLoader:
+    """腾讯 CN 行情 Loader（board_lots）。"""
+
     markets = ["CN"]
     unit = "board_lots"
 
     def _synthetic_bars(self, symbol, start, end):
+        """生成合成 bars 列表，逐日等差递增，保证离线可运行。"""
         try:
             s = datetime.strptime(start, "%Y-%m-%d")
             e = datetime.strptime(end, "%Y-%m-%d")
@@ -41,6 +52,7 @@ class TencentLoader:
         return bars
 
     def _rate_limit(self):
+        """live 模式下限流 1s，避免触发服务端限频；synthetic 模式直接跳过。"""
         try:
             try:
                 from hero_quant.config.settings import Settings
@@ -59,29 +71,26 @@ class TencentLoader:
             pass
 
     def get_bars(self, symbol, start, end, interval="1d"):
+        """拉取行情，兼容旧参数顺序并遵循 HERO_DATA_MODE 门控。"""
         _intervals = {"1d", "1m", "5m", "15m", "30m", "1h", "1wk", "1mo", "1D", "1W"}
         if start in _intervals and "-" in end and "-" in interval:
             start, end, interval = end, interval, start
-        # HERO_DATA_MODE via Settings (single env gate)
+
         try:
             from hero_quant.config.settings import Settings
             mode = Settings().data_mode
         except Exception:
             import os
             mode = os.environ.get("HERO_DATA_MODE", "synthetic")
-        # Normalize
         if isinstance(mode, str):
             mode = mode.strip().lower()
         else:
             mode = "synthetic"
-        # Synthetic mode: immediate synthetic (真解析仅 live)
         if mode == "synthetic":
             return self._synthetic_bars(symbol, start, end)
 
-        # Live mode: attempt true parsing with rate limit
         self._rate_limit()
         try:
-            # map symbol to tencent code: 600519.SH -> sh600519
             code = symbol.split(".")[0]
             suffix = symbol.split(".")[-1].lower() if "." in symbol else ""
             if suffix in ("sh", "sz"):
@@ -129,15 +138,11 @@ class TencentLoader:
                                 })
                         if len(bars) > 0:
                             return bars
-                # parse failure -> raise ValueError (caller will fallback with log)
                 raise ValueError("no bars parsed, fallback")
         except ValueError as e:
-            # parse failure: raise then fallback synthetic but log; in live still fallback synthetic to keep e2e
             logger.warning("tencent parse failed for %s: %s - fallback synthetic", symbol, e)
             return self._synthetic_bars(symbol, start, end)
         except Exception as e:
-            # Network error in live still fallback synthetic but log
             logger.warning("tencent network error for %s: %s - fallback synthetic", symbol, e)
             return self._synthetic_bars(symbol, start, end)
-        # Fallback synthetic if reaching here
         return self._synthetic_bars(symbol, start, end)

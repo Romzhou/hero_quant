@@ -1,6 +1,7 @@
-"""Hierarchical directory routing for memory entries.
+"""层次化目录路由：按 memory_type 分流与检索。
 
-Minimal port of vibe memory/hierarchy.py 70-379.
+职责：为 MemoryStore 提供文件分目录落盘、扫描与索引能力；上游由 store 的写入/检索调用，下游映射到文件系统。
+设计要点：类别固定为 user/feedback/project/reference，未知类型回落到 base；扫描跳过 archive 等系统文件；索引为轻量 yaml 统计，关键词上限 10。
 """
 
 from __future__ import annotations
@@ -25,10 +26,9 @@ class CategorySummary:
 
 
 class MemoryHierarchy:
-    """Manages hierarchical directory structure for memory entries.
+    """管理记忆的层次化目录结构，兼容扁平历史数据。
 
-    Provides routed access to memory files organized by memory_type,
-    while maintaining backward compatibility with flat-stored entries.
+    职责：按 memory_type 路由读写，维护目录与索引的一致性；不变量为 CATEGORIES 固定集合与 archive 跳过规则。
     """
 
     def __init__(self, base_dir: Path) -> None:
@@ -46,10 +46,7 @@ class MemoryHierarchy:
         return cat_dir
 
     def route_entry(self, memory_type: str, filename: str) -> Path:
-        """Determine storage path: base_dir/{memory_type}/{filename}.
-
-        Creates category directory on demand. Falls back to base_dir for unknown types.
-        """
+        """确定存储路径：命中类别则落到 ``base_dir/{memory_type}/{filename}``，否则回落到 base。"""
         if memory_type in CATEGORIES:
             cat_dir = self._ensure_category_dir(memory_type)
             return cat_dir / filename
@@ -58,6 +55,7 @@ class MemoryHierarchy:
         return self._base_dir / filename
 
     def recover_extensionless_entries(self) -> List[Path]:
+        """修复无后缀的历史条目，符合 frontmatter 的补为 .md。"""
         recovered: List[Path] = []
         for category in CATEGORIES:
             cat_dir = self._base_dir / category
@@ -85,7 +83,7 @@ class MemoryHierarchy:
         return recovered
 
     def scan_all(self) -> List[Path]:
-        """Scan base dir + all category subdirs for *.md files. Skips archive."""
+        """扫描 base 与各类别子目录下的 ``*.md``，跳过归档与系统文件。"""
         self.recover_extensionless_entries()
         results: List[Path] = []
         if self._base_dir.is_dir():
@@ -104,6 +102,7 @@ class MemoryHierarchy:
         return results
 
     def scan_category(self, category: str) -> List[Path]:
+        """扫描指定类别目录下的记忆文件。"""
         cat_dir = self._base_dir / category
         results: List[Path] = []
         if not cat_dir.is_dir():
@@ -115,6 +114,7 @@ class MemoryHierarchy:
         return results
 
     def rebuild_index(self, entries: list) -> None:
+        """按条目重建 ``.hierarchy.yaml`` 轻量索引。"""
         cat_data: Dict[str, CategorySummary] = {cat: CategorySummary() for cat in CATEGORIES}
         for entry in entries:
             mtype = entry.get("memory_type", "") if isinstance(entry, dict) else getattr(entry, "memory_type", "")
@@ -150,6 +150,7 @@ class MemoryHierarchy:
         self._index_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     def _parse_index_keywords(self) -> Dict[str, List[str]]:
+        """解析索引中的类别关键词，失败则返回空。"""
         if not self._index_path.is_file():
             return {}
         result: Dict[str, List[str]] = {}
@@ -178,6 +179,7 @@ class MemoryHierarchy:
         return result
 
     def prune_search_scope(self, query_tokens: Set[str], category_filter: str = "") -> List[Path]:
+        """按 query token 与类别过滤缩小检索范围。"""
         if category_filter:
             if category_filter in CATEGORIES:
                 return self.scan_category(category_filter)
@@ -208,6 +210,7 @@ class MemoryHierarchy:
         return results
 
     def migrate_flat_entry(self, file_path: Path, memory_type: str) -> Optional[Path]:
+        """将扁平历史文件迁移到对应类别子目录。"""
         if not file_path.is_file():
             return None
         if file_path.parent != self._base_dir:

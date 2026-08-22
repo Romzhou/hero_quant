@@ -1,15 +1,15 @@
-"""Minimal factor marketplace billing — factor as asset, billing → attribution closed loop."""
+"""因子市场计费 —— 因子即资产，计费到归因闭环。
+
+职责：提供因子发布、购买与归因统计；架构位置：billing 域，依赖可选 ledger 做来源追溯。
+设计决策：以 tenant 为隔离维度，内存存储因子与购买记录，ledger 仅作追加与溯源的外部同步。
+"""
 from __future__ import annotations
 
 from typing import Dict, List, Optional
 
 
 class BillingService:
-    """Factor marketplace with multi-tenant RLS isolation.
-
-    Keep RLS isolation simple: where tenant == ...
-    No over-engineering: in-memory factors + purchases, optional ledger sync.
-    """
+    """因子市场服务，多租户行级隔离；内存态因子与购买记录，可选 ledger 同步溯源。"""
 
     def __init__(self, ledger=None):
         self.ledger = ledger
@@ -24,6 +24,7 @@ class BillingService:
         tenant: str = "default",
         description: str = "",
     ) -> dict:
+        """发布因子，记录归属租户与定价。"""
         factor = {
             "factor_id": factor_id,
             "name": name,
@@ -32,7 +33,7 @@ class BillingService:
             "description": description,
         }
         self._factors[factor_id] = factor
-        # optional ledger append for provenance (provider tenant)
+        # 同步到 ledger 以保留发布溯源（按提供方 tenant）
         if self.ledger is not None:
             try:
                 self.ledger.append(
@@ -45,11 +46,13 @@ class BillingService:
         return factor
 
     def list_factors(self, tenant: str | None = None) -> List[dict]:
+        """按租户列出因子，未指定则返回全部。"""
         if tenant is None:
             return list(self._factors.values())
         return [f for f in self._factors.values() if f.get("tenant") == tenant]
 
     def get_factor(self, factor_id: str) -> Optional[dict]:
+        """按 ID 获取因子。"""
         return self._factors.get(factor_id)
 
     def purchase(
@@ -58,6 +61,7 @@ class BillingService:
         buyer_tenant: str,
         price: float | None = None,
     ) -> dict:
+        """购买因子，生成购买收据并可选同步 ledger。"""
         factor = self._factors.get(factor_id)
         if factor is None:
             raise ValueError(f"factor not found: {factor_id}")
@@ -82,17 +86,16 @@ class BillingService:
         return receipt
 
     def attribution(self, factor_id: str) -> dict:
-        """Attribution closed loop: purchases + revenue for factor."""
+        """归因闭环：统计指定因子的购买次数与总收入。"""
         relevant = [p for p in self._purchases if p.get("factor_id") == factor_id]
-        # also count from ledger if available and purchases empty fallback
+        # 若 ledger 可用，以其持久化记录作为补充，避免内存重启后统计丢失
         if self.ledger is not None:
             try:
                 _entries = self.ledger.query(tenant=None) if hasattr(self.ledger, "_read_all") else []  # placeholder
             except Exception:
-                _entries = []  # noqa: F841 - placeholder for future use
-            # ledger-based counting as fallback: scan ledger for purchase_factor
-            # we already have _purchases, but if ledger has extra entries not in memory (e.g., restarted service),
-            # include them
+                _entries = []  # noqa: F841 - 占位，未来扩展查询
+            # 若内存与 ledger 不一致（例如服务重启后），以 ledger 为准补齐
+            # 已有内存购买记录，仅当 ledger 更多时才合并
             try:
                 all_entries = self.ledger._read_all()  # type: ignore
                 ledger_purchases = [
@@ -101,9 +104,9 @@ class BillingService:
                     if e.get("record", {}).get("action") == "purchase_factor"
                     and e.get("record", {}).get("factor_id") == factor_id
                 ]
-                # if ledger has more than memory, merge (dedup by count)
+                # 仅当 ledger 记录更多时合并，按计数去重视为增量
                 if len(ledger_purchases) > len(relevant):
-                    # estimate revenue from ledger prices
+                    # 按 ledger 中的价格汇总收入
                     rev = sum(float(e.get("price", 0) or 0) for e in ledger_purchases)
                     return {
                         "factor_id": factor_id,
@@ -116,9 +119,10 @@ class BillingService:
         return {"factor_id": factor_id, "purchases": len(relevant), "revenue": revenue}
 
     def list_purchases(self, tenant: str) -> List[dict]:
-        """RLS: where tenant == buyer_tenant."""
+        """按租户列出购买记录（行级隔离：buyer_tenant == tenant）。"""
         return [p for p in self._purchases if p.get("buyer_tenant") == tenant or p.get("tenant") == tenant]
 
-    # alias for compatibility
+    # 兼容别名
     def list_purchases_by_tenant(self, tenant: str) -> List[dict]:
+        """按租户列出购买记录的兼容别名。"""
         return self.list_purchases(tenant)

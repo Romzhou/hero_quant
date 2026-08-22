@@ -1,9 +1,8 @@
-"""Polars vector base — vectorized indicators with pandas parity.
+"""Polars 向量化基座：与 pandas 指标保持对齐的向量化实现。
 
-Design aligned to Rust+Polars future (Task 6):
-- Provides polars-backed SMA (and scaffolding for 60 operators)
-- Guarantees parity with pandas indicators.sma via rolling_mean
-- API returns pandas Series preserving index for drop-in use
+职责：提供 polars 加速的 sma（及后续多算子脚手架），返回 pandas Series 以便直接替换。
+架构位置：quantlib 向量化层，未来与 Rust 内核协同；当前保证与 indicators.sma 的滚动语义一致。
+关键设计：rolling_mean 的 min_samples/min_periods 与 pandas 对齐；保留原始索引与名称。
 """
 from __future__ import annotations
 
@@ -20,6 +19,7 @@ else:
 
 
 def _require_polars() -> None:
+    """确保 polars 已安装，否则给出明确安装指引。"""
     if pl is None:
         raise ImportError(
             "polars is required for vectorized indicators. Install with: pip install hero-quant[vector]"
@@ -27,6 +27,7 @@ def _require_polars() -> None:
 
 
 def _validate_window(window, default: int = 20) -> int:
+    """校验窗口参数：非正/非法回落默认值。"""
     try:
         w = int(window)
         if w <= 0:
@@ -37,7 +38,7 @@ def _validate_window(window, default: int = 20) -> int:
 
 
 def _to_series(x, name: str = "value") -> pd.Series:
-    """Mirror indicators._to_series for parity."""
+    """与 indicators._to_series 同步的归一化逻辑，保证两者对齐。"""
     if isinstance(x, pd.DataFrame):
         if "close" in x.columns:
             s = x["close"]
@@ -59,16 +60,7 @@ def _to_series(x, name: str = "value") -> pd.Series:
 
 
 def sma_polars(series, window: int = 20, *args, **kwargs) -> pd.Series:
-    """Polars-backed SMA via rolling_mean, pandas parity.
-
-    Mirrors hero_quant.quantlib.indicators.sma semantics:
-    - rolling(window=n, min_periods=n).mean()
-    - handles Series/DataFrame/list/ndarray, empty, NaN/inf, aliases
-
-    Args:
-        series: input data
-        window: rolling window (aliases: n, period, span)
-    """
+    """SMA（Polars 加速）：rolling_mean(window, min_samples=n) 与 pandas 语义一致。"""
     if "n" in kwargs:
         window = kwargs["n"]
     if "period" in kwargs:
@@ -87,8 +79,7 @@ def sma_polars(series, window: int = 20, *args, **kwargs) -> pd.Series:
     idx = s.index
     orig_name = s.name
 
-    # Build polars Series as Float64 to handle NaN correctly
-    # Use numpy float conversion to avoid Int64 NaN construction error
+    # 以 Float64 构造 polars 序列，避免 Int64 对 NaN 的构造错误
     try:
         values = s.values.astype(float).tolist()
     except Exception:
@@ -99,14 +90,14 @@ def sma_polars(series, window: int = 20, *args, **kwargs) -> pd.Series:
 
     pl_s = pl.Series("value", values, dtype=pl.Float64, strict=False)
 
-    # Polars rolling_mean: use min_samples=n to match pandas min_periods=n
+    # min_samples/min_periods 与 pandas min_periods 对齐，保证不足窗口为 null/NaN
     try:
         res_list = pl_s.rolling_mean(window_size=n, min_samples=n).to_list()
     except TypeError:
-        # fallback for older polars API using min_periods
+        # 兼容旧版 polars API
         res_list = pl_s.rolling_mean(window_size=n, min_periods=n).to_list()
 
-    # Convert back to pandas preserving index; None -> NaN via dtype float
+    # 转回 pandas 并保留索引；None 经 dtype float 自动转为 NaN
     result = pd.Series(res_list, index=idx, dtype=float)
     if orig_name is not None:
         result.name = orig_name
@@ -115,17 +106,16 @@ def sma_polars(series, window: int = 20, *args, **kwargs) -> pd.Series:
     return result
 
 
-# Scaffolding for future 60 operators (Rust stubs) — vectorized wrappers
-# These expose pandas API but will be backed by polars/rust kernels
+# 向量化算子脚手架：后续将由 polars/Rust 内核算子替换，目前委托 pandas 保持对齐
 def ema_polars(series, span: int = 20, **kwargs) -> pd.Series:
-    """Placeholder polars EMA — delegates to pandas ewm for parity until Rust kernel."""
+    """EMA（Polars 占位）：暂委托 pandas ewm，保持对齐直至 Rust 内核就绪。"""
     from hero_quant.quantlib.indicators import ema
 
     return ema(series, span=span, **kwargs)
 
 
 def rsi_polars(series, period: int = 14, **kwargs) -> pd.Series:
-    """Placeholder polars RSI — delegates to pandas for parity."""
+    """RSI（Polars 占位）：暂委托 pandas Wilder 实现保持对齐。"""
     from hero_quant.quantlib.indicators import rsi
 
     return rsi(series, period=period, **kwargs)

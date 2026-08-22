@@ -1,4 +1,7 @@
-"""hero_quant.sandbox — L0 AST + L1 policy + abstract sandbox + Landlock probe."""
+"""沙箱包入口 — 汇集 L0 AST 守卫、L1 策略、抽象沙箱与 Landlock 探针。
+
+对外提供统一导入面，缺失 runner 时以兼容存根兜底，保证基础功能可用。
+"""
 
 from .ast_guard import ALLOWED_ROOTS, assert_allowlist, check_import_allowlist, get_allowed_roots
 from .base import BaseSandbox, DockerBackend, LocalShellBackend
@@ -16,7 +19,7 @@ try:
         probe_raw,
         validate_probe_args,
     )
-except Exception:  # pragma: no cover — runner import must not break base package
+except Exception:  # pragma: no cover — runner 缺失时不影响基础沙箱功能
     LAUNCHER_BIN = "landlock-run"  # type: ignore
     LAUNCHER_FAILURE_EXIT = 125  # type: ignore
 

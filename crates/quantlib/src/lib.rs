@@ -1,10 +1,13 @@
-//! hero-quant Rust core — stub exposing hot-path kernels via PyO3.
-//! Minimal proof of extraction: provides sma/ema/rsi stubs with pure-Rust parity logic.
-//! Full 60 kernels to be ported incrementally; this stub proves crate boundary + CI gate.
+//! Quantlib Rust 性能内核
+//! 定位：纯 Rust 实现的行情与回测热路径指标计算，供 Python 通过 PyO3 桥接调用（`quantlib.rust`）。
+//! 已实现：SMA / EMA / RSI / Bollinger / MACD / max_drawdown 等，向 60+ kernels 渐进迁移。
+//! 约定：window/span/period 为 0 时回退默认（SMA/EMA 20、RSI 14、MACD 12/26/9），与 Python 侧缺省对齐。
 
 use pyo3::prelude::*;
 
-/// Pure-Rust SMA: rolling mean with window, returns Option<f64> (None for insufficient data)
+/// SMA 滚动均值
+///
+/// 窗口为 n（为 0 时取 20），返回与输入等长向量，不足窗口处为 None。
 fn sma_vec(data: &[f64], window: usize) -> Vec<Option<f64>> {
     let n = if window == 0 { 20 } else { window };
     let mut out = Vec::with_capacity(data.len());
@@ -23,7 +26,9 @@ fn sma_vec(data: &[f64], window: usize) -> Vec<Option<f64>> {
     out
 }
 
-/// Pure-Rust EMA: ewm(span, adjust=False) min_periods=1
+/// EMA 指数移动平均（EWMA，`adjust=False`，`min_periods=1`）
+///
+/// span 为周期（0 则取 20），`alpha = 2/(n+1)`，首值取首个输入，后续按 `alpha*v + (1-alpha)*prev` 递推。
 fn ema_vec(data: &[f64], span: usize) -> Vec<f64> {
     let n = if span == 0 { 20 } else { span };
     let alpha = 2.0 / (n as f64 + 1.0);
@@ -40,6 +45,10 @@ fn ema_vec(data: &[f64], span: usize) -> Vec<f64> {
     out
 }
 
+/// RSI 相对强弱指标（Wilder 平滑）
+///
+/// period 为 0 则取 14；采用 Wilder EWM `alpha = 1/n` 对 gains/losses 递推平滑，
+/// `RS = avg_gain/avg_loss`，`RSI = 100 - 100/(1+RS)`；全涨时 100，平盘时 50。为与 Python 侧对齐首值固定 50。
 fn rsi_vec(data: &[f64], period: usize) -> Vec<f64> {
     let n = if period == 0 { 14 } else { period };
     if data.is_empty() {
@@ -55,7 +64,7 @@ fn rsi_vec(data: &[f64], period: usize) -> Vec<f64> {
             losses[i] = -d;
         }
     }
-    // Wilder's smoothing alpha = 1/n
+    // Wilder 平滑系数
     let alpha = 1.0 / n as f64;
     let mut avg_gain = 0.0;
     let mut avg_loss = 0.0;
@@ -74,7 +83,7 @@ fn rsi_vec(data: &[f64], period: usize) -> Vec<f64> {
             let rs = avg_gain / avg_loss;
             100.0 - (100.0 / (1.0 + rs))
         };
-        // first element synthetic uses 50
+        // 首值固定 50，避免冷启动偏置并与 Python 合成一致
         if i == 0 {
             out.push(50.0);
         } else {
@@ -84,6 +93,9 @@ fn rsi_vec(data: &[f64], period: usize) -> Vec<f64> {
     out
 }
 
+/// 最大回撤（max drawdown）
+///
+/// 遍历权益曲线维护 cummax，`dd = v/cummax - 1` 取最小负值；空序列返回 0，已是回升则不为正。
 fn max_drawdown_vec(equity: &[f64]) -> f64 {
     if equity.is_empty() {
         return 0.0;
@@ -104,34 +116,41 @@ fn max_drawdown_vec(equity: &[f64]) -> f64 {
     if mdd > 0.0 { 0.0 } else { mdd }
 }
 
-// ── PyO3 wrappers ──
+// ── PyO3 导出（属性参数不动，doc 用于 Python __doc__ 亦可中文） ──
 
+/// PyO3 导出：SMA 滚动均值
 #[pyfunction]
 fn sma(data: Vec<f64>, window: usize) -> PyResult<Vec<Option<f64>>> {
     Ok(sma_vec(&data, window))
 }
 
+/// PyO3 导出：EMA 指数移动平均
 #[pyfunction]
 fn ema(data: Vec<f64>, span: usize) -> PyResult<Vec<f64>> {
     Ok(ema_vec(&data, span))
 }
 
+/// PyO3 导出：RSI（Wilder 平滑，首值 50）
 #[pyfunction]
 fn rsi(data: Vec<f64>, period: usize) -> PyResult<Vec<f64>> {
     Ok(rsi_vec(&data, period))
 }
 
+/// PyO3 导出：最大回撤
 #[pyfunction]
 fn max_drawdown(equity: Vec<f64>) -> PyResult<f64> {
     Ok(max_drawdown_vec(&equity))
 }
 
+/// PyO3 导出：布林带（Bollinger Bands）
+///
+/// 中轨为 SMA(n)，上下轨 `m ± k·σ`，σ 为样本标准差（分母 `n-1`），k 为 NaN 时取 2.0；不足窗口处为 None。
 #[pyfunction]
 fn bollinger(data: Vec<f64>, window: usize, num_std: f64) -> PyResult<(Vec<Option<f64>>, Vec<Option<f64>>, Vec<Option<f64>>)> {
     let n = if window == 0 { 20 } else { window };
     let k = if num_std.is_nan() { 2.0 } else { num_std };
     let mid = sma_vec(&data, n);
-    // std dev rolling
+    // 滚动标准差：逐窗口计算 σ，供上下轨使用
     let mut upper = Vec::with_capacity(data.len());
     let mut lower = Vec::with_capacity(data.len());
     for i in 0..data.len() {
@@ -150,6 +169,9 @@ fn bollinger(data: Vec<f64>, window: usize, num_std: f64) -> PyResult<(Vec<Optio
     Ok((mid, upper, lower))
 }
 
+/// PyO3 导出：MACD
+///
+/// `macd = EMA_fast - EMA_slow`，`signal = EMA(macd)`，`hist = macd - signal`；0 值回退默认 12/26/9。
 #[pyfunction]
 fn macd(data: Vec<f64>, fast: usize, slow: usize, signal: usize) -> PyResult<(Vec<f64>, Vec<f64>, Vec<f64>)> {
     let ef = ema_vec(&data, if fast == 0 { 12 } else { fast });
@@ -160,6 +182,7 @@ fn macd(data: Vec<f64>, fast: usize, slow: usize, signal: usize) -> PyResult<(Ve
     Ok((macd_line, signal_line, hist))
 }
 
+/// Python 模块入口：注册全部指标函数并暴露 __version__
 #[pymodule]
 fn quantlib(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(sma, m)?)?;

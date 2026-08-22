@@ -1,9 +1,8 @@
-"""Python shim for Rust quantlib crate.
+"""Rust 桥接层：优先调用编译期 quantlib 扩展，缺失时回落至 Python 实现。
 
-Tries to import compiled `quantlib` extension (maturin/PyO3); falls back to pure-Python
-indicators so tests/CI pass without Rust toolchain. Proves extraction boundary.
-
-Exposes: sma, ema, rsi, bollinger, macd, max_drawdown, is_rust_available
+职责：为上层提供统一的 sma/ema/rsi/bollinger/macd/max_drawdown 接口，屏蔽是否有 Rust 工具链的差异。
+架构位置：quantlib 的薄封装，位于 Python 与 Rust crate 之间，保持与 indicators 的 API 一致。
+关键设计：运行时探测 IS_RUST；单点回落保证 CI/本地均可运行；返回 pandas 类型以保持可替换性。
 """
 from __future__ import annotations
 
@@ -11,11 +10,11 @@ import importlib.util
 
 import pandas as pd
 
-# detection flag
+# 运行时探测：是否可用 Rust 编译扩展
 IS_RUST = False
 _RUST_MOD = None
 try:
-    # compiled extension is named `quantlib` (cdylib)
+    # 编译产物名为 quantlib（cdylib）
     spec = importlib.util.find_spec("quantlib")
     if spec is not None:
         import quantlib as _rust_ext  # type: ignore
@@ -30,10 +29,11 @@ __version__ = getattr(_RUST_MOD, "__version__", "0.2.0-py-fallback") if _RUST_MO
 
 
 def is_rust_available() -> bool:
+    """是否已加载 Rust 扩展。"""
     return IS_RUST
 
 
-# ── Fallback delegation to Python indicators ──
+# ── 回落至 Python 实现 ──
 from hero_quant.quantlib.indicators import (  # noqa: E402
     bollinger as _py_bollinger,
 )
@@ -45,11 +45,12 @@ from hero_quant.quantlib.indicators import sma as _py_sma  # noqa: E402
 
 
 def _use_rust() -> bool:
+    """判断是否走 Rust 路径。"""
     return IS_RUST and _RUST_MOD is not None
 
 
 def _to_list(series) -> list[float]:
-    """Coerce Series/DataFrame/list to list[float] for Rust Vec<f64>."""
+    """将 Series/DataFrame/list 归一为 list[float]，以适配 Rust Vec<f64>。"""
     import numpy as np
 
     if isinstance(series, pd.DataFrame):
@@ -66,27 +67,28 @@ def _to_list(series) -> list[float]:
         except Exception:
             s = pd.Series(dtype=float)
     s = pd.to_numeric(s, errors="coerce").replace([np.inf, -np.inf], float("nan"))
-    # Rust Vec<f64> cannot carry NaN? we keep NaN as float nan
+    # Rust 侧以 NaN 表示缺失，此处保留 NaN
     return s.tolist()
 
 
 def sma(series, window: int = 20, *args, **kwargs) -> pd.Series:
-    # alias handling mirroring indicators.sma
+    """SMA：优先 Rust，失败回落 Python；语义与 indicators.sma 一致。"""
+    # 兼容别名
     if "n" in kwargs:
         window = kwargs["n"]
     if "period" in kwargs:
         window = kwargs["period"]
     if "span" in kwargs:
         window = kwargs["span"]
-    # try rust path
+    # 尝试 Rust 路径
     if _use_rust():
         try:
             data = _to_list(series)
-            # rust sma expects Vec<f64> + window usize
+            # Rust 期望 Vec<f64> 与窗口大小
             raw = _RUST_MOD.sma([float(x) if x == x else 0.0 for x in data], int(window))
-            # raw is Vec<Option<f64>> -> convert to Series
+            # Vec<Option<f64>> 转 Series，None 映射为 NaN
             vals = [v if v is not None else float("nan") for v in raw]
-            # preserve index if Series
+            # 保留原始索引以保持可替换性
             if isinstance(series, pd.Series):
                 idx = series.index
             elif isinstance(series, pd.DataFrame):
@@ -94,14 +96,15 @@ def sma(series, window: int = 20, *args, **kwargs) -> pd.Series:
             else:
                 idx = None
             out = pd.Series(vals, index=idx)
-            # keep nan for insufficient window as per py impl
+            # 不足窗口的 NaN 与 Python 实现对齐
             return out
         except Exception:
-            pass
+            pass  # 任意异常均回落 Python
     return _py_sma(series, window, *args, **kwargs)
 
 
 def ema(series, span: int = 20, *args, **kwargs) -> pd.Series:
+    """EMA：优先 Rust，失败回落 Python。"""
     if "n" in kwargs:
         span = kwargs["n"]
     if "window" in kwargs:
@@ -111,7 +114,7 @@ def ema(series, span: int = 20, *args, **kwargs) -> pd.Series:
     if _use_rust():
         try:
             data = _to_list(series)
-            raw = _RUST_MOD.ema([float(x) if x == x else 0.0 for x in data], int(span))
+            raw = _RUST_MOD.ema([float(x) if x == x else 0.0 for x in data], int(span))  # NaN 已在 _to_list 归一
             if isinstance(series, pd.Series):
                 idx = series.index
             elif isinstance(series, pd.DataFrame):
@@ -125,6 +128,7 @@ def ema(series, span: int = 20, *args, **kwargs) -> pd.Series:
 
 
 def rsi(series, period: int = 14, *args, **kwargs) -> pd.Series:
+    """RSI：优先 Rust，失败回落 Python；Wilder EWM 实现。"""
     if "n" in kwargs:
         period = kwargs["n"]
     if "window" in kwargs:
@@ -148,7 +152,7 @@ def rsi(series, period: int = 14, *args, **kwargs) -> pd.Series:
 
 
 def bollinger(series, window: int = 20, num_std: float = 2.0, *args, **kwargs):
-    # delegate always to py for simplicity (rust path optional)
+    """布林带：优先 Rust（无别名时），失败回落 Python。"""
     if _use_rust() and "n" not in kwargs and "k" not in kwargs:
         try:
             data = _to_list(series)
@@ -171,6 +175,7 @@ def bollinger(series, window: int = 20, num_std: float = 2.0, *args, **kwargs):
 
 
 def macd(series, fast: int = 12, slow: int = 26, signal: int = 9, *args, **kwargs):
+    """MACD：优先 Rust，失败回落 Python。"""
     if _use_rust():
         try:
             data = _to_list(series)
@@ -190,9 +195,9 @@ def macd(series, fast: int = 12, slow: int = 26, signal: int = 9, *args, **kwarg
 
 
 def max_drawdown(equity) -> float:
+    """最大回撤：优先 Rust，失败回落 Python。"""
     if _use_rust():
         try:
-            # coerce to list
             if isinstance(equity, pd.Series):
                 data = equity.tolist()
             elif isinstance(equity, pd.DataFrame):
@@ -206,5 +211,5 @@ def max_drawdown(equity) -> float:
     return _py_mdd(equity)
 
 
-# aliases for spec "sma_ema etc"
-sma_ema = sma  # placeholder alias proof
+# 别名占位：保持兼容
+sma_ema = sma

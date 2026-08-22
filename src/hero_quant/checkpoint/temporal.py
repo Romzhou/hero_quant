@@ -1,17 +1,8 @@
-"""Temporal Activity heartbeat 15s + heartbeatDetails 续跑占位 (Wave C5).
+"""Temporal 心跳与续跑占位。
 
-真实 Temporal 用法:
-    from temporalio import activity
-    @activity.defn
-    async def run_backtest_activity(params):
-        activity.heartbeat({"step": 1})
-        details = activity.info().heartbeat_details  # 续跑恢复点
-
-占位实现：
-- HEARTBEAT_INTERVAL_SECONDS = 15
-- heartbeat(details) / get_heartbeat_details() 内存占位
-- HeartbeatHelper 线程/协程心跳循环占位
-- heartbeatDetails 续跑：保存/恢复上次心跳上下文
+职责：提供 Activity 心跳发送、heartbeatDetails 续跑恢复及后台心跳循环。
+架构位置：`checkpoint` 侧车，被长任务与 Temporal Worker 集成引用。
+关键设计：ContextVar + thread-local 双写保证跨协程/线程可见；15s 固定心跳间隔；`HeartbeatHelper` 封装线程/异步双循环，离线时静默兼容真实 `temporalio.activity.heartbeat`。
 """
 
 from __future__ import annotations
@@ -23,10 +14,10 @@ import time
 from typing import Any, Dict, Optional
 
 HEARTBEAT_INTERVAL_SECONDS = 15
-HEARTBEAT_INTERVAL = HEARTBEAT_INTERVAL_SECONDS  # alias
+HEARTBEAT_INTERVAL = HEARTBEAT_INTERVAL_SECONDS  # 兼容别名
 DEFAULT_HEARTBEAT_TIMEOUT = 30  # Temporal activity heartbeatTimeout 占位
 
-# 线程/协程隔离的心跳上下文 — heartbeatDetails 续跑核心
+# 线程/协程隔离的心跳上下文 — heartbeatDetails 续跑核心（ContextVar 保证协程隔离）
 _heartbeat_details_ctx: contextvars.ContextVar[Optional[Dict[str, Any]]] = contextvars.ContextVar(
     "_heartbeat_details", default=None
 )
@@ -34,20 +25,18 @@ _thread_local = threading.local()
 
 
 def _get_thread_details() -> Optional[Dict[str, Any]]:
+    """读取线程局部的心跳详情。"""
     return getattr(_thread_local, "details", None)
 
 
 def _set_thread_details(details: Optional[Dict[str, Any]]) -> None:
+    """写入线程局部的心跳详情。"""
     _thread_local.details = details
 
 
 def heartbeat(details: Dict[str, Any] | Any = None) -> None:
-    """发送心跳 — 记录 heartbeatDetails 供续跑恢复.
-
-    真实 Temporal 会调用 ``activity.heartbeat(details)`` 并受 heartbeatTimeout 约束。
-    占位实现仅做内存记录 + ContextVar 同步，便于单测与本地续跑模拟。
-    """
-    # 归一化为 dict
+    """发送心跳 — 记录 heartbeatDetails 供重试/续跑恢复。"""
+    # 归一化为 dict，便于后续序列化与 Temporal 透传
     if details is None:
         payload: Dict[str, Any] = {"ts": time.time()}
     elif isinstance(details, dict):
@@ -63,7 +52,7 @@ def heartbeat(details: Dict[str, Any] | Any = None) -> None:
         pass
     _set_thread_details(payload)
 
-    # 真实 Temporal 分支占位 — 若在 Temporal worker 上下文中则透传
+    # 真实 Temporal 分支 — 若在 Activity 上下文中则透传，否则静默忽略
     try:
         from temporalio import activity as temporal_activity  # type: ignore
 
@@ -74,11 +63,8 @@ def heartbeat(details: Dict[str, Any] | Any = None) -> None:
 
 
 def get_heartbeat_details() -> Optional[Dict[str, Any]]:
-    """获取上次心跳详情 — 用于 Activity 重试/续跑恢复.
-
-    真实 Temporal: ``activity.info().heartbeat_details`` 或 ``activity.get_heartbeat_details()``
-    """
-    # 优先 ContextVar
+    """获取上次心跳详情，用于 Activity 重试/续跑恢复。"""
+    # 优先 ContextVar（协程隔离更准确）
     try:
         ctx_val = _heartbeat_details_ctx.get()
         if ctx_val is not None:
@@ -89,7 +75,7 @@ def get_heartbeat_details() -> Optional[Dict[str, Any]]:
     if thread_val is not None:
         return dict(thread_val)
 
-    # 尝试 Temporal 原生
+    # 回退：尝试 Temporal 原生 heartbeat_details
     try:
         from temporalio import activity as temporal_activity  # type: ignore
 
@@ -109,17 +95,10 @@ def get_heartbeat_details() -> Optional[Dict[str, Any]]:
 
 
 class HeartbeatHelper:
-    """Activity 心跳辅助 — 每 15s 自动 heartbeat，支持续跑恢复点.
-
-    用法:
-        helper = HeartbeatHelper(interval=15)
-        helper.start({"step": 0})
-        # ... 长任务中 helper.heartbeat({"step": n})
-        details = helper.get_details()  # 续跑时恢复
-        helper.stop()
-    """
+    """Activity 心跳辅助 — 每 15s 自动 heartbeat，支持续跑恢复点。"""
 
     def __init__(self, interval: float = HEARTBEAT_INTERVAL_SECONDS) -> None:
+        # 下限 0.5s，避免过密心跳对调度与网络造成压力
         self.interval = max(0.5, float(interval))
         self._details: Optional[Dict[str, Any]] = None
         self._stop = threading.Event()
@@ -127,15 +106,17 @@ class HeartbeatHelper:
         self._async_task: Optional[asyncio.Task] = None
 
     def start(self, initial_details: Dict[str, Any] | None = None) -> None:
+        """启动后台心跳线程，立即发送一次初始心跳。"""
         self._details = dict(initial_details) if initial_details else {}
         self._stop.clear()
         heartbeat(self._details)
-        # 后台线程每 interval 心跳一次（占位，无真实长任务也可用）
+        # 后台线程每 interval 心跳一次（daemon，避免阻塞进程退出）
         if self._thread is None or not self._thread.is_alive():
             self._thread = threading.Thread(target=self._run_loop, daemon=True, name="temporal-heartbeat")
             self._thread.start()
 
     def _run_loop(self) -> None:
+        """后台线程循环 — 定时透传最近一次 details。"""
         while not self._stop.wait(self.interval):
             try:
                 heartbeat(self._details)
@@ -143,6 +124,7 @@ class HeartbeatHelper:
                 pass
 
     def heartbeat(self, details: Dict[str, Any] | Any) -> None:
+        """手动上报一次心跳并更新本地缓存。"""
         if isinstance(details, dict):
             self._details = dict(details)
         else:
@@ -150,18 +132,21 @@ class HeartbeatHelper:
         heartbeat(self._details)
 
     def get_details(self) -> Optional[Dict[str, Any]]:
+        """获取最近心跳详情，优先本实例缓存。"""
         # 优先本实例，其次全局
         if self._details is not None:
             return dict(self._details)
         return get_heartbeat_details()
 
     def stop(self) -> None:
+        """停止后台线程，最多等待 1s 保证资源回收。"""
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=1.0)
 
     # 异步变体占位
     async def astart(self, initial_details: Dict[str, Any] | None = None) -> None:
+        """异步启动 — 复用同步线程并可选创建异步循环任务。"""
         self.start(initial_details)
         # 异步循环占位（可选）
         try:
@@ -171,6 +156,7 @@ class HeartbeatHelper:
             pass
 
     async def _async_loop(self) -> None:
+        """异步心跳循环 — 与线程循环互补。"""
         while not self._stop.is_set():
             await asyncio.sleep(self.interval)
             try:
@@ -179,6 +165,7 @@ class HeartbeatHelper:
                 pass
 
     async def astop(self) -> None:
+        """异步停止 — 取消异步任务并回收线程。"""
         self.stop()
         if self._async_task is not None:
             try:
@@ -187,8 +174,7 @@ class HeartbeatHelper:
                 pass
 
 
-# 兼容别名 — 供外部 ``from hero_quant.checkpoint.temporal import HeartbeatTimer`` 误引用时友好提示
-# （实际心跳由 HeartbeatHelper 提供）
+# 兼容别名 — 历史导入 `HeartbeatTimer` 指向 HeartbeatHelper
 try:
     HeartbeatTimer = HeartbeatHelper  # type: ignore
 except Exception:

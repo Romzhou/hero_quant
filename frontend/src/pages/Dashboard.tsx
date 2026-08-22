@@ -1,3 +1,8 @@
+/**
+ * Dashboard 看板页
+ * - 职责：聚合展示资产/收益/年化/回撤等核心指标与四域快捷入口、最近活动
+ * - 数据流：当前为静态占位，后续可接 /v1/portfolio/summary 与 events 活动流；卡片 hover 与交错淡入仅为视觉层次
+ */
 export default function Dashboard() {
   return (
     <div className="mx-auto max-w-7xl px-6 py-6">

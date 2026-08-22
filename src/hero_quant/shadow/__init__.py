@@ -1,4 +1,4 @@
-"""hero_quant.shadow — Shadow 2.0 熔断对接风控."""
+"""影子账户包入口 — 汇集台账、风控引擎与归因能力。"""
 
 from .service import (
     ATTRIBUTION_CATEGORIES,

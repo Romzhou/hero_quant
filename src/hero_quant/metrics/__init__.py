@@ -1,16 +1,8 @@
-"""hero_quant.metrics — Prometheus observability hardening.
+"""可观测性 —— prometheus 指标集中注册与辅助方法。
 
-Wave E wall-time governance + observability hardening:
-- histo: hero_quant_wall_time_seconds (operation/status)
-- histo: http_request_duration_seconds (existing, re-exported for compat)
-- counter: hero_quant_governance_wall_time_exceeded_total (operation)
-- gauge: circuit_state already in telemetry/circuit.py (3-state)
-- histo: hero_quant_governance_ledger_append_duration_seconds
-- counter: hero_quant_governance_ledger_append_total
-- counter: hero_quant_governance_dedup_op_total
-All collectors handle duplicate registration (reload-safe).
-
-Provides helper functions observe_wall_time / inc_exceeded used by governance/wall_time.
+职责：注册 wall-time 治理、ledger 追加与 HTTP 相关的 histogram / counter，并提供 observe/inc 辅助。
+架构位置：metrics 层，被 governance / ledger / server 等模块复用。
+设计决策：所有收集器在重复注册时复用既有实例（reload-safe）；wall-time 按 operation/status 分桶，ledger 按 tenant/status 观测。
 """
 
 from __future__ import annotations
@@ -41,6 +33,7 @@ __all__ = [
 
 
 def _get_or_create_histogram(name: str, doc: str, labels: list[str], buckets=None):
+    """获取或创建 Histogram，重复注册时复用已注册实例。"""
     if Histogram is None:
         return None
     try:
@@ -50,18 +43,18 @@ def _get_or_create_histogram(name: str, doc: str, labels: list[str], buckets=Non
         h = Histogram(name, doc, **kw)
         return h
     except Exception as e:
-        # already registered (reload / tests) — reuse existing collector (handle DuplicateTimeseries)
+        # 已注册（重载/测试场景）—— 从 REGISTRY 复用既有收集器
         try:
             if REGISTRY is not None:
-                # try direct name and with suffix variations
+                # 尝试直接名及常见后缀
                 for cand in (name, f"{name}_bucket", f"{name}_count"):
                     if cand in getattr(REGISTRY, "_names_to_collectors", {}):
                         return REGISTRY._names_to_collectors[cand]  # type: ignore[attr-defined]
-                # fallback: search by collector name substring
+                # 回退：按原名查找
                 return REGISTRY._names_to_collectors.get(name)  # type: ignore[attr-defined]
         except Exception:
             pass
-        # also try to find by checking if error indicates duplicate, try registry lookup
+        # 再次尝试按原名直接查找
         try:
             if REGISTRY is not None and name in getattr(REGISTRY, "_names_to_collectors", {}):
                 return REGISTRY._names_to_collectors[name]  # type: ignore[attr-defined]
@@ -71,6 +64,7 @@ def _get_or_create_histogram(name: str, doc: str, labels: list[str], buckets=Non
 
 
 def _get_or_create_counter(name: str, doc: str, labels: list[str]):
+    """获取或创建 Counter，重复注册时复用。"""
     if Counter is None:
         return None
     try:
@@ -86,6 +80,7 @@ def _get_or_create_counter(name: str, doc: str, labels: list[str]):
 
 
 def _get_or_create_gauge(name: str, doc: str, labels: list[str] | None = None):
+    """获取或创建 Gauge，重复注册时复用。"""
     if Gauge is None:
         return None
     try:
@@ -103,7 +98,7 @@ def _get_or_create_gauge(name: str, doc: str, labels: list[str] | None = None):
         return None
 
 
-# -- Wall-time governance metrics (hardening) --
+# wall-time 治理指标（单位：秒，分桶兼顾短耗时与长任务）
 WALL_TIME_SECONDS = _get_or_create_histogram(
     "hero_quant_wall_time_seconds",
     "Wall-time duration in seconds by operation and status",
@@ -111,7 +106,7 @@ WALL_TIME_SECONDS = _get_or_create_histogram(
     buckets=[0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0],
 )
 
-# Alias for tests that may look for hero_quant_wall_time_duration_seconds or wall_time_seconds
+# 兼容别名：部分测试按 wall_time_duration 检索
 WALL_TIME_DURATION = WALL_TIME_SECONDS
 
 WALL_TIME_BUDGET_EXCEEDED = _get_or_create_counter(
@@ -120,7 +115,7 @@ WALL_TIME_BUDGET_EXCEEDED = _get_or_create_counter(
     ["operation"],
 )
 
-# Ledger hardening metrics
+# ledger 追加指标
 LEDGER_APPEND_DURATION = _get_or_create_histogram(
     "hero_quant_governance_ledger_append_duration_seconds",
     "Ledger append wall-time duration in seconds",
@@ -140,8 +135,7 @@ DEDUP_OP_TOTAL = _get_or_create_counter(
     ["op", "status"],
 )
 
-# -- HTTP metrics (re-export for server compatibility) --
-# Note: server.py already defines its own Histogram; we provide shared fallback
+# HTTP 指标（server 已有同名 Histogram 时复用，此处为共享回退）
 REQUEST_DURATION = _get_or_create_histogram(
     "http_request_duration_seconds",
     "HTTP request duration in seconds",
@@ -156,7 +150,7 @@ REQUEST_COUNTER = _get_or_create_counter(
 
 
 def observe_wall_time(operation: str, duration: float, status: str = "success") -> None:
-    """Observe wall-time duration for an operation."""
+    """记录 wall-time 耗时（秒）。"""
     try:
         if WALL_TIME_SECONDS is not None:
             WALL_TIME_SECONDS.labels(operation=operation, status=status).observe(float(duration))
@@ -165,7 +159,7 @@ def observe_wall_time(operation: str, duration: float, status: str = "success") 
 
 
 def inc_wall_time_exceeded(operation: str = "generic") -> None:
-    """Increment wall-time budget exceeded counter."""
+    """累计 wall-time 超预算次数。"""
     try:
         if WALL_TIME_BUDGET_EXCEEDED is not None:
             WALL_TIME_BUDGET_EXCEEDED.labels(operation=operation).inc()
@@ -174,6 +168,7 @@ def inc_wall_time_exceeded(operation: str = "generic") -> None:
 
 
 def observe_ledger_append(tenant: str, duration: float, status: str = "success") -> None:
+    """记录 ledger 追加耗时并计数。"""
     try:
         if LEDGER_APPEND_DURATION is not None:
             LEDGER_APPEND_DURATION.labels(tenant=tenant, status=status).observe(float(duration))
@@ -187,6 +182,7 @@ def observe_ledger_append(tenant: str, duration: float, status: str = "success")
 
 
 def inc_ledger_append(tenant: str, status: str = "success") -> None:
+    """累计 ledger 追加次数。"""
     try:
         if LEDGER_APPEND_TOTAL is not None:
             LEDGER_APPEND_TOTAL.labels(tenant=tenant, status=status).inc()
@@ -195,12 +191,12 @@ def inc_ledger_append(tenant: str, status: str = "success") -> None:
 
 
 def get_wall_time_metrics() -> dict[str, Any]:
-    """Snapshot of wall-time metrics for debugging / tests (reads counter values if possible)."""
+    """获取 wall-time 指标快照，用于调试/测试。"""
     out: dict[str, Any] = {}
-    # Try to read Prometheus exposition via generate_latest parsing fallback - simple counter read
+    # 通过内部 _metrics 判断计数器是否可用（仅用于测试探针）
     try:
         if WALL_TIME_BUDGET_EXCEEDED is not None and hasattr(WALL_TIME_BUDGET_EXCEEDED, "_metrics"):
-            # internal private; provide count
+            # 内部私有结构，仅作可用性探针
             out["exceeded_metric_available"] = True
     except Exception:
         pass

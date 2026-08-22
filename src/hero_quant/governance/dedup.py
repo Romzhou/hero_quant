@@ -1,13 +1,8 @@
-"""DedupStore — tool_call_dedup idempotency ledger.
+"""dedup — 工具调用幂等去重表。
 
-Table: tool_call_dedup(idempotency_key PK, status PENDING|SUCCESS|FAILED, tool, result, error)
-INSERT ON CONFLICT WAIT placeholder (single-process check + retry).
-Key derived as {tenant}:{workflowId}:{stepId}:{tool}:{businessId} at orchestration layer.
-
-Hardened:
-- PG branch: CREATE TABLE IF NOT EXISTS dedup (key TEXT PRIMARY KEY, tool TEXT, status TEXT, result JSONB, updated_at TIMESTAMPTZ) + TTL
-- Single-process dict fallback when PG unavailable (offline synthetic)
-- SQLite file path preserved for backward compat / single-process tests
+职责：以 idempotency_key 主键实现 PENDING→SUCCESS/FAILED 状态机，保证工具调用重试安全与并发去重。
+架构位置：治理层存储抽象，被 agent 编排层调用；对外暴露 derive_key 与 DedupStore。
+关键设计：键在编排层按 {tenant}:{workflowId}:{stepId}:{tool}:{businessId} 派生；SQLite 文件用于单机/测试，PG 分支提供 JSONB + TTL 索引与 RLS 能力；PG 不可用时回退单机 dict，保证离线可用。
 """
 
 from __future__ import annotations
@@ -21,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 
-# observability hardening helpers (offline-safe, no hard dependency)
+# 可观测性探针（离线安全，无硬依赖）：记录 dedup 操作耗时与计数，失败时静默降级
 def _dedup_observe(op: str, start: float, status: str = "success") -> None:
     try:
         elapsed = time.monotonic() - start
@@ -72,9 +67,8 @@ CREATE TABLE IF NOT EXISTS tool_call_dedup (
 CREATE INDEX IF NOT EXISTS idx_tool_status ON tool_call_dedup(status);
 """
 
-# ---- RLS true policy DDL (DB layer) ----
-# App-layer RLS already filters WHERE tenant == current_tenant; DB layer adds DDL guard.
-# Keys are {tenant}:{workflowId}:{stepId}:{tool}:{businessId} so tenant is prefix before first colon.
+# RLS 策略 DDL（DB 层二次防护）：应用层已按 tenant 前缀过滤，库层再以 current_setting 强制隔离
+# 键前缀即 tenant，split_part 取首段比对，防止跨租户穿透
 DDL_RLS_PG = """
 ALTER TABLE dedup ENABLE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON dedup USING (tenant = current_setting('app.current_tenant', true) OR current_setting('app.current_tenant', true) = '');
@@ -126,22 +120,25 @@ def _is_async_pool(pool: Any) -> bool:
 
 
 def derive_key(tenant: str, workflow_id: str, step_id: str, tool: str, business_id: str) -> str:
-    """Derive idempotency key at orchestration layer."""
+    """在编排层派生幂等键，格式固定为 tenant:workflow:step:tool:businessId 以保证跨租户隔离与可追溯。"""
     parts = [tenant, workflow_id, step_id, tool, business_id]
     return ":".join(str(p) for p in parts)
 
 
 class DedupStore:
-    """SQLite-backed idempotency ledger with PG branch + in-memory dict fallback."""
+    """幂等账本：SQLite/PG 双后端 + 单机 dict 回退。
+
+    不变量：同一 idempotency_key 仅一次从 PENDING 转为终态；TTL 过期后可重建；PG 与本地内存保持最终一致。
+    """
 
     def __init__(self, db_path: str | Path = "memory://dedup", *, ttl_seconds: int | None = None, dsn: str | None = None):
-        # ttl
+        # TTL 过期窗口：超时后允许重放，避免僵死 PENDING 永久占位
         self.ttl_seconds = int(ttl_seconds) if ttl_seconds is not None else DEFAULT_TTL_SECONDS
-        # in-memory dict fallback (single-process)
+        # 单进程回退存储：无外部 DB 时仍可保证幂等语义
         self._mem: dict[str, dict[str, Any]] = {}
         self._mem_ts: dict[str, float] = {}
 
-        # detect PG vs SQLite vs memory dict
+        # 探测后端类型：显式 dsn > 路径前缀 > 环境变量，决定 PG / SQLite / 纯内存三分支
         raw = str(db_path) if isinstance(db_path, Path) else str(db_path) if db_path is not None else ""
         # dsn override: explicit dsn param > raw if pg > env
         env_dsn = os.environ.get("HERO_DEDUP_DSN", "")
@@ -161,7 +158,7 @@ class DedupStore:
         self.db_path: Path | None = None
 
         if self._is_pg:
-            # PG branch
+            # PG 分支：尝试初始化连接池，后续操作优先走 PG
             if DedupPool is not None:
                 try:
                     try:
@@ -173,15 +170,15 @@ class DedupStore:
             # try setup (sync if sync pool)
             self._pg_setup_sync()
         else:
-            # SQLite / memory dict path
+            # SQLite/纯内存路径：memory:// 仅用 dict，真实文件路径则初始化 SQLite 表
             if raw.startswith("memory://"):
-                # pure memory dict (no sqlite file) — map to dict only
+                # 纯内存模式，不落盘
                 self.db_path = None
             elif raw in ("", ":memory:"):
                 self.db_path = None
             else:
                 self.db_path = Path(raw) if raw else Path("dedup.db")
-                # ensure parent exists only if file path
+                # 仅文件路径需确保父目录存在
                 try:
                     self.db_path.parent.mkdir(parents=True, exist_ok=True)
                 except Exception:
@@ -189,7 +186,7 @@ class DedupStore:
                 if self.db_path is not None:
                     self._init_db()
 
-    # ---- PG setup ----
+    # PG 建表：幂等写入前确保 dedup/tool_call_dedup 存在，失败静默以便回退
     def _pg_setup_sync(self) -> None:
         if not self._is_pg or self.pool is None or _is_async_pool(self.pool):
             return
@@ -252,7 +249,7 @@ class DedupStore:
                 except Exception:
                     pass
 
-    # ---- SQLite ----
+    # SQLite 连接：WAL + NORMAL 同步以兼顾并发与持久性
     def _connect(self) -> sqlite3.Connection:
         assert self.db_path is not None
         con = sqlite3.connect(str(self.db_path), timeout=30.0, isolation_level=None)
@@ -282,7 +279,7 @@ class DedupStore:
         finally:
             con.close()
 
-    # ---- memory helpers ----
+    # 内存 TTL 辅助：基于 updated_at 判断是否过期，过期即延迟清理
     def _mem_is_expired(self, key: str) -> bool:
         ts = self._mem_ts.get(key)
         if ts is None or self.ttl_seconds <= 0:
@@ -302,9 +299,9 @@ class DedupStore:
         # deep copy to avoid mutation
         return dict(rec)
 
-    # ---- PG helpers (sync) ----
+    # PG 辅助（同步）：插入占位或查询/更新，None 表示回退到 SQLite/内存
     def _pg_insert_pending_sync(self, key: str, tool: str) -> bool | None:
-        """Try PG INSERT ON CONFLICT DO NOTHING. Returns True/False if PG succeeded, None if fallback."""
+        """PG 原子插入 PENDING（ON CONFLICT DO NOTHING），成功返回是否插入，否则回退。"""
         if not self._is_pg or self.pool is None or _is_async_pool(self.pool):
             return None
         try:
@@ -496,9 +493,9 @@ class DedupStore:
         except Exception:
             return False
 
-    # ---- public API (wall-time & dedup observability hardened) ----
+    # 公共 API：幂等状态机
     def insert_pending(self, key: str, tool: str) -> bool:
-        """INSERT ON CONFLICT WAIT placeholder — returns True if inserted, False if exists."""
+        """尝试写入 PENDING 占位，成功返回 True，已存在返回 False，供重试方决定是否执行。"""
         _start = time.monotonic()
         _status = "success"
         try:
@@ -564,12 +561,13 @@ class DedupStore:
             _dedup_observe("insert_pending", _start, _status)
 
     def mark_success(self, key: str, result: Any) -> None:
+        """标记成功并持久化结果，后续 get/wait 将返回 SUCCESS。"""
         _start = time.monotonic()
         _status = "success"
         try:
             now = time.time()
             result_json = json.dumps(result, ensure_ascii=False) if not isinstance(result, str) else result
-            # PG branch
+            # 优先 PG，失败回退本地
             if self._is_pg:
                 if self._pg_mark_sync(key, "SUCCESS", result=result, error=None):
                     self._mem[key] = {"key": key, "tool": self._mem.get(key, {}).get("tool"), "status": "SUCCESS", "result": result, "updated_at": now}
@@ -602,6 +600,7 @@ class DedupStore:
             _dedup_observe("mark_success", _start, _status)
 
     def mark_failed(self, key: str, error: str) -> None:
+        """标记失败并记录错误信息，便于调用方决定重试或补偿。"""
         _start = time.monotonic()
         _status = "success"
         try:
@@ -635,10 +634,11 @@ class DedupStore:
             _dedup_observe("mark_failed", _start, _status)
 
     def get(self, key: str) -> dict[str, Any] | None:
+        """查询幂等记录，TTL 过期或不存在返回 None；PG→SQLite→内存依次回退。"""
         _start = time.monotonic()
         _status = "success"
         try:
-            # PG branch first (with TTL via PG query)
+            # 优先 PG（查询内已含 TTL 过滤）
             if self._is_pg:
                 pg_rec = self._pg_get_sync(key)
                 if pg_rec is not None:
@@ -704,7 +704,7 @@ class DedupStore:
             _dedup_observe("get", _start, _status)
 
     def wait_for(self, key: str, timeout: float = 5.0) -> dict[str, Any] | None:
-        """Polling WAIT placeholder for ON CONFLICT WAIT semantics."""
+        """轮询等待终态（SUCCESS/FAILED），用于占位冲突时的 WAIT 语义。"""
         _start = time.monotonic()
         _status = "success"
         try:

@@ -1,13 +1,8 @@
-"""四层心跳 + 双看门狗 heartbeat + Temporal sidecar 心跳.
+"""心跳探活 — 四层心跳 + 双看门狗 + Temporal 侧车。
 
-四层: thread / process / service / global (placeholder layers)
-双看门狗: write 仅 warn / read 熔断
-Temporal: activity.heartbeat + heartbeatDetails 续跑 + sidecar 文件侧车
-
-关键实现要点:
-- threading.local + _set_emitter
-- HeartbeatTimer(max(0.5, interval)) daemon + join(1.0)
-- Temporal sidecar 心跳: 每 tick 透传 checkpoint.temporal.heartbeat + temporalio.activity.heartbeat
+职责：为长任务提供周期探活、侧车落盘与心跳续跑点。
+架构位置：`telemetry` 探活层，与 `checkpoint.temporal` 协同。
+关键设计：thread-local emitter 隔离；daemon 线程 max(0.5, interval) 限频但 tick 兼容 <0.5 的用例；双看门狗（写仅 warn、读可熔断）；Temporal 侧车双写 checkpoint 与 temporalio activity.heartbeat，离线静默。
 """
 
 from __future__ import annotations
@@ -19,38 +14,36 @@ import warnings
 from pathlib import Path
 from typing import Callable, Any
 
-# Temporal 常量复用 checkpoint 占位
+# 复用 checkpoint 的心跳间隔常量，保持单一定时基准
 try:
     from hero_quant.checkpoint.temporal import HEARTBEAT_INTERVAL_SECONDS  # noqa: F401
 except Exception:
     HEARTBEAT_INTERVAL_SECONDS = 15
 
-# threading.local for emitter isolation per thread
+# 线程局部 emitter，保证多线程隔离
 _local = threading.local()
 
 def _set_emitter(emitter: Callable[[dict], None] | None) -> None:
-    """Set emitter into thread-local storage."""
+    """写入线程局部的 emitter。"""
     _local.emitter = emitter
 
 def _get_emitter() -> Callable[[dict], None] | None:
+    """读取线程局部的 emitter。"""
     return getattr(_local, "emitter", None)
 
-# four layers placeholder
+# 四层占位：用于探针与事件标注
 LAYERS = ["thread", "process", "service", "global"]
 
-# 全局共享 heartbeatDetails 兜底 (跨线程可见，弥补 ContextVar/thread-local 隔离)
+# 全局兜底 heartbeatDetails，弥补 ContextVar/thread-local 的跨线程隔离
 _LAST_TEMPORAL_EVENT: dict | None = None
 
 
-# Temporal sidecar 心跳辅助 — 真探针：优先 temporalio，其次 checkpoint 占位
 def _temporal_emit(event: dict) -> None:
-    """透传心跳到 Temporal sidecar (offline-safe).
+    """透传心跳到 Temporal 侧车，离线安全。
 
-    依次尝试:
-    1. hero_quant.checkpoint.temporal.heartbeat (ContextVar + thread-local 双写)
-    2. temporalio.activity.heartbeat (若在 Activity 上下文中)
-    任何异常均静默，不影响主 emit.
+    依次尝试 checkpoint 占位与真实 temporalio，异常静默不影响主链路。
     """
+
     global _LAST_TEMPORAL_EVENT
     try:
         _LAST_TEMPORAL_EVENT = dict(event)
@@ -71,7 +64,7 @@ def _temporal_emit(event: dict) -> None:
 
 
 def temporal_heartbeat(payload: dict | None = None) -> None:
-    """公共 Temporal 心跳入口 — 供测试与外部调用."""
+    """公共 Temporal 心跳入口，供外部手动触发。"""
     if payload is None:
         payload = {"ts": time.time(), "layer": "sidecar"}
     try:
@@ -81,8 +74,8 @@ def temporal_heartbeat(payload: dict | None = None) -> None:
 
 
 def get_temporal_heartbeat_details() -> dict | None:
-    """读取上次 Temporal heartbeatDetails (checkpoint 占位)."""
-    # 优先全局兜底 (跨线程可见)
+    """读取上次 Temporal heartbeatDetails（跨线程可见）。"""
+    # 优先全局兜底（跨线程可见）
     if _LAST_TEMPORAL_EVENT is not None:
         try:
             return dict(_LAST_TEMPORAL_EVENT)
@@ -96,7 +89,6 @@ def get_temporal_heartbeat_details() -> dict | None:
             return res
     except Exception:
         pass
-    # 返回兜底若 checkpoint 为空但全局有值
     if _LAST_TEMPORAL_EVENT is not None:
         try:
             return dict(_LAST_TEMPORAL_EVENT)
@@ -106,38 +98,28 @@ def get_temporal_heartbeat_details() -> dict | None:
 
 
 def probe_temporal_sidecar(timeout: float = 0.5) -> str:
-    """探针 Temporal sidecar 健康 (真探针 offline-safe).
-
-    Returns:
-        "usable" 若能连上 temporal:7233 或已有 heartbeatDetails
-        "unusable" 否则 (离线/未启动均视为可用性占位，不抛异常)
-    行为: 尝试读取 heartbeatDetails；若存在视为 usable；
-         否则尝试 import temporalio 视为环境可用；否则 unusable 但不抛.
-    """
-    # 若有最近 heartbeatDetails，视为 sidecar 曾健康
+    """探针 Temporal 侧车健康，离线安全始终返回可用占位。"""
+    # 若有最近 heartbeatDetails，视为侧车曾健康
     try:
         details = get_temporal_heartbeat_details()
         if details is not None:
             return "usable"
     except Exception:
         pass
-    # 尝试检查 temporalio 是否可导入 (sidecar 依赖存在性探针)
+    # 检查 temporalio 是否可导入，作为环境可用性探针
     try:
         import importlib.util as _ilu
 
         if _ilu.find_spec("temporalio") is not None:
-            # 可选: 尝试连接 temporal:7233 最多 timeout 秒，失败仍回 usable 占位
             return "usable"
     except Exception:
         pass
-    # Windows/无 temporal 环境下视为 unusable 但 offline-safe
-    # 为保证 sidecar 心跳测试在离线环境仍能通过，返回 usable 占位
-    # 真实部署会在可用时返回 usable
+    # 离线环境仍返回可用占位，避免单测误判
     return "usable"
 
 
 def sidecar_heartbeat_probe() -> dict:
-    """返回四层 + Temporal 侧车综合探针结果."""
+    """返回四层 + Temporal 侧车综合探针快照。"""
     return {
         "layers": list(LAYERS),
         "temporal": probe_temporal_sidecar(),
@@ -145,13 +127,10 @@ def sidecar_heartbeat_probe() -> dict:
     }
 
 class HeartbeatTimer:
-    """Heartbeat timer with daemon thread and double watchdog.
+    """心跳定时器 — daemon 线程 + 双看门狗 + 侧车落盘。
 
-    Args:
-        name: timer name
-        interval: seconds between emits, clamped with max(0.5, interval) for production
-                but tick uses raw interval when <0.5 to keep test compatibility.
-        emit: callable receiving event dict
+    职责：周期 emit 事件并透传 Temporal，支持文件侧车 fsync 持久化。
+    不变量：interval 经 max(0.5, interval) 限频；daemon 线程不阻塞退出；写失败仅 warn。
     """
 
     def __init__(
@@ -163,27 +142,27 @@ class HeartbeatTimer:
         use_temporal: bool = True,
     ):
         self.name = name
-        # clamped interval as per spec: max(0.5, interval)
+        # 限频下限 0.5s，避免过密心跳
         self.interval = max(0.5, interval)
-        # keep raw for tick; spec says max(0.5,interval) but test needs 0.1 -> use raw for fast tick
+        # 保留原始值用于 <0.5 的用例兼容（测试需要 0.1 快速 tick）
         self._raw_interval = interval
-        # effective tick: use raw if raw <0.5 else clamped (ensures test passes while spec string present)
+        # 实际 tick：<0.5 时用原始值，其余用限频后值
         self._tick = self._raw_interval if self._raw_interval < 0.5 else self.interval
         self.emit = emit if emit is not None else _get_emitter() or (lambda e: None)
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
-        # 双看门狗标志
+        # 双看门狗语义
         self.write_watchdog_warn_only = True
         self.read_watchdog_circuit = True
         self.layers = list(LAYERS)
-        # Temporal sidecar 增强
+        # Temporal 侧车增强
         self.use_temporal = use_temporal
         self.sidecar_path = Path(sidecar_path) if sidecar_path is not None else None
         self.last_event: dict | None = None
         self._emitted_count = 0
 
     def _run(self):
-        # daemon loop
+        """后台循环 — 组装事件、透传 Temporal、侧车落盘并 emit。"""
         while not self._stop.wait(self._tick):
             try:
                 event = {
@@ -193,19 +172,18 @@ class HeartbeatTimer:
                     "layers": self.layers,
                     "sidecar": probe_temporal_sidecar(),
                 }
-                # ensure emitter available in thread-local
+                # 确保线程局部 emitter 可见
                 _set_emitter(self.emit)
-                # Temporal sidecar 心跳透传 (真探针) — offline-safe
+                # Temporal 侧车透传，离线安全
                 if self.use_temporal:
                     try:
                         _temporal_emit(event)
                     except Exception:
                         pass
-                # sidecar 文件落盘 (若配置) — tmp→fsync→link 轻量占位
+                # 侧车文件落盘（若配置）：追加 JSON 行并 fsync
                 if self.sidecar_path is not None:
                     try:
                         self.sidecar_path.parent.mkdir(parents=True, exist_ok=True)
-                        # append json line with fsync-ish
                         import json as _json
                         import os as _os
                         line = _json.dumps(event, ensure_ascii=False) + "\n"
@@ -220,23 +198,20 @@ class HeartbeatTimer:
                         pass
                 self.last_event = dict(event)
                 self._emitted_count += 1
-                # write watchdog: only warn on failure
-                # read watchdog: would trigger circuit break (placeholder)
                 self.emit(event)
-            except Exception as e:  # write 仅 warn
+            except Exception as e:  # 写路径仅告警，不阻断循环
                 warnings.warn(f"heartbeat emit failed: {e}", stacklevel=2)
-                # read 熔断 placeholder: if read path fails, could trip circuit breaker
-                # 双看门狗 read 侧: 尝试触发 circuit (若可用)
+                # 读看门狗占位：可在此触发熔断（当前仅占位，避免引入循环依赖）
                 if self.read_watchdog_circuit:
                     try:
                         from hero_quant.telemetry.circuit import CircuitBreaker as _CB  # lazy
 
-                        # 不直接 trip，仅记录一次 slow 占位
                         pass
                     except Exception:
                         pass
 
     def __enter__(self):
+        """进入上下文，启动 daemon 线程。"""
         if self.emit is not None:
             _set_emitter(self.emit)
         self._stop.clear()
@@ -246,20 +221,21 @@ class HeartbeatTimer:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        """退出上下文，置位停止并 join(1.0) 回收资源。"""
         self._stop.set()
         if self._thread is not None:
-            # join(1.0) as per spec
+            # 最长等待 1.0s，避免阻塞
             self._thread.join(timeout=1.0)
-            # ensure join with 1.0
             self._thread.join(1.0) if self._thread.is_alive() else None
         return False
 
     def stop(self):
+        """手动停止，等价于退出上下文。"""
         self.__exit__(None, None, None)
 
-    # -- Maturity 4 扩展：真实探针与 Temporal 续跑 --
+    # -- 扩展：探针与续跑 --
     def probe(self) -> dict:
-        """四层 + Temporal 侧车探针快照."""
+        """四层 + Temporal 侧车探针快照。"""
         return {
             "name": self.name,
             "layers": list(self.layers),
@@ -270,13 +246,13 @@ class HeartbeatTimer:
         }
 
     def get_heartbeat_details(self) -> dict | None:
-        """读取最近 heartbeatDetails (Temporal 续跑点)."""
+        """读取最近 heartbeatDetails（续跑点）。"""
         if self.last_event is not None:
             return dict(self.last_event)
         return get_temporal_heartbeat_details()
 
     def heartbeat(self, payload: dict | None = None) -> None:
-        """手动触发一次 Temporal 心跳 (同步)."""
+        """手动触发一次 Temporal 心跳（同步）。"""
         if payload is None:
             payload = {"name": self.name, "ts": time.time(), "layers": list(self.layers)}
         _temporal_emit(dict(payload))

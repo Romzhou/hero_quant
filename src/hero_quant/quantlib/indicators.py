@@ -1,7 +1,8 @@
-"""Production-core quantlib indicators — pure pandas/numpy/scipy, no external deps.
+"""指标库：纯 pandas/numpy 的核心技术指标（无外部依赖）。
 
-Implements: sma, ema, rsi (Wilder/EWM), bollinger, macd, max_drawdown.
-Handles Series/DataFrame/list/ndarray, empty, NaN/inf guards, window validation.
+职责：提供 sma/ema/rsi/bollinger/macd/max_drawdown，供回测/研究/工具调用。
+架构位置：quantlib 基础层，被 rust/polars 上层封装复用；保证空数据/NaN/Inf 鲁棒性。
+关键设计：rsi 采用 Wilder EWM（alpha=1/n）；bollinger 以滚动均值±k·std；macd 为快慢 EMA 差。
 """
 from __future__ import annotations
 
@@ -10,13 +11,7 @@ import pandas as pd
 
 
 def _to_series(x, name: str = "value") -> pd.Series:
-    """Coerce input to pd.Series handling DataFrame/list/ndarray/Series.
-
-    - DataFrame: use 'close' if exists else first column
-    - list/ndarray: convert
-    - Series: copy with numeric coercion
-    Replaces inf with NaN, coerces to numeric.
-    """
+    """将任意输入归一为数值型 Series：DataFrame 优先 close/equity/首列，非法/Inf 置为 NaN。"""
     if isinstance(x, pd.DataFrame):
         if "close" in x.columns:
             s = x["close"]
@@ -42,6 +37,7 @@ def _to_series(x, name: str = "value") -> pd.Series:
 
 
 def _validate_window(window, default: int = 20) -> int:
+    """校验窗口参数：非正/非法回落至默认值，保证滚动窗口有效。"""
     try:
         w = int(window)
         if w <= 0:
@@ -52,101 +48,83 @@ def _validate_window(window, default: int = 20) -> int:
 
 
 def sma(series, window: int = 20, *args, **kwargs) -> pd.Series:
-    """Simple moving average: rolling mean.
-
-    Args:
-        series: Series/DataFrame/list
-        window: rolling window (also accepts n, period, span as aliases)
-    """
-    # alias handling: sma(s, 3) or sma(s, n=3) or window as second positional
+    """SMA 简单移动平均：rolling(window, min_periods=n).mean()，不足窗口为 NaN。"""
+    # 兼容别名 n/period/span
     if args:
-        # if window was passed as series and second arg is window
-        pass
-    # kwargs aliases
+        pass  # 保留位置参数兼容位，当前无需额外处理
     if "n" in kwargs:
         window = kwargs["n"]
     if "period" in kwargs:
         window = kwargs["period"]
     if "span" in kwargs:
         window = kwargs["span"]
-    # also handle window passed as e.g. window= None
     n = _validate_window(window, default=20)
     s = _to_series(series)
     if s.empty:
         return s
-    # keep original index
+    # 滚动均值：需满窗口才出值，保持与 polars 版本一致
     return s.rolling(window=n, min_periods=n).mean()
 
 
 def ema(series, span: int = 20, *args, **kwargs) -> pd.Series:
-    """Exponential moving average via ewm(span=span, adjust=False)."""
-    # alias handling
+    """EMA 指数移动平均：ewm(span=n, adjust=False, min_periods=1).mean()。"""
+    # 兼容别名 n/window/period
     if "n" in kwargs:
         span = kwargs["n"]
     if "window" in kwargs:
         span = kwargs["window"]
     if "period" in kwargs:
         span = kwargs["period"]
-    # if span passed positionally as second arg via *args? not needed
     n = _validate_window(span, default=20)
     s = _to_series(series)
     if s.empty:
         return s
-    return s.ewm(span=n, adjust=False, min_periods=1).mean()
+    return s.ewm(span=n, adjust=False, min_periods=1).mean()  # Wilder 风格的指数平滑
 
 
 def rsi(series, period: int = 14, *args, **kwargs) -> pd.Series:
-    """Relative Strength Index 0-100 using Wilder's smoothing (ewm alpha=1/period).
-
-    Replicates vibe 2026-08-11 fix: use ewm not simple rolling.
-    Handles n > len(s) via min_periods=1, NaN/inf guards, clips to [0,100].
-    """
-    # alias handling
+    """RSI 相对强弱(0-100)：Wilder 平滑 ewm(alpha=1/n)，收益/损失分别指数平滑后求 RS。"""
+    # 兼容别名 n/window/span
     if "n" in kwargs:
         period = kwargs["n"]
     if "window" in kwargs:
         period = kwargs["window"]
     if "span" in kwargs:
         period = kwargs["span"]
-    # positional alias if period passed as second arg without keyword and span is default?
-    # already covered by signature
     n = _validate_window(period, default=14)
     s = _to_series(series)
     if s.empty:
         return pd.Series(dtype=float)
-    # if series length 1, diff is NaN -> fillna
+    # 涨跌分解：仅保留同向部分
     delta = s.diff()
     gain = delta.where(delta > 0, 0.0)
     loss = -delta.where(delta < 0, 0.0)
 
-    # Wilder's smoothing: alpha = 1/n
+    # Wilder 平滑：alpha = 1/n，指数加权而非简单滚动，避免滞后失真
     avg_gain = gain.ewm(alpha=1 / n, adjust=False, min_periods=1).mean()
     avg_loss = loss.ewm(alpha=1 / n, adjust=False, min_periods=1).mean()
 
-    rs = avg_gain / avg_loss
-    rsi_series = 100 - (100 / (1 + rs))
+    rs = avg_gain / avg_loss  # 相对强度
+    rsi_series = 100 - (100 / (1 + rs))  # 归一至 0-100
 
-    # Where avg_loss == 0 → RSI 100 (pure gains)
+    # 边界：全为上涨则 RSI=100
     rsi_series = rsi_series.where(avg_loss != 0, 100.0)
-    # Where both avg_gain and avg_loss are 0 (flat series) → 50
+    # 边界：横盘（无涨无跌）则中性 50
     flat_mask = (avg_gain == 0) & (avg_loss == 0)
     rsi_series = rsi_series.where(~flat_mask, 50.0)
 
-    # Any remaining NaN (e.g., first element) → 50
+    # 首元素等 NaN 回落至中性
     rsi_series = rsi_series.fillna(50.0)
-    # inf guard
+    # 无穷保护
     rsi_series = rsi_series.replace([np.inf, -np.inf], np.nan).fillna(50.0)
-    # Clip to [0,100]
+    # 限幅保证有效区间
     rsi_series = rsi_series.clip(lower=0, upper=100)
     return rsi_series
 
 
 def bollinger(series, window: int = 20, num_std: float = 2.0, *args, **kwargs):
-    """Bollinger Bands: returns (middle, upper, lower) via rolling mean+std.
-
-    Aliases: bollinger(s, n=20, k=2), bollinger(s, window, num_std), bollinger(s, 20, 2)
-    """
-    # kwargs aliases
+    """布林带：middle=滚动均值，upper/lower=middle±k·滚动标准差（k 默认 2）。"""
+    # 兼容别名 n/k/std/num_std
     if "n" in kwargs:
         window = kwargs["n"]
     if "k" in kwargs:
@@ -155,9 +133,6 @@ def bollinger(series, window: int = 20, num_std: float = 2.0, *args, **kwargs):
         num_std = kwargs["std"]
     if "num_std" in kwargs:
         num_std = kwargs["num_std"]
-    # handle positional args: if called as bollinger(s, n, k) we already have window,num_std
-    # but if called with args excess, handle
-    # e.g. bollinger(s, 20, 2) -> ok. If someone does bollinger(s, n=20,k=2) covered.
 
     n = _validate_window(window, default=20)
     try:
@@ -165,7 +140,7 @@ def bollinger(series, window: int = 20, num_std: float = 2.0, *args, **kwargs):
     except Exception:
         k = 2.0
     if k < 0:
-        k = 2.0
+        k = 2.0  # 负倍数无意义，回落默认
 
     s = _to_series(series)
     if s.empty:
@@ -173,12 +148,12 @@ def bollinger(series, window: int = 20, num_std: float = 2.0, *args, **kwargs):
         return empty, empty, empty
 
     mid = s.rolling(window=n, min_periods=n).mean()
-    # pandas std uses ddof=1 default; use same for consistency
+    # 滚动标准差 ddof=1 与 pandas 默认一致
     std = s.rolling(window=n, min_periods=n).std(ddof=1)
-    # fill std NaN with 0 for early periods? keep NaN but upper/lower will be NaN as well
+    # 带宽区间：不足窗口时保持 NaN，避免误导
     upper = mid + k * std
     lower = mid - k * std
-    # inf guards
+    # 无穷保护
     mid = mid.replace([np.inf, -np.inf], np.nan)
     upper = upper.replace([np.inf, -np.inf], np.nan)
     lower = lower.replace([np.inf, -np.inf], np.nan)
@@ -186,20 +161,14 @@ def bollinger(series, window: int = 20, num_std: float = 2.0, *args, **kwargs):
 
 
 def macd(series, fast: int = 12, slow: int = 26, signal: int = 9, *args, **kwargs):
-    """MACD via EMA: returns (macd_line, signal_line, hist).
-
-    macd = ema(fast) - ema(slow)
-    signal = ema(macd, signal)
-    hist = macd - signal
-    """
-    # kwargs aliases
+    """MACD：macd=EMA(fast)-EMA(slow)，signal=EMA(macd, signal)，hist=macd-signal。"""
+    # 兼容别名 n_fast/n_slow/n_signal/window
     if "n_fast" in kwargs:
         fast = kwargs["n_fast"]
     if "n_slow" in kwargs:
         slow = kwargs["n_slow"]
     if "n_signal" in kwargs:
         signal = kwargs["n_signal"]
-    # also allow window/fast/slow/signal interchange
     if "window" in kwargs and fast == 12 and "fast" not in kwargs:
         fast = kwargs["window"]
 
@@ -214,11 +183,11 @@ def macd(series, fast: int = 12, slow: int = 26, signal: int = 9, *args, **kwarg
 
     ema_fast = s.ewm(span=fast_n, adjust=False, min_periods=1).mean()
     ema_slow = s.ewm(span=slow_n, adjust=False, min_periods=1).mean()
-    macd_line = ema_fast - ema_slow
-    signal_line = macd_line.ewm(span=signal_n, adjust=False, min_periods=1).mean()
-    hist = macd_line - signal_line
+    macd_line = ema_fast - ema_slow  # 快慢线差
+    signal_line = macd_line.ewm(span=signal_n, adjust=False, min_periods=1).mean()  # 信号线
+    hist = macd_line - signal_line  # 柱状图
 
-    # inf guards
+    # 无穷保护
     macd_line = macd_line.replace([np.inf, -np.inf], np.nan)
     signal_line = signal_line.replace([np.inf, -np.inf], np.nan)
     hist = hist.replace([np.inf, -np.inf], np.nan)
@@ -227,34 +196,26 @@ def macd(series, fast: int = 12, slow: int = 26, signal: int = 9, *args, **kwarg
 
 
 def max_drawdown(equity) -> float:
-    """Maximum drawdown as most negative (equity / cummax - 1).min().
-
-    Handles Series/DataFrame/list, empty, NaN/inf guards.
-    Returns 0.0 for empty or invalid input.
-    """
+    """最大回撤：(equity/cummax-1).min()，空/全 NaN 回落 0。"""
     s = _to_series(equity)
-    # dropna for cummax calc but keep logic: if empty return 0
     if s.empty:
         return 0.0
-    # drop NaN for computation; if all NaN return 0
+    # 剔除 NaN 后计算，若全 NaN 则无有效回撤
     s_clean = s.dropna()
     if s_clean.empty:
         return 0.0
-    # replace 0 cummax to avoid division by zero -> treat as NaN then fill
-    cummax = s_clean.cummax()
-    # avoid division by zero: where cummax ==0, set dd to 0
-    # cummax can be 0 if equity starts at 0; handle
+    cummax = s_clean.cummax()  # 滚动峰值
+    # 避免除零：cummax 为 0 时回撤置零（权益起点为 0 的边界）
     with np.errstate(divide="ignore", invalid="ignore"):
         dd = s_clean / cummax - 1.0
     dd = dd.replace([np.inf, -np.inf], np.nan).fillna(0.0)
     try:
-        mdd = float(dd.min())
+        mdd = float(dd.min())  # 最深回撤
     except Exception:
         return 0.0
     if np.isnan(mdd) or np.isinf(mdd):
         return 0.0
-    # Most negative drawdown; if positive (never drawdown) return 0? Keep as min which would be 0.0
-    # Ensure within [-1, 0]
+    # 单调上涨时回撤为 0，不返回正值
     if mdd > 0:
         mdd = 0.0
     return mdd

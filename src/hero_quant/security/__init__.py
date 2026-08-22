@@ -1,4 +1,4 @@
-"""hero_quant.security — credentials, approval, redaction backbone."""
+"""安全能力入口 — 汇集凭据解析、审批与脱敏三大支柱，对外提供统一导入面。"""
 
 from .approval import ApprovalPolicy, ApprovalService
 from .credentials import REF_PATTERN, resolve

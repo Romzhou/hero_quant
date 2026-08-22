@@ -1,22 +1,12 @@
-"""Landlock probe + fail-closed runner.
+"""沙箱执行器 — Landlock 隔离的 fail-closed 执行层。
 
-Mirrors deepseek-harness native/landlock-run contract (C11 musl static binary):
-  landlock-run [--ro <path>]... [--rw <path>]... -- <argv>...
-  landlock-run --probe
-  Exit 125 on every launcher failure (usage, unenforcing kernel, unopenable grant, failed exec)
-  Report lines: "landlock: fully enforced" / "landlock: partially enforced (older ABI)"
-  Fatal prefix: "landlock-run: " before exit 125
+职责：把 ``BaseSandbox.confine`` 的授权结果落地为 ``landlock-run`` 子进程调用，
+对外暴露 ``probe()`` 作为唯一可用性信号，不直接检查二进制是否存在。
 
-Platform chain (vibe-trading scanner idea):
-  linux   -> landlock-run probe (functional, not --version check)
-  darwin  -> seatbelt (not implemented, returns unusable -> fail-closed)
-  windows -> unusable (no Landlock)
-Consumers use probe() as sole availability signal; launcher_path existence is never checked directly.
-
-Fail-closed: when kernel cannot enforce and caller requires enforcement,
-SandboxUnavailableError is raised and wrapped command is NOT run.
-
-This module does NOT modify trace/ledger durability (no flock/fsync changes).
+安全设计：fail-closed 原则——当 ``workspace-write`` 且 ``require_enforcement=True``
+但内核不支持或二进制缺失时抛 ``SandboxUnavailableError`` 且绝不执行原命令；
+仅 Linux 尝试真实探针，Darwin/Windows 直接判定 ``unusable``；探针与执行均带
+超时，错误统一前缀 ``landlock-run: `` 与退出码 125，便于调用方统一识别。
 """
 from __future__ import annotations
 
@@ -30,39 +20,34 @@ from typing import Dict, List, Tuple
 from .base import BaseSandbox
 
 # ---------------------------------------------------------------------------
-# Contract constants (pinned, mirrors docs/cli-contract.md)
+# 合约常量（与 docs/cli-contract.md 及 landlock-run 二进制保持一致，勿随意改动）
 # ---------------------------------------------------------------------------
 LAUNCHER_FAILURE_EXIT: int = 125
 LAUNCHER_BIN: str = "landlock-run"
 
-# Platform-agnostic verdict
+# 平台无关的执行结果类型
 LandlockEnforcement = str  # 'full' | 'partial' | 'unusable'
 
-# Fatal prefix required by contract — consumers need both exit 125 and this prefix
+# 合约要求的错误前缀——调用方同时依赖退出码 125 与此外缀来判定启动器失败
 _FATAL_PREFIX = "landlock-run: "
 _NOT_ENFORCED_MSG = "landlock is not enforced by this kernel (ABI unsupported or disabled)"
 
 
 class SandboxUnavailableError(RuntimeError):
-    """Fail-closed error: Landlock required but kernel/binary cannot enforce."""
+    """Fail-closed 隔离不可用错误：要求强隔离但内核/二进制无法提供时抛出。"""
 
 
 # ---------------------------------------------------------------------------
-# Launcher path resolution — mirrors deepseek-harness entry package launcherPath()
-# Existence deliberately NOT checked; probe() is the availability signal.
+# 启动器路径解析 —— 仅做路径推导，不检查存在性；是否可用以 probe() 为准
+# 刻意不做存在性检查，避免 TOCTOU；探针是唯一可信信号
 # ---------------------------------------------------------------------------
 
 def launcher_path(
     resolve_via_which: bool = True,
     fallback: str | None = None,
 ) -> str:
-    """Return absolute launcher path for this host (existence unchecked).
-
-    Uses shutil.which when available; otherwise falls back to a non-existent
-    absolute path inside the package's node_modules boundary so that
-    probe() correctly reports unusable.
-    """
-    # Allow env override for tests / operator (not ambient by default, explicit opt-in)
+    """推导本机 ``landlock-run`` 绝对路径（不检查存在性，可用性由 probe 判定）。"""
+    # 允许通过环境变量显式覆盖，便于测试与运维注入
     env = os.environ.get("HERO_LANDLOCK_BIN", "").strip()
     if env:
         return env
@@ -72,8 +57,8 @@ def launcher_path(
             return found
     if fallback:
         return fallback
-    # Fallback absolute path that deliberately does not exist on hosts without the package
-    # Mirror deepseek-harness fallback: inside package boundary, never cwd-relative
+    # 回退路径刻意指向包内不存在的绝对路径，使 probe 能稳定判定为 unusable
+    # 避免使用 cwd 相对路径，防止路径劫持
     try:
         # src/hero_quant/sandbox/runner.py -> src/hero_quant -> hero_quant -> repo root guess
         repo_root = Path(__file__).resolve().parents[3]
@@ -81,24 +66,17 @@ def launcher_path(
         return str(candidate)
     except Exception:
         pass
-    # Last resort: bare binary name resolved via PATH (will be ENOENT -> probe unusable)
+    # 最后回退为裸二进制名，依赖 PATH 解析；缺失时探针将返回 unusable
     return LAUNCHER_BIN
 
 
 # ---------------------------------------------------------------------------
-# CLI contract validation — mirrors landlock-run's hand-rolled argv parse
-# Returns 0 if syntactically valid, 125 if usage error (never runs command)
+# CLI 合约校验 —— 镜像 landlock-run 的手写 argv 解析，语法错误直接返回 125
+# 绝不执行命令，仅做语法合法性检查
 # ---------------------------------------------------------------------------
 
 def validate_probe_args(argv: List[str]) -> int:
-    """Validate argv against landlock-run CLI grammar.
-
-    Args:
-        argv: Full argv including launcher binary as argv[0], e.g.
-              ["landlock-run", "--probe"] or ["landlock-run", "--ro","/","--","echo","hi"]
-    Returns:
-        0 if valid, 125 if usage error (LAUNCHER_FAILURE_EXIT)
-    """
+    """按 landlock-run CLI 文法校验 argv，合法返回 0 否则返回 125。"""
     if not argv:
         return LAUNCHER_FAILURE_EXIT
     # argv[0] is binary name, rest is args
@@ -106,26 +84,25 @@ def validate_probe_args(argv: List[str]) -> int:
     if not args:
         return LAUNCHER_FAILURE_EXIT
 
-    # --probe is mutually exclusive with grants and command
+    # --probe 与授权/命令互斥，出现时必须独占
     if "--probe" in args:
         if len(args) != 1 or args[0] != "--probe":
             return LAUNCHER_FAILURE_EXIT
         return 0
 
-    # Parse grants and separator
+    # 解析授权与分隔符
     i = 0
     has_seen_sep = False
     command_start = -1
     while i < len(args):
         token = args[i]
         if token in ("--ro", "--rw"):
-            # requires path argument
+            # 授权标志后必须跟路径参数
             if i + 1 >= len(args):
                 return LAUNCHER_FAILURE_EXIT
             nxt = args[i + 1]
             if not nxt or nxt.startswith("-"):
-                # path must not look like a flag; but allow absolute paths starting with /
-                # Only reject if nxt is exactly -- or another grant flag
+                # 路径不应被误判为标志；仅当下一个 token 是已知标志时拒绝
                 if nxt in ("--ro", "--rw", "--probe", "--"):
                     return LAUNCHER_FAILURE_EXIT
             i += 2
@@ -134,31 +111,25 @@ def validate_probe_args(argv: List[str]) -> int:
             command_start = i + 1
             break
         else:
-            # unknown flag
+            # 未知标志一律视为用法错误，防止注入额外参数
             return LAUNCHER_FAILURE_EXIT
 
     if not has_seen_sep:
         return LAUNCHER_FAILURE_EXIT
     if command_start < 0 or command_start >= len(args):
         return LAUNCHER_FAILURE_EXIT
-    # command must be non-empty
+    # 命令不能为空
     if not args[command_start]:
         return LAUNCHER_FAILURE_EXIT
     return 0
 
 
 # ---------------------------------------------------------------------------
-# Grant args builder — mirrors entry package grantArgs({readOnly, readWrite})
+# 授权参数构造 —— 将 {readOnly, readWrite} 映射为 --ro/--rw 序列
 # ---------------------------------------------------------------------------
 
 def grant_args(grants: Dict[str, List[str]]) -> List[str]:
-    """Build --ro/--rw args from grants dict.
-
-    Example:
-        grant_args({"readOnly": ["/"], "readWrite": ["/tmp/work"]})
-        -> ["--ro","/","--rw","/tmp/work"]
-    Read-only roots first, in caller order.
-    """
+    """由授权字典构造 --ro/--rw 参数列表，只读在前、读写在后，保持调用方顺序。"""
     out: List[str] = []
     for ro in grants.get("readOnly", []) or []:
         out.extend(["--ro", str(ro)])
@@ -168,11 +139,11 @@ def grant_args(grants: Dict[str, List[str]]) -> List[str]:
 
 
 # ---------------------------------------------------------------------------
-# Functional probe — spawn landlock-run --probe and classify result
+# 功能探针 —— 实际执行 landlock-run --probe 并归类结果
 # ---------------------------------------------------------------------------
 
 def _run_probe_binary(launcher: str, timeout_ms: int = 2000) -> Tuple[int, str, str]:
-    """Run `launcher --probe` and return (exit_code, stdout, stderr)."""
+    """执行 ``launcher --probe`` 并返回 (exit_code, stdout, stderr)，带超时保护防挂死。"""
     try:
         result = subprocess.run(
             [launcher, "--probe"],
@@ -193,36 +164,23 @@ def probe_raw(
     launcher: str | None = None,
     timeout_ms: int = 2000,
 ) -> Tuple[int, str, str]:
-    """Raw probe: returns (exit_code, stdout, stderr) without verdict mapping.
-
-    On non-Linux or missing binary, synthesizes the contract-compliant
-    failure: exit 125 + "landlock-run: ..." stderr.
-    This ensures the --probe contract is testable on Windows.
-    """
-    # Validate --probe syntax first (contract: --probe takes no other args)
-    # If caller passed launcher that includes args, we only probe the binary itself
+    """原始探针：返回 (exit_code, stdout, stderr)；非 Linux 或缺失二进制时合成合约要求的失败输出。"""
+    # 校验探针语法（合约要求 --probe 不带其他参数）
     bin_path = launcher or launcher_path()
-    # On non-Linux, Landlock is unavailable by definition — synthesize unusable
-    # (still goes through _run_probe_binary attempt first for fidelity on Linux CI)
+    # 非 Linux 平台本质上不支持 Landlock，直接合成 unusable 结果
     if sys.platform != "linux":
-        # Try to run binary if it somehow exists (e.g., Windows Subsystem), but
-        # if exit is 0 with valid report, honour it; otherwise synthesize.
-        # For determinism on this host, synthesize directly when platform is win32/darwin
         return LAUNCHER_FAILURE_EXIT, "", f"{_FATAL_PREFIX}{_NOT_ENFORCED_MSG}\n"
 
-    # On Linux, try real binary
-    # If binary missing, _run_probe_binary will return 125 with fatal prefix
+    # Linux 下尝试真实二进制
     exit_code, out, err = _run_probe_binary(bin_path, timeout_ms=timeout_ms)
-    # Normalize: ensure fatal errors carry prefix, unusable probe returns 125
+    # 归一化：失败信息必须携带 fatal 前缀以满足合约
     if exit_code != 0 and not err.startswith(_FATAL_PREFIX):
-        # wrap generic error with prefix for contract compliance
         err = f"{_FATAL_PREFIX}{err}" if err else f"{_FATAL_PREFIX}{_NOT_ENFORCED_MSG}\n"
     if exit_code == 0:
-        # Contract requires exactly one stdout line on success
+        # 成功时 stdout 应包含 enforced 标识；空输出时按 fully enforced 兜底
         if "partially enforced" in out or "fully enforced" in out:
             pass
         else:
-            # If binary returned 0 but no expected line, treat as full (best-effort)
             if not out.strip():
                 out = "landlock: fully enforced\n"
     return exit_code, out, err
@@ -232,11 +190,7 @@ def probe(
     launcher: str | None = None,
     timeout_ms: int = 2000,
 ) -> LandlockEnforcement:
-    """Functional probe verdict: 'full' | 'partial' | 'unusable'.
-
-    Uses landlock-run --probe functional check (not --version).
-    Synchronous by design: callers cache the result.
-    """
+    """功能探针裁决：返回 'full' | 'partial' | 'unusable'，基于实际执行而非版本检查。"""
     exit_code, out, _err = probe_raw(launcher=launcher, timeout_ms=timeout_ms)
     if exit_code != 0:
         return "unusable"
@@ -246,21 +200,15 @@ def probe(
 
 
 # ---------------------------------------------------------------------------
-# LandlockSandbox — fail-closed wrapper over BaseSandbox
+# LandlockSandbox — 在 BaseSandbox 之上的 fail-closed 封装
 # ---------------------------------------------------------------------------
 
 class LandlockSandbox(BaseSandbox):
-    """Landlock-aware sandbox. Wraps argv with landlock-run when enforcement available.
+    """Landlock 感知的沙箱，基于探针结果决定是否以 landlock-run 包裹执行。
 
-    Policy mapping (workspace-write):
-      grants = {readOnly: ["/"], readWrite: [workspaceRoot, /tmp]}
-    Other modes: no Landlock wrapping needed.
-
-    Fail-closed: if require_enforcement=True and probe is unusable and mode is
-    workspace-write, execute() raises SandboxUnavailableError without running the command.
-    This satisfies D2 "落地 fail-closed" requirement.
-
-    Not modifying trace/ledger: this sandbox only governs subprocess confinement.
+    安全不变量：workspace-write 模式下若探针为 unusable 且 require_enforcement
+    为真，execute() 必须抛 SandboxUnavailableError 且不执行命令（fail-closed）；
+    其他模式不做 Landlock 包裹，由上层隔离保证。
     """
 
     def __init__(
@@ -279,37 +227,37 @@ class LandlockSandbox(BaseSandbox):
 
     @property
     def enforcement(self) -> str:
-        """Return enforcement level for current host/policy."""
+        """返回当前主机与策略下的隔离等级。"""
         v = self._verdict()
-        # For read-only mode, enforcement is always full (no Landlock needed)
+        # read-only 模式无需 Landlock，视为 full
         mode = self._policy.get("mode") if isinstance(self._policy, dict) else None
         if mode == "read-only":
             return "full"
-        # For workspace-write, map probe verdict directly
+        # workspace-write 直接映射探针结果
         if v in ("full", "partial"):
             return v
-        # unusable maps to unusable (caller can treat as partial degraded); test expects partial/unusable
+        # unusable 保持原样，调用方可降级为 partial 处理
         return "unusable"
 
     def confine(self, argv: List[str], policy: Dict) -> List[str]:  # type: ignore[override]
-        """Build confinement prefix. Returns landlock-run wrapper when usable, else base bwrap fallback."""
-        # Merge stored policy with per-call policy
+        """构造隔离前缀：可用时返回 landlock-run 包裹，否则回退到基类 bwrap 逻辑。"""
+        # 合并存储策略与单次调用策略（单次优先）
         merged: Dict = {}
         if isinstance(self._policy, dict):
             merged.update(self._policy)
         if isinstance(policy, dict):
             merged.update(policy)
         mode = merged.get("mode")
-        # read-only and danger-full-access: no Landlock wrapping at Python layer
+        # 非 workspace-write 不在 Python 层做 Landlock 包裹
         if mode != "workspace-write":
             return super().confine(argv, merged)
 
         verdict = self._verdict()
         if verdict == "unusable":
-            # Cannot enforce — return no-op (caller decides fail-closed vs fallback)
+            # 无法强隔离时返回 no-op，由 execute 的 fail-closed 逻辑决定是否执行
             return super().confine(argv, merged)
 
-        # Build grants: ro / , rw workspaceRoot + /tmp
+        # 构造授权：根目录只读，工作区与 /tmp 可写
         ws = merged.get("workspaceRoot") or merged.get("workspace_root") or merged.get("canonicalPath") or "/tmp"
         try:
             ws_canonical = str(Path(ws).resolve())
@@ -328,17 +276,9 @@ class LandlockSandbox(BaseSandbox):
         require_enforcement: bool = True,
         timeout: float | None = None,
     ) -> Tuple[str, str, int]:
-        """Execute cmd with fail-closed semantics.
-
-        Args:
-            cmd: argv list or shell string
-            require_enforcement: if True and policy is workspace-write and probe is unusable,
-                                 raise SandboxUnavailableError instead of running.
-            timeout: optional subprocess timeout seconds.
-        """
+        """以 fail-closed 语义执行命令；强隔离缺失时抛异常而非执行。"""
         if isinstance(cmd, str):
-            # Shell strings bypass Landlock argv confinement (shell expansion needed)
-            # Still fail-closed if enforcement required and workspace-write
+            # shell 字符串需 shell 展开，无法做 argv 级隔离；仍需 fail-closed 判定
             mode = self._policy.get("mode") if isinstance(self._policy, dict) else None
             if require_enforcement and mode == "workspace-write" and self._verdict() == "unusable":
                 raise SandboxUnavailableError(
@@ -348,7 +288,7 @@ class LandlockSandbox(BaseSandbox):
             result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
             return result.stdout, result.stderr, result.returncode
 
-        # list argv path
+        # list argv 路径
         argv = [str(x) for x in cmd]
         mode = self._policy.get("mode") if isinstance(self._policy, dict) else None
         if require_enforcement and mode == "workspace-write" and self._verdict() == "unusable":
@@ -356,37 +296,30 @@ class LandlockSandbox(BaseSandbox):
                 f"{_FATAL_PREFIX}{_NOT_ENFORCED_MSG} (exit {LAUNCHER_FAILURE_EXIT}); "
                 f"workspace-write requires Landlock but probe is unusable; command not run"
             )
-        # Build confined argv (may be landlock-run prefix or bwrap/no-op fallback)
-        # Use per-call policy merging via confine
+        # 构造隔离后的 argv（可能是 landlock 前缀或 bwrap/no-op 回退）
         wrapped = self.confine(argv, {})
-        # If wrapped starts with landlock-run but binary missing (e.g., Windows), avoid ENOENT
+        # 非 Linux 下 landlock 前缀无意义，避免 ENOENT；已在上方处理 require_enforcement 分支
         if wrapped and wrapped[0] == self._launcher and sys.platform != "linux":
-            # On non-Linux, landlock-run prefix would be nonsense — fallback to local run
-            # But we already raised if require_enforcement; for permissive mode, just run locally
             if not require_enforcement:
-                # fallback to base confine (bwrap conditional no-op on Windows)
                 fallback = super().confine(argv, self._policy)
                 try:
                     result = subprocess.run(fallback, shell=False, capture_output=True, text=True, timeout=timeout)
                 except FileNotFoundError:
                     result = subprocess.run(argv, shell=False, capture_output=True, text=True, timeout=timeout)
                 return result.stdout, result.stderr, result.returncode
-        # If wrapped is landlock-run on Linux but binary missing, probe would have been unusable and we'd have raised or returned no-op
-        # So wrapped here is either landlock prefix (usable) or no-op fallback
+        # Linux 下若二进制缺失，探针已为 unusable，此处包裹应为 no-op；防御性再检查
         if wrapped and wrapped[0] == self._launcher:
-            # Check binary exists before spawn; if not, fallback gracefully when not require_enforcement
             if not Path(self._launcher).exists() and shutil.which(self._launcher) is None:
                 if not require_enforcement:
                     fallback = super().confine(argv, self._policy)
                     result = subprocess.run(fallback, shell=False, capture_output=True, text=True, timeout=timeout)
                     return result.stdout, result.stderr, result.returncode
-                # Should have already raised, but handle defensively
                 raise SandboxUnavailableError(f"{_FATAL_PREFIX}launcher not found: {self._launcher} (exit {LAUNCHER_FAILURE_EXIT})")
 
         try:
             result = subprocess.run(wrapped, shell=False, capture_output=True, text=True, timeout=timeout)
         except FileNotFoundError as e:
-            # Binary missing (bwrap/landlock) — fallback to original argv when permissive
+            # 二进制缺失时宽松模式回退到原 argv，严格模式转为 fail-closed 异常
             if not require_enforcement:
                 result = subprocess.run(argv, shell=False, capture_output=True, text=True, timeout=timeout)
                 return result.stdout, result.stderr, result.returncode

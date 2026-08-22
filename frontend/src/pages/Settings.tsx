@@ -1,3 +1,8 @@
+/**
+ * Settings 设置页
+ * - 职责：本地偏好配置（仅浏览器存储，不上传服务端）—— API 基地址与模型选择
+ * - 数据流：读写 Zustand settings store；apiBase 为空时走 Vite 同源代理 /v1，填写后可直连远端网关
+ */
 import { useSettingsStore } from "../store/settings"
 
 export default function Settings() {

@@ -1,3 +1,10 @@
+/**
+ * Live 实盘监控页
+ * - 职责：实时展示 events.jsonl 增量事件、OTel 成本熔断与调用链路阶段
+ * - 数据流：订阅 /v1/trace/events?offset（fetch ReadableStream 优先，失败回退 EventSource），按 offset 增量追加；
+ *   无后端时用本地 mock 心跳维持演示，cost/ratio 驱动 BudgetBreaker 熔断条与 CLOSED/HALF_OPEN/OPEN 状态
+ * - 关键细节：offset/cost 用 ref 同步避免 effect 频繁重建，自清理 abort/reader/timer 防止泄漏
+ */
 import { useEffect, useRef, useState } from "react"
 
 type LiveEvent = { ts: string; offset: number; type: string; tool?: string; msg?: string; cost?: number }
@@ -22,11 +29,11 @@ export default function Live() {
   const readerRef = useRef<ReadableStreamDefaultReader<Uint8Array> | null>(null)
   const abortRef = useRef<AbortController | null>(null)
 
-  // keep refs in sync without re-creating SSE effect
+  // 用 ref 镜像 offset/cost，避免 SSE effect 依赖频繁变动导致重建连接
   useEffect(() => { offsetRef.current = offset }, [offset])
   useEffect(() => { costRef.current = cost }, [cost])
 
-  // Real SSE: /v1/trace/events?offset with fetch fallback + EventSource
+  // 订阅实盘事件：fetch 流式优先，异常时尝试 EventSource；paused 时暂停
   useEffect(() => {
     if (paused) return
     let aborted = false
@@ -87,13 +94,13 @@ export default function Live() {
           }
           return
         } catch {
-          // try next candidate
+          // 候选地址失败则尝试下一个，无需提示，前端静默回退
         } finally {
           try { await reader?.cancel() } catch {}
           if (readerRef.current === reader) readerRef.current = null
         }
       }
-      // fallback EventSource
+      // fetch 候选均失败，回退 EventSource
       try {
         const es = new EventSource(`/v1/trace/events?offset=${curOffset}`)
         esRef.current = es
@@ -116,7 +123,7 @@ export default function Live() {
     }
 
     streamFetch()
-    // Mock heartbeat when backend unreachable — uses refs to avoid deps leak
+    // 本地 mock 心跳：后端不可达时保持实时感，用 ref 读最新 cost/offset 避免闭包过期
     const mock = setInterval(() => {
       if (aborted || paused) return
       if (Math.random() < 0.28) {
@@ -126,7 +133,7 @@ export default function Live() {
         const types = ["tool", "otel", "circuit", "trace"] as const
         const t = types[Math.floor(Math.random() * types.length)]
         const nextOffset = offsetRef.current++
-        // keep offset state in sync but via ref-driven increment
+        // 以 ref 自增为真源，同步到 state 触发渲染，避免并发 effect 竞态
         setOffset(offsetRef.current)
         setEvents(prev => [
           ...prev.slice(-199),
@@ -147,6 +154,7 @@ export default function Live() {
       }
     }, 1300)
 
+    // 清理：标记 aborted、清定时器、关闭 SSE/流读取器，防止切页或暂停后泄漏
     return () => {
       aborted = true
       clearInterval(mock)
@@ -156,6 +164,7 @@ export default function Live() {
     }
   }, [paused])
 
+  // 事件追加后自动滚底，保持最新 offset 可见；兼容无 scrollTo 的容器
   useEffect(() => {
     const el = listRef.current as unknown as { scrollTo?: (o: unknown) => void; scrollTop?: number; scrollHeight?: number } | null
     if (el?.scrollTo) el.scrollTo({ top: el.scrollHeight, behavior: "smooth" })

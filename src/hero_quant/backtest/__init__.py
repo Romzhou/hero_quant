@@ -1,4 +1,7 @@
-"""Backtest package."""
+"""回测包：导出 BacktestEngine、批量与指标、校验能力。
+
+职责：对外统一暴露 backtest 核心能力，保持导入路径稳定。
+"""
 
 from .bench import DEFAULT_BENCHMARK_MAP, _resolve_benchmark, run_batch
 from .engine import BacktestEngine

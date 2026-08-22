@@ -1,9 +1,8 @@
-"""Credentials refs — per-operation re-resolve + shadow fail-loud + 0600.
+"""凭据管理 — 按次解析、热重载与 0600 权限约束。
 
-REF_PATTERN supports ${ENV_VAR} and ref:xxx / credential:xxx forms.
-resolve() re-parses on every call, never caches, shadow fail-loud.
-Hot-reload: files re-read on each resolve; 0600 enforcement via os.stat warns if not 0600.
-Uses environ.get pattern (config gate compliant).
+职责：为 ``${VAR}``/``ref:``/``credential:`` 等引用提供统一解析入口。
+安全设计：每次调用重新解析不缓存；缺失时 fail-loud 抛异常；文件凭据
+每次重读并以 ``os.stat`` 检查 0600 权限，非 0600 时告警，防凭据泄露与陈旧值复用。
 """
 
 from __future__ import annotations
@@ -13,15 +12,15 @@ import re
 import warnings
 from pathlib import Path
 
-# Matches ${VAR}, $VAR, ref:xxx, credential:xxx, env:xxx
+# 匹配 ${VAR}、$VAR、ref:xxx / credential:xxx / env:xxx 三类引用
 REF_PATTERN = re.compile(r"^(?:\$\{([^}]+)\}|\$(?P<var2>[A-Za-z_][A-Za-z0-9_]*)$|(?:ref|credential|env):(?P<ref>.+))")
 
-# Fallback generic: any ${...}
+# 兜底匹配：字符串内嵌的任意 ${...}
 _GENERIC_REF = re.compile(r"\$\{([^}]+)\}")
 
 
 def _check_0600(path: Path) -> None:
-    """Warn if file permissions are not 0600 (owner read/write only)."""
+    """检查文件权限是否为 0600，非 0600 时告警（防多用户可读导致泄露）。"""
     try:
         st = os.stat(path)
         mode = st.st_mode & 0o777
@@ -34,44 +33,36 @@ def _check_0600(path: Path) -> None:
     except FileNotFoundError:
         pass
     except Exception:
-        # stat may fail on Windows or missing; do not block resolve
+        # Windows 或缺失时 stat 可能失败，不阻塞解析流程
         pass
 
 
 def _read_credential_file(path: Path) -> str:
-    """Read credential file with 0600 check and hot-reload (re-read each call)."""
+    """读取凭据文件：先做 0600 检查，每次调用均重读以支持热重载。"""
     _check_0600(path)
     return path.read_text(encoding="utf-8").strip()
 
 
 def _resolve_env_key(key: str) -> str | None:
-    # shadow read — single source via environ.get
+    # 统一经 environ.get 读取，便于审计与 mock
     return os.environ.get(key)
 
 
 def resolve(ref: str) -> str:
-    """Resolve credential ref per-operation, shadow fail-loud.
-
-    - Plain value without ref pattern returns as-is (unless path exists -> file).
-    - ${VAR} or $VAR -> env lookup, fail-loud if missing (ValueError).
-    - ref:xxx / credential:xxx / env:xxx -> env lookup or file lookup.
-    - Hot-reload: re-reads file each time if path exists, warns if not 0600.
-    - Plain file path that exists -> read with 0600 check (hot-reload).
-    """
+    """按次解析凭据引用，缺失时 fail-loud；文件凭据每次重读并校验 0600。"""
     if not isinstance(ref, str):
         raise TypeError("ref must be str")
     ref = ref.strip()
     if not ref:
         return ref
 
-    # Direct ${VAR} entire string or ref:xxx
+    # 匹配整串为 ${VAR} 或 ref:xxx 的情况
     m = REF_PATTERN.match(ref)
     if m:
-        # ${VAR}
         var = m.group(1) or m.group("var2") or m.group("ref")
         if var:
             var = var.strip()
-            # Support ${VAR:-default} minimal
+            # 支持 ${VAR:-default} 语法
             if ":-" in var:
                 key, default = var.split(":-", 1)
                 val = _resolve_env_key(key.strip())
@@ -80,13 +71,10 @@ def resolve(ref: str) -> str:
                 return val
             val = _resolve_env_key(var)
             if val is not None:
-                # If env value is a file path that exists, hot-reload file content?
-                # Spec: reads env OR file path each call — if env points to file, prefer env value.
-                # But also support var being a file path when env missing:
+                # 环境变量存在时直接返回其值，不再做文件二次解析
                 return val
-            # Not in env — try file path if var looks like path
+            # 环境变量缺失时尝试按文件路径读取
             p = Path(var)
-            # Also try expanded user / env path
             try:
                 p_exp = Path(os.path.expandvars(os.path.expanduser(var)))
             except Exception:
@@ -97,11 +85,10 @@ def resolve(ref: str) -> str:
                         return _read_credential_file(cand)
                 except Exception:
                     continue
-            # Also handle ref:env:VAR where env var value is file path
-            # Fallback fail-loud
+            # 未找到则 fail-loud，防静默使用空值
             raise ValueError(f"credential ref not found (shadow fail-loud): {ref}")
 
-    # Embedded ${VAR} inside larger string — replace all (re-parse each call)
+    # 字符串内嵌多个 ${VAR} 的替换（每次调用重新解析）
     if "${" in ref:
         def _repl(g):
             key = g.group(1).strip()
@@ -116,27 +103,22 @@ def resolve(ref: str) -> str:
 
         return _GENERIC_REF.sub(_repl, ref)
 
-    # No pattern — plain value. Hot-reload: if it's a file path that exists, read it
-    # (supports direct file ref without ref: prefix; re-read each resolve)
+    # 无模式的纯值：若指向已存在文件则按凭据文件读取（支持热重载）
     try:
         p_plain = Path(ref)
         if p_plain.exists() and p_plain.is_file():
-            # Avoid reading huge arbitrary files: only if path looks credential-like
-            # or caller explicitly passes file path. We treat any existing file as credential file.
             return _read_credential_file(p_plain)
     except Exception:
         pass
 
-    # Return plain value as-is
     return ref
 
 
 def write_credential_file(path: str | Path, content: str) -> Path:
-    """Write credential file with 0600, placeholder for hot-reload."""
+    """写入凭据文件并置为 0600 权限，通过临时文件重命名保证原子性。"""
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
-    # Write via tmp + rename for durability
-    tmp = p.with_suffix(p.suffix + ".tmp")
+    tmp = p.with_suffix(p.suffix + ".tmp")  # 先写临时文件再原子替换，防并发截断
     tmp.write_text(content, encoding="utf-8")
     try:
         os.chmod(tmp, 0o600)
@@ -144,7 +126,7 @@ def write_credential_file(path: str | Path, content: str) -> Path:
         pass
     tmp.replace(p)
     try:
-        os.chmod(p, 0o600)
+        os.chmod(p, 0o600)  # 确保最终文件仅所有者可读写
     except Exception:
         pass
     return p

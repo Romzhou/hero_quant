@@ -1,8 +1,8 @@
-"""Market data tools — production-core (Wave B5 hardened).
+"""行情工具集：提供 OHLCV 拉取、标的搜索等只读工具。
 
-Port vibe-trading 64-tool registry idea to 15 core tools.
-Each tool uses @tool with parameters/output JSON Schemas and is_concurrency_safe marker.
-get_market_data walks registry with Tencent + Yahoo loaders and audits concurrency safety.
+位于 tools 层数据入口，基于 MarketDataRegistry 聚合 Tencent（CN, board_lots）
+与 Yahoo（US, shares）双源，通过 provenance{source, unit} 全链路记录数据
+来源与单位；缺省回退至合成数据。并发安全上读操作标 True，写操作标 False。
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ from hero_quant.tools.registry import TOOL_REGISTRY, tool
 
 
 def _make_registry():
-    """Create MarketDataRegistry with Tencent + Yahoo loaders."""
+    """创建已注册 Tencent + Yahoo 的 MarketDataRegistry（双源 fallback 链）。"""
     from hero_quant.data.registry import MarketDataRegistry
 
     reg = MarketDataRegistry()
@@ -33,7 +33,7 @@ def _make_registry():
 
 
 def _synthetic_fallback(symbol: str, start: str, end: str):
-    """Generate synthetic bars as fallback (CN-live synthetic)."""
+    """合成兜底：复用 TencentLoader 的合成逻辑，保证离线可运行。"""
     try:
         from hero_quant.data.loaders.tencent import TencentLoader
 
@@ -80,7 +80,7 @@ def get_market_data(
     start: str = "2026-08-01",
     end: str = "2026-08-03",
 ) -> Dict[str, Any]:
-    """Registry-backed market data fetch with concurrency audit and dual-loader fallback."""
+    """通过 Registry 拉取行情，含并发安全审计与双源回退；失败回退合成数据。"""
     spec = TOOL_REGISTRY.get("get_market_data")
     is_safe = False
     if spec is not None:
@@ -95,12 +95,12 @@ def get_market_data(
             raise ImportError("pip install hero-quant[us] or [ashare] - no loader registered")
         bars, prov = reg.get_bars(symbol, interval, start, end)
         provenance = {"source": getattr(prov, "source", "unknown"), "unit": getattr(prov, "unit", "shares")}
-        # preserve extra if any
+        # 透传 provenance 额外字段，便于上游追踪来源细节
         if hasattr(prov, "extra") and prov.extra:
             provenance["extra"] = prov.extra
         return {"bars": bars, "provenance": provenance, "ok": True, "concurrency_safe": is_safe}
     except Exception as e:
-        # synthetic fallback with error string
+        # 异常时仍返回合成数据并附带错误信息，避免 Agent 中断
         bars = _synthetic_fallback(symbol, start, end)
         return {
             "bars": bars,
@@ -124,6 +124,7 @@ def get_market_data(
     is_concurrency_safe=lambda args: True,
 )
 def list_markets() -> Dict[str, Any]:
+    """列出支持的市场与数据源（CN/US/CRYPTO）。"""
     return {"markets": ["CN", "US", "CRYPTO"], "ok": True}
 
 
@@ -145,6 +146,7 @@ def list_markets() -> Dict[str, Any]:
     is_concurrency_safe=lambda args: True,
 )
 def get_ticker_info(symbol: str) -> Dict[str, Any]:
+    """获取标的基础信息（占位实现，保持 schema 兼容）。"""
     return {"symbol": symbol, "ok": True, "info": {}}
 
 
@@ -166,7 +168,7 @@ def get_ticker_info(symbol: str) -> Dict[str, Any]:
     is_concurrency_safe=lambda args: True,
 )
 def get_fundamentals(symbol: str) -> Dict[str, Any]:
-    # Placeholder: returns empty info but correct schema; no external dependency
+    """获取基本面信息（占位实现，无外部依赖，保持 schema 正确）。"""
     return {"symbol": symbol, "info": {}, "ok": True}
 
 
@@ -188,12 +190,14 @@ def get_fundamentals(symbol: str) -> Dict[str, Any]:
     is_concurrency_safe=lambda args: True,
 )
 def search_symbols(keyword: str) -> Dict[str, Any]:
-    # Try registry search if loader supports it, otherwise mock candidates
+    """按关键字搜索标的，返回模拟候选（保持离线可用）。"""
     candidates: list[Dict[str, Any]] = []
-    # placeholder: mock 3 candidates with keyword
+    # 离线环境下以关键字派生模拟候选，避免依赖外部搜索接口
+
     kw = (keyword or "").strip()
     if kw:
-        # naive: uppercase keyword as symbol stem
+        # 将关键字大写作为标的前缀，拼接常见后缀生成候选
+
         stem = kw.upper().replace(" ", "_")
         for suffix in [".SH", ".US", ""]:
             candidates.append({"symbol": f"{stem}{suffix}", "name": f"{kw} mock {suffix or 'generic'}"})
@@ -218,7 +222,7 @@ def search_symbols(keyword: str) -> Dict[str, Any]:
     is_concurrency_safe=lambda args: True,
 )
 def search_symbol(keyword: str) -> Dict[str, Any]:
-    # Delegate to search_symbols for consistency
+    """search_symbols 的别名，保持工具命名兼容。"""
     return search_symbols(keyword)
 
 
@@ -250,6 +254,7 @@ def get_bars_range(
     start: str = "2026-08-01",
     end: str = "2026-08-03",
 ) -> Dict[str, Any]:
+    """批量拉取多标的行情，逐个调用 get_market_data 并聚合结果。"""
     data: Dict[str, Any] = {}
     for sym in symbols or []:
         try:

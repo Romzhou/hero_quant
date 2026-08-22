@@ -1,14 +1,8 @@
-"""Hash-chained, fsynced, flock-protected JSONL ledger — per-tenant chain with GENESIS + O(n) verify + rotate.
+"""ledger — Hash 链 JSONL 账本。
 
-Tenant chain keeps original business hash algorithm: sha256(f"{tenant_seq}:{prev_hash}:{payload}")
-where payload = json.dumps(record, sort_keys=True, ensure_ascii=False)
-
-Enhancements vs legacy:
-- GENESIS_PREV_HASH = "sha256:genesis" (legacy "0"*64 still accepted for backward compat)
-- fcntl.flock / msvcrt critical section across read+verify+append (O(n) verify before append)
-- LedgerCorruptionError on corrupted history (refuse to extend broken chain)
-- DEFAULT_ROTATE_BYTES = 64MiB + archive_segments / rotate_if_needed
-- build_export / verify_export stubs with export_hash
+职责：以追加写 JSONL 记录可审计操作历史，提供防篡改与可验证能力。
+架构位置：治理层核心持久化，支撑 shadow、agent 轨迹与对账。
+关键设计：每租户独立 hash 链，record_hash = sha256("{tenant_seq}:{prev_hash}:{payload}")，payload 为 sort_keys 的 canonical JSON；首条 prev_hash 为 GENESIS（兼容 legacy 0*64）；append 前 O(n) 全链 verify，发现断链抛 LedgerCorruptionError 拒绝扩展；文件以 0600 权限 + fsync + 目录 fsync 落盘，跨平台以 fcntl/msvcrt 加锁保护 read-verify-append 临界区；达 64MiB 触发 rotate 归档。
 """
 from __future__ import annotations
 
@@ -64,6 +58,7 @@ __all__ = [
 ]
 
 
+# fsync 失败仅告警一次，避免日志风暴；降级为 flush-only 仍可提供尽力持久性
 def _warn_fsync_failure(exc: OSError, target: Any) -> None:
     global _fsync_warned
     if _fsync_warned:
@@ -73,6 +68,7 @@ def _warn_fsync_failure(exc: OSError, target: Any) -> None:
 
 
 def _canonical_json(obj: Any) -> str:
+    # 规范化序列化：sort_keys + 紧凑分隔符 + ascii 保证跨平台 hash 稳定
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=True, default=str)
 
 
@@ -81,7 +77,7 @@ def _sha256_hex(text: str) -> str:
 
 
 def compute_record_hash(seq: int, prev_record_hash: str, payload: Mapping[str, Any]) -> str:
-    """Reference global-chain hash (seq+prev+payload) — not the per-tenant business hash."""
+    """计算全局链参考 hash（seq+prev+payload 的 canonical JSON），与租户业务链 hash 算法区分。"""
     body = _canonical_json({"seq": seq, "prev_record_hash": prev_record_hash, "payload": payload})
     return f"sha256:{_sha256_hex(body)}"
 
@@ -92,6 +88,8 @@ def _is_genesis(h: str) -> bool:
 
 @dataclass(frozen=True)
 class ChainBreak:
+    """链断裂位置描述，用于 verify 失败定位。"""
+
     index: int
     seq: int | None
     reason: str
@@ -103,6 +101,8 @@ class ChainBreak:
 
 @dataclass(frozen=True)
 class ChainVerificationResult:
+    """链校验结果：ok 表示全链通过，first_break 指向首个断裂。"""
+
     ok: bool
     record_count: int
     first_break: ChainBreak | None
@@ -116,12 +116,15 @@ class ChainVerificationResult:
 
 
 class LedgerCorruptionError(RuntimeError):
+    """追加时发现历史已断裂，拒绝扩展以防止分叉污染。"""
+
     def __init__(self, chain_break: ChainBreak) -> None:
         super().__init__(f"ledger chain broken at index={chain_break.index} seq={chain_break.seq} reason={chain_break.reason}: {chain_break.detail}")
         self.chain_break = chain_break
 
 
 def _lock_exclusive(handle: BinaryIO) -> None:
+    # 排他锁保护 read-verify-append 临界区，避免并发追加导致 seq/prev_hash 分叉
     if fcntl is not None:
         try:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
@@ -129,18 +132,15 @@ def _lock_exclusive(handle: BinaryIO) -> None:
             pass
         return
     if msvcrt is not None:  # pragma: no cover
-        # Windows: try byte-range lock without polluting ledger content.
-        # Avoid writing sentinel \x00 into ledger file (would corrupt JSONL).
+        # Windows 以字节范围锁模拟；避免写入 sentinel \x00 污染 JSONL
         try:
-            # try locking first byte if file has content, else try lock 0-len gracefully
             handle.seek(0, os.SEEK_END)
             size = handle.tell()
             handle.seek(0)
             if size > 0:
                 msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
             else:
-                # empty file: no lock needed yet (single byte range would require sentinel)
-                # attempt non-blocking lock on 0 bytes — if fails, proceed unlocked (verify still catches fork)
+                # 空文件无需占位锁，尝试加锁失败则退化为无锁（verify 仍可检出分叉）
                 try:
                     msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
                 except OSError:
@@ -151,6 +151,7 @@ def _lock_exclusive(handle: BinaryIO) -> None:
 
 
 def _unlock(handle: BinaryIO) -> None:
+    # 与 _lock_exclusive 配对释放
     if fcntl is not None:
         try:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
@@ -160,7 +161,7 @@ def _unlock(handle: BinaryIO) -> None:
     if msvcrt is not None:  # pragma: no cover
         try:
             handle.seek(0)
-            # only unlock if we previously locked a byte
+            # 仅当曾加锁时再解锁，避免误解锁
             handle.seek(0, os.SEEK_END)
             if handle.tell() > 0:
                 handle.seek(0)
@@ -170,7 +171,7 @@ def _unlock(handle: BinaryIO) -> None:
 
 
 def _fsync_dir(directory: Path) -> None:
-    # Windows has no O_DIRECTORY; fallback to O_RDONLY with graceful degrade
+    # 目录 fsync 保证 rename/新建文件落盘；Windows 无 O_DIRECTORY 时退化为 O_RDONLY
     flags = getattr(os, "O_DIRECTORY", 0)
     if flags:
         try:
@@ -197,25 +198,23 @@ def _fsync_dir(directory: Path) -> None:
 
 
 def archive_segments(path: Path) -> list[Path]:
+    """列出已归档分段（按 4 位序号排序）。"""
     return sorted(path.parent.glob(f"{path.stem}.[0-9]" + "[0-9]" * (ARCHIVE_SUFFIX_WIDTH - 1) + path.suffix))
 
 
 def rotate_if_needed(path: Path, max_bytes: int = DEFAULT_ROTATE_BYTES, *, fsync: bool = True) -> Path | None:
+    """大小超过阈值时轮转归档；轮转前先全链 verify，断链则拒绝归档。"""
     if max_bytes <= 0:
         raise ValueError(f"max_bytes must be positive, got {max_bytes}")
     if not path.exists() or path.stat().st_size < max_bytes:
         return None
-    # verify before rotate — refuse to seal corrupted chain
-    # use Ledger verify (class-level)
+    # 轮转前校验，避免固化已损坏历史
     tmp = Ledger(path)
     if not tmp.verify():
-        # build detailed break for error
         entries = tmp._read_all()
-        # find first hash mismatch for error detail
         for idx, e in enumerate(entries):
             if "_raw" in e:
                 raise LedgerCorruptionError(ChainBreak(idx, None, "malformed_json", str(e.get("_raw"))))
-        # fallback generic
         raise LedgerCorruptionError(ChainBreak(0, None, "prev_hash_mismatch", "ledger corrupted, cannot rotate"))
     counter = len(archive_segments(path)) + 1
     archive = path.with_name(f"{path.stem}.{counter:0{ARCHIVE_SUFFIX_WIDTH}d}{path.suffix}")
@@ -241,10 +240,10 @@ def _read_raw_records(path: Path) -> list[dict[str, Any]]:
 
 
 def build_export(path: Path) -> dict[str, Any]:
+    """构建可携带的导出包，含全量记录与基于 canonical JSON 的 export_hash。"""
     ledger = Ledger(path)
     entries = ledger._read_all()
     verification_ok = ledger.verify()
-    # detailed result
     count = len([e for e in entries if "_raw" not in e]) if verification_ok else len(entries)
     verification = {"ok": verification_ok, "record_count": count, "first_break": None}
     envelope = {"format": EXPORT_FORMAT, "source_path": str(path), "records": entries}
@@ -253,6 +252,7 @@ def build_export(path: Path) -> dict[str, Any]:
 
 
 def export_chain_to_file(path: Path, dest: Path) -> Path:
+    """导出账本到文件，便于离线审计与归档。"""
     exp = build_export(path)
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_text(json.dumps(exp, sort_keys=True, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -260,7 +260,7 @@ def export_chain_to_file(path: Path, dest: Path) -> Path:
 
 
 def verify_chain(path: Path) -> ChainVerificationResult:
-    """Compatibility shim for verify_chain(path) -> ChainVerificationResult"""
+    """校验单文件链的完整性（seq 连续与 hash 链）。"""
     ledger = Ledger(path)
     entries = ledger._read_all()
     ok, brk = ledger._verify_entries(entries)
@@ -268,7 +268,7 @@ def verify_chain(path: Path) -> ChainVerificationResult:
 
 
 def verify_chain_with_archives(path: Path) -> ChainVerificationResult:
-    """Verify whole history including sealed archive_segments."""
+    """校验包含归档分段的完整历史，拼接 archive_segments + 当前文件后统一 verify。"""
     records: list[dict[str, Any]] = []
     for seg in [*archive_segments(path), path]:
         if not seg.exists():
@@ -292,6 +292,7 @@ def verify_chain_with_archives(path: Path) -> ChainVerificationResult:
 
 
 def verify_export(export: Mapping[str, Any] | str | Path) -> ChainVerificationResult:
+    """校验导出包：先比对 export_hash，再按租户链逐条重算 record_hash。"""
     if isinstance(export, Path):
         data: Mapping[str, Any] = json.loads(export.read_text(encoding="utf-8"))
     elif isinstance(export, str):
@@ -352,6 +353,11 @@ def verify_export(export: Mapping[str, Any] | str | Path) -> ChainVerificationRe
 
 
 class Ledger:
+    """JSONL hash 链账本：追加写、按租户隔离、可全链校验。
+
+    不变量：全局 seq 单调递增且连续；每租户 tenant_seq 连续、prev_hash 指向前一条 record_hash；任意 record 被篡改则 verify() 失败；0600 权限与 fsync 保证落盘后可恢复。
+    """
+
     def __init__(self, path: Path):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -365,6 +371,7 @@ class Ledger:
                 pass
 
     def _read_all(self):
+        """逐行读取 JSONL，兼容旧 sentinel 残留的 NUL，损坏行以 _raw 标记。"""
         if not self.path.exists():
             return []
         entries = []
@@ -372,7 +379,7 @@ class Ledger:
             text = self.path.read_text(encoding="utf-8", errors="ignore")
         except FileNotFoundError:
             return []
-        # handle stray NUL from old sentinel
+        # 兼容历史 Windows sentinel 写入的 \x00
         text = text.replace("\x00", "")
         for line in text.splitlines():
             line = line.strip()
@@ -385,11 +392,12 @@ class Ledger:
         return entries
 
     def _verify_entries(self, entries: list[dict[str, Any]]) -> tuple[bool, ChainBreak | None]:
+        """O(n) 全链校验：全局 seq 连续 + 每租户 prev_hash/record_hash 链。"""
         for e in entries:
             if "_raw" in e:
                 idx = entries.index(e)
                 return False, ChainBreak(idx, None, "malformed_json", str(e.get("_raw")))
-        # global seq check
+        # 全局 seq 单调连续校验
         for idx, entry in enumerate(entries, start=1):
             if entry.get("seq") != idx:
                 return False, ChainBreak(idx-1, entry.get("seq"), "seq_gap", f"expected seq={idx} found {entry.get('seq')!r}")
@@ -408,16 +416,17 @@ class Ledger:
                 if ts is not None and ts != idx:
                     return False, ChainBreak(idx-1, ts, "seq_gap", f"tenant {t} expected tenant_seq={idx} got {ts!r}")
                 ph = entry.get("prev_hash")
-                # allow genesis equivalence
+                # 首条允许 GENESIS 与 legacy 0*64 等价
                 if ph != prev and not (_is_genesis(ph) and _is_genesis(prev) and idx == 1):
                     return False, ChainBreak(idx-1, eff, "prev_hash_mismatch", f"expected {prev!r} got {ph!r}")
                 record = entry.get("record")
                 if record is None:
                     return False, ChainBreak(idx-1, eff, "missing_chain_fields", "missing record")
+                # 拼接顺序固定为 tenant_seq:prev_hash:payload，payload 需 canonical 序列化以保证确定性
                 payload = json.dumps(record, sort_keys=True, ensure_ascii=False)
                 expected = hashlib.sha256(f"{eff}:{prev}:{payload}".encode()).hexdigest()
                 if entry.get("record_hash") != expected:
-                    # try legacy genesis alternative for first record
+                    # 首条兼容 legacy GENESIS 形态
                     if idx == 1 and _is_genesis(prev) and _is_genesis(ph):
                         alt_prev = _LEGACY_GENESIS if prev == GENESIS_PREV_HASH else GENESIS_PREV_HASH
                         alt = hashlib.sha256(f"{eff}:{alt_prev}:{payload}".encode()).hexdigest()
@@ -429,6 +438,7 @@ class Ledger:
         return True, None
 
     def append(self, record: dict, tenant: str = "default", price: float | None = None):
+        """追加一条记录：先加锁并全链校验，再计算 tenant_seq/prev_hash/record_hash 并 fsync 落盘。"""
         import time as _t
 
         _append_start = _t.monotonic()
@@ -439,16 +449,16 @@ class Ledger:
                 record = redact_payload(record, sink=sink)
         except Exception:
             pass
-        # flock critical section across read+verify+write
+        # 锁保护 read-verify-append 临界区，防止并发分叉
         created = not self.path.exists()
-        # open a+b for locking and reading existing
+        # 以 a+b 打开以便加锁后回读历史
         handle = open(self.path, "a+b")
         try:
             _lock_exclusive(handle)
             try:
                 handle.seek(0)
                 raw_bytes = handle.read()
-                # strip any stray NUL bytes from legacy Windows sentinel
+                # 清理历史 sentinel 残留的 NUL
                 existing_text = raw_bytes.decode("utf-8", errors="ignore").replace("\x00", "")
                 entries: list[dict[str, Any]] = []
                 for line in existing_text.splitlines():
@@ -459,7 +469,7 @@ class Ledger:
                         entries.append(json.loads(s))
                     except json.JSONDecodeError:
                         entries.append({"_raw": s})
-                # O(n) verify whole chain before append
+                # 追加前全链校验，断链则拒绝写入
                 ok, brk = self._verify_entries(entries)
                 if not ok:
                     assert brk is not None
@@ -488,10 +498,9 @@ class Ledger:
             raise
         finally:
             handle.close()
-            # observability hardening: ledger append duration histogram + wall-time
+            # 观测：记录追加耗时直方图与 wall-time
             try:
                 _elapsed = _t.monotonic() - _append_start
-                # metrics hardening (optional, offline-safe)
                 try:
                     from hero_quant.metrics import LEDGER_APPEND_DURATION, observe_ledger_append, observe_wall_time
 
@@ -500,7 +509,6 @@ class Ledger:
                             LEDGER_APPEND_DURATION.labels(tenant=str(tenant), status=_status).observe(float(_elapsed))
                         except Exception:
                             pass
-                    # also aggregate wall-time
                     try:
                         observe_wall_time("ledger_append", float(_elapsed), status=_status)
                     except Exception:
@@ -522,6 +530,7 @@ class Ledger:
         return obj
 
     def verify(self, tenant: str | None = None) -> bool:
+        """校验链完整性；指定 tenant 时仅校验该租户子链。"""
         entries = self._read_all()
         for e in entries:
             if "_raw" in e:
@@ -561,16 +570,19 @@ class Ledger:
             return ok
 
     def query(self, tenant: str):
-        """RLS isolation: return entries where tenant == ..."""
+        """按租户隔离查询，返回该 tenant 的全部条目。"""
         entries = self._read_all()
         return [e for e in entries if e.get("tenant", "default") == tenant]
 
     def query_by_tenant(self, tenant: str):
+        """query 的别名，保持对旧调用的兼容。"""
         return self.query(tenant)
 
     def list_records(self, tenant: str):
+        """列出指定租户的记录（query 的语义化别名）。"""
         return self.query(tenant)
 
     def list_tenants(self):
+        """列出账本中出现过的所有 tenant。"""
         entries = self._read_all()
         return sorted({e.get("tenant", "default") for e in entries})

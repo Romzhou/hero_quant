@@ -1,3 +1,10 @@
+/**
+ * Chat / 回测对话页
+ * - 职责：投研对话主界面，承载自然语言 → 行情/回测/报告的流式交互
+ * - 数据流：输入 q → 订阅 /v1/query/stream（优先 EventSource，超时或无消息回退 fetch ReadableStream）→ 解析 data: 行
+ *   约定 JSON 字段：delta/text/content/answer 为增量文本，type=="tool" 为工具轨迹，type=="error" 为错误，[DONE] 为结束
+ * - 渲染：delta 逐片追加到 assistant 消息，tool 事件聚合到 traceByMsgId 渲染轨迹条；支持 AbortController 中断与空响应兜底
+ */
 import { useRef, useState } from "react"
 import { useChatStore } from "../store/chat"
 
@@ -22,10 +29,10 @@ export default function Chat() {
 
     const aid = String(Date.now() + 1)
     push({ id: aid, role: "assistant", content: "" })
-    // 真实 SSE：初始轨迹为空，由后端 tool 事件驱动；仅占位用于视觉一致
+    // 初始化空轨迹，占位保证 UI 结构稳定，后续由后端 type=="tool" 事件填充
     setTraceByMsgId(s => ({ ...s, [aid]: [] }))
 
-    // Abort previous if any
+    // 中断上一轮未结束的流，避免并发 SSE 串扰
     abortRef.current?.abort()
     esRef.current?.close()
     const controller = new AbortController()
@@ -39,6 +46,7 @@ export default function Chat() {
       if (!delta) return
       hasDelta = true
       acc += delta
+      // 直接写 Zustand，避免闭包 messages 过期；用 raf 聚合滚动避免每片 delta 强制布局抖动
       useChatStore.setState(s => ({
         messages: s.messages.map(m => m.id === aid ? { ...m, content: acc } : m),
       }))
@@ -82,7 +90,7 @@ export default function Chat() {
         if (delta) appendDelta(delta)
       } catch (e) {
         if (e instanceof SyntaxError) {
-          // 非 JSON 则按原始 delta 处理
+          // 非 JSON 的 data: 行按纯文本 delta 处理，兼容后端直接吐文本的降级
           if (raw) appendDelta(raw)
         } else {
           throw e
@@ -90,6 +98,7 @@ export default function Chat() {
       }
     }
 
+    // fetch 回退：手动解析 SSE 帧，兼容不支持 EventSource 或代理缓冲的场景
     const fetchFallback = async () => {
       const url = `/v1/query/stream?q=${encodeURIComponent(q)}`
       const resp = await fetch(url, {
@@ -128,6 +137,7 @@ export default function Chat() {
       }
     }
 
+    // 优先 EventSource：浏览器原生 SSE 自动重连，失败或超时再回退 fetch
     const tryEventSource = () =>
       new Promise<void>((resolve, reject) => {
         let gotMessage = false
@@ -136,7 +146,7 @@ export default function Chat() {
         try {
           const es = new EventSource(`/v1/query/stream?q=${encodeURIComponent(q)}`)
           esRef.current = es
-          // keep url var used to satisfy spec literal
+          // 保留 url 变量避免未使用告警，同时显式声明订阅地址
           void url
           es.onmessage = (ev) => {
             gotMessage = true
@@ -201,7 +211,7 @@ export default function Chat() {
             esRef.current = null
             if (!gotMessage && !fallbackTriggered) {
               fallbackTriggered = true
-              // fallback to fetch ReadableStream at /v1/query/stream
+              // 尚未收到任何消息时判定为连接失败，回退到 fetch 手动解析 SSE
               fetchFallback()
                 .then(() => {
                   if (!settled) {
@@ -228,7 +238,7 @@ export default function Chat() {
               }
             }
           }
-          // safety timeout: if EventSource not connecting in 1200ms, fallback
+          // 超时保护：1200ms 内未建连则主动回退，避免 EventSource 挂起无反馈
           setTimeout(() => {
             if (!gotMessage && es.readyState !== 1 && !fallbackTriggered) {
               fallbackTriggered = true
@@ -250,7 +260,7 @@ export default function Chat() {
             }
           }, 1200)
         } catch (err) {
-          // EventSource not supported -> direct fallback to fetch ReadableStream at /v1/query/stream
+          // 环境不支持 EventSource 时直接走 fetch 回退
           fetchFallback()
             .then(() => {
               if (!settled) {
@@ -272,7 +282,7 @@ export default function Chat() {
     } catch (e: unknown) {
       if ((e as Error)?.name === "AbortError") return
       const msg = e instanceof Error ? e.message : String(e)
-      // if EventSource fallback already attempted and still failed, error already handled; but ensure UI
+      // 仅在无任何 delta 时展示错误，避免已流式部分内容被错误覆盖
       if (!hasDelta) {
         setError(msg)
         useChatStore.setState(s => ({
@@ -288,6 +298,7 @@ export default function Chat() {
       abortRef.current = null
       esRef.current?.close()
       esRef.current = null
+      // 收尾滚动到底，确保最后 delta 可见
       requestAnimationFrame(() => listRef.current?.scrollTo({ top: 99999, behavior: "smooth" }))
     }
   }

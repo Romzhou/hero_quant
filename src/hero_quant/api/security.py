@@ -1,11 +1,10 @@
-"""Minimal security helpers - HMAC + Host whitelist + Bearer/sk redaction.
+"""api.security — 轻量安全辅助：HMAC、Host 白名单与凭据脱敏。
 
-- check_host(host, whitelist): if whitelist empty/None -> allow all locally;
-  else check Host header against whitelist CSV from env HERO_HOST_WHITELIST.
-- verify_hmac: dual-mode — (payload, signature, secret) HMAC-SHA256 AND
-  verify_hmac(request) placeholder that checks Authorization Bearer/sk prefix
-  via redaction patterns (Bearer/sk-/AKIA/JWT).
+职责：为 API 边界提供 Host 校验与 HMAC/凭据前缀校验的最小实现。
+架构位置：被 api.server 的安全中间件及相关鉴权流程复用。
+关键设计：白名单为空时本地放行便于离线/测试；HMAC 采用常量时间比较；凭据检测复用脱敏正则（Bearer/sk/AKIA/JWT）仅做前缀存在性判断。
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -14,7 +13,7 @@ import os
 import re
 from typing import Any
 
-# Re-use redaction patterns to detect secret prefixes without leaking
+# 复用脱敏正则以无泄露方式判断凭据前缀是否存在
 
 _BEARER_RE = re.compile(r"Bearer\s+[A-Za-z0-9\-_\.=~\+/]+=*", re.IGNORECASE)
 _SK_RE = re.compile(r"sk-[A-Za-z0-9]{10,}")
@@ -23,27 +22,29 @@ _JWT_RE = re.compile(r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{
 
 
 def _get_whitelist_from_env() -> list[str]:
+    """从环境变量 HERO_HOST_WHITELIST 读取 CSV 白名单。"""
     raw = os.environ.get("HERO_HOST_WHITELIST", "")
     if not raw or not raw.strip():
         return []
-    # CSV split
+    # 按逗号切分并去除空项
     parts = [h.strip() for h in raw.split(",")]
     return [p for p in parts if p]
 
 
 def _normalize_host(host: str) -> str:
+    """规范化 Host：去端口、转小写、去空白，用于白名单比对。"""
     if not host:
         return ""
-    # strip port, lower-case, strip whitespace
+    # 去端口并统一小写，便于大小写不敏感匹配
     return host.split(":")[0].strip().lower()
 
 
 def check_host(host: str, allowed_hosts: list[str] | None = None) -> bool:
-    """Check host against whitelist.
+    """校验 Host 是否在白名单内。
 
-    - If allowed_hosts is None, loads from env HERO_HOST_WHITELIST CSV.
-    - Empty whitelist => allow all locally (offline/test friendly).
-    - Otherwise exact host (port-stripped, case-insensitive) must be in whitelist.
+    - allowed_hosts 为 None 时从环境变量 HERO_HOST_WHITELIST 加载。
+    - 白名单为空时本地放行（离线/测试友好）。
+    - 否则要求去端口、大小写不敏感的精确匹配。
     """
     if allowed_hosts is None:
         allowed_hosts = _get_whitelist_from_env()
@@ -55,27 +56,24 @@ def check_host(host: str, allowed_hosts: list[str] | None = None) -> bool:
 
 
 def verify_hmac(payload: bytes | Any, signature: str | None = None, secret: str | None = None) -> bool:
-    """Verify HMAC-SHA256 signature.
+    """校验 HMAC-SHA256 签名，支持双模式。
 
-    Dual-mode placeholder:
-    - Classic: verify_hmac(payload_bytes, signature_hex, secret) -> HMAC compare.
-    - Request: verify_hmac(request) where request has .headers with Authorization
-      containing Bearer/sk-/AKIA/JWT prefix (checked via redaction regex). In that
-      mode, signature/secret may be omitted and we just validate header presence.
+    - 经典模式：verify_hmac(payload_bytes, signature_hex, secret) 做 HMAC 比对。
+    - 请求占位模式：verify_hmac(request) 通过脱敏正则检查 Authorization/X-API-Key 是否含 Bearer/sk-/AKIA/JWT 前缀；此时 signature/secret 可省略。
     """
-    # Request placeholder mode: first arg looks like FastAPI Request
+    # 请求占位模式：首参形如 FastAPI Request
     if hasattr(payload, "headers") or hasattr(payload, "scope"):
-        # treat payload as request
+        # 将 payload 视为请求对象
         request = payload
-        # Extract headers dict-like
+        # 提取类字典 Headers
         headers = {}
         try:
-            # FastAPI Starlette Request.headers is case-insensitive
+            # Starlette Request.headers 大小写不敏感
             h = getattr(request, "headers", {})
-            # headers may be Headers object — convert via get
+            # Headers 对象通过 get 访问
             if hasattr(h, "get"):
                 auth = h.get("Authorization") or h.get("authorization") or ""
-                # Also check X-API-Key style
+                # 兼容 X-API-Key 形式
                 api_key = h.get("X-API-Key") or h.get("x-api-key") or ""
                 combined = f"{auth} {api_key}".strip()
             else:
@@ -83,12 +81,12 @@ def verify_hmac(payload: bytes | Any, signature: str | None = None, secret: str 
         except Exception:
             combined = ""
         if not combined:
-            # Try dict access fallback
+            # 字典访问回退
             try:
                 combined = str(headers)
             except Exception:
                 combined = ""
-        # Check via redaction patterns: Bearer, sk-, AKIA, JWT
+        # 通过脱敏正则判断是否含可识别前缀
         if _BEARER_RE.search(combined):
             return True
         if _SK_RE.search(combined):
@@ -97,18 +95,12 @@ def verify_hmac(payload: bytes | Any, signature: str | None = None, secret: str 
             return True
         if _JWT_RE.search(combined):
             return True
-        # Placeholder: if no secret pattern, consider missing auth as fail
-        # For offline/local where no auth required, we treat empty as True? But
-        # spec says verify_hmac(request) checks Bearer/sk prefix via redaction,
-        # so we return False when no recognizable prefix.
-        # Keep lenient: if combined empty, return True for local (no whitelist)?
-        # To avoid breaking local, return True when no header but whitelist empty?
-        # We choose: empty => False (needs auth), but check_host already gates.
+        # 无可识别前缀视为鉴权缺失；本地无白名单场景由 check_host 放行，此处保持严格
         return False
 
-    # Classic HMAC bytes mode
+    # 经典 HMAC 字节模式
     if not isinstance(payload, (bytes, bytearray)):
-        # allow str payload for convenience
+        # 兼容字符串输入
         if isinstance(payload, str):
             payload = payload.encode()
         else:
@@ -120,22 +112,22 @@ def verify_hmac(payload: bytes | Any, signature: str | None = None, secret: str 
 
 
 def verify_request_auth(request: Any) -> bool:
-    """Explicit request auth verify via redaction patterns (alias)."""
+    """请求鉴权显式入口：基于脱敏正则的别名封装。"""
     return verify_hmac(request, None, None)
 
 
 def is_host_allowed(request: Any, allowed_hosts: list[str] | None = None) -> bool:
-    """Helper to check Host header from FastAPI Request against whitelist."""
+    """从 FastAPI Request 提取 Host 并做白名单校验的便捷方法。"""
     host = ""
     try:
-        # Try request.headers.get("host")
+        # 优先从 headers 获取 host
         h = getattr(request, "headers", {})
         if hasattr(h, "get"):
             host = h.get("host") or h.get("Host") or ""
         if not host and hasattr(request, "url"):
-            # Fallback to URL hostname
+            # 回退到 URL 主机名
             host = getattr(request.url, "hostname", "") or ""
-        # Also try request.client.host as last resort
+        # 最后尝试 client.host
         if not host and hasattr(request, "client"):
             host = getattr(request.client, "host", "") or ""
     except Exception:
@@ -143,13 +135,13 @@ def is_host_allowed(request: Any, allowed_hosts: list[str] | None = None) -> boo
     return check_host(host, allowed_hosts)
 
 
-# Backwards compat alias for HMAC X-API-Key style
+# 兼容旧 X-API-Key 形式的 HMAC 校验别名
 def verify_api_key(request: Any, expected_key: str | None = None) -> bool:
-    """Check X-API-Key header against expected (or HERO_API_KEY env)."""
+    """校验 X-API-Key 请求头；未配置 HERO_API_KEY 时本地放行。"""
     if expected_key is None:
         expected_key = os.environ.get("HERO_API_KEY", "")
         if not expected_key:
-            # No key configured locally => allow
+            # 本地未配置密钥时放行
             return True
     try:
         h = getattr(request, "headers", {})

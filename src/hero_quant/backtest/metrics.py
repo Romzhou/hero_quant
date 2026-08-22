@@ -1,4 +1,9 @@
-"""Metrics for backtest engine - pure pandas/numpy/scipy."""
+"""绩效指标：纯 pandas/numpy 的回测后验计算。
+
+职责：基于权益曲线计算 sharpe、max_drawdown、annual_return、turnover 等，并汇总为 compute_metrics。
+架构位置：被 BacktestEngine 调用，产出 tearsheet 所需指标；不依赖外部量化库。
+关键设计：年化以 252 交易日为基准；除零/空数据/NaN 均回落为 0，避免指标发散。
+"""
 
 from __future__ import annotations
 
@@ -7,23 +12,16 @@ import pandas as pd
 
 
 def sharpe_ratio(equity: pd.Series, risk_free: float = 0.0, periods: int = 252) -> float:
-    """Annualized Sharpe ratio from equity curve.
-
-    Args:
-        equity: equity series (index date, value price)
-        risk_free: annual risk free rate
-        periods: trading periods per year
-    """
+    """年化 Sharpe：(日超额均值 / 日波动) * sqrt(252)，空/零波动回落 0。"""
     if equity is None or len(equity) < 2:
         return 0.0
-    # daily returns
+    # 日收益序列
     ret = equity.pct_change().dropna()
     if ret.empty or ret.std(ddof=1) == 0 or np.isnan(ret.std(ddof=1)):
-        return 0.0
-    # excess return
-    # risk_free daily
+        return 0.0  # 零波动或无效数据无法定义 Sharpe
+    # 年化无风险折为日
     rf_daily = risk_free / periods
-    excess = ret - rf_daily
+    excess = ret - rf_daily  # 超额收益
     sr = excess.mean() / excess.std(ddof=1) * np.sqrt(periods)
     if np.isnan(sr) or np.isinf(sr):
         return 0.0
@@ -31,21 +29,18 @@ def sharpe_ratio(equity: pd.Series, risk_free: float = 0.0, periods: int = 252) 
 
 
 def max_drawdown(equity: pd.Series) -> float:
-    """Maximum drawdown (negative value, e.g. -0.05 for 5% drawdown).
-
-    Computes min(equity / cummax - 1).
-    """
+    """最大回撤（负值，如 -0.05）：min(equity / cummax - 1)，空序列回落 0。"""
     if equity is None or len(equity) == 0:
         return 0.0
-    # ensure Series
+    # 统一为 Series
     s = pd.Series(equity) if not isinstance(equity, pd.Series) else equity
-    # handle DataFrame with single column
+    # 兼容单列 DataFrame 传入
     if isinstance(equity, pd.DataFrame):
         s = equity.iloc[:, 0]
-    cummax = s.cummax()
-    # avoid division by zero
+    cummax = s.cummax()  # 滚动峰值
+    # 避免除零：cummax 为 0 处回撤归零（已在后续 NaN 处理）
     dd = s / cummax - 1.0
-    # min drawdown (most negative)
+    # 最深回撤（最小值即最负）
     mdd = float(dd.min())
     if np.isnan(mdd):
         return 0.0
@@ -53,21 +48,18 @@ def max_drawdown(equity: pd.Series) -> float:
 
 
 def annual_return(equity: pd.Series, periods: int = 252) -> float:
-    """Annualized return from equity curve.
-
-    Uses compound annual growth rate.
-    """
+    """年化收益（CAGR）：(end/start)^(252/n)-1，起点为 0 或空回落 0。"""
     if equity is None or len(equity) < 2:
         return 0.0
     s = pd.Series(equity) if not isinstance(equity, pd.Series) else equity
     if isinstance(equity, pd.DataFrame):
         s = equity.iloc[:, 0]
-    start = float(s.iloc[0])
-    end = float(s.iloc[-1])
+    start = float(s.iloc[0])  # 起点净值
+    end = float(s.iloc[-1])  # 终点净值
     if start == 0 or np.isnan(start) or np.isnan(end):
-        return 0.0
+        return 0.0  # 起点为零无法定义 CAGR
     n = len(s)
-    # CAGR
+    # CAGR 年化
     try:
         ann = (end / start) ** (periods / n) - 1
     except Exception:
@@ -78,19 +70,11 @@ def annual_return(equity: pd.Series, periods: int = 252) -> float:
 
 
 def turnover(positions: pd.DataFrame | pd.Series | None = None, weights=None) -> float:
-    """Estimate turnover.
-
-    Simplified: if positions provided, turnover = mean absolute change.
-    Otherwise 0.0.
-
-    Args:
-        positions: DataFrame of positions over time or Series
-        weights: optional weights to estimate
-    """
+    """换手率估计：有持仓时取日均绝对变动，否则为 0。"""
     if positions is not None:
         try:
             if isinstance(positions, pd.DataFrame):
-                # sum absolute change across assets per day, mean
+                # 多资产：每日各标的绝对变动求和后取均值
                 diff = positions.diff().abs().sum(axis=1).dropna()
                 if not diff.empty:
                     return float(diff.mean())
@@ -100,12 +84,11 @@ def turnover(positions: pd.DataFrame | pd.Series | None = None, weights=None) ->
                     return float(diff.mean())
         except Exception:
             return 0.0
-    # fallback heuristic from weights: stable weights => low turnover
+    # 无持仓时的权重回落：稳定权重视为低换手
     if weights is not None:
         try:
             _w = np.asarray(weights, dtype=float)
-            # turnover proxy: if rebalanced daily, turnover ~ 0
-            # keep minimal non-zero to indicate costs impact
+            # 日频再平衡代理，暂视为 0 换手
             return 0.0
         except Exception:
             return 0.0
@@ -113,20 +96,10 @@ def turnover(positions: pd.DataFrame | pd.Series | None = None, weights=None) ->
 
 
 def compute_metrics(equity_series: pd.Series | pd.DataFrame, costs: float = 0.0, positions=None, weights=None) -> dict:
-    """Compute standard backtest metrics.
-
-    Args:
-        equity_series: equity curve (Series or DataFrame with single column)
-        costs: transaction costs (for info, not used in calc except turnover)
-        positions: optional positions for turnover
-        weights: optional weights for turnover
-
-    Returns:
-        dict with keys: sharpe, annual_return, max_drawdown, turnover, volatility, cumulative_return
-    """
-    # Normalize to Series
+    """汇总常规回测指标：sharpe/annual_return/max_drawdown/turnover/volatility/cumulative_return。"""
+    # 归一化为 Series
     if isinstance(equity_series, pd.DataFrame):
-        # if DataFrame with 'equity' column or single column
+        # 优先 equity 列，否则取首列
         if "equity" in equity_series.columns:
             s = equity_series["equity"]
         else:
@@ -136,7 +109,7 @@ def compute_metrics(equity_series: pd.Series | pd.DataFrame, costs: float = 0.0,
 
     s = pd.Series(s) if not isinstance(s, pd.Series) else s
 
-    # Ensure numeric
+    # 数值化并剔除缺失，空序列直接回落零指标
     s = pd.to_numeric(s, errors="coerce").dropna()
     if s.empty:
         return {
@@ -153,9 +126,9 @@ def compute_metrics(equity_series: pd.Series | pd.DataFrame, costs: float = 0.0,
     mdd = max_drawdown(s)
     to = turnover(positions, weights)
 
-    # additional metrics
+    # 年化波动率与累计收益
     ret = s.pct_change().dropna()
-    vol = float(ret.std(ddof=1) * np.sqrt(252)) if not ret.empty and ret.std(ddof=1) != 0 else 0.0
+    vol = float(ret.std(ddof=1) * np.sqrt(252)) if not ret.empty and ret.std(ddof=1) != 0 else 0.0  # 252 交易日年化
     cum_ret = float(s.iloc[-1] / s.iloc[0] - 1) if s.iloc[0] != 0 else 0.0
 
     return {

@@ -1,10 +1,8 @@
-"""ScheduledResearch Temporal Cron — ZoneInfo timezone-aware cron dispatch.
+"""定时研究调度 — ZoneInfo 时区感知的 cron 分发。
 
-Minimal implementation:
-- cron 5-field validation (minute hour dom month dow)
-- ZoneInfo timezone-aware next_trigger via minute brute-force (366d horizon)
-- 5 playbooks registry (hard-coded + markdown files)
-- Temporal Cron placeholder (to_temporal_cron)
+职责：提供 cron 解析/校验、时区感知的 next_trigger 计算及 playbook 注册表。
+架构位置：`scheduled` 核心，对接 Temporal Cron，本地可离线计算触发时间用于测试。
+关键设计：5 字段 cron 全量解析（*, */n, a,b,c, a-b, a-b/n）；ZoneInfo 校验；分钟级暴力搜索 366 天 horizon；5 个 playbook 注册表统一 `to_temporal_cron` 与 `dispatch`。
 """
 
 from __future__ import annotations
@@ -16,43 +14,34 @@ from typing import Dict, List, Optional, Set, Tuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
-# ---------- cron parsing ----------
+# ---------- cron 解析 ----------
 
 _CRON_RANGES = {
     "minute": (0, 59),
     "hour": (0, 23),
     "dom": (1, 31),
     "month": (1, 12),
-    "dow": (0, 7),  # 0 and 7 = Sunday
+    "dow": (0, 7),  # 0 与 7 均表示周日
 }
 
 
 def _parse_field(field_str: str, min_val: int, max_val: int) -> Set[int]:
-    """Parse single cron field into set of ints.
+    """解析单个 cron 字段为整数集合，支持 *, */n, a,b,c, a-b, a-b/n。"""
 
-    Supports:
-    - "*"
-    - "*/n"
-    - "a,b,c"
-    - "a-b"
-    - "a-b/n" and "*/n" and "a/n"
-    Single values.
-    Raises ValueError on invalid.
-    """
     field_str = field_str.strip()
     if not field_str:
         raise ValueError("empty cron field")
 
     result: Set[int] = set()
 
-    # split by comma (list)
+    # 按逗号拆分列表项
     parts = field_str.split(",")
     for part in parts:
         part = part.strip()
         if not part:
             raise ValueError(f"invalid cron part empty in {field_str!r}")
 
-        # handle step "/"
+        # 含步进 "/"
         if "/" in part:
             base, step_s = part.split("/", 1)
             try:
@@ -61,7 +50,6 @@ def _parse_field(field_str: str, min_val: int, max_val: int) -> Set[int]:
                 raise ValueError(f"invalid step {step_s!r} in {part!r}")
             if step <= 0:
                 raise ValueError(f"step must be >0 got {step} in {part!r}")
-            # base can be "*", "a-b", "a", etc.
             base = base.strip()
             if base == "*" or base == "":
                 start, end = min_val, max_val
@@ -74,7 +62,7 @@ def _parse_field(field_str: str, min_val: int, max_val: int) -> Set[int]:
                 if start < min_val or end > max_val or start > end:
                     raise ValueError(f"range {base!r} out of bounds [{min_val},{max_val}]")
             else:
-                # single value with step like "2/3" means from 2 to max step 3
+                # 单值带步进如 "2/3" 表示从 2 到 max 每 3
                 try:
                     start = int(base)
                 except ValueError:
@@ -82,14 +70,13 @@ def _parse_field(field_str: str, min_val: int, max_val: int) -> Set[int]:
                 if start < min_val or start > max_val:
                     raise ValueError(f"value {start} out of bounds [{min_val},{max_val}]")
                 end = max_val
-            # expand
             for v in range(start, end + 1):
                 if (v - start) % step == 0:
                     if min_val <= v <= max_val:
                         result.add(v)
             continue
 
-        # no step — handle "*" or range or single
+        # 无步进：处理 "*"、区间或单值
         if part == "*":
             result.update(range(min_val, max_val + 1))
             continue
@@ -103,7 +90,7 @@ def _parse_field(field_str: str, min_val: int, max_val: int) -> Set[int]:
                 raise ValueError(f"range {part!r} out of bounds [{min_val},{max_val}]")
             result.update(range(a, b + 1))
             continue
-        # single integer
+        # 单值
         try:
             v = int(part)
         except ValueError:
@@ -118,7 +105,7 @@ def _parse_field(field_str: str, min_val: int, max_val: int) -> Set[int]:
 
 
 def _normalize_dow(values: Set[int]) -> Set[int]:
-    """Normalize dow: 7 -> 0 (Sunday)."""
+    """归一化周：7 视为 0（周日）。"""
     out: Set[int] = set()
     for v in values:
         if v == 7:
@@ -129,7 +116,7 @@ def _normalize_dow(values: Set[int]) -> Set[int]:
 
 
 def parse_cron(cron_expr: str) -> Tuple[Set[int], Set[int], Set[int], Set[int], Set[int]]:
-    """Parse cron 5-field into sets; raises ValueError if invalid."""
+    """解析 5 字段 cron 为集合，非法抛 ValueError。"""
     if not isinstance(cron_expr, str):
         raise ValueError("cron must be str")
     cron_expr = cron_expr.strip()
@@ -149,13 +136,13 @@ def parse_cron(cron_expr: str) -> Tuple[Set[int], Set[int], Set[int], Set[int], 
 
 
 def validate_cron(cron_expr: str) -> bool:
-    """Validate cron; returns True or raises ValueError."""
+    """校验 cron 合法性，合法返回 True 否则抛 ValueError。"""
     parse_cron(cron_expr)
     return True
 
 
 def _check_match(candidate: datetime, minute_set, hour_set, dom_set, month_set, dow_set) -> bool:
-    # candidate is already timezone-aware in target tz
+    """判断候选时间是否匹配 cron 集合（candidate 已为目标时区）。"""
     if candidate.minute not in minute_set:
         return False
     if candidate.hour not in hour_set:
@@ -164,9 +151,7 @@ def _check_match(candidate: datetime, minute_set, hour_set, dom_set, month_set, 
         return False
     if candidate.month not in month_set:
         return False
-    # dow: python weekday Mon=0 ... Sun=6 ; cron dow Sun=0, Mon=1 ... Sat=6
-    # convert candidate.weekday() -> cron dow
-    # weekday 0 Mon -> 1, 1 Tue ->2 ... 5 Sat ->6, 6 Sun ->0
+    # 周：Python weekday 周一 0..周日 6 转 cron 周日 0..周六 6
     py_wday = candidate.weekday()  # 0 Mon
     cron_dow = (py_wday + 1) % 7  # Mon 0->1, Sun 6->0
     if cron_dow not in dow_set:
@@ -175,18 +160,16 @@ def _check_match(candidate: datetime, minute_set, hour_set, dom_set, month_set, 
 
 
 def get_next_trigger(cron_expr: str, tz_name: str, after: Optional[datetime] = None) -> datetime:
-    """Compute next trigger after `after` for cron in given timezone.
+    """计算严格大于 `after` 的下次触发时间（带时区）。
 
-    - Validates cron 5-field
-    - Validates timezone via ZoneInfo
-    - Returns timezone-aware datetime in target ZoneInfo, strictly > after
-    - Horizon 366 days; raises ValueError if not found
+    校验 cron 与时区，horizon 366 天，未命中抛 ValueError。
     """
-    # validate cron 5-field first (raises ValueError for bad cron)
+
+    # 先校验 cron 合法性
     parse_result = parse_cron(cron_expr)
     minute_set, hour_set, dom_set, month_set, dow_set = parse_result
 
-    # validate timezone
+    # 校验时区
     try:
         tz = ZoneInfo(tz_name)
     except ZoneInfoNotFoundError as e:
@@ -194,32 +177,25 @@ def get_next_trigger(cron_expr: str, tz_name: str, after: Optional[datetime] = N
     except Exception as e:
         raise ValueError(f"invalid timezone {tz_name!r}: {e}") from e
 
-    # normalize after
+    # 归一化 after：无则取当前时区时间；naive 视为目标时区
     if after is None:
         after = datetime.now(tz)
     else:
         if not isinstance(after, datetime):
             raise ValueError("after must be datetime")
         if after.tzinfo is None:
-            # treat naive as in target timezone
             after = after.replace(tzinfo=tz)
         else:
             after = after.astimezone(tz)
 
-    # start at next minute boundary, strictly > after
-    # truncate seconds/microseconds then +1 minute
+    # 从下一分钟边界开始（严格 > after）
     candidate = after.replace(second=0, microsecond=0) + timedelta(minutes=1)
 
-    # optional fast path for daily/weekly — but brute force is fine for 366d (527k iterations worst)
     horizon = candidate + timedelta(days=366)
-    # safety cap 366*1440 ~ 527040 iterations
+    # 最多 366*1440 次迭代
     while candidate <= horizon:
         if _check_match(candidate, minute_set, hour_set, dom_set, month_set, dow_set):
-            # ensure returned dt has correct tzinfo key (candidate already in tz)
-            # Candidate is already tz-aware via after conversion; adding timedelta keeps tzinfo
-            # But datetime + timedelta retains tzinfo, need to ensure it's still ZoneInfo(tz_name)
-            # Re-attach ZoneInfo to be safe if needed (dst transitions handled by conversion)
-            # Use candidate.astimezone(tz) to normalize DST
+            # 规范化 DST：确保返回为目标 ZoneInfo
             try:
                 candidate = candidate.astimezone(tz)
             except Exception:
@@ -230,23 +206,26 @@ def get_next_trigger(cron_expr: str, tz_name: str, after: Optional[datetime] = N
     raise ValueError(f"no next trigger found within 366d for cron {cron_expr!r} tz {tz_name!r} after {after!r}")
 
 
-# ---------- playbooks ----------
+# ---------- playbook 注册 ----------
 
 @dataclass
 class ScheduledPlaybook:
+    """定时 playbook 定义。"""
+
     name: str
     cron: str
     timezone: str
     description: str
     title_cn: str = ""
     file: Optional[Path] = None
-    # extra metadata
     tags: List[str] = field(default_factory=list)
 
     def next_trigger(self, after: Optional[datetime] = None) -> datetime:
+        """计算该 playbook 的下次触发时间。"""
         return get_next_trigger(self.cron, self.timezone, after=after)
 
     def to_dict(self) -> Dict[str, str]:
+        """转为字典摘要。"""
         return {
             "name": self.name,
             "cron": self.cron,
@@ -256,7 +235,7 @@ class ScheduledPlaybook:
         }
 
 
-# 5 minimal playbooks — must match markdown files on disk
+# 5 个内置 playbook，需与磁盘 markdown 文件对应
 _PLAYBOOKS_DATA: List[Dict[str, str]] = [
     {
         "name": "premarket-brief",
@@ -302,6 +281,7 @@ _PLAYBOOKS_DATA: List[Dict[str, str]] = [
 
 
 def _build_playbooks() -> List[ScheduledPlaybook]:
+    """由内置数据构建 playbook 列表（含文件路径与标签）。"""
     out: List[ScheduledPlaybook] = []
     base = Path(__file__).parent / "playbooks"
     for data in _PLAYBOOKS_DATA:
@@ -323,24 +303,21 @@ _PLAYBOOK_MAP: Dict[str, ScheduledPlaybook] = {p.name: p for p in PLAYBOOKS}
 
 
 def list_playbooks() -> List[ScheduledPlaybook]:
+    """列出全部 playbook。"""
     return list(PLAYBOOKS)
 
 
 def get_playbook(name: str) -> ScheduledPlaybook:
+    """按名获取 playbook，不存在抛 KeyError。"""
     if name not in _PLAYBOOK_MAP:
         raise KeyError(f"playbook {name!r} not found; available: {list(_PLAYBOOK_MAP.keys())}")
     return _PLAYBOOK_MAP[name]
 
 
 class ScheduledService:
-    """Timezone-aware dispatch service — Temporal Cron placeholder.
+    """时区感知调度服务 — Temporal Cron 占位。
 
-    Temporal usage (production):
-        from temporalio.client import Client
-        await client.start_scheduled(..., cron=playbook.cron, tz=playbook.timezone)
-
-    This service provides local next_trigger computation that mirrors Temporal's
-    cron + timezone dispatch for testing without Temporal server.
+    职责：提供本地 next_trigger 计算，语义与 Temporal cron+时区一致，便于离线测试。
     """
 
     def __init__(self, playbooks: Optional[List[ScheduledPlaybook]] = None):
@@ -348,40 +325,40 @@ class ScheduledService:
         self._map: Dict[str, ScheduledPlaybook] = {p.name: p for p in self._playbooks}
 
     def list_playbooks(self) -> List[ScheduledPlaybook]:
+        """列出已注册 playbook。"""
         return list(self._playbooks)
 
     def get_playbook(self, name: str) -> ScheduledPlaybook:
+        """按名获取 playbook。"""
         if name not in self._map:
             raise KeyError(f"playbook {name!r} not found")
         return self._map[name]
 
     def next_trigger(self, cron_expr: str, tz_name: str, after: Optional[datetime] = None) -> datetime:
+        """通用 cron 下次触发时间。"""
         return get_next_trigger(cron_expr, tz_name, after=after)
 
     def next_trigger_for_playbook(self, name: str, after: Optional[datetime] = None) -> datetime:
+        """指定 playbook 的下次触发时间。"""
         p = self.get_playbook(name)
         return p.next_trigger(after=after)
 
     def validate_cron(self, cron_expr: str) -> bool:
+        """校验 cron 合法性。"""
         return validate_cron(cron_expr)
 
     def to_temporal_cron(self, name_or_cron: str) -> str:
-        """Return 5-field cron string for Temporal schedule.
+        """转为 Temporal 可用的 5 字段 cron 字符串。"""
 
-        If name_or_cron is a known playbook name, returns its cron.
-        Otherwise validates and returns the cron itself.
-        """
         if name_or_cron in self._map:
             return self._map[name_or_cron].cron
-        # validate it is a cron
+        # 否则校验其本身为合法 cron
         validate_cron(name_or_cron)
         return name_or_cron
 
     def dispatch(self, name: str, after: Optional[datetime] = None) -> Dict[str, str]:
-        """Timezone-aware dispatch placeholder — returns next trigger info.
+        """时区感知分发占位 — 返回下次触发信息，生产环境将入队 Temporal。"""
 
-        In production this would enqueue a Temporal scheduled workflow.
-        """
         p = self.get_playbook(name)
         nxt = p.next_trigger(after=after)
         return {
@@ -394,7 +371,7 @@ class ScheduledService:
         }
 
 
-# alias for spec alternative naming
+# 兼容别名
 Scheduler = ScheduledService
 
 __all__ = [

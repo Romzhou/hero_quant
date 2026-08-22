@@ -1,3 +1,8 @@
+/**
+ * Risk 风控页
+ * - 职责：展示敞口/限额/熔断/拒单等风控总览、规则清单（PIT/cross_source/双桶熔断/grounding）与归因五类覆盖
+ * - 数据流：当前为静态占位，后续可接 /v1/risk/summary 与 ledger 审计流；所有决策以 ledger.verify() 为可追溯锚点
+ */
 export default function Risk() {
   return (
     <div className="mx-auto max-w-7xl px-6 py-6">

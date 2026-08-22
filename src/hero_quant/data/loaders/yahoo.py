@@ -1,16 +1,27 @@
+"""Yahoo 行情 Loader：US 股票、shares 单位与双路径容错。
+
+位于 data/loaders 层 US 分支，markets=["US"]、unit="shares"；
+优先使用 yf.download，失败回退至 Ticker.history，超时与异常均转为
+可操作的 pip 安装提示以便 Registry 做 fallback。
+"""
+
 import logging
 
 logger = logging.getLogger(__name__)
 
+
 class YahooLoader:
+    """Yahoo US 行情 Loader（shares）。"""
+
     markets = ["US"]
     unit = "shares"
 
     def get_bars(self, symbol, start, end, interval="1d"):
+        """拉取 US 行情，兼容旧参数顺序；双路径 download→history 做容错。"""
         _intervals = {"1d", "1m", "5m", "15m", "30m", "1h", "1wk", "1mo", "1D", "1W"}
         if start in _intervals and "-" in end and "-" in interval:
             start, end, interval = end, interval, start
-        # lazy import yfinance
+
         try:
             import yfinance as yf
         except ImportError as e:
@@ -18,7 +29,6 @@ class YahooLoader:
 
         try:
             ticker_symbol = symbol.split(".")[0] if "." in symbol else symbol
-            # Prefer yf.download as primary (vibe-trading logic port)
             df = None
             try:
                 df = yf.download(ticker_symbol, start=start, end=end, interval=interval, progress=False, auto_adjust=False, timeout=5)
@@ -26,12 +36,10 @@ class YahooLoader:
                 # older yfinance without timeout param
                 df = yf.download(ticker_symbol, start=start, end=end, interval=interval, progress=False, auto_adjust=False)
             except Exception as e:
-                # download failed -> try Ticker.history fallback
                 logger.warning("yfinance download failed for %s: %s, trying history", ticker_symbol, e)
                 df = None
 
             if df is None or len(df) == 0:
-                # fallback to Ticker.history
                 try:
                     ticker = yf.Ticker(ticker_symbol)
                     df = ticker.history(start=start, end=end, interval=interval, auto_adjust=False)
@@ -75,5 +83,4 @@ class YahooLoader:
         except ImportError:
             raise
         except Exception as e:
-            # actionable ImportError for registry fallback chain
             raise ImportError("pip install hero-quant[us]") from e

@@ -1,3 +1,12 @@
+"""工具注册表：语义化合约、JSON Schema 校验与并发安全标记。
+
+位于 tools 层核心，@tool 装饰器负责将函数注册为 LLM 可调用工具：
+- 以 JSON Schema 约束输入/输出，提前校验保证合约稳定；
+- is_concurrency_safe(read True / write False) 供调用方做并发审计；
+- get_definitions 按名称排序返回，确保 KV-cache 命中稳定；
+- presentAs 为展示形态桩（native/code/both），当前保持 native 稳定。
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -6,7 +15,7 @@ import inspect
 
 
 def assertSupportedJsonSchema(schema: Dict[str, Any]) -> None:
-    """Validate minimal JSON Schema support. Raises ValueError on unsupported."""
+    """校验最小可用 JSON Schema 子集，不支持的类型抛出 ValueError。"""
     if not isinstance(schema, dict):
         raise ValueError("schema must be dict")
     if "type" not in schema:
@@ -32,6 +41,7 @@ def assertSupportedJsonSchema(schema: Dict[str, Any]) -> None:
 
 
 def _normalize_concurrency_safe(fn: Callable | bool | None) -> Callable[[Dict[str, Any]], bool]:
+    """将 bool/Callable 统一为 Callable[[args], bool]，默认 False（保守写安全）。"""
     if fn is None:
         return lambda args: False
     if callable(fn):
@@ -45,16 +55,17 @@ def _normalize_concurrency_safe(fn: Callable | bool | None) -> Callable[[Dict[st
 
 @dataclass
 class ToolSpec:
+    """单工具的语义化合约与运行时元数据。"""
+
     name: str
     description: str
     func: Callable
     signature: inspect.Signature | None = None
     parameters: Dict[str, Any] | None = None
-    output: Dict[str, Any] | None = None  # stored as {"schema": ..., "render": ...}
+    output: Dict[str, Any] | None = None  # 统一存为 {"schema": ..., "render": ...}
     is_concurrency_safe: Callable[[Dict[str, Any]], bool] = field(default_factory=lambda: lambda args: False)  # type: ignore
     timeoutMs: int | None = None
-    # stub for presentAs
-    presentAs: str = "native"
+    presentAs: str = "native"  # 展示形态桩，预留 code/both
 
 
 TOOL_REGISTRY: Dict[str, ToolSpec] = {}
@@ -69,17 +80,13 @@ def tool(
     timeoutMs: int | None = None,
     **kwargs: Any,
 ):
-    """Decorator to register a function as a tool with semantic contract.
+    """注册函数为工具，固化语义化合约与并发安全标记。
 
-    Supports:
-    - name, description (required)
-    - parameters: JSON Schema for inputs (validated)
-    - output: JSON Schema for outputs (validated, stored as {schema, render})
-    - is_concurrency_safe: Callable[[args], bool] or bool
-    - timeoutMs: int (also accepts timeout_ms / timeoutms aliases)
-    - presentAs: native|code|both (stub)
+    约定：只读工具 is_concurrency_safe 为 True，有状态写为 False；
+    parameters/output 为 JSON Schema，注册期即校验；timeoutMs 与
+    presentAs 为可选扩展，支持下划线/驼峰别名兼容。
     """
-    # handle aliases
+    # 兼容下划线/驼峰等别名写法
     if timeoutMs is None:
         if "timeout_ms" in kwargs:
             timeoutMs = kwargs.pop("timeout_ms")
@@ -87,7 +94,6 @@ def tool(
             timeoutMs = kwargs.pop("timeoutms")
         elif "timeout" in kwargs:
             timeoutMs = kwargs.pop("timeout")
-    # is_concurrency_safe alias
     if is_concurrency_safe is None and "concurrency_safe" in kwargs:
         is_concurrency_safe = kwargs.pop("concurrency_safe")
 
@@ -96,7 +102,7 @@ def tool(
     if name in TOOL_REGISTRY:
         raise ValueError(f"tool name '{name}' already registered")
 
-    # validate schemas early
+    # 注册期即校验 Schema， fail-fast 避免运行时合约漂移
     if parameters is not None:
         assertSupportedJsonSchema(parameters)
     if output is not None:
@@ -108,10 +114,9 @@ def tool(
         if not description:
             raise ValueError("description must be non-empty")
 
-        # normalize is_concurrency_safe to callable
         safe_fn = _normalize_concurrency_safe(is_concurrency_safe)
 
-        # wrap output as {schema, render}
+        # 输出 Schema 统一包为 {schema, render}，便于后续扩展渲染层
         if output is not None:
             if isinstance(output, dict) and "schema" in output and "render" in output:
                 output_wrapped: Dict[str, Any] | None = output
@@ -120,10 +125,8 @@ def tool(
         else:
             output_wrapped = None
 
-        # presentAs stub
         present_as = kwargs.get("presentAs", kwargs.get("present_as", "native"))
 
-        # timeoutMs normalization
         t_ms = None
         if timeoutMs is not None:
             try:
@@ -149,12 +152,9 @@ def tool(
 
 
 def get_definitions(presentAs: str = "native") -> list[Dict[str, Any]]:
-    """Return tool definitions sorted by name (toolOrder) for KV-cache stability.
+    """按名称排序返回工具定义，保证 KV-cache 稳定；presentAs 为展示形态桩。"""
+    # 按名称排序：避免注册顺序抖动导致 KV-cache 失效
 
-    presentAs: native|code|both — stub, currently returns native form regardless
-    (both would return merged, code would return code string; minimal keeps native).
-    """
-    # toolOrder sort + KV-cache stable: sorted by name
     defs: list[Dict[str, Any]] = []
     for tool_name in sorted(TOOL_REGISTRY.keys()):
         spec = TOOL_REGISTRY[tool_name]
@@ -165,10 +165,8 @@ def get_definitions(presentAs: str = "native") -> list[Dict[str, Any]]:
             "parameters": params,
         }
         defs.append({"type": "function", "function": func_def})
-    # presentAs stub handling
+    # presentAs 桩：当前保持 native 稳定，code/both 预留扩展
     if presentAs == "code":
-        # code present would transform, but minimal keeps native for stability
-        # we could map via presentation.present_as_code, but keep native to pass tests
         pass
     elif presentAs == "both":
         pass

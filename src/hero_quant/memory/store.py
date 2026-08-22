@@ -1,4 +1,8 @@
-"""MemoryStore - file+sqlite FTS5+dedup minimal implementation with vector hybrid + pgvector sidecar."""
+"""记忆存储：文件 + SQLite FTS5 双存储与向量混合检索。
+
+职责：对外提供记忆的写入、检索与去重；上游供 Agent/Graph 调用，下游落盘到文件、SQLite 索引及可选 pgvector。
+设计要点：文件为真实来源（可审计、支持层次路由），SQLite FTS5 为检索索引（BM25）；优先 trigram 分词以兼顾中英文；30 秒滑动窗口内对归一化 content 去重；向量检索本地优先、pgvector sidecar 配置时作为一等公民且失败静默回退。
+"""
 
 from __future__ import annotations
 
@@ -15,20 +19,16 @@ from .lifecycle import HALF_LIFE_DAYS, _DECAY_LAMBDA, compute_importance
 
 
 def _content_hash(name: str, content: str) -> str:
-    """vibe persistent.py:35-39 思路 content_hash，去重哈希.
-
-    sha256((f"{name}:{content}").lower().strip().encode()).hexdigest()[:12]
-    """
+    """计算去重哈希：对 ``name:content`` 归一化后取 sha256 前 12 位。"""
     return hashlib.sha256(f"{name}:{content}".lower().strip().encode()).hexdigest()[:12]
 
 
-# ---- pgvector sidecar hardening (Wave E3) ----
-# Env gate consolidated in Settings; thin wrappers here delegate to single sources.
+# pgvector sidecar 的 DSN 前缀白名单；鉴权与解析统一收口到 Settings，此处仅做轻量委托。
 _PG_PREFIXES = ("postgresql://", "postgres://", "postgresql+psycopg://")
 
 
 def _pgvector_dsn() -> str | None:
-    """Resolve pgvector DSN via Settings (single env gate)."""
+    """经 Settings 解析 pgvector DSN，未配置或格式非法则返回 None。"""
     try:
         from hero_quant.config.settings import Settings
 
@@ -42,7 +42,7 @@ def _pgvector_dsn() -> str | None:
 
 
 def is_pgvector_configured() -> bool:
-    """Whether pgvector sidecar should be attempted (env gate via Settings)."""
+    """判断是否应启用 pgvector sidecar（由 Settings 统一鉴权）。"""
     try:
         from hero_quant.config.settings import Settings
 
@@ -56,7 +56,7 @@ def is_pgvector_configured() -> bool:
 
 
 def get_vector_dim() -> int:
-    """Single source: delegate to hero_quant.agent.embed.get_vector_dim."""
+    """获取向量维度，单一来源委托给 ``hero_quant.agent.embed``。"""
     try:
         from hero_quant.agent.embed import get_vector_dim as _embed_dim
 
@@ -66,7 +66,7 @@ def get_vector_dim() -> int:
 
 
 def _vector_to_literal(vec) -> str:
-    """Serialize vector to pgvector literal '[0.1,0.2]' for TEXT fallback or vector type."""
+    """将向量序列化为 pgvector 字面量 ``[0.1,0.2]``，兼顾 vector 类型与 TEXT 回退。"""
     try:
         from hero_quant.agent.embed import to_pgvector_literal  # type: ignore
 
@@ -79,13 +79,10 @@ def _vector_to_literal(vec) -> str:
 
 
 class PgVectorSidecar:
-    """Postgres pgvector sidecar — first-class when configured, graceful fallback to local.
+    """Postgres pgvector 侧车：配置时一等公民，未就绪则静默回退到本地。
 
-    - DDL: CREATE EXTENSION vector + memory_vectors(key PK, content, embedding vector(dim), namespace)
-    - UPSERT via INSERT ... ON CONFLICT (key) DO UPDATE
-    - SEARCH via embedding <=> query::vector (cosine distance) with namespace filter
-    - If psycopg not installed or connection fails, _enabled=False and all ops no-op.
-    - Timeout hardening: connection timeout 5s, statement timeout 5s.
+    职责：承载向量的一致性扩容，状态由 ``_enabled/_pool/_is_async`` 控制，连接失败时所有操作 no-op。
+    不变量：DDL 幂等（vector 扩展 + memory_vectors 表 + 索引），UPSERT 按 key 冲突覆盖，检索按余弦距离 ``<=>`` 排序并支持 namespace 过滤；超时统一 5s 熔断。
     """
 
     def __init__(self, dsn: str | None = None, dim: int | None = None) -> None:
@@ -103,7 +100,7 @@ class PgVectorSidecar:
     def _init_pool(self) -> None:
         if not self.dsn:
             return
-        # lazy import pool; fallback to direct psycopg if pool unavailable
+        # 延迟导入连接池；不可用时回退到直连 psycopg，避免硬依赖
         Pool = None  # type: ignore
         try:
             try:
@@ -117,14 +114,14 @@ class PgVectorSidecar:
         except Exception:
             Pool = None  # type: ignore
         if Pool is None:
-            # check psycopg availability
+            # 检查 psycopg 是否可用
             try:
                 import importlib.util as _ilu
 
                 if _ilu.find_spec("psycopg") is None:
                     self._last_error = "psycopg not installed"
                     return
-                # no pool, will use direct connect per operation — still enabled
+                # 无连接池时改为每次直连，仍视为可用
                 self._enabled = True
                 return
             except Exception as e:
@@ -138,7 +135,7 @@ class PgVectorSidecar:
                     self._pool = Pool(conninfo=self.dsn, min_size=1, max_size=5)  # type: ignore
                 except TypeError:
                     self._pool = Pool(self.dsn)  # type: ignore  # type: ignore
-            # detect async
+            # 识别是否为异步连接池
             try:
                 import inspect as _ins
 
@@ -146,7 +143,7 @@ class PgVectorSidecar:
             except Exception:
                 self._is_async = False
             self._enabled = True
-            # try ensure schema sync only if not async (async will do lazy)
+            # 仅同步池立即同步表结构，异步池延迟到使用时
             if not self._is_async:
                 self._ensure_schema_sync()
         except Exception as e:
@@ -155,9 +152,10 @@ class PgVectorSidecar:
             self._enabled = False
 
     def _ensure_schema_sync(self) -> None:
+        """同步侧车表结构，失败不影响主流程。"""
         if not self._enabled or self._is_async:
             return
-        # DDL guarded — extension + table + index (best effort)
+        # DDL 防御式执行：扩展、表、索引均为 best-effort，失败静默
         try:
             if self._pool is not None and hasattr(self._pool, "connection"):
                 with self._pool.connection() as conn:  # type: ignore
@@ -165,7 +163,7 @@ class PgVectorSidecar:
                         conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
                     except Exception:
                         pass
-                    # try vector type, fallback to TEXT
+                    # 优先创建 vector 类型列，失败则回退到 TEXT
                     created = False
                     try:
                         conn.execute(
@@ -180,10 +178,10 @@ class PgVectorSidecar:
                             created = True
                         except Exception:
                             created = False
-                    # best-effort index (ivfflat requires vector)
+                    # 索引为 best-effort，ivfflat 仅在 vector 类型时有效
                     if created:
                         try:
-                            # only if vector type succeeded
+                            # 仅 vector 类型成功时创建向量索引
                             conn.execute(
                                 "CREATE INDEX IF NOT EXISTS idx_memory_vectors_embedding ON memory_vectors USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100)"
                             )
@@ -224,7 +222,7 @@ class PgVectorSidecar:
                     except Exception:
                         pass
             else:
-                # direct psycopg path — try one-off connection
+                # 无连接池时走一次性直连路径
                 try:
                     import psycopg  # type: ignore
 
@@ -250,6 +248,7 @@ class PgVectorSidecar:
             pass
 
     def ping(self) -> bool:
+        """探测侧车连通性，任意路径成功即返回 True。"""
         if not self._enabled:
             return False
         try:
@@ -287,24 +286,25 @@ class PgVectorSidecar:
             return False
 
     def upsert(self, key: str, content: str, embedding: list[float], namespace: str | None = None) -> bool:
+        """向侧车写入/更新一条向量记录，失败返回 False。"""
         if not self._enabled or not key:
             return False
         lit = _vector_to_literal(embedding)
         ns = namespace or ""
-        # try sync pool path; async pool will fallback to False (caller fallback to local)
+        # 异步池暂不支持同步写入，直接回退由调用方走本地
         if self._is_async:
             return False
         try:
             if self._pool is not None and hasattr(self._pool, "connection"):
                 with self._pool.connection() as conn:  # type: ignore
-                    # try vector::vector insertion, fallback to TEXT
+                    # 优先按 vector 类型写入，失败则回退到 TEXT 列
                     try:
                         conn.execute(
                             "INSERT INTO memory_vectors (key, content, embedding, namespace) VALUES (%s, %s, %s::vector, %s) ON CONFLICT (key) DO UPDATE SET content=EXCLUDED.content, embedding=EXCLUDED.embedding, namespace=EXCLUDED.namespace",
                             (key, content, lit, ns),
                         )
                     except Exception:
-                        # fallback TEXT column
+                        # 回退到 TEXT 列的兼容写法
                         with conn.cursor() as cur:  # type: ignore
                             cur.execute(
                                 "INSERT INTO memory_vectors (key, content, embedding, namespace) VALUES (%s, %s, %s, %s) ON CONFLICT (key) DO UPDATE SET content=EXCLUDED.content, embedding=EXCLUDED.embedding, namespace=EXCLUDED.namespace",
@@ -358,6 +358,7 @@ class PgVectorSidecar:
             return False
 
     def search(self, query_vec: list[float], top_k: int = 5, namespace: str | None = None) -> list[dict]:
+        """在侧车中按余弦距离检索最相似的 top_k 条记录。"""
         if not self._enabled or not query_vec:
             return []
         lit = _vector_to_literal(query_vec)
@@ -368,7 +369,7 @@ class PgVectorSidecar:
             if self._pool is not None and hasattr(self._pool, "connection") and not self._is_async:
                 with self._pool.connection() as conn:  # type: ignore
                     try:
-                        # cosine distance: 1 - cosine => ORDER BY embedding <=> query asc
+                        # 余弦距离：ORDER BY embedding <=> query 升序即最相似在前
                         if ns:
                             cur = conn.execute(  # type: ignore
                                 "SELECT key, content, embedding FROM memory_vectors WHERE namespace=%s ORDER BY embedding <=> %s::vector LIMIT %s",
@@ -444,35 +445,39 @@ class PgVectorSidecar:
 
 
 class MemoryStore:
-    """File storage with SQLite FTS5 and 30s dedup + optional tenant/thread namespace isolation + vector hybrid + pgvector sidecar."""
+    """记忆主存储：文件落地 + SQLite FTS5 索引 + 30 秒去重 + 向量混合检索。
+
+    职责：统一管理记忆的持久化与召回；线程安全依赖 SQLite ``check_same_thread=False`` 与文件锁，索引一致性由同事务写入保障。
+    关键状态：``_recent_hashes`` 为 30s 滑动窗口去重表，``_meta`` 为 Ebbinghaus 衰减的内存元数据，``_vector_enabled/_fts_enabled`` 标记能力可用性。
+    """
 
     def __init__(self, base_path: Path | str, namespace: str | None = None):
         self.base = Path(base_path)
         self.base.mkdir(parents=True, exist_ok=True)
         self.namespace = namespace
         self._recent_hashes: dict[str, float] = {}
-        self._meta: dict[str, dict] = {}  # ns_key -> {quality_score, access_count, last_accessed}
+        self._meta: dict[str, dict] = {}  # ns_key -> {quality_score, access_count, last_accessed}，内存态衰减元数据
         self._fts_enabled = False
         self._vector_enabled = False
         self.db_path = self.base / "memory.db"
         self._init_db()
-        # hierarchy helper (lazy import to avoid cycle)
+        # 延迟导入层次路由，避免循环依赖
         try:
             from .hierarchy import MemoryHierarchy
 
             self.hierarchy = MemoryHierarchy(self.base)
         except Exception:
             self.hierarchy = None  # type: ignore
-        # pgvector sidecar — first-class when configured, fallback to local hybrid if unavailable
+        # pgvector 侧车：已配置则作为一等公民，否则回退到本地混合检索
         self._pgvector: PgVectorSidecar | None = None
         self._pgvector_enabled: bool = False
         try:
             if is_pgvector_configured():
-                # dim may be overridden via env; use get_vector_dim()
+                # 维度以 Settings/env 为准，统一由 get_vector_dim 提供
                 self._pgvector = PgVectorSidecar(dim=get_vector_dim())
-                # _enabled may be False if pool fails; still keep object for diagnostics
+                # 即使连接失败也保留对象以便诊断
                 self._pgvector_enabled = bool(getattr(self._pgvector, "_enabled", False))
-                # vector hybrid remains enabled even if pg not reachable (local fallback)
+                # 侧车不可用时本地向量仍保持可用
                 if self._pgvector_enabled:
                     self._vector_enabled = True
             else:
@@ -484,20 +489,22 @@ class MemoryStore:
 
     @property
     def vector_backend(self) -> str:
-        """Return 'pgvector' if sidecar enabled and reachable, else 'local'."""
+        """返回当前向量后端：``pgvector`` 或 ``local``。"""
         if self._pgvector is not None and getattr(self._pgvector, "_enabled", False):
-            # optional ping check (best effort, not blocking search)
+            # 仅做标识，不在属性访问中阻塞式 ping
             return "pgvector"
         return "local"
 
     def get_vector_backend(self) -> str:
+        """返回当前向量后端标识。"""
         return self.vector_backend
 
     def is_pgvector_enabled(self) -> bool:
+        """侧车是否已启用且就绪。"""
         return bool(self._pgvector_enabled and self._pgvector is not None and getattr(self._pgvector, "_enabled", False))
 
     def _ns_key(self, key: str) -> str:
-        """Prefix key with namespace if set: f"{namespace}:{key}" else key."""
+        """按 namespace 拼接存储键。"""
         if self.namespace:
             return f"{self.namespace}:{key}"
         return key
@@ -508,25 +515,28 @@ class MemoryStore:
         return None
 
     def _safe_filename(self, ns_key: str) -> str:
-        # Windows-safe: colon and slash not allowed in filenames
+        """生成文件安全名，规避 Windows 禁用字符与路径穿越。"""
+        # Windows 禁止 ``:`` ``/`` ``\``，统一替换为 ``__``
         safe = ns_key.replace(":", "__").replace("/", "__").replace("\\", "__")
-        # also strip any path separators that could cause traversal
+        # 阻断 ``..`` 穿越
         safe = safe.replace("..", "__")
         return f"{safe}.md"
 
     def _safe_prefix(self) -> str | None:
+        """返回用于文件过滤的安全前缀。"""
         if self.namespace:
-            # sanitized prefix for file filtering
+            # 与 _safe_filename 保持同构替换
             return self.namespace.replace(":", "__").replace("/", "__").replace("\\", "__") + "__"
         return None
 
     def _init_db(self) -> None:
+        """初始化 SQLite：建表、补齐向量列、创建 FTS5 索引。"""
         self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
-        # notes table — include vector column for hybrid recall (D3)
+        # 主表为检索索引，真实来源仍是文件
         self._conn.execute(
             "CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT, content TEXT, created TEXT)"
         )
-        # ensure vector column exists (for existing DBs)
+        # 兼容老库：按需补齐向量列
         try:
             cur = self._conn.cursor()
             cur.execute("PRAGMA table_info(notes)")
@@ -537,21 +547,21 @@ class MemoryStore:
                     self._conn.commit()
                 except sqlite3.OperationalError:
                     pass
-            # re-check
+            # 二次探查列存在性以决定向量能力
             cur.execute("PRAGMA table_info(notes)")
             cols2 = [row[1] for row in cur.fetchall()]
             self._vector_enabled = "vector" in cols2 or "embedding" in cols2
-            # also consider that we could have vector handling even if column missing (fallback in-memory)
+            # 即使缺列也启用向量逻辑，改为即时计算，保证测试与旧库可用
             if "vector" in cols2:
                 self._vector_enabled = True
             else:
-                # still enable vector logic via on-the-fly embed (no column) to satisfy tests
+                # 无列时走即时 embedding 回退
                 self._vector_enabled = True
         except Exception:
             self._vector_enabled = True
-        # try FTS5 creation
+        # 创建 FTS5 虚表
         try:
-            # trigram helps CJK, try first
+            # 优先 trigram：对中英文无空格场景召回更友好
             self._conn.execute(
                 "CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(content, tokenize='trigram')"
             )
@@ -567,13 +577,13 @@ class MemoryStore:
         self._conn.commit()
 
     def _embed_text(self, text: str):
-        """Lazy embed helper — imports pluggable embed to avoid circular deps."""
+        """对文本做 embedding，延迟导入以避免循环依赖。"""
         try:
             from hero_quant.agent.embed import embed  # type: ignore
 
             return embed(text)
         except Exception:
-            # fallback deterministic hash 32-dim
+            # 回退：基于哈希的 32 维确定性向量
             import hashlib as _hl
 
             h = _hl.sha256(text.encode("utf-8")).digest()
@@ -589,6 +599,7 @@ class MemoryStore:
             return vals[:32]
 
     def _cosine_sim(self, a, b) -> float:
+        """计算余弦相似度，优先委托 embed 模块，失败则本地计算。"""
         try:
             from hero_quant.agent.embed import cosine_sim  # type: ignore
 
@@ -602,14 +613,10 @@ class MemoryStore:
             return dot / (na * nb)
 
     def _load_vector_for_key(self, key: str):
-        """Load stored vector JSON for key if column exists, else None.
-
-        Handles dim drift: if stored vector length mismatches current
-        get_vector_dim(), treat as stale and return None to trigger re-embed.
-        """
+        """按 key 载入已存向量；维度漂移时视为过期返回 None 触发重算。"""
         try:
             cur = self._conn.cursor()
-            # check column exists first
+            # 先确认向量列存在，避免旧库报错
             cur.execute("PRAGMA table_info(notes)")
             cols = [row[1] for row in cur.fetchall()]
             if "vector" not in cols:
@@ -625,7 +632,7 @@ class MemoryStore:
                         return None
                 else:
                     parsed = raw
-                # dim drift check: single source via embed.get_vector_dim
+                # 维度漂移校验：以当前 get_vector_dim 为准
                 try:
                     from hero_quant.agent.embed import get_vector_dim as _gvd
 
@@ -640,7 +647,7 @@ class MemoryStore:
         return None
 
     def _ensure_vector_dim(self, vec, content: str):
-        """Re-embed if vec is None or dim mismatches current dim."""
+        """向量为空或维度不匹配时重算，保证与当前 dim 一致。"""
         try:
             from hero_quant.agent.embed import get_vector_dim as _gvd
 
@@ -651,23 +658,23 @@ class MemoryStore:
         except Exception:
             return vec if vec is not None else self._embed_text(content)
 
-    # ---- pgvector sidecar helpers ----
+    # pgvector 侧车辅助
     def _pgvector_upsert(self, ns_key: str, content: str, vec) -> None:
-        """Best-effort upsert into pgvector sidecar — never raises, falls back silently."""
+        """尽力写入侧车向量，失败静默回退，不抛异常。"""
         if not self._pgvector_enabled or self._pgvector is None or vec is None:
             return
         try:
-            # namespace isolation: sidecar stores namespace separately for filtered search
+            # 侧车按 namespace 隔离存储，检索时可按 namespace 过滤
             ns = self.namespace or ""
             ok = self._pgvector.upsert(ns_key, content, vec, namespace=ns)
             if not ok:
-                # do not disable permanently; keep enabled flag for next try
+                # 失败不永久禁用，保留下次重试机会
                 pass
         except Exception:
             pass
 
     def _pgvector_search(self, query: str, top_k: int = 5) -> list[dict]:
-        """Try pgvector sidecar search — returns [] on any failure to trigger local fallback."""
+        """尝试侧车检索，失败返回空列表以触发本地回退。"""
         if not self._pgvector_enabled or self._pgvector is None:
             return []
         if not query:
@@ -677,17 +684,17 @@ class MemoryStore:
             if qvec is None:
                 return []
             ns = self.namespace or "" if self.namespace else None
-            # search sidecar
+            # 调用侧车检索
             pg_hits = self._pgvector.search(qvec, top_k=top_k, namespace=ns)
-            # pg_hits are [{"key":..., "content":...}] already namespace-filtered if backend supports it
-            # ensure prefix filtering for safety when namespace is set but sidecar stored with prefix
+            # 侧车已按 namespace 过滤时仍做二次前缀校验，防御不一致
+            # 侧车前后缀双重保障：即使后端未过滤也能正确隔离
             if self._ns_prefix() is not None and pg_hits:
                 prefix = self._ns_prefix()
                 pg_hits = [h for h in pg_hits if h.get("key", "").startswith(prefix or "")]
-            # attach score via cosine for hybrid re-rank (compute locally if not returned)
+            # 侧车未直接返回距离时本地补算余弦分数用于混合重排
             out: list[dict] = []
             for h in pg_hits:
-                # compute cosine on the fly for hybrid (pg distance not exposed, so recompute)
+                # 本地重算相似度以统一混合打分
                 try:
                     cvec = self._load_vector_for_key(h["key"])
                     if cvec is None:
@@ -701,22 +708,23 @@ class MemoryStore:
             return []
 
     def write(self, key: str, content: str, memory_type: str | None = None) -> None:
+        """写入一条记忆：经去重、落盘、建索引并同步向量侧车。"""
         now = time.time()
         ns_key = self._ns_key(key)
-        # 30s sliding window content_hash dedup (cross-key, case/whitespace normalized)
-        # 过期清理：移除 >30s 的哈希
+        # 30 秒滑动窗口去重：跨 key、大小写/空白归一
+        # 定时清理过期哈希，避免内存膨胀
         self._recent_hashes = {h: ts for h, ts in self._recent_hashes.items() if now - ts < 30}
-        # 内容归一哈希（跨 key 去重核心，大小写/空白归一）
+        # 内容归一哈希为去重核心
         content_hash = hashlib.sha256(content.lower().strip().encode()).hexdigest()[:12]
-        # 完整 name:content 哈希（vibe 兼容，满足 spec _content_hash 要求）
+        # 同时校验 name:content 组合哈希，覆盖同内容不同键的重复
         full_hash = _content_hash(ns_key, content)
         if content_hash in self._recent_hashes or full_hash in self._recent_hashes:
             return
         self._recent_hashes[content_hash] = now
         self._recent_hashes[full_hash] = now
 
-        # atomic file write: tmp -> fsync -> os.replace, 0600, flock compat
-        # hierarchy routing: if memory_type in CATEGORIES route to subdir
+        # 原子落盘：tmp 写入 -> fsync -> os.replace，权限 0600，兼容 flock
+        # 层次路由：memory_type 命中 CATEGORIES 时分目录，其余回落到 base
         safe_name = self._safe_filename(ns_key)
         if memory_type:
             try:
@@ -725,7 +733,7 @@ class MemoryStore:
                 if memory_type in CATEGORIES and self.hierarchy is not None:
                     file_path = self.hierarchy.route_entry(memory_type, safe_name)
                 else:
-                    # unknown type falls back to base
+                    # 未知类型回落到 base 目录并告警
                     if memory_type not in CATEGORIES and memory_type:
                         import logging
 
@@ -738,7 +746,7 @@ class MemoryStore:
         else:
             file_path = self.base / safe_name
         tmp_path = self.base / f".{safe_name}.tmp.{os.getpid()}"
-        # ensure parent exists (key may contain subdirs)
+        # 兼容层次路由的子目录结构，确保父目录存在
         file_path.parent.mkdir(parents=True, exist_ok=True)
         try:
             with open(tmp_path, "w", encoding="utf-8") as f:
@@ -747,7 +755,7 @@ class MemoryStore:
 
                     fcntl.flock(f.fileno(), fcntl.LOCK_EX)
                 except ImportError:
-                    # Windows fallback: try msvcrt
+                    # Windows 回退：尝试 msvcrt 文件锁
                     try:
                         import msvcrt  # type: ignore
 
@@ -778,9 +786,9 @@ class MemoryStore:
                 except Exception:
                     pass
 
-        # sqlite index with namespaced key — with vector column
+        # 以 namespace 键写入 SQLite 索引（含向量列）
         created = datetime.now(timezone.utc).isoformat()
-        # compute vector embedding (pluggable dense)
+        # 计算向量（可插拔 embedding）
         vector_json = None
         try:
             vec = self._embed_text(content)
@@ -790,7 +798,7 @@ class MemoryStore:
             vector_json = None
         try:
             cur = self._conn.cursor()
-            # check if vector column exists
+            # 探查向量列是否存在以选择写入路径
             cur.execute("PRAGMA table_info(notes)")
             cols = [row[1] for row in cur.fetchall()]
             has_vector = "vector" in cols
@@ -804,10 +812,10 @@ class MemoryStore:
                     "INSERT INTO notes (key, content, created) VALUES (?, ?, ?)",
                     (ns_key, content, created),
                 )
-                # try to add vector after
+                # 向量列后续出现时可通过更新回填，此处占位
                 if vector_json is not None:
                     try:
-                        # attempt to store via update if column appears later
+                        # 预留更新路径，当前无操作
                         pass
                     except Exception:
                         pass
@@ -819,7 +827,7 @@ class MemoryStore:
                         (rowid, content),
                     )
                 except sqlite3.OperationalError:
-                    # fallback without rowid mapping
+                    # 回退：不依赖 rowid 的插入
                     try:
                         cur.execute(
                             "INSERT INTO notes_fts (content) VALUES (?)", (content,)
@@ -827,7 +835,7 @@ class MemoryStore:
                     except Exception:
                         pass
             self._conn.commit()
-            # pgvector sidecar upsert (best-effort, never breaks local write)
+            # 侧车同步：尽力而为，失败不影响本地写入事务
             try:
                 if vector_json is not None:
                     try:
@@ -837,7 +845,7 @@ class MemoryStore:
                     if vec_obj is not None:
                         self._pgvector_upsert(ns_key, content, vec_obj)
                 else:
-                    # fallback: compute vec again for pg if needed (dim-consistent)
+                    # 本地向量缺失时即时计算再同步，保证维度一致
                     try:
                         vec2 = self._embed_text(content)
                         if vec2 is not None:
@@ -851,25 +859,25 @@ class MemoryStore:
                 self._conn.rollback()
             except Exception:
                 pass
-        # Ebbinghaus meta: default quality_score/access_count/last_accessed (in-memory Dict, no DDL)
+        # 初始化 Ebbinghaus 元数据：内存态，无需 DDL
         if ns_key not in self._meta:
             self._meta[ns_key] = {"quality_score": 0.5, "access_count": 0, "last_accessed": now}
         else:
-            # preserve existing but update last_accessed if not explicitly managed? keep as is
+            # 已有元数据保持不变，避免覆盖外部更新的访问计数
             pass
 
     def _importance_for(self, item: dict, now: float) -> float:
-        """Compute importance for a search item via Ebbinghaus 14d decay."""
+        """按 Ebbinghaus 14 天衰减计算单条记忆的重要性。"""
         ns_key = item.get("key", "")
         meta = self._meta.get(ns_key)
         if meta is None:
-            # file-scan fallback uses stem (safe filename) not raw ns_key; try reverse lookup
+            # 文件扫描场景下 key 为安全文件名，需反向映射到原始 ns_key
             for k, v in self._meta.items():
                 if self._safe_filename(k).removesuffix(".md") == ns_key:
                     meta = v
                     break
             if meta is None:
-                # suffix match fallback for namespace-prefixed keys
+                # 兼容带 namespace 前缀的后缀匹配
                 for k, v in self._meta.items():
                     if ns_key.endswith(k.split(":")[-1]) or k.endswith(ns_key.split(":")[-1]):
                         meta = v
@@ -887,48 +895,48 @@ class MemoryStore:
             return qs
 
     def _rank_with_decay(self, items: list[dict]) -> list[dict]:
+        """按衰减后的重要性对候选集重排。"""
         if not items or len(items) <= 1:
             return items
         now = time.time()
         scored: list[tuple[float, float, dict]] = []
         for it in items:
             imp = self._importance_for(it, now)
-            weighted = 1.0 * (0.5 + 0.5 * imp)  # score*(0.5+0.5*importance), base score=1
+            weighted = 1.0 * (0.5 + 0.5 * imp)  # 基准分 1，按重要性线性加权
             scored.append((weighted, imp, it))
         scored.sort(key=lambda x: x[0], reverse=True)
         return [it for _, _, it in scored]
 
     def vector_search(self, query: str, top_k: int = 5) -> list[dict]:
-        """Pure vector cosine topK search — hybrid component.
+        """纯向量余弦 topK 检索，混合检索的子组件。
 
-        Uses pgvector sidecar first-class when configured, fallback to stored vector column
-        or on-the-fly local cosine. Namespace-aware filtering.
+        优先走 pgvector 侧车，失败回退到本地向量列或即时计算；全程按 namespace 隔离。
         """
         if not query:
             return []
-        # pgvector sidecar first-class: try PG before local (hybrid fallback)
+        # 侧车一等公民：先尝试 pgvector，再与本地结果融合
         try:
             pg_hits = self._pgvector_search(query, top_k=top_k)
             if pg_hits:
-                # if pg returned enough hits, return directly; else supplement with local
+                # 命中充足则直接返回，否则保留以便后续与本地合并
                 if len(pg_hits) >= max(1, int(top_k)):
                     return pg_hits[: max(1, int(top_k))]
-                # will merge later — keep pg_hits for union
+                # 命中不足，稍后与本地候选合并
             else:
                 pg_hits = []
         except Exception:
             pg_hits = []
         prefix = self._ns_prefix()
-        # embed query
+        # 对查询做 embedding
         try:
             qvec = self._embed_text(query)
         except Exception:
-            return pg_hits  # fallback to whatever pg gave
-        # fetch all notes with vector
+            return pg_hits  # embedding 失败则仅返回侧车结果
+        # 载入本地候选
         candidates: list[dict] = []
         try:
             cur = self._conn.cursor()
-            # check vector column
+            # 探查向量列可用性
             cur.execute("PRAGMA table_info(notes)")
             cols = [row[1] for row in cur.fetchall()]
             has_vector = "vector" in cols
@@ -938,21 +946,21 @@ class MemoryStore:
                 for k, c, v in rows:
                     if prefix is not None and not k.startswith(prefix):
                         continue
-                    # parse vector if present
+                    # 解析已存向量
                     note_vec = None
                     if v:
                         try:
                             note_vec = json.loads(v) if isinstance(v, str) else v
                         except Exception:
                             note_vec = None
-                    # dim drift: re-embed if stored vector length mismatches current dim
+                    # 维度漂移时重算，保证与当前 dim 一致
                     note_vec = self._ensure_vector_dim(note_vec, c)
                     if note_vec is None:
                         continue
                     sim = self._cosine_sim(qvec, note_vec)
                     candidates.append({"key": k, "content": c, "vector": note_vec, "_score": sim})
             else:
-                # no vector column: fallback to content-only LIKE + on-fly embed for all rows
+                # 无向量列时全量即时计算，兼容旧库
                 cur.execute("SELECT key, content FROM notes")
                 rows = cur.fetchall()
                 for k, c in rows:
@@ -962,9 +970,9 @@ class MemoryStore:
                     sim = self._cosine_sim(qvec, note_vec)
                     candidates.append({"key": k, "content": c, "_score": sim})
         except Exception:
-            # DB fallback: scan files
+            # 数据库异常时回退到文件扫描
             candidates = []
-        # file fallback if DB gave no candidates but files exist (hierarchy-aware)
+        # 数据库无候选时回退扫描文件，兼顾层次目录
         if not candidates:
             try:
                 from .hierarchy import MemoryHierarchy
@@ -980,11 +988,10 @@ class MemoryStore:
                     if safe_prefix is not None and not md_file.name.startswith(safe_prefix):
                         continue
                     txt = md_file.read_text(encoding="utf-8")
-                    # derive key from filename reverse; approximate
-                    # try to find DB key mapping via safe filename
+                    # 从文件名反推原始 key，近似还原
                     derived_key = md_file.stem.replace("__", ":")
                     if prefix is not None and not derived_key.startswith(prefix.rstrip(":")):
-                        # also check safe prefix
+                        # 二次校验安全前缀，避免命名空间串扰
                         if safe_prefix and not md_file.name.startswith(safe_prefix):
                             continue
                     note_vec = self._embed_text(txt)
@@ -992,46 +999,45 @@ class MemoryStore:
                     candidates.append({"key": derived_key, "content": txt, "_score": sim})
                 except Exception:
                     continue
-        # sort by cosine desc
+        # 按余弦相似度降序
         candidates.sort(key=lambda x: x.get("_score", 0.0), reverse=True)
-        # merge pgvector sidecar hits (first-class) with local candidates — hybrid fallback
-        # pg_hits already filtered by namespace and scored; union dedup by key keeps best score
+        # 融合侧车与本地结果：按 key 去重，保留更高分数
         if pg_hits:
-            # build map from local candidates for quick score lookup
+            # 以本地候选建表便于分数对比
             local_by_key = {c["key"]: c for c in candidates}
-            # start with pg hits (preserve order by pg score)
+            # 以侧车结果为基准，保留其排序
             merged: dict[str, dict] = {}
             for h in pg_hits:
                 merged[h["key"]] = {"key": h["key"], "content": h["content"], "_score": float(h.get("score", 0.0))}
-            # add local candidates that are not already in pg
+            # 补充侧车未覆盖的本地候选
             for c in candidates:
                 if c["key"] not in merged:
                     merged[c["key"]] = c
                 else:
-                    # keep higher score if duplicate (max of pg vs local)
+                    # 同 key 取更高分数
                     if float(c.get("_score", 0.0)) > float(merged[c["key"]].get("_score", 0.0)):
                         merged[c["key"]]["_score"] = float(c.get("_score", 0.0))
-            # re-sort merged by score desc
+            # 按分数重排后截取 top_k
             all_items = list(merged.values())
             all_items.sort(key=lambda x: float(x.get("_score", 0.0)), reverse=True)
             out: list[dict] = []
             for it in all_items[: max(0, top_k)]:
                 out.append({"key": it["key"], "content": it["content"], "score": float(it.get("_score", 0.0))})
             return out
-        # strip internal _score before return? Keep for hybrid but expose without
+        # 剔除内部 _score，仅暴露 score
         out: list[dict] = []
         for it in candidates[: max(0, top_k)]:
-            # preserve key/content; optionally include score
+            # 保留 key/content/score 三元组
             out.append({"key": it["key"], "content": it["content"], "score": it.get("_score", 0.0)})
         return out
 
     def _search_bm25_raw(self, query: str) -> list[dict]:
-        """Original BM25/FTS/LIKE/file fallback without vector, returns deduplicated candidates."""
+        """不含向量的 BM25/FTS/LIKE/文件回退检索，返回去重后的候选。"""
         if not query:
             return []
         prefix = self._ns_prefix()
         safe_prefix = self._safe_prefix()
-        # try FTS5 MATCH first
+        # 优先走 FTS5 MATCH
         if self._fts_enabled:
             try:
                 cur = self._conn.cursor()
@@ -1058,7 +1064,7 @@ class MemoryStore:
                 pass
             except Exception:
                 pass
-        # fallback LIKE
+        # 回退到 LIKE 模糊匹配
         try:
             cur = self._conn.cursor()
             pattern = f"%{query}%"
@@ -1105,34 +1111,24 @@ class MemoryStore:
             return []
 
     def search(self, query: str) -> list[dict]:
-        """Hybrid search: BM25 FTS + LIKE plus vector cosine topK re-rank, preserving Ebbinghaus.
-
-        Steps:
-        - gather BM25 candidates via _search_bm25_raw
-        - gather vector candidates via vector_search (top 10)
-        - merge union deduplicated by key/content
-        - compute hybrid score = 0.6*cosine + 0.3*importance + 0.1*bm25_hit
-        - sort descending, yield merged ranked list
-        Falls back to BM25 + decay if vector fails.
-        """
+        """混合检索：BM25 召回 + 向量余弦重排 + Ebbinghaus 衰减加权。"""
         if not query:
             return []
         prefix = self._ns_prefix()
-        # raw BM25 candidates
+        # 文本召回候选
         bm25_candidates = self._search_bm25_raw(query)
-        # vector candidates
+        # 向量召回候选
         vector_candidates: list[dict] = []
         if self._vector_enabled:
             try:
                 vector_candidates = self.vector_search(query, top_k=10)
             except Exception:
                 vector_candidates = []
-        # if both empty, try vector fallback alone (already merged) -> return empty
+        # 两路皆空则直接返回
         if not bm25_candidates and not vector_candidates:
             return []
-        # merge union by key
+        # 按 key 合并两路去重，向量侧优先
         merged: dict[str, dict] = {}
-        # vector first (preserves vector order but hybrid will re-sort)
         for item in vector_candidates:
             k = item["key"]
             if k not in merged:
@@ -1142,61 +1138,55 @@ class MemoryStore:
             if k not in merged:
                 merged[k] = {"key": k, "content": item["content"]}
             else:
-                # keep content from bm25 if missing?
+                # 同 key 已存在，保留向量侧内容
                 pass
-        # also include any bm25 duplicates by content not key?
-        # dedup by content as secondary
-        # Build list
+        # 后续按内容二次去重
         items = list(merged.values())
-        # if we had no merge (e.g., vector disabled), fallback to decay rank
+        # 无向量能力时退化为衰减排序
         if not self._vector_enabled or not vector_candidates:
-            # No vector: use existing decay rank over bm25
-            # But still need namespace filter already done
+            # 命名空间已在召回时过滤，直接走衰减排序
             return self._rank_with_decay(bm25_candidates if bm25_candidates else items)
 
-        # compute hybrid scores
+        # 计算混合分数 0.6*cosine + 0.3*importance + 0.1*bm25_hit
         now = time.time()
-        # precompute query vector once
+        # 预先计算查询向量
         try:
             qvec = self._embed_text(query)
         except Exception:
             qvec = None
-        # build fast lookup for bm25 keys
+        # BM25 命中集合用于加权
         bm25_keys = {it["key"] for it in bm25_candidates}
         scored: list[tuple[float, float, float, dict]] = []
         for it in items:
             key = it["key"]
             content = it["content"]
-            # cosine
+            # 计算余弦相似度
             cos = 0.0
             if qvec is not None:
-                # try stored vector first
+                # 优先用已存向量
                 stored_vec = self._load_vector_for_key(key)
                 if stored_vec is not None:
                     cos = self._cosine_sim(qvec, stored_vec)
                 else:
-                    # fallback compute from content
+                    # 回退到即时计算
                     try:
                         cvec = self._embed_text(content)
                         cos = self._cosine_sim(qvec, cvec)
                     except Exception:
                         cos = 0.0
-                # clamp to [-1,1]
+                # 截断到 [-1,1] 并保留原值参与混合
                 if cos > 1.0:
                     cos = 1.0
                 elif cos < -1.0:
                     cos = -1.0
-                # normalize negative to 0 for ranking (optional) keep raw
-                # but keep as is for hybrid
             imp = self._importance_for(it, now)
             bm25_hit = 1.0 if key in bm25_keys else (1.0 if query.lower() in content.lower() else 0.0)
             hybrid = 0.6 * cos + 0.3 * imp + 0.1 * bm25_hit
-            # also boost exact vector top? keep hybrid
             scored.append((hybrid, cos, imp, it))
-        # sort by hybrid desc, then cosine, then importance
+        # 按混合分、余弦、重要性三级排序
         scored.sort(key=lambda x: (x[0], x[1], x[2]), reverse=True)
         result = [it for _, _, _, it in scored]
-        # namespace isolation already filtered; ensure deduplication by content
+        # 已做命名空间隔离，最后按内容去重
         seen: dict[str, dict] = {}
         deduped: list[dict] = []
         for it in result:
