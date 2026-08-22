@@ -19,6 +19,8 @@ import os
 import pathlib
 import json
 
+from hero_quant.api.security import SSE_TICKET_TTL_SECONDS, consume_ticket, issue_ticket
+
 # 预注册 metrics 加固指标（wall-time、ledger、去重等），失败不影响主流程
 try:
     import hero_quant.metrics  # noqa: F401  # registers WALL_TIME_SECONDS, etc.
@@ -248,10 +250,22 @@ def query(q: str = ""):
     return {"query": q, "status": "ok"}
 
 
+@app.post("/v1/query/ticket")
+def query_ticket():
+    """签发一个短时、单次消费的 SSE 查询票据。"""
+    REQUEST_COUNTER.labels(endpoint="/v1/query/ticket").inc()
+    return {
+        "ticket": issue_ticket(ttl=SSE_TICKET_TTL_SECONDS),
+        "expires_in": SSE_TICKET_TTL_SECONDS,
+    }
+
+
 @app.get("/v1/query/stream")
-def query_stream(q: str = ""):
+def query_stream(q: str = "", ticket: str | None = None):
     """SSE 查询流占位：以 text/event-stream 返回单条事件。"""
     REQUEST_COUNTER.labels(endpoint="/v1/query/stream").inc()
+    if not consume_ticket(ticket):
+        return JSONResponse(status_code=403, content={"detail": "Invalid or expired SSE ticket"})
 
     def event_generator():
         yield f"data: {{\"query\": \"{q}\", \"status\": \"ok\"}}\n\n"

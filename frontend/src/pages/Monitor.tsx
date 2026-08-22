@@ -37,8 +37,20 @@ export default function Monitor() {
         `/v1/events?offset=${curOffset}`,
         `/v1/query/stream?offset=${curOffset}`,
       ]
-      for (const url of candidates) {
+      for (const candidate of candidates) {
         try {
+          let url = candidate
+          if (candidate.startsWith("/v1/query/stream")) {
+            const ticketResp = await fetch("/v1/query/ticket", {
+              method: "POST",
+              headers: { Accept: "application/json" },
+            })
+            if (!ticketResp.ok) continue
+            const payload = await ticketResp.json() as { ticket?: unknown }
+            if (typeof payload.ticket !== "string" || !payload.ticket) continue
+            if (aborted) return
+            url += `&ticket=${encodeURIComponent(payload.ticket)}`
+          }
           const resp = await fetch(url, { headers: { Accept: "text/event-stream" } })
           if (!resp.ok || !resp.body) continue
           const reader = resp.body.getReader()

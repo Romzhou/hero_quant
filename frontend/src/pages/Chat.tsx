@@ -38,6 +38,18 @@ export default function Chat() {
     const controller = new AbortController()
     abortRef.current = controller
 
+    const issueSseTicket = async () => {
+      const resp = await fetch("/v1/query/ticket", {
+        method: "POST",
+        headers: { Accept: "application/json" },
+        signal: controller.signal,
+      })
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
+      const payload = await resp.json() as { ticket?: unknown }
+      if (typeof payload.ticket !== "string" || !payload.ticket) throw new Error("SSE ticket missing")
+      return payload.ticket
+    }
+
     let acc = ""
     let hasDelta = false
     let settled = false
@@ -100,7 +112,8 @@ export default function Chat() {
 
     // fetch 回退：手动解析 SSE 帧，兼容不支持 EventSource 或代理缓冲的场景
     const fetchFallback = async () => {
-      const url = `/v1/query/stream?q=${encodeURIComponent(q)}`
+      const ticket = await issueSseTicket()
+      const url = `/v1/query/stream?q=${encodeURIComponent(q)}&ticket=${encodeURIComponent(ticket)}`
       const resp = await fetch(url, {
         method: "GET",
         headers: { Accept: "text/event-stream" },
@@ -138,16 +151,15 @@ export default function Chat() {
     }
 
     // 优先 EventSource：浏览器原生 SSE 自动重连，失败或超时再回退 fetch
-    const tryEventSource = () =>
-      new Promise<void>((resolve, reject) => {
+    const tryEventSource = async () => {
+      const ticket = await issueSseTicket()
+      return new Promise<void>((resolve, reject) => {
         let gotMessage = false
         let fallbackTriggered = false
-        const url = `/v1/query/stream?q=${encodeURIComponent(q)}`
+        const url = `/v1/query/stream?q=${encodeURIComponent(q)}&ticket=${encodeURIComponent(ticket)}`
         try {
-          const es = new EventSource(`/v1/query/stream?q=${encodeURIComponent(q)}`)
+          const es = new EventSource(url)
           esRef.current = es
-          // 保留 url 变量避免未使用告警，同时显式声明订阅地址
-          void url
           es.onmessage = (ev) => {
             gotMessage = true
             const data: string = ev.data
@@ -276,6 +288,7 @@ export default function Chat() {
             })
         }
       })
+    }
 
     try {
       await tryEventSource()

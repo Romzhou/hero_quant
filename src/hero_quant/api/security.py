@@ -11,6 +11,9 @@ import hashlib
 import hmac
 import os
 import re
+import secrets
+import threading
+import time
 from typing import Any
 
 # 复用脱敏正则以无泄露方式判断凭据前缀是否存在
@@ -19,6 +22,38 @@ _BEARER_RE = re.compile(r"Bearer\s+[A-Za-z0-9\-_\.=~\+/]+=*", re.IGNORECASE)
 _SK_RE = re.compile(r"sk-[A-Za-z0-9]{10,}")
 _AKIA_RE = re.compile(r"AKIA[0-9A-Z]{16}")
 _JWT_RE = re.compile(r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}")
+
+SSE_TICKET_TTL_SECONDS = 60
+_tickets: dict[str, float] = {}
+_ticket_lock = threading.Lock()
+
+
+def _purge_expired_tickets(now: float) -> None:
+    """清理已过期票据；在票据读写时惰性执行，避免后台清理线程。"""
+    for ticket, expires_at in list(_tickets.items()):
+        if expires_at <= now:
+            del _tickets[ticket]
+
+
+def issue_ticket(ttl: float = SSE_TICKET_TTL_SECONDS) -> str:
+    """生成一个带 TTL 的随机单次票据。"""
+    now = time.monotonic()
+    with _ticket_lock:
+        _purge_expired_tickets(now)
+        ticket = secrets.token_urlsafe(32)
+        _tickets[ticket] = now + ttl
+        return ticket
+
+
+def consume_ticket(ticket: str | None) -> bool:
+    """校验并消费票据，票据不存在、过期或已消费时返回 False。"""
+    if not ticket:
+        return False
+    now = time.monotonic()
+    with _ticket_lock:
+        _purge_expired_tickets(now)
+        expires_at = _tickets.pop(ticket, None)
+        return expires_at is not None and expires_at > now
 
 
 def _get_whitelist_from_env() -> list[str]:
