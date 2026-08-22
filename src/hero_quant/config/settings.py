@@ -96,12 +96,19 @@ def _vector_dsn_from_env() -> str | None:
     return None
 
 
+def _llm_model_slot_from_env(key: str) -> str:
+    """读取独立 LLM 槽位，未设置时回退到 legacy 模型配置。"""
+    return os.getenv(key) or os.getenv("HERO_LLM_MODEL", "gpt-4o-mini")
+
+
 @dataclass
 class Settings:
     """全局配置聚合，字段按分组：LLM / 数据与基准 / wall-time 治理 / 向量与嵌入 / checkpoint。"""
 
     llm_provider: str = field(default_factory=lambda: os.getenv("HERO_LLM_PROVIDER", "openai"))
     llm_model: str = field(default_factory=lambda: os.getenv("HERO_LLM_MODEL", "gpt-4o-mini"))
+    llm_model_deep: str = field(default_factory=lambda: _llm_model_slot_from_env("HERO_LLM_MODEL_DEEP"))
+    llm_model_quick: str = field(default_factory=lambda: _llm_model_slot_from_env("HERO_LLM_MODEL_QUICK"))
     api_key: str | None = field(default_factory=lambda: os.getenv("HERO_API_KEY"))  # type: ignore[arg-type]
     data_default_market: str = field(default_factory=lambda: os.getenv("HERO_DATA_MARKET", "CN"))
     data_mode: str = field(default_factory=lambda: os.getenv("HERO_DATA_MODE", "synthetic"))
