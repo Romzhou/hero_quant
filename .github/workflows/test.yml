@@ -8,17 +8,25 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: '3.11'
-      - name: Install locked dependencies (hash-checked)
+      - name: Install locked dependencies (hash-checked, blocking)
         run: |
-          # requirements-lock.txt 已由 uv pip compile --generate-hashes 生成真实 hash；CI 先尝试 hash 校验，失败则回退到常规安装以保证离线/占位兼容
-          pip install --require-hashes -r requirements-lock.txt || pip install -e ".[dev,ashare,us]"
-      - name: Install CI tools
-        run: pip install pytest ruff pip-audit
+          # requirements-lock.txt 仅覆盖 core（uv pip compile pyproject.toml --generate-hashes）；阻塞式校验，无静默回退（移除 || fallback）
+          pip install --require-hashes -r requirements-lock.txt
+      - name: Install project and CI tools (explicit, no fallback)
+        # pytest-cov/pip-audit/ruff 不在 lock 中；hash 通过后显式安装本地包与工具（不使用 || true / continue-on-error）
+        run: |
+          pip install -e ".[dev,ashare,us]"
+          pip install pytest pytest-cov ruff pip-audit
       - name: Lint with ruff
         run: ruff check .
       - name: Run tests
-        run: pytest -q
+        # Coverage gate: 2026-08-22 实测 49% (10661 stmts, 5392 missed, 207 passed)；阈值 46 保留 ~3% headroom 且不致 CI 红
+        run: pytest -q --cov=src --cov-report=term --cov-fail-under=46
       - name: Audit dependencies
-        run: pip-audit || true
-      - name: Secret scan
-        run: gitleaks detect --no-git || true
+        # Blocking gate since W1-D (was "|| true")
+        run: pip-audit
+      - name: Secret scan (gitleaks)
+        # Blocking gate since W1-D: official action replaces custom `gitleaks detect --no-git || true`
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

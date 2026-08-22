@@ -8,7 +8,6 @@ jobs:
   hash-lock:
     name: hash-lock
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - name: Set up Python 3.11
@@ -16,12 +15,11 @@ jobs:
         with:
           python-version: "3.11"
           cache: "pip"
-      - name: Hash-lock dry-run
-        continue-on-error: true
+      - name: Hash-lock check (blocking)
         run: |
           # requirements-lock.txt generated via: uv pip compile --generate-hashes pyproject.toml -o requirements-lock.txt
-          # Real sha256 hashes, CI fallback is: pip install --require-hashes -r requirements-lock.txt || pip install -e ".[dev,ashare,us]"
-          pip install --dry-run --require-hashes -r requirements-lock.txt || echo "hash-lock dry-run failed (non-blocking)"
+          # Blocking gate since W1-D: hash mismatch or missing lock file fails the job.
+          pip install --dry-run --require-hashes -r requirements-lock.txt
 
   lint:
     name: lint
@@ -49,11 +47,14 @@ jobs:
         with:
           python-version: "3.11"
           cache: "pip"
-      - name: Install dependencies
+      - name: Install dependencies (hash-gated, blocking)
         run: |
-          pip install -e ".[dev]" || pip install pytest pytest-cov ruff
+          # requirements-lock.txt 仅覆盖 core 依赖（uv pip compile pyproject.toml --generate-hashes）；hash 校验为阻塞门，失败即阻断（不使用 || fallback）
+          # pip-audit/ruff/pytest-cov 阻塞门见 test.yml；此处 test job 亦强制 hash 安装
+          pip install --require-hashes -r requirements-lock.txt
+          pip install -e ".[dev]"
       - name: Run tests
         # pyproject.toml [tool.pytest.ini_options] testpaths = ["tests"] pythonpath = ["src"]
-        # 0-threshold preserves maturity-3 without blocking
+        # Coverage gate: 2026-08-22 实测 49% (10661 stmts, 5392 missed, 207 passed)；阈值 46 保留 ~3% headroom 且不致 CI 红
         run: |
-          pytest -q --cov --cov-fail-under=0 || pytest -q
+          pytest -q --cov=src --cov-report=term --cov-fail-under=46
