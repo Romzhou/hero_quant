@@ -10,6 +10,8 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from . import scanner
+
 ARGUMENTS_SINK = "arguments"
 RESULT_SINK = "result"
 
@@ -80,6 +82,28 @@ def _redact_string(value: str, sink: str) -> str:
     return value
 
 
+def _scan_string(value: str, *, preserve_zero_width: bool = False) -> str:
+    """Apply scanner steps without allowing scanner failures to break redaction."""
+    try:
+        scanned = scanner.neutralize(value)
+        if not preserve_zero_width:
+            scanned = scanner.strip_zero_width(scanned)
+        return scanned
+    except Exception:
+        return value
+
+
+def _neutralize_content(value: Any) -> Any:
+    """Neutralize result content while preserving secret-like text and zero-width chars."""
+    if isinstance(value, str):
+        return _scan_string(value, preserve_zero_width=True)
+    if isinstance(value, dict):
+        return {key: _neutralize_content(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_neutralize_content(item) for item in value]
+    return value
+
+
 def redact_payload(payload: Any, sink: str = ARGUMENTS_SINK) -> Any:
     """按 sink 瀑布对载荷脱敏：敏感键一律替换，字符串值按模式匹配；递归处理嵌套结构。"""
     if isinstance(payload, dict):
@@ -87,7 +111,7 @@ def redact_payload(payload: Any, sink: str = ARGUMENTS_SINK) -> Any:
         for k, v in payload.items():
             # RESULT_SINK 下 content 字段透传，避免误删工具正常输出
             if sink == RESULT_SINK and k == "content":
-                out[k] = v
+                out[k] = _neutralize_content(v)
                 continue
             if _is_sensitive_key(k):
                 out[k] = _REDACTED
@@ -97,14 +121,14 @@ def redact_payload(payload: Any, sink: str = ARGUMENTS_SINK) -> Any:
             elif isinstance(v, list):
                 out[k] = [redact_payload(item, sink=sink) if isinstance(item, (dict, list, str)) else item for item in v]
             elif isinstance(v, str):
-                out[k] = _redact_string(v, sink=sink)
+                out[k] = _scan_string(_redact_string(v, sink=sink))
             else:
                 out[k] = v
         return out
     elif isinstance(payload, list):
         return [redact_payload(item, sink=sink) for item in payload]
     elif isinstance(payload, str):
-        return _redact_string(payload, sink=sink)
+        return _scan_string(_redact_string(payload, sink=sink))
     else:
         return payload
 
