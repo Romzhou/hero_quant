@@ -233,6 +233,26 @@ def assert_allowlist(code: str) -> None:
         raise ValueError("import allowlist violation or banned pattern detected")
 
 
+class SandboxViolation(RuntimeError):
+    """AST 守卫违规：Python 分支 fail-closed 拒绝执行时抛出。"""
+
+
+def check_source(source: str) -> None:
+    """审查 Python 源码，违规或语法错误即抛 SandboxViolation（fail-closed）。
+
+    约束：仅 Python 执行分支在 compile/exec 前调用；AST 解析失败必须拒绝；
+    非 Python 载荷不受此函数影响。
+    """
+    if not source or not source.strip():
+        return
+    try:
+        ast.parse(source)
+    except SyntaxError as e:
+        raise SandboxViolation(f"syntax error: {e}") from e
+    if not check_import_allowlist(source):
+        raise SandboxViolation("import allowlist violation or banned pattern detected")
+
+
 def get_allowed_roots() -> set[str]:
     """返回当前白名单的拷贝，供测试与自检使用。"""
     return set(ALLOWED_ROOTS)

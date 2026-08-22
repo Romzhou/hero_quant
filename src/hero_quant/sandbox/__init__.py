@@ -3,7 +3,14 @@
 对外提供统一导入面，缺失 runner 时以兼容存根兜底，保证基础功能可用。
 """
 
-from .ast_guard import ALLOWED_ROOTS, assert_allowlist, check_import_allowlist, get_allowed_roots
+from .ast_guard import (
+    ALLOWED_ROOTS,
+    SandboxViolation,
+    assert_allowlist,
+    check_import_allowlist,
+    check_source,
+    get_allowed_roots,
+)
 from .base import BaseSandbox, DockerBackend, LocalShellBackend
 from .policy import VALID_MODES, canonical_path, is_path_writable, resolve_policy
 
@@ -13,12 +20,19 @@ try:
         LAUNCHER_FAILURE_EXIT,
         LandlockSandbox,
         SandboxUnavailableError,
+        SandboxViolation as _RunnerSandboxViolation,
+        check_source as _runner_check_source,
+        execute_python,
         grant_args,
         launcher_path,
         probe,
         probe_raw,
         validate_probe_args,
     )
+
+    # 保持便捷导出的统一身份：包级 SandboxViolation 即 ast_guard 的同一类型
+    SandboxViolation = _RunnerSandboxViolation  # type: ignore
+    check_source = _runner_check_source  # type: ignore
 except Exception:  # pragma: no cover — runner 缺失时不影响基础沙箱功能
     LAUNCHER_BIN = "landlock-run"  # type: ignore
     LAUNCHER_FAILURE_EXIT = 125  # type: ignore
@@ -41,13 +55,25 @@ except Exception:  # pragma: no cover — runner 缺失时不影响基础沙箱�
     def validate_probe_args(*a, **kw):  # type: ignore
         return 125
 
+    # AST 守卫保持 fail-closed：委托 canonical ast_guard，保持异常身份不 fork
+    # SandboxViolation / check_source 已在顶层从 ast_guard 导入，此处不再重定义
+
     class LandlockSandbox(BaseSandbox):  # type: ignore
-        pass
+        def execute_python(self, source, *a, **kw):  # type: ignore
+            check_source(source)
+            raise RuntimeError("runner unavailable")
+
+    def execute_python(source, *a, **kw):  # type: ignore
+        check_source(source)
+        raise RuntimeError("runner unavailable")
 
 
 __all__ = [
     "check_import_allowlist",
     "assert_allowlist",
+    "check_source",
+    "SandboxViolation",
+    "execute_python",
     "ALLOWED_ROOTS",
     "get_allowed_roots",
     "resolve_policy",

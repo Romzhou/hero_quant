@@ -17,7 +17,12 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Tuple
 
+from . import ast_guard
 from .base import BaseSandbox
+
+# 便捷导出：保持与 ast_guard 同一身份，避免 bare re-export 被 ruff 误判为死代码
+SandboxViolation = ast_guard.SandboxViolation
+check_source = ast_guard.check_source
 
 # ---------------------------------------------------------------------------
 # 合约常量（与 docs/cli-contract.md 及 landlock-run 二进制保持一致，勿随意改动）
@@ -199,6 +204,23 @@ def probe(
     return "full"
 
 
+def _execute_python_impl(
+    source: str,
+    globals_dict: dict | None = None,
+    locals_dict: dict | None = None,
+) -> dict:
+    """共享的 Python 执行实现：先 AST 守卫再 compile/exec，消除重复。"""
+    ast_guard.check_source(source)
+    code = compile(source, "<sandbox>", "exec")
+    g_dict: dict = {} if globals_dict is None else dict(globals_dict)
+    if locals_dict is None:
+        exec(code, g_dict)  # type: ignore[arg-type]
+        return g_dict
+    l_dict: dict = dict(locals_dict)
+    exec(code, g_dict, l_dict)  # type: ignore[arg-type]
+    return {"globals": g_dict, "locals": l_dict}
+
+
 # ---------------------------------------------------------------------------
 # LandlockSandbox — 在 BaseSandbox 之上的 fail-closed 封装
 # ---------------------------------------------------------------------------
@@ -325,3 +347,21 @@ class LandlockSandbox(BaseSandbox):
                 return result.stdout, result.stderr, result.returncode
             raise SandboxUnavailableError(f"{_FATAL_PREFIX}{e} (exit {LAUNCHER_FAILURE_EXIT})") from e
         return result.stdout, result.stderr, result.returncode
+
+    def execute_python(  # type: ignore[no-redef]
+        self,
+        source: str,
+        globals_dict: dict | None = None,
+        locals_dict: dict | None = None,
+    ) -> dict:
+        """Python 执行分支：compile/exec 前先经 ast_guard.check_source 审查，fail-closed."""
+        return _execute_python_impl(source, globals_dict, locals_dict)
+
+
+def execute_python(
+    source: str,
+    globals_dict: dict | None = None,
+    locals_dict: dict | None = None,
+) -> dict:
+    """模块级 Python 执行入口：先 AST 审查再 compile/exec，fail-closed."""
+    return _execute_python_impl(source, globals_dict, locals_dict)
