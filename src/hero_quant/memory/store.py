@@ -23,6 +23,15 @@ def _content_hash(name: str, content: str) -> str:
     return hashlib.sha256(f"{name}:{content}".lower().strip().encode()).hexdigest()[:12]
 
 
+def _content_bigrams(content: str) -> str:
+    """将内容预切为相邻二字 token，供无 trigram 时的 FTS5 回退使用。"""
+    return " ".join(
+        content[index : index + 2]
+        for index in range(len(content) - 1)
+        if not any(char.isspace() for char in content[index : index + 2])
+    )
+
+
 # pgvector sidecar 的 DSN 前缀白名单；鉴权与解析统一收口到 Settings，此处仅做轻量委托。
 _PG_PREFIXES = ("postgresql://", "postgres://", "postgresql+psycopg://")
 
@@ -458,6 +467,8 @@ class MemoryStore:
         self._recent_hashes: dict[str, float] = {}
         self._meta: dict[str, dict] = {}  # ns_key -> {quality_score, access_count, last_accessed}，内存态衰减元数据
         self._fts_enabled = False
+        self._trigram_enabled = False
+        self._bigram_enabled = False
         self._vector_enabled = False
         self.db_path = self.base / "memory.db"
         self._init_db()
@@ -566,14 +577,31 @@ class MemoryStore:
                 "CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(content, tokenize='trigram')"
             )
             self._fts_enabled = True
-        except sqlite3.OperationalError:
+            self._trigram_enabled = True
+        except Exception:
             try:
                 self._conn.execute(
                     "CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(content)"
                 )
                 self._fts_enabled = True
-            except sqlite3.OperationalError:
+            except Exception:
                 self._fts_enabled = False
+
+        # trigram 不支持短 token；独立的内容 bigram 表覆盖短查询及 trigram 建表失败。
+        try:
+            self._conn.execute(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts_bigram USING fts5(bigrams)"
+            )
+            cur = self._conn.cursor()
+            cur.execute("SELECT id, content FROM notes")
+            for rowid, content in cur.fetchall():
+                cur.execute(
+                    "INSERT OR REPLACE INTO notes_fts_bigram (rowid, bigrams) VALUES (?, ?)",
+                    (rowid, _content_bigrams(content)),
+                )
+            self._bigram_enabled = True
+        except Exception:
+            self._bigram_enabled = False
         self._conn.commit()
 
     def _embed_text(self, text: str):
@@ -826,7 +854,7 @@ class MemoryStore:
                         "INSERT INTO notes_fts (rowid, content) VALUES (?, ?)",
                         (rowid, content),
                     )
-                except sqlite3.OperationalError:
+                except Exception:
                     # 回退：不依赖 rowid 的插入
                     try:
                         cur.execute(
@@ -834,6 +862,14 @@ class MemoryStore:
                         )
                     except Exception:
                         pass
+            if self._bigram_enabled:
+                try:
+                    cur.execute(
+                        "INSERT INTO notes_fts_bigram (rowid, bigrams) VALUES (?, ?)",
+                        (rowid, _content_bigrams(content)),
+                    )
+                except Exception:
+                    pass
             self._conn.commit()
             # 侧车同步：尽力而为，失败不影响本地写入事务
             try:
@@ -865,6 +901,76 @@ class MemoryStore:
         else:
             # 已有元数据保持不变，避免覆盖外部更新的访问计数
             pass
+
+    def index_external(self, key: str, content: str) -> None:
+        """索引已由外部文件持久化的内容，不重复写入记忆文件。"""
+        now = time.time()
+        ns_key = self._ns_key(key)
+        vector = None
+        vector_json = None
+        try:
+            vector = self._embed_text(content)
+            if vector is not None:
+                try:
+                    vector_json = json.dumps(vector)
+                except Exception:
+                    vector_json = None
+        except Exception:
+            pass
+
+        try:
+            cur = self._conn.cursor()
+            cur.execute("SELECT id FROM notes WHERE key = ?", (ns_key,))
+            old_rowids = [row[0] for row in cur.fetchall()]
+            for rowid in old_rowids:
+                for table in ("notes_fts", "notes_fts_bigram"):
+                    try:
+                        cur.execute(f"DELETE FROM {table} WHERE rowid = ?", (rowid,))
+                    except Exception:
+                        pass
+            cur.execute("DELETE FROM notes WHERE key = ?", (ns_key,))
+
+            cur.execute("PRAGMA table_info(notes)")
+            columns = [row[1] for row in cur.fetchall()]
+            if "vector" in columns:
+                cur.execute(
+                    "INSERT INTO notes (key, content, created, vector) VALUES (?, ?, ?, ?)",
+                    (ns_key, content, datetime.now(timezone.utc).isoformat(), vector_json),
+                )
+            else:
+                cur.execute(
+                    "INSERT INTO notes (key, content, created) VALUES (?, ?, ?)",
+                    (ns_key, content, datetime.now(timezone.utc).isoformat()),
+                )
+            rowid = cur.lastrowid
+            if self._fts_enabled:
+                try:
+                    cur.execute(
+                        "INSERT INTO notes_fts (rowid, content) VALUES (?, ?)",
+                        (rowid, content),
+                    )
+                except Exception:
+                    pass
+            if self._bigram_enabled:
+                try:
+                    cur.execute(
+                        "INSERT INTO notes_fts_bigram (rowid, bigrams) VALUES (?, ?)",
+                        (rowid, _content_bigrams(content)),
+                    )
+                except Exception:
+                    pass
+            self._conn.commit()
+        except Exception:
+            try:
+                self._conn.rollback()
+            except Exception:
+                pass
+            return
+
+        if vector is not None:
+            self._pgvector_upsert(ns_key, content, vector)
+        if ns_key not in self._meta:
+            self._meta[ns_key] = {"quality_score": 0.5, "access_count": 0, "last_accessed": now}
 
     def _importance_for(self, item: dict, now: float) -> float:
         """按 Ebbinghaus 14 天衰减计算单条记忆的重要性。"""
@@ -1031,12 +1137,48 @@ class MemoryStore:
             out.append({"key": it["key"], "content": it["content"], "score": it.get("_score", 0.0)})
         return out
 
+    def _search_bigram_raw(self, query: str) -> list[dict]:
+        """使用内容侧预切 bigram 表检索，失败时返回空列表。"""
+        if not self._bigram_enabled or len(query) < 2:
+            return []
+        tokens = _content_bigrams(query).split()
+        if not tokens:
+            return []
+        # Quote each token so punctuation in user input cannot become FTS syntax.
+        match_query = " ".join(f'"{token.replace(chr(34), chr(34) * 2)}"' for token in tokens)
+        try:
+            cur = self._conn.cursor()
+            cur.execute(
+                "SELECT notes.key, notes.content "
+                "FROM notes_fts_bigram JOIN notes ON notes_fts_bigram.rowid = notes.id "
+                "WHERE notes_fts_bigram MATCH ?",
+                (match_query,),
+            )
+            rows = cur.fetchall()
+            prefix = self._ns_prefix()
+            result = [{"key": key, "content": content} for key, content in rows]
+            if prefix is not None:
+                result = [item for item in result if item["key"].startswith(prefix)]
+            seen: set[str] = set()
+            return [
+                item
+                for item in result
+                if not (item["content"] in seen or seen.add(item["content"]))
+            ]
+        except Exception:
+            return []
+
     def _search_bm25_raw(self, query: str) -> list[dict]:
         """不含向量的 BM25/FTS/LIKE/文件回退检索，返回去重后的候选。"""
         if not query:
             return []
         prefix = self._ns_prefix()
         safe_prefix = self._safe_prefix()
+        # trigram 对少于三个字符的 query 不可用；trigram 建表失败时所有 query 走此回退。
+        if len(query) < 3 or not self._trigram_enabled:
+            bigram_result = self._search_bigram_raw(query)
+            if bigram_result:
+                return bigram_result
         # 优先走 FTS5 MATCH
         if self._fts_enabled:
             try:
@@ -1064,6 +1206,10 @@ class MemoryStore:
                 pass
             except Exception:
                 pass
+        # FTS 异常或无命中时仍尝试 bigram，再降级到内容 LIKE。
+        bigram_result = self._search_bigram_raw(query)
+        if bigram_result:
+            return bigram_result
         # 回退到 LIKE 模糊匹配
         try:
             cur = self._conn.cursor()
