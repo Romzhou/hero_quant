@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+import logging
+
 from typing import Any
 
 try:
@@ -15,8 +17,11 @@ except Exception:  # pragma: no cover - prometheus_client unavailable fallback t
     Counter = Histogram = Gauge = None  # type: ignore
     REGISTRY = None  # type: ignore
 
+_logger = logging.getLogger(__name__)
+
 __all__ = [
     "WALL_TIME_SECONDS",
+    "WALL_TIME_DURATION",
     "WALL_TIME_BUDGET_EXCEEDED",
     "LEDGER_APPEND_DURATION",
     "LEDGER_APPEND_TOTAL",
@@ -48,21 +53,14 @@ def _get_or_create_histogram(name: str, doc: str, labels: list[str], buckets=Non
         h = Histogram(name, doc, **kw)
         return h
     except Exception:
-        # 已注册（重载/测试场景）—— 从 REGISTRY 复用既有收集器
+        # 已注册（重载/测试场景）—— 从 REGISTRY 复用既有收集器（回退到私有 API，仅作兼容）
         try:
             if REGISTRY is not None:
-                # 尝试直接名及常见后缀
+                collectors = getattr(REGISTRY, "_names_to_collectors", {})
                 for cand in (name, f"{name}_bucket", f"{name}_count"):
-                    if cand in getattr(REGISTRY, "_names_to_collectors", {}):
-                        return REGISTRY._names_to_collectors[cand]  # type: ignore[attr-defined]
-                # 回退：按原名查找
-                return REGISTRY._names_to_collectors.get(name)  # type: ignore[attr-defined]
-        except Exception:
-            pass
-        # 再次尝试按原名直接查找
-        try:
-            if REGISTRY is not None and name in getattr(REGISTRY, "_names_to_collectors", {}):
-                return REGISTRY._names_to_collectors[name]  # type: ignore[attr-defined]
+                    if cand in collectors:
+                        return collectors[cand]  # type: ignore[attr-defined]
+                return collectors.get(name)  # type: ignore[attr-defined]
         except Exception:
             pass
         return None
@@ -176,8 +174,8 @@ def observe_wall_time(operation: str, duration: float, status: str = "success") 
     try:
         if WALL_TIME_SECONDS is not None:
             WALL_TIME_SECONDS.labels(operation=operation, status=status).observe(float(duration))
-    except Exception:
-        pass
+    except Exception as e:  # pragma: no cover - observability must not break business
+        _logger.debug("observe_wall_time failed: %s", e, exc_info=True)
 
 
 def inc_wall_time_exceeded(operation: str = "generic") -> None:
@@ -185,8 +183,8 @@ def inc_wall_time_exceeded(operation: str = "generic") -> None:
     try:
         if WALL_TIME_BUDGET_EXCEEDED is not None:
             WALL_TIME_BUDGET_EXCEEDED.labels(operation=operation).inc()
-    except Exception:
-        pass
+    except Exception as e:  # pragma: no cover
+        _logger.debug("inc_wall_time_exceeded failed: %s", e, exc_info=True)
 
 
 def observe_ledger_append(tenant: str, duration: float, status: str = "success") -> None:
@@ -194,13 +192,13 @@ def observe_ledger_append(tenant: str, duration: float, status: str = "success")
     try:
         if LEDGER_APPEND_DURATION is not None:
             LEDGER_APPEND_DURATION.labels(tenant=tenant, status=status).observe(float(duration))
-    except Exception:
-        pass
+    except Exception as e:  # pragma: no cover
+        _logger.debug("observe_ledger_append duration failed: %s", e, exc_info=True)
     try:
         if LEDGER_APPEND_TOTAL is not None:
             LEDGER_APPEND_TOTAL.labels(tenant=tenant, status=status).inc()
-    except Exception:
-        pass
+    except Exception as e:  # pragma: no cover
+        _logger.debug("observe_ledger_append total failed: %s", e, exc_info=True)
 
 
 def inc_ledger_append(tenant: str, status: str = "success") -> None:
@@ -208,8 +206,8 @@ def inc_ledger_append(tenant: str, status: str = "success") -> None:
     try:
         if LEDGER_APPEND_TOTAL is not None:
             LEDGER_APPEND_TOTAL.labels(tenant=tenant, status=status).inc()
-    except Exception:
-        pass
+    except Exception as e:  # pragma: no cover
+        _logger.debug("inc_ledger_append failed: %s", e, exc_info=True)
 
 
 def inc_llm_retry(provider: str = "unknown", reason: str = "error") -> None:
@@ -217,8 +215,8 @@ def inc_llm_retry(provider: str = "unknown", reason: str = "error") -> None:
     try:
         if LLM_RETRY_TOTAL is not None:
             LLM_RETRY_TOTAL.labels(provider=provider, reason=reason).inc()
-    except Exception:
-        pass
+    except Exception as e:  # pragma: no cover
+        _logger.debug("inc_llm_retry failed: %s", e, exc_info=True)
 
 
 def inc_llm_timeout(provider: str = "unknown") -> None:
@@ -226,17 +224,16 @@ def inc_llm_timeout(provider: str = "unknown") -> None:
     try:
         if LLM_TIMEOUT_TOTAL is not None:
             LLM_TIMEOUT_TOTAL.labels(provider=provider).inc()
-    except Exception:
-        pass
+    except Exception as e:  # pragma: no cover
+        _logger.debug("inc_llm_timeout failed: %s", e, exc_info=True)
 
 
 def get_wall_time_metrics() -> dict[str, Any]:
     """获取 wall-time 指标快照，用于调试/测试。"""
     out: dict[str, Any] = {}
-    # 通过内部 _metrics 判断计数器是否可用（仅用于测试探针）
+    # 通过公开可用性探针判断（避免依赖私有 _metrics）
     try:
-        if WALL_TIME_BUDGET_EXCEEDED is not None and hasattr(WALL_TIME_BUDGET_EXCEEDED, "_metrics"):
-            # 内部私有结构，仅作可用性探针
+        if WALL_TIME_BUDGET_EXCEEDED is not None:
             out["exceeded_metric_available"] = True
     except Exception:
         pass
