@@ -64,16 +64,19 @@ def test_trace_large_tool_result_sidecar_still_redacted(tmp_path):
     payload = {"type": "tool_result", "content": "x" * 100, "api_key": "sk-1234567890abcdef", "secret": "mySecret"}
     w.append(payload)
     w.close()
-    # generic sidecar overflow path not taken for tool_result? tool_result uses result_path branch
-    # For large content (>50) should still redact api_key while offloading content
-    import json
-    # This payload content length 100 > threshold 50, so expect result_path
     lines = (tmp_path / "trace.jsonl").read_text().strip().splitlines()
     rec = json.loads(lines[0])
     assert rec.get("api_key") in ("***", "***REDACTED***")
     assert rec.get("secret") in ("***", "***REDACTED***")
-    # content was offloaded; preview should equal original content (passthrough)
-    assert rec.get("preview") == "x" * 100 or rec.get("content") == "x" * 100 or rec.get("preview") is not None
+    # content was offloaded; verify offload contract precisely
+    assert "result_path" in rec, f"expected result_path for offloaded content, got {rec}"
+    assert "content" not in rec, "tool_result offload should remove content"
+    assert "sidecar" not in rec, "tool_result path should use result_path not sidecar"
+    # preview should be prefix of original content (preview_len == 500 default, but threshold 50 still uses preview_len)
+    assert rec.get("preview") == "x" * 100, f"preview should equal content[:preview_len], got {rec.get('preview')!r}"
+    # sidecar file must exist
+    sidecar_file = tmp_path / rec["result_path"]
+    assert sidecar_file.exists(), f"sidecar file missing {sidecar_file}"
 
 
 def test_ledger_auto_redaction(tmp_path):

@@ -13,10 +13,12 @@ def test_ledger_append_with_tenant_and_price(tmp_path):
     # also legacy signature still works
     ledger.append({"action": "order", "symbol": "600519.SH"})
     assert ledger.verify() is True
-    # entries stored with tenant/price
-    entries = ledger._read_all()
-    assert any(e.get("tenant") == "tenant_a" for e in entries)
-    assert any(e.get("price") == 99.5 for e in entries)
+    # use public query to verify tenant/price correlation (avoid private API coupling)
+    entries = ledger.query(tenant="tenant_a") if hasattr(ledger, "query") else ledger._read_all()
+    # correlate tenant and price on same entry (not separate any() checks)
+    def _rec(e):
+        return e.get("record", e)
+    assert any((e.get("tenant") == "tenant_a" or _rec(e).get("tenant") == "tenant_a") and (e.get("price") == 99.5 or _rec(e).get("price") == 99.5 or _rec(e).get("price") == pytest.approx(99.5)) for e in entries), f"tenant_a entry with price 99.5 missing, entries={entries}"
 
 
 def test_ledger_verify_isolation_per_tenant(tmp_path):
@@ -35,10 +37,15 @@ def test_ledger_verify_isolation_per_tenant(tmp_path):
 
     # tamper alice's record -> alice verify fails, bob still passes (RLS isolation)
     p = tmp_path / "ledger.jsonl"
-    text = p.read_text(encoding="utf-8")
-    # replace first alice payload amount
-    tampered = text.replace('"factor": "f1"', '"factor": "HACKED"', 1)
-    p.write_text(tampered, encoding="utf-8")
+    import json as _json
+    lines = p.read_text(encoding="utf-8").splitlines()
+    objs = [_json.loads(l) for l in lines if l.strip()]
+    for o in objs:
+        rec = o.get("record", o)
+        if o.get("tenant") == "alice" and rec.get("factor") == "f1":
+            rec["factor"] = "HACKED"
+            break
+    p.write_text("\n".join(_json.dumps(o, ensure_ascii=False, separators=(",", ":")) for o in objs) + "\n", encoding="utf-8")
     assert ledger.verify(tenant="alice") is False
     assert ledger.verify(tenant="bob") is True
     # global verify should also fail after tamper
@@ -54,23 +61,16 @@ def test_ledger_rls_query_isolation(tmp_path):
     ledger.append({"action": "publish", "id": 2}, tenant="t2")
     ledger.append({"action": "publish", "id": 3}, tenant="t1")
 
-    # RLS query API — must be simple where tenant=...
-    assert hasattr(ledger, "query") or hasattr(ledger, "query_by_tenant") or hasattr(ledger, "list_records")
-    # try canonical names
-    if hasattr(ledger, "query"):
-        r1 = ledger.query(tenant="t1")
-        r2 = ledger.query(tenant="t2")
-    elif hasattr(ledger, "query_by_tenant"):
-        r1 = ledger.query_by_tenant("t1")
-        r2 = ledger.query_by_tenant("t2")
-    else:
-        r1 = ledger.list_records(tenant="t1")
-        r2 = ledger.list_records(tenant="t2")
+    # enforce canonical RLS query API
+    assert hasattr(ledger, "query"), "Ledger.query(tenant=...) is required; query_by_tenant/list_records are not acceptable aliases"
+    r1 = ledger.query(tenant="t1")
+    r2 = ledger.query(tenant="t2")
 
     assert len(r1) == 2
     assert len(r2) == 1
-    assert all(x["record"]["id"] != 2 for x in r1)
-    assert r2[0]["record"]["id"] == 2
+    def _rec(x): return x.get("record", x)
+    assert all(_rec(x).get("id") != 2 for x in r1)
+    assert _rec(r2[0]).get("id") == 2
 
 
 def test_billing_factor_marketplace_list_price():
@@ -101,21 +101,20 @@ def test_billing_purchase_to_ledger_attribution_loop(tmp_path):
     svc.publish_factor(factor_id="f1", name="F1", price=50.0, tenant="provider")
     # buyer purchases — should append ledger entry with buyer tenant and price
     receipt = svc.purchase(factor_id="f1", buyer_tenant="buyer_x")
-    assert receipt["tenant"] == "buyer_x" or receipt.get("buyer_tenant") == "buyer_x"
+    assert receipt.get("tenant") == "buyer_x" or receipt.get("buyer_tenant") == "buyer_x", f"receipt tenant mismatch {receipt}"
     # ledger isolated verification
     assert ledger.verify(tenant="buyer_x") is True
     # attribution closed loop: factor revenue aggregated
     attr = svc.attribution(factor_id="f1")
     assert attr["purchases"] >= 1
     assert attr["revenue"] >= 50.0
-    # RLS: buyer_x purchases visible only to buyer_x, not to other tenant
-    if hasattr(svc, "list_purchases"):
-        assert len(svc.list_purchases(tenant="buyer_x")) == 1
-        assert len(svc.list_purchases(tenant="other")) == 0
-    # ledger RLS isolation also holds
-    if hasattr(ledger, "query"):
-        assert len(ledger.query(tenant="buyer_x")) == 1
-        assert len(ledger.query(tenant="other")) == 0
+    # RLS must be asserted unconditionally (no hasattr gate)
+    assert hasattr(svc, "list_purchases"), "BillingService.list_purchases required for RLS"
+    assert len(svc.list_purchases(tenant="buyer_x")) == 1
+    assert len(svc.list_purchases(tenant="other")) == 0
+    assert hasattr(ledger, "query"), "Ledger.query required for RLS"
+    assert len(ledger.query(tenant="buyer_x")) == 1
+    assert len(ledger.query(tenant="other")) == 0
 
 
 # --- Task10 P1 HIGH items TDD ---

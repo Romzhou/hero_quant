@@ -7,6 +7,7 @@ Requirements:
 - bench run_batch 旧调用兼容，metrics.json/tearsheet 增加 non-PIT disclosure
 """
 
+import copy
 import json
 import pathlib
 import tempfile
@@ -24,14 +25,16 @@ SAMPLE = [
 def test_load_news_filters_by_trade_date():
     from hero_quant.data.loaders.news import load_news
 
-    out = load_news(SAMPLE, trade_date="2024-01-02", snapshot_date="2024-01-02")
+    out = load_news(copy.deepcopy(SAMPLE), trade_date="2024-01-02", snapshot_date="2024-01-02")
     # should only return trade_date == 2024-01-02  -> ids 1,2,4,5 (4 items)
     ids = {r["id"] for r in out}
     assert ids == {1, 2, 4, 5}, f"trade_date filter failed, got {ids}"
     assert len(out) == 4
     # no cross contamination
-    out2 = load_news(SAMPLE, trade_date="2024-01-03", snapshot_date="2024-01-03")
+    out2 = load_news(copy.deepcopy(SAMPLE), trade_date="2024-01-03", snapshot_date="2024-01-03")
     assert {r["id"] for r in out2} == {3}
+    # ensure SAMPLE not mutated
+    assert all("pit" not in r for r in SAMPLE), "load_news must not mutate input"
 
 
 def test_load_news_pit_verified_only_when_publish_lte_snapshot():
@@ -39,29 +42,36 @@ def test_load_news_pit_verified_only_when_publish_lte_snapshot():
 
     # snapshot = 2024-01-02 12:00, so publish <= snapshot is pit True
     snapshot = "2024-01-02 12:00:00"
-    out = load_news(SAMPLE, trade_date="2024-01-02", snapshot_date=snapshot)
+    out = load_news(copy.deepcopy(SAMPLE), trade_date="2024-01-02", snapshot_date=snapshot)
     by_id = {r["id"]: r for r in out}
     # id 1 publish 2024-01-01 <= snapshot => pit True
     assert by_id[1]["pit"] is True, f"id1 should be pit True, got {by_id[1]}"
-    # id 5 has own snapshot_date 2024-01-02 but passed snapshot larger, still publish <= snapshot => pit True? But overwritten?
+    # id 5 per-record snapshot_date must not override global snapshot — global governs
+    assert by_id[5]["pit"] is True, f"id5 should be pit True (global snapshot governs), got {by_id[5]}"
     # id 2 publish 2024-01-03 > snapshot => pit False
     assert by_id[2]["pit"] is False, f"id2 future publish should be pit False, got {by_id[2]}"
     # id 4 missing publish_time => pit False (unknown)
     assert by_id[4]["pit"] is False, f"id4 missing time should be pit False, got {by_id[4]}"
+    # cross-field invariant: pit True => verified status, pit False => non-verified
+    for r in out:
+        if r["pit"] is True:
+            assert r["pit_status"] in ("verified", "pit", "available", "ok"), f"pit True must have verified status, got {r}"
+        else:
+            assert r["pit_status"] not in ("verified", "pit", "available", "ok") or r["pit_status"] in ("future", "unknown", "unavailable", "missing", "non-pit", "non_pit", "excluded"), f"pit False status {r['pit_status']!r} inconsistent"
 
 
 def test_load_news_pit_status_honest_unknown():
     from hero_quant.data.loaders.news import load_news
 
-    out = load_news(SAMPLE, trade_date="2024-01-02", snapshot_date="2024-01-02")
+    out = load_news(copy.deepcopy(SAMPLE), trade_date="2024-01-02", snapshot_date="2024-01-02")
     by_id = {r["id"]: r for r in out}
     # missing publish_time must not fabricate PIT, must be pit False and status unknown/unavailable
     assert by_id[4]["pit"] is False
     assert by_id[4].get("pit_status") in ("unknown", "unavailable", "missing", "non-pit", "non_pit"), f"pit_status dishonest: {by_id[4]}"
     # verified case should have status verified/pit
     assert by_id[1].get("pit_status") in ("verified", "pit", "available", "ok"), f"pit_status for verified unexpected: {by_id[1]}"
-    # future case status should indicate future / non-pit
-    assert by_id[2].get("pit_status") in ("future", "non-pit", "non_pit", "unavailable", "unknown", "excluded"), f"future status unexpected: {by_id[2]}"
+    # future case must be explicit future/non-pit, not generic unknown (honesty)
+    assert by_id[2].get("pit_status") in ("future", "non-pit", "non_pit", "excluded"), f"future status must be explicit future/non-pit, got {by_id[2]}"
     # every record must have pit_status field honest
     for r in out:
         assert "pit_status" in r, f"missing pit_status in {r}"
@@ -72,14 +82,23 @@ def test_load_news_available_at_alias():
     from hero_quant.data.loaders.news import load_news
 
     # available_at as alias for snapshot_date
-    out1 = load_news(SAMPLE, trade_date="2024-01-02", snapshot_date="2024-01-02 12:00:00")
-    out2 = load_news(SAMPLE, trade_date="2024-01-02", available_at="2024-01-02 12:00:00")
+    out1 = load_news(copy.deepcopy(SAMPLE), trade_date="2024-01-02", snapshot_date="2024-01-02 12:00:00")
+    out2 = load_news(copy.deepcopy(SAMPLE), trade_date="2024-01-02", available_at="2024-01-02 12:00:00")
     assert {r["id"]: r["pit"] for r in out1} == {r["id"]: r["pit"] for r in out2}
+    # both supplied with different values — snapshot_date should govern (explicit wins)
+    out_both = load_news(copy.deepcopy(SAMPLE), trade_date="2024-01-02", snapshot_date="2024-01-03 12:00:00", available_at="2024-01-01 12:00:00")
+    by_both = {r["id"]: r for r in out_both}
+    # with later snapshot, future item id2 (2024-01-03) becomes PIT True only if snapshot >= publish
+    assert by_both[2]["pit"] is True, "when both alias present, snapshot_date should govern"
     # no snapshot at all => all pit False (cannot verify)
-    out3 = load_news(SAMPLE, trade_date="2024-01-02")
+    out3 = load_news(copy.deepcopy(SAMPLE), trade_date="2024-01-02")
     for r in out3:
         assert r["pit"] is False, f"without snapshot all should be non-PIT, got {r}"
         assert r["pit_status"] in ("unknown", "unavailable", "missing", "non-pit", "non_pit")
+    # exact equality boundary: publish_time == snapshot is PIT True (<=)
+    eq_rec = [{"id": 999, "trade_date": "2024-01-02", "publish_time": "2024-01-02 12:00:00"}]
+    out_eq = load_news(eq_rec, trade_date="2024-01-02", snapshot_date="2024-01-02 12:00:00")
+    assert out_eq[0]["pit"] is True, "publish_time == snapshot should be PIT True"
 
 
 def test_load_news_no_mutation_and_field_variants():
@@ -104,12 +123,18 @@ def test_disclosure_helper():
     helper = None
     for name in ("get_disclosure", "build_disclosure", "format_disclosure", "get_pit_disclosure", "disclosure", "news_disclosure", "build_news_disclosure"):
         if hasattr(m, name):
-            helper = getattr(m, name)
-            break
-    assert helper is not None, "news.py must expose disclosure helper (get_disclosure/build_disclosure)"
+            cand = getattr(m, name)
+            if callable(cand):
+                helper = cand
+                break
+    assert helper is not None and callable(helper), "news.py must expose callable disclosure helper (get_disclosure/build_disclosure)"
 
-    filtered = load_news(SAMPLE, trade_date="2024-01-02", snapshot_date="2024-01-02")
-    text = helper(filtered) if helper.__code__.co_argcount >= 1 else helper()
+    filtered = load_news(copy.deepcopy(SAMPLE), trade_date="2024-01-02", snapshot_date="2024-01-02")
+    # handle both helper(filtered) and helper() via try
+    try:
+        text = helper(filtered)
+    except TypeError:
+        text = helper()
     # handle helper returning str or dict
     if isinstance(text, dict):
         text = json.dumps(text)
@@ -300,3 +325,34 @@ def test_news_trade_date_filter_logs_and_schema_raise(caplog):
     out2 = load_news(recs_many, trade_date="2024-01-02", snapshot_date="2024-01-02")
     assert len(out2) == 1
     assert any("dropped" in r.message.lower() for r in caplog.records)
+
+
+def test_load_news_invalid_publish_time_honest():
+    from hero_quant.data.loaders.news import load_news
+    # malformed string/None publish_time must be honest pit=False/unknown without raising
+    for bad in ["not-a-date", "", "   ", None]:
+        rec = [{"id": 1, "trade_date": "2024-01-02", "publish_time": bad}]
+        out = load_news(rec, trade_date="2024-01-02", snapshot_date="2024-01-02 12:00:00")
+        assert out[0]["pit"] is False, f"malformed {bad!r} should be pit False, got {out[0]}"
+        assert out[0]["pit_status"] in ("unknown", "unavailable", "missing", "non-pit", "non_pit"), f"bad time status {out[0]}"
+    # numeric timestamp is implementation-specific: pd.to_datetime(12345) -> 1970-01-01, so pit may be True
+    # ensure it does not raise and has honest status
+    rec_num = [{"id": 1, "trade_date": "2024-01-02", "publish_time": 12345}]
+    out_num = load_news(rec_num, trade_date="2024-01-02", snapshot_date="2024-01-02 12:00:00")
+    assert "pit" in out_num[0] and "pit_status" in out_num[0]
+
+
+def test_load_news_pit_status_consistency():
+    from hero_quant.data.loaders.news import load_news
+    recs = [
+        {"id": 1, "trade_date": "2024-01-02", "publish_time": "2024-01-01 10:00:00"},
+        {"id": 2, "trade_date": "2024-01-02", "publish_time": "2024-01-03 10:00:00"},
+        {"id": 3, "trade_date": "2024-01-02"},
+    ]
+    out = load_news(copy.deepcopy(recs), trade_date="2024-01-02", snapshot_date="2024-01-02 12:00:00")
+    for r in out:
+        assert "pit" in r and "pit_status" in r
+        if r["pit"] is True:
+            assert r["pit_status"] in ("verified", "pit", "available", "ok")
+        else:
+            assert r["pit_status"] in ("unknown", "unavailable", "missing", "non-pit", "non_pit", "future", "excluded")
