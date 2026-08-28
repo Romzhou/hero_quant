@@ -169,20 +169,38 @@ BANNED_ATTRS = {
 }
 
 
-def _is_banned_attribute(node: ast.Attribute) -> bool:
-    """判定属性访问是否命中黑名单（直接执行能力或受限根模块的任意属性）。"""
-    if isinstance(node.value, ast.Name):
-        base = node.value.id
-        attr = node.attr
-        if (base, attr) in BANNED_ATTRS:
-            return True
-        # ctypes / socket / requests 的任意属性均视为高危（外联或底层操作）
-        if base in {"ctypes", "socket", "requests"}:
-            return True
-        if base == "subprocess":
-            return True  # subprocess 的任意方法均可能创建子进程
-        if base == "os" and attr in {"system", "popen", "execve", "spawnl", "spawnlp", "execv", "execl"}:
-            return True
+def _get_root_name(node: ast.AST) -> str | None:
+    """递归剥离 Attribute 直到 Name，返回根名称或 None。"""
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return _get_root_name(node.value)
+    return None
+
+
+def _is_banned_attribute(node: ast.Attribute, alias_map: dict[str, str] | None = None) -> bool:
+    """判定属性访问是否命中黑名单（直接执行能力或受限根模块的任意属性）。
+
+    支持链式属性（a.b.c）与别名映射：通过 _get_root_name 提取根，
+    再经 alias_map 还原到真实根后判定 BANNED_IMPORT_ROOTS。
+    """
+    alias_map = alias_map or {}
+    root = _get_root_name(node)
+    if root is None:
+        return False
+    effective = alias_map.get(root, root)
+    attr = node.attr
+    if (effective, attr) in BANNED_ATTRS:
+        return True
+    # 受限根的任意属性均视为高危；链式解析后命中 banned root 即拦截
+    if effective in BANNED_IMPORT_ROOTS:
+        return True
+    if effective in {"ctypes", "socket", "requests"}:
+        return True
+    if effective == "subprocess":
+        return True
+    if effective == "os" and attr in {"system", "popen", "execve", "spawnl", "spawnlp", "execv", "execl"}:
+        return True
     return False
 
 
@@ -194,6 +212,25 @@ def check_import_allowlist(code: str) -> bool:
         tree = ast.parse(code)
     except SyntaxError:
         return False
+
+    # 收集别名映射 {asname -> real_root}，用于链式与别名绕过检测
+    alias_map: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                root = alias.name.split(".")[0]
+                asname = alias.asname if alias.asname else alias.name.split(".")[0]
+                alias_map[asname] = root
+                # 处理 `import os.path` 无别名时，补 root 自映射
+                if alias.asname is None and "." in alias.name:
+                    alias_map[root] = root
+        elif isinstance(node, ast.ImportFrom):
+            if node.module is None:
+                continue
+            root = node.module.split(".")[0]
+            for alias in node.names:
+                asname = alias.asname if alias.asname else alias.name
+                alias_map[asname] = root
 
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -216,12 +253,26 @@ def check_import_allowlist(code: str) -> bool:
             func = node.func
             if isinstance(func, ast.Name) and func.id in BANNED_CALL_NAMES:
                 return False  # 拦截 eval/exec/__import__ 动态执行
-            if isinstance(func, ast.Attribute):
-                if _is_banned_attribute(func):
+            # from-import 别名直接调用：`from os import system as s; s(...)`
+            if isinstance(func, ast.Name) and func.id in alias_map:
+                effective = alias_map.get(func.id, func.id)
+                if effective in BANNED_IMPORT_ROOTS:
                     return False
+            if isinstance(func, ast.Attribute):
+                if _is_banned_attribute(func, alias_map):
+                    return False
+            # getattr/setattr/hasattr 间接调用：首参经 alias_map 解析到 banned root
+            if isinstance(func, ast.Name) and func.id in {"getattr", "setattr", "hasattr"}:
+                if node.args:
+                    first = node.args[0]
+                    root = _get_root_name(first)
+                    if root is not None:
+                        effective = alias_map.get(root, root)
+                        if effective in BANNED_IMPORT_ROOTS:
+                            return False
         elif isinstance(node, ast.Attribute):
             # 即使未调用，单纯引用高危属性也应拦截（如 x = os.system）
-            if _is_banned_attribute(node):
+            if _is_banned_attribute(node, alias_map):
                 return False
 
     return True
