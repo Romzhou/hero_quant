@@ -138,30 +138,38 @@ class MemoryLifecycle:
                 if safe == fname:
                     apply_meta(v)
                     return qs, ac, last
-            # 回退：按 stem 模糊匹配
+            # 精确 stem 匹配（去 fuzzy endswith）
             stem = file_path.stem
             for k, v in meta_dict.items():
-                if stem == k or stem.endswith(k) or k.endswith(stem):
+                if stem == k:
                     apply_meta(v)
                     return qs, ac, last
             # 层次文件需处理 namespace 前缀替换，未命中则保留默认值
         # 回退解析 frontmatter 中的质量分
         try:
             text = file_path.read_text(encoding="utf-8")
-            if text.startswith("---"):
-                for line in text.splitlines()[1:10]:
-                    if line.startswith("quality_score:"):
-                        qs = float(line.split(":", 1)[1].strip())
-                    elif line.startswith("access_count:"):
-                        ac = int(line.split(":", 1)[1].strip())
-                    elif line.startswith("last_accessed:"):
-                        # 兼容 ISO 与时间戳两种写法
-                        val = line.split(":", 1)[1].strip()
+            if text.lstrip().startswith("---"):
+                lines = text.lstrip().splitlines()
+                for line in lines[1:11]:
+                    stripped = line.lstrip()
+                    if stripped.startswith("quality_score:"):
+                        qs = float(stripped.split(":", 1)[1].strip())
+                    elif stripped.startswith("access_count:"):
+                        ac = int(stripped.split(":", 1)[1].strip())
+                    elif stripped.startswith("last_accessed:"):
+                        # 兼容 ISO 与时间戳两种写法，支持缩进
+                        val = stripped.split(":", 1)[1].strip()
                         try:
                             last = float(val)
                         except ValueError:
-                            pass
-                    if line.strip() == "---":
+                            try:
+                                from datetime import datetime
+
+                                iso = val.replace("Z", "+00:00")
+                                last = datetime.fromisoformat(iso).timestamp()
+                            except Exception:
+                                pass
+                    if stripped == "---":
                         break
         except Exception as _exc:
             logger.debug("silent handled: offline-safe: lifecycle optional", exc_info=_exc)  # intentional: offline-safe: lifecycle optional
@@ -202,9 +210,6 @@ class MemoryLifecycle:
                     "importance": round(imp, 4),
                     "reason": reason,
                 }
-                # 兼容带 namespace 前缀的安全名，保留完整 stem 即可满足测试的子串匹配
-                if "__" in name:
-                    pass
                 actions.append(record)
                 if not dry_run:
                     effective = "archive" if not self.ENABLE_DELETE else action
@@ -219,11 +224,30 @@ class MemoryLifecycle:
         try:
             if action == "archive":
                 dest = archive_dir / file_path.name
-                # 目标已存在时避免覆盖
-                if dest.exists():
-                    logger.warning("GC archive dest exists: %s", dest)
-                    return
-                file_path.rename(dest)
+                # 目标冲突计数版本重试，重试 rename 原子
+                counter = 1
+                stem = file_path.stem
+                suffix = file_path.suffix
+                while dest.exists():
+                    dest = archive_dir / f"{stem}.{counter}{suffix}"
+                    counter += 1
+                while True:
+                    try:
+                        file_path.rename(dest)
+                        break
+                    except FileExistsError as exc:
+                        logger.warning("GC archive collision FileExistsError for %s -> %s: %s", file_path, dest, exc)
+                        dest = archive_dir / f"{stem}.{counter}{suffix}"
+                        counter += 1
+                        continue
+                    except (OSError, IOError) as exc:
+                        if dest.exists():
+                            logger.warning("GC archive dest exists versioning %s: %s", dest, exc)
+                            dest = archive_dir / f"{stem}.{counter}{suffix}"
+                            counter += 1
+                            continue
+                        logger.warning("GC archive failed for %s: %s", file_path, exc)
+                        return
                 # 归档后保留 SQLite 行，搜索回退仍可见，仅文件态视为已回收
                 try:
                     from .hierarchy import MemoryHierarchy
@@ -235,12 +259,36 @@ class MemoryLifecycle:
                     pass  # intentional offline-safe: lifecycle optional
             elif action == "delete":
                 dest = archive_dir / file_path.name
+                # dest 冲突版本化 dest.stem.{n}.suffix
+                if dest.exists():
+                    base_stem = dest.stem
+                    suffix = dest.suffix
+                    counter = 1
+                    while dest.exists():
+                        dest = archive_dir / f"{base_stem}.{counter}{suffix}"
+                        counter += 1
+                # 备份写 tmp+rename 原子，读/写包 try 失败 logger.warning+return 不 unlink
+                tmp = dest.with_name(dest.name + ".tmp")
                 try:
-                    dest.write_text(file_path.read_text(encoding="utf-8"), encoding="utf-8")
-                except Exception as _exc:
-                    logger.debug("silent handled: offline-safe: lifecycle optional", exc_info=_exc)  # intentional: offline-safe: lifecycle optional
-                    pass  # intentional offline-safe: lifecycle optional
-                file_path.unlink()
+                    content = file_path.read_text(encoding="utf-8")
+                except (OSError, UnicodeError, IOError) as exc:
+                    logger.warning("GC delete backup read failed for %s: %s", file_path, exc)
+                    return
+                try:
+                    tmp.write_text(content, encoding="utf-8")
+                    tmp.rename(dest)
+                except (OSError, IOError) as exc:
+                    logger.warning("GC delete backup write failed for %s -> %s: %s", file_path, dest, exc)
+                    try:
+                        if tmp.exists():
+                            tmp.unlink()
+                    except OSError:
+                        pass
+                    return
+                try:
+                    file_path.unlink()
+                except (OSError, IOError) as exc:
+                    logger.warning("GC delete unlink failed for %s: %s", file_path, exc)
         except (OSError, IOError) as exc:
             logger.warning("GC action(%s, %s) failed: %s", file_path.name, action, exc)
 
@@ -366,10 +414,13 @@ class MemoryLifecycle:
         actions: list[dict] = []
         for stage, period, sources in self._compression_sources(current_time):
             target = self.memory_dir / stage / f"{period}.md"
+            # 源只读一次复用
+            content_map: dict[Path, str] = {}
             records: list[tuple[str, str]] = []
             for source in sources:
                 content = self._read_compressible(source)
                 if content is not None:
+                    content_map[source] = content
                     records.append((source.stem, content))
             summary = self._tfidf_summary(records)
             if not summary:
@@ -386,14 +437,43 @@ class MemoryLifecycle:
                 continue
             try:
                 target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_text(summary + "\n", encoding="utf-8")
+                # target 存在则 merge(去重已存在跳过)或版本化，tmp+replace 原子
+                final_text: str | None = summary + "\n"
+                if target.exists():
+                    try:
+                        existing = target.read_text(encoding="utf-8")
+                    except OSError as exc:
+                        logger.warning("Compression read existing failed for %s: %s", target, exc)
+                        existing = ""
+                    existing_set = {line.strip() for line in existing.splitlines() if line.strip()}
+                    new_lines = [line for line in summary.splitlines() if line.strip() not in existing_set]
+                    if not new_lines:
+                        # 去重已存在跳过写，但仍归档源
+                        final_text = None
+                    else:
+                        if existing.strip():
+                            final_text = existing.rstrip("\n") + "\n" + "\n".join(new_lines) + "\n"
+                        else:
+                            final_text = "\n".join(new_lines) + "\n"
+                if final_text is not None:
+                    tmp = target.with_name(target.name + ".tmp")
+                    try:
+                        tmp.write_text(final_text, encoding="utf-8")
+                        tmp.replace(target)
+                    except OSError as exc:
+                        logger.warning("Compression write failed for %s: %s", target, exc)
+                        try:
+                            if tmp.exists():
+                                tmp.unlink()
+                        except OSError:
+                            pass
+                        continue
             except OSError as exc:
                 logger.warning("Compression write failed for %s: %s", target, exc)
                 continue
             self._index_compression(stage, period, summary)
-            for source in sources:
-                if self._read_compressible(source) is not None:
-                    self._compressed_archive(source, stage)
+            for source in content_map:
+                self._compressed_archive(source, stage)
         return actions
 
     # 预留接口：与上游事件体系对齐
