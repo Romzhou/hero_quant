@@ -116,3 +116,131 @@ def test_billing_purchase_to_ledger_attribution_loop(tmp_path):
     if hasattr(ledger, "query"):
         assert len(ledger.query(tenant="buyer_x")) == 1
         assert len(ledger.query(tenant="other")) == 0
+
+
+# --- Task10 P1 HIGH items TDD ---
+
+def test_billing_silent_exception_not_swallowed():
+    """publish/purchase ledger failures must be logged and not silently swallowed (fail-closed)."""
+    import inspect
+    from hero_quant.billing.service import BillingService
+    src = inspect.getsource(BillingService.publish_factor)
+    # must log with exc_info / structlog and not bare pass
+    assert "logger" in src or "structlog" in src or "exc_info" in src
+    # should not have bare except: pass that hides billing failures
+    # check that except blocks contain logging or raise, not just pass
+    # source should contain 'except Exception' with logging
+    assert "except Exception" in src
+    # ensure not just 'except Exception:\n                pass'
+    assert "pass" not in src or "logger" in src or "structlog" in src
+
+    # functional: ledger failure must surface (raise) not silent
+    class FailingLedger:
+        def append(self, *a, **kw):
+            raise RuntimeError("ledger down")
+        def _read_all(self): return []
+        def query(self, **kw): return []
+
+    svc = BillingService(ledger=FailingLedger())
+    # publish should not silently swallow — should raise or at least not return normally without logging
+    # Our contract: fail-closed -> raise
+    try:
+        svc.publish_factor(factor_id="fail_f", name="Fail", price=10, tenant="t1")
+        raised = False
+    except RuntimeError:
+        raised = True
+    except Exception:
+        raised = True
+    assert raised is True, "ledger failure must not be silently swallowed"
+
+
+def test_billing_global_lock_exists():
+    """Module-level globals must be guarded by threading.Lock."""
+    import inspect
+    import hero_quant.billing.service as mod
+    assert hasattr(mod, "_GLOBAL_LOCK"), "missing _GLOBAL_LOCK"
+    src = inspect.getsource(mod.BillingService.publish_factor)
+    # publish_factor and purchase should use lock
+    src2 = inspect.getsource(mod.BillingService.purchase)
+    src_all = src + src2 + inspect.getsource(mod.BillingService.list_factors)
+    assert "_GLOBAL_LOCK" in src_all or "with _GLOBAL_LOCK" in src_all
+
+
+def test_billing_pg_noop_explicit_warning():
+    """PG persistence no-op must log warning 'PG persistence not implemented, using emulated store' once."""
+    import inspect
+    from hero_quant.billing.service import BillingService
+    import hero_quant.billing.service as mod
+    src = inspect.getsource(mod.BillingService.__init__)
+    mod_src = inspect.getsource(mod)
+    assert "PG persistence not implemented" in mod_src, "warning string missing"
+    # DDL should be gated or removed, not dead no-op
+    # check _pg_publish_sync is not bare pass without warning
+    pg_src = inspect.getsource(mod.BillingService._pg_publish_sync)
+    assert "PG persistence not implemented" in pg_src or "emulated" in pg_src.lower() or "warning" in pg_src.lower()
+
+
+def test_billing_attribution_dedup_single_source():
+    """Attribution must use single source of truth and dedup by purchase_id; double-attribution not possible."""
+    import inspect
+    from hero_quant.billing.service import BillingService, _GLOBAL_PURCHASES, _GLOBAL_FACTORS
+    dsn = "postgresql://postgres:postgres@localhost:5432/hero_quant_billing_dedup_test"
+    _GLOBAL_FACTORS.pop(dsn, None)
+    _GLOBAL_PURCHASES.pop(dsn, None)
+    svc = BillingService(dsn=dsn)
+    svc.publish_factor(factor_id="dedup_f", name="Dedup", price=10.0, tenant="prov")
+    receipt = svc.purchase(factor_id="dedup_f", buyer_tenant="buyer_x", price=10.0)
+    # attribution baseline
+    attr1 = svc.attribution("dedup_f")
+    assert attr1["purchases"] == 1
+    # duplicate same purchase_id in global (simulate retry / merge bug)
+    pid = receipt.get("purchase_id") or receipt.get("id")
+    # if no purchase_id yet, dedup key will be missing -> test source check
+    src = inspect.getsource(svc.attribution)
+    assert "purchase_id" in src or "dedup" in src.lower() or "set(" in src, "attribution must dedup by explicit key"
+    # ensure no len-based merge
+    assert "len(self._purchases) > len(relevant)" not in src
+    assert "p not in relevant" not in src
+    # functional double-insert: insert duplicate receipt with same purchase_id
+    if pid is not None:
+        dup = receipt.copy()
+        # duplicate in global store
+        _GLOBAL_PURCHASES[dsn].append(dup)
+        # also duplicate in instance
+        svc._purchases.append(dup)
+        attr2 = svc.attribution("dedup_f")
+        assert attr2["purchases"] == 1, f"double-attribution must not occur, got {attr2}"
+        assert attr2["revenue"] == 10.0
+    # else source-level check suffices
+
+
+def test_billing_rls_all_read_paths_filter_tenant():
+    """ALL factor read paths must filter by tenant: tenant B cannot read tenant A's factor."""
+    from hero_quant.billing.service import BillingService, _GLOBAL_FACTORS, _GLOBAL_PURCHASES
+    dsn = "postgresql://postgres:postgres@localhost:5432/hero_quant_billing_rls_all"
+    _GLOBAL_FACTORS.pop(dsn, None)
+    _GLOBAL_PURCHASES.pop(dsn, None)
+    svc = BillingService(dsn=dsn)
+    svc.publish_factor(factor_id="rls_f", name="RLS", price=99.0, tenant="tenantA")
+    # list_factors isolates
+    assert len(svc.list_factors(tenant="tenantA")) == 1
+    assert len(svc.list_factors(tenant="tenantB")) == 0
+    # get_factor must also isolate when tenant supplied
+    # new signature get_factor(factor_id, tenant=...)
+    try:
+        got_a = svc.get_factor("rls_f", tenant="tenantA")
+    except TypeError:
+        got_a = svc.get_factor("rls_f")  # fallback old signature
+    try:
+        got_b = svc.get_factor("rls_f", tenant="tenantB")
+    except TypeError:
+        # if old signature, then this test expects failure (fragile)
+        got_b = None
+        assert False, "get_factor must accept tenant param for RLS"
+    assert got_a is not None, "tenantA should read own factor"
+    assert got_b is None, "tenantB must NOT read tenantA's factor via get_factor"
+    # generic: any read path should not leak
+    if hasattr(svc, "get_factor"):
+        import inspect
+        src = inspect.getsource(svc.get_factor)
+        assert "tenant" in src.lower()

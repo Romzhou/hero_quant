@@ -300,41 +300,62 @@ class AsyncPostgresSaver:
     def _pg_put_sync(self, thread_id: str, checkpoint: Dict[str, Any], config: Dict[str, Any]) -> bool:
         """同步 UPSERT 到 Postgres（幂等，带 expires_at）。Task7 tenant/thread/seq schema."""
         if not self._is_pg_mode() or self._pool_is_async():
-            # if we have real pool async, not sync; still try emulated global fallback outside
-            pass
+            return False
         if self._is_real_pg_pool() and not self._pool_is_async():
             try:
                 tenant, thread, seq = _thread_to_keys(thread_id)
-                expires_at_sql = "now() + interval '%s seconds'" % int(self.ttl_seconds) if self.ttl_seconds > 0 else "NULL"
                 ck_json = json.dumps(checkpoint, ensure_ascii=False)
                 cfg_json = json.dumps(config, ensure_ascii=False) if config else json.dumps({}, ensure_ascii=False)
-                # Try new schema first, fallback to legacy thread_id
-                sql_new = f"""
-                    INSERT INTO checkpoints (tenant, thread, seq, checkpoint, expires_at)
-                    VALUES (%s, %s, %s, %s::jsonb, {expires_at_sql})
-                    ON CONFLICT (tenant, thread, seq) DO UPDATE SET checkpoint=EXCLUDED.checkpoint, expires_at=EXCLUDED.expires_at
-                """
-                sql_legacy = f"""
-                    INSERT INTO checkpoints_legacy (thread_id, checkpoint, config, expires_at)
-                    VALUES (%s, %s::jsonb, %s::jsonb, {expires_at_sql})
-                    ON CONFLICT (thread_id) DO UPDATE SET checkpoint=EXCLUDED.checkpoint, config=EXCLUDED.config, expires_at=EXCLUDED.expires_at
-                """
+                ttl_val = None
+                try:
+                    ttl_val = int(self.ttl_seconds) if self.ttl_seconds is not None else 0
+                except Exception:
+                    ttl_val = 0
+                use_ttl = ttl_val is not None and ttl_val > 0
+                if use_ttl:
+                    expires_at_expr = "now() + (%s * interval '1 second')"
+                    sql_new = f"""
+                        INSERT INTO checkpoints (tenant, thread, seq, checkpoint, expires_at)
+                        VALUES (%s, %s, %s, %s::jsonb, {expires_at_expr})
+                        ON CONFLICT (tenant, thread, seq) DO UPDATE SET checkpoint=EXCLUDED.checkpoint, expires_at=EXCLUDED.expires_at
+                    """
+                    sql_legacy = f"""
+                        INSERT INTO checkpoints_legacy (thread_id, checkpoint, config, expires_at)
+                        VALUES (%s, %s::jsonb, %s::jsonb, {expires_at_expr})
+                        ON CONFLICT (thread_id) DO UPDATE SET checkpoint=EXCLUDED.checkpoint, config=EXCLUDED.config, expires_at=EXCLUDED.expires_at
+                    """
+                    params_new = (tenant, thread, seq, ck_json, ttl_val)
+                    params_legacy = (thread_id, ck_json, cfg_json, ttl_val)
+                else:
+                    expires_at_expr = "NULL"
+                    sql_new = f"""
+                        INSERT INTO checkpoints (tenant, thread, seq, checkpoint, expires_at)
+                        VALUES (%s, %s, %s, %s::jsonb, {expires_at_expr})
+                        ON CONFLICT (tenant, thread, seq) DO UPDATE SET checkpoint=EXCLUDED.checkpoint, expires_at=EXCLUDED.expires_at
+                    """
+                    sql_legacy = f"""
+                        INSERT INTO checkpoints_legacy (thread_id, checkpoint, config, expires_at)
+                        VALUES (%s, %s::jsonb, %s::jsonb, {expires_at_expr})
+                        ON CONFLICT (thread_id) DO UPDATE SET checkpoint=EXCLUDED.checkpoint, config=EXCLUDED.config, expires_at=EXCLUDED.expires_at
+                    """
+                    params_new = (tenant, thread, seq, ck_json)
+                    params_legacy = (thread_id, ck_json, cfg_json)
                 if hasattr(self.pool, "connection"):
                     with self.pool.connection() as conn:  # type: ignore
                         try:
-                            conn.execute(sql_new, (tenant, thread, seq, ck_json))  # type: ignore
+                            conn.execute(sql_new, params_new)  # type: ignore
                             # also maintain legacy for compatibility
                             try:
-                                conn.execute(sql_legacy, (thread_id, ck_json, cfg_json))  # type: ignore
+                                conn.execute(sql_legacy, params_legacy)  # type: ignore
                             except Exception:
                                 pass
                         except Exception:
                             # fallback legacy if new fails (table missing)
                             with conn.cursor() as cur:  # type: ignore
                                 try:
-                                    cur.execute(sql_new, (tenant, thread, seq, ck_json))
+                                    cur.execute(sql_new, params_new)
                                 except Exception:
-                                    cur.execute(sql_legacy, (thread_id, ck_json, cfg_json))
+                                    cur.execute(sql_legacy, params_legacy)
                         try:
                             conn.commit()  # type: ignore
                         except Exception as _exc:
@@ -345,9 +366,9 @@ class AsyncPostgresSaver:
                     try:
                         with conn.cursor() as cur:
                             try:
-                                cur.execute(sql_new, (tenant, thread, seq, ck_json))
+                                cur.execute(sql_new, params_new)
                             except Exception:
-                                cur.execute(sql_legacy, (thread_id, ck_json, cfg_json))
+                                cur.execute(sql_legacy, params_legacy)
                         conn.commit()
                     finally:
                         try:
@@ -371,14 +392,29 @@ class AsyncPostgresSaver:
             try:
                 tenant, thread, seq = _thread_to_keys(thread_id)
                 ck_json = json.dumps(checkpoint, ensure_ascii=False)
-                expires_at_sql = "now() + interval '%s seconds'" % int(self.ttl_seconds) if self.ttl_seconds > 0 else "NULL"
-                sql_new = f"""
-                    INSERT INTO checkpoints (tenant, thread, seq, checkpoint, expires_at)
-                    VALUES (%s, %s, %s, %s::jsonb, {expires_at_sql})
-                    ON CONFLICT (tenant, thread, seq) DO UPDATE SET checkpoint=EXCLUDED.checkpoint, expires_at=EXCLUDED.expires_at
-                """
+                try:
+                    ttl_val = int(self.ttl_seconds) if self.ttl_seconds is not None else 0
+                except Exception:
+                    ttl_val = 0
+                use_ttl = ttl_val is not None and ttl_val > 0
+                if use_ttl:
+                    expires_at_expr = "now() + (%s * interval '1 second')"
+                    sql_new = f"""
+                        INSERT INTO checkpoints (tenant, thread, seq, checkpoint, expires_at)
+                        VALUES (%s, %s, %s, %s::jsonb, {expires_at_expr})
+                        ON CONFLICT (tenant, thread, seq) DO UPDATE SET checkpoint=EXCLUDED.checkpoint, expires_at=EXCLUDED.expires_at
+                    """
+                    params_new = (tenant, thread, seq, ck_json, ttl_val)
+                else:
+                    expires_at_expr = "NULL"
+                    sql_new = f"""
+                        INSERT INTO checkpoints (tenant, thread, seq, checkpoint, expires_at)
+                        VALUES (%s, %s, %s, %s::jsonb, {expires_at_expr})
+                        ON CONFLICT (tenant, thread, seq) DO UPDATE SET checkpoint=EXCLUDED.checkpoint, expires_at=EXCLUDED.expires_at
+                    """
+                    params_new = (tenant, thread, seq, ck_json)
                 async with self.pool.connection() as conn:  # type: ignore
-                    await conn.execute(sql_new, (tenant, thread, seq, ck_json))  # type: ignore
+                    await conn.execute(sql_new, params_new)  # type: ignore
                 return True
             except Exception:
                 return False
