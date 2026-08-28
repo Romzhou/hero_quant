@@ -14,6 +14,10 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 
+class DataValidationError(ValueError):
+    """Loader validation error for unparseable dates/inputs."""
+
+
 class AKShareLoader:
     """AKShare 东财日线 Loader（CN, board_lots）。"""
 
@@ -27,9 +31,23 @@ class AKShareLoader:
         try:
             s = datetime.strptime(start, "%Y-%m-%d")
             e = datetime.strptime(end, "%Y-%m-%d")
-        except Exception:
-            s = datetime(2026, 8, 1)
-            e = datetime(2026, 8, 19)
+        except Exception as exc:
+            # Only allow deterministic fallback when explicitly gated synthetic mode, with warning
+            try:
+                from hero_quant.config.settings import Settings
+
+                _mode = Settings().data_mode
+            except Exception as se:
+                import os
+
+                _mode = os.environ.get("HERO_DATA_MODE", "live")
+                logger.warning("settings load failed in _synthetic_df: %s", se, exc_info=se)
+            if isinstance(_mode, str) and _mode.strip().lower() == "synthetic":
+                logger.warning("unparseable dates fallback to deterministic range for %s: %s", symbol, exc, exc_info=exc)
+                s = datetime(2026, 8, 1)
+                e = datetime(2026, 8, 19)
+            else:
+                raise DataValidationError(f"invalid date format start={start!r} end={end!r}: {exc}") from exc
         if e < s:
             e = s
         dates: list[str] = []
@@ -98,17 +116,20 @@ class AKShareLoader:
                 df = df.set_index("date")
             except Exception:
                 pass
-        # 成交量归一至 board_lots：超阈值视为 shares 需 /100
+        # 成交量归一至 board_lots：超阈值视为 shares 需 /100；单位 board_lots (1=100 shares)，阈值 100000 用于区分 shares/board_lots；heuristic 为确定性有序处理
         if "volume" in df.columns:
             try:
                 vol = pd.to_numeric(df["volume"], errors="coerce").fillna(100.0)
+                # deterministic ordering: ensure stable max calculation (no random)
                 try:
-                    if float(vol.max()) > 100000:
+                    max_vol = float(vol.max())
+                    if max_vol > 100000:
                         vol = vol / 100.0
-                except Exception:
-                    pass
+                except Exception as he:
+                    logger.warning("volume heuristic skipped: %s", he, exc_info=he)
                 df["volume"] = vol
-            except Exception:
+            except Exception as e:
+                logger.warning("volume coercion failed, fallback to 100.0: %s", e, exc_info=e)
                 df["volume"] = 100.0
         else:
             df["volume"] = 100.0
@@ -133,8 +154,15 @@ class AKShareLoader:
     def get_bars(self, symbol: str, start: str, end: str, interval: str = "1d") -> pd.DataFrame:
         """拉取行情，返回 OHLCV DataFrame；兼容旧参数顺序并遵循 HERO_DATA_MODE 门控。"""
         _intervals = {"1d", "1m", "5m", "15m", "30m", "1h", "1wk", "1mo", "1D", "1W"}
-        if start in _intervals and "-" in end and "-" in interval:
-            start, end, interval = end, interval, start
+        # Explicit interval validation with clear error; only swap when unambiguous legacy order
+        if start in _intervals:
+            if "-" in str(end) and "-" in str(interval):
+                # unambiguous legacy order: start is interval, end/start are dates
+                start, end, interval = end, interval, start
+            else:
+                raise DataValidationError(f"ambiguous legacy argument order: start={start!r} end={end!r} interval={interval!r}")
+        if interval not in _intervals:
+            raise DataValidationError(f"invalid interval {interval!r}, expected one of {sorted(_intervals)}")
 
         try:
             from hero_quant.config.settings import Settings
@@ -162,16 +190,15 @@ class AKShareLoader:
 
         try:
             code = symbol.split(".")[0]
-            # normalize dates to YYYYMMDD
+            # normalize dates to YYYYMMDD — fail fast on unparseable dates
             try:
                 start_n = start.replace("-", "")
                 end_n = end.replace("-", "")
                 # ensure 8 digits
                 datetime.strptime(start_n, "%Y%m%d")
                 datetime.strptime(end_n, "%Y%m%d")
-            except Exception:
-                start_n = "20250101"
-                end_n = "20250110"
+            except Exception as e:
+                raise DataValidationError(f"invalid date format start={start!r} end={end!r}: {e}") from e
             df_ak = None
             # primary: stock_zh_a_hist
             try:
@@ -189,6 +216,8 @@ class AKShareLoader:
             if normalized is not None and len(normalized) > 0:
                 return normalized
             raise ValueError("no bars parsed")
+        except DataValidationError:
+            raise
         except ValueError as e:
             logger.warning("akshare parse failed for %s: %s", symbol, e, exc_info=e)
             raise RuntimeError(f"akshare fetch failed for {symbol}: {e}") from e

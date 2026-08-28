@@ -13,6 +13,11 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
+
+class DataValidationError(ValueError):
+    """Loader validation error for unparseable dates/inputs."""
+
+
 # interval 到 ccxt timeframe 的显式映射
 _TIMEFRAME_MAP = {
     "1d": "1d",
@@ -41,9 +46,22 @@ class CCXTLoader:
         try:
             s = datetime.strptime(start, "%Y-%m-%d")
             e = datetime.strptime(end, "%Y-%m-%d")
-        except Exception:
-            s = datetime(2026, 8, 1)
-            e = datetime(2026, 8, 19)
+        except Exception as exc:
+            try:
+                from hero_quant.config.settings import Settings
+
+                _mode = Settings().data_mode
+            except Exception as se:
+                import os
+
+                _mode = os.environ.get("HERO_DATA_MODE", "live")
+                logger.warning("settings load failed in _synthetic_df: %s", se, exc_info=se)
+            if isinstance(_mode, str) and _mode.strip().lower() == "synthetic":
+                logger.warning("unparseable dates fallback to deterministic range for %s: %s", symbol, exc, exc_info=exc)
+                s = datetime(2026, 8, 1)
+                e = datetime(2026, 8, 19)
+            else:
+                raise DataValidationError(f"invalid date format start={start!r} end={end!r}: {exc}") from exc
         if e < s:
             e = s
         dates: list[str] = []
@@ -107,7 +125,7 @@ class CCXTLoader:
             from hero_quant.config.settings import Settings
 
             mode = Settings().data_mode
-        except Exception as e:
+        except (KeyError, AttributeError, ImportError, ValueError) as e:
             logger.warning("settings load failed for %s: %s", symbol, e, exc_info=e)
             import os
 
@@ -116,6 +134,8 @@ class CCXTLoader:
             mode = mode.strip().lower()
         else:
             mode = "live"
+        if mode not in ("synthetic", "live"):
+            raise DataValidationError(f"unknown data_mode {mode!r}, expected 'synthetic' or 'live'")
         if mode == "synthetic":
             return self._synthetic_df(symbol, start, end)
 
@@ -130,26 +150,28 @@ class CCXTLoader:
         try:
             s_dt = datetime.strptime(start, "%Y-%m-%d")
             e_dt = datetime.strptime(end, "%Y-%m-%d")
-        except Exception:
-            s_dt = datetime(2025, 1, 1)
-            e_dt = datetime(2025, 1, 5)
+        except Exception as e:
+            raise DataValidationError(f"invalid date format start={start!r} end={end!r}: {e}") from e
         if e_dt < s_dt:
             e_dt = s_dt
         since = int(s_dt.timestamp() * 1000)
         days = (e_dt - s_dt).days + 1
-        if timeframe in ("1h", "1m", "5m", "15m", "30m"):
-            # 细粒度周期需更多行数以覆盖同等天数
-            limit = min(1500, max(days * 24, 5))
-            if timeframe == "1m":
-                limit = min(1500, max(days * 1440, 5))
-            elif timeframe == "5m":
-                limit = min(1500, max(days * 288, 5))
+        # Correct limit math per timeframe; intraday needs minutes-per-day multipliers
+        _intraday_multipliers = {"1m": 1440, "5m": 288, "15m": 96, "30m": 48, "1h": 24}
+        if timeframe in _intraday_multipliers:
+            requested = days * _intraday_multipliers[timeframe]
+            limit = min(1500, max(requested, 5))
+            if requested > 1500:
+                logger.warning("ccxt limit truncated: requested %s truncated to %s for %s timeframe=%s days=%s", requested, limit, symbol, timeframe, days)
         else:
-            limit = min(1500, max(days + 5, 5))
+            requested = days + 5
+            limit = min(1500, max(requested, 5))
 
         try:
             exchange = ccxt.binance()
             ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, since=since, limit=limit)
+            if ohlcv is not None and len(ohlcv) < limit and len(ohlcv) < requested:
+                logger.warning("ccxt history truncated: requested %s returned %s for %s timeframe=%s", requested, len(ohlcv), symbol, timeframe)
             if not ohlcv:
                 raise ValueError("empty ohlcv")
             # ohlcv: [timestamp, open, high, low, close, volume]
@@ -170,6 +192,8 @@ class CCXTLoader:
             if len(df) == 0:
                 raise ValueError("empty df")
             return df
+        except DataValidationError:
+            raise
         except ValueError as e:
             logger.warning("ccxt parse failed for %s: %s", symbol, e, exc_info=e)
             raise RuntimeError(f"ccxt fetch failed for {symbol}: {e}") from e

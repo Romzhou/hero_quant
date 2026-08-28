@@ -8,10 +8,27 @@ live 下限流 1s 后请求腾讯 qfq 接口，live 失败显式抛 RuntimeError
 from datetime import datetime, timedelta
 import time
 import urllib.request
+import urllib.parse
 import json
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+class DataValidationError(ValueError):
+    """Loader validation error for unparseable dates/inputs."""
+
+
+def _coerce_float(val, default):
+    """Preserve 0.0; only fallback when None or empty/whitespace string."""
+    if val is None:
+        return float(default)
+    if isinstance(val, str) and val.strip() == "":
+        return float(default)
+    try:
+        return float(val)
+    except Exception:
+        return float(default)
 
 
 class TencentLoader:
@@ -25,9 +42,22 @@ class TencentLoader:
         try:
             s = datetime.strptime(start, "%Y-%m-%d")
             e = datetime.strptime(end, "%Y-%m-%d")
-        except Exception:
-            s = datetime(2026, 8, 1)
-            e = datetime(2026, 8, 19)
+        except Exception as exc:
+            try:
+                from hero_quant.config.settings import Settings
+
+                _mode = Settings().data_mode
+            except Exception as se:
+                import os
+
+                _mode = os.environ.get("HERO_DATA_MODE", "live")
+                logger.warning("settings load failed in _synthetic_bars: %s", se, exc_info=se)
+            if isinstance(_mode, str) and _mode.strip().lower() == "synthetic":
+                logger.warning("unparseable dates fallback to deterministic range for %s: %s", symbol, exc, exc_info=exc)
+                s = datetime(2026, 8, 1)
+                e = datetime(2026, 8, 19)
+            else:
+                raise DataValidationError(f"invalid date format start={start!r} end={end!r}: {exc}") from exc
         if e < s:
             e = s
         bars = []
@@ -76,8 +106,13 @@ class TencentLoader:
     def get_bars(self, symbol, start, end, interval="1d"):
         """拉取行情，兼容旧参数顺序并遵循 HERO_DATA_MODE 门控。"""
         _intervals = {"1d", "1m", "5m", "15m", "30m", "1h", "1wk", "1mo", "1D", "1W"}
-        if start in _intervals and "-" in end and "-" in interval:
-            start, end, interval = end, interval, start
+        if start in _intervals:
+            if "-" in str(end) and "-" in str(interval):
+                start, end, interval = end, interval, start
+            else:
+                raise DataValidationError(f"ambiguous legacy argument order: start={start!r} end={end!r} interval={interval!r}")
+        if interval not in _intervals:
+            raise DataValidationError(f"invalid interval {interval!r}, expected one of {sorted(_intervals)}")
 
         try:
             from hero_quant.config.settings import Settings
@@ -103,7 +138,9 @@ class TencentLoader:
                 tencent_symbol = f"{suffix}{code}"
             else:
                 tencent_symbol = code
-            url = f"http://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={tencent_symbol},day,,,{320},qfq"
+            # Force https and sanitize symbol to prevent injection (MITM protection)
+            tencent_symbol = urllib.parse.quote(tencent_symbol, safe="")
+            url = f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={tencent_symbol},day,,,{320},qfq"
             with urllib.request.urlopen(url, timeout=2) as resp:
                 raw = resp.read()
                 text = raw.decode("utf-8", errors="ignore") if isinstance(raw, (bytes, bytearray)) else str(raw)
@@ -126,25 +163,27 @@ class TencentLoader:
                             if isinstance(item, (list, tuple)) and len(item) >= 6:
                                 bars.append({
                                     "date": str(item[0]),
-                                    "open": float(item[1]) if item[1] else 1500.0,
-                                    "close": float(item[2]) if item[2] else 1500.0,
-                                    "high": float(item[3]) if item[3] else 1510,
-                                    "low": float(item[4]) if item[4] else 1490,
-                                    "volume": float(item[5]) if item[5] else 100,
+                                    "open": _coerce_float(item[1], 1500.0),
+                                    "close": _coerce_float(item[2], 1500.0),
+                                    "high": _coerce_float(item[3], 1510),
+                                    "low": _coerce_float(item[4], 1490),
+                                    "volume": _coerce_float(item[5], 100),
                                 })
                             elif isinstance(item, dict):
                                 # already shaped dict - ensure volume handling and required fields
                                 bars.append({
                                     "date": str(item.get("date", "")),
-                                    "open": float(item.get("open", 1500.0) or 1500.0),
-                                    "close": float(item.get("close", 1500.0) or 1500.0),
-                                    "high": float(item.get("high", 1510) or 1510),
-                                    "low": float(item.get("low", 1490) or 1490),
-                                    "volume": float(item.get("volume", 100) or 100),
+                                    "open": _coerce_float(item.get("open", 1500.0), 1500.0),
+                                    "close": _coerce_float(item.get("close", 1500.0), 1500.0),
+                                    "high": _coerce_float(item.get("high", 1510), 1510),
+                                    "low": _coerce_float(item.get("low", 1490), 1490),
+                                    "volume": _coerce_float(item.get("volume", 100), 100),
                                 })
                         if len(bars) > 0:
                             return bars
                 raise ValueError("no bars parsed")
+        except DataValidationError:
+            raise
         except ValueError as e:
             logger.warning("tencent parse failed for %s: %s", symbol, e, exc_info=e)
             raise RuntimeError(f"tencent fetch failed for {symbol}: {e}") from e

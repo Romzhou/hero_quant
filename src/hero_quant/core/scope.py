@@ -8,6 +8,9 @@
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class Scope:
@@ -25,6 +28,27 @@ class Scope:
             return f"Scope(key={self.key!r}, parent={parent_key!r})"
         return f"Scope(key={self.key!r})"
 
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, Scope):
+            return False
+        if self.key != other.key:
+            return False
+        # recursive parent equality on value fields
+        if self.parent is None and other.parent is None:
+            return True
+        if self.parent is None or other.parent is None:
+            return False
+        return self.parent == other.parent
+
+    def __hash__(self) -> int:
+        # hash on value fields (key + parent) — logical duplicates deduplicate
+        # guard recursion if cycle exists (should already be rejected)
+        try:
+            return hash((self.key, self.parent))
+        except RecursionError:
+            logger.error("cycle detected during hash for scope %r", self.key)
+            return hash(self.key) ^ id(self.parent)
+
 
 def create_scope(key: str, parent: Optional[Scope] = None) -> Scope:
     """创建作用域，可选关联父级。"""
@@ -35,6 +59,19 @@ def link_scope_parent(child: Scope, parent: Scope) -> Scope:
     """为子作用域绑定父级（原地修改）并返回子级。"""
     if child is None or parent is None:
         raise ValueError("child and parent must be non-None Scope")
+    # cycle detection: walk parent chain to ensure child not ancestor
+    cur: Optional[Scope] = parent
+    seen: set[int] = set()
+    while cur is not None:
+        if cur is child or cur == child:
+            logger.error("cycle detected in link_scope_parent: child=%r parent=%r", getattr(child, "key", None), getattr(parent, "key", None))
+            raise ValueError(f"cycle detected: linking {child.key!r} under {parent.key!r} creates cycle")
+        cid = id(cur)
+        if cid in seen:
+            logger.error("cycle detected traversing parent chain for %r", getattr(parent, "key", None))
+            raise ValueError("cycle detected in parent chain")
+        seen.add(cid)
+        cur = getattr(cur, "parent", None)
     child.parent = parent
     return child
 
@@ -43,7 +80,7 @@ class ScopedLayers:
     """按作用域分层的键值存储，合并时子级覆盖父级。"""
 
     def __init__(self) -> None:
-        # 以 Scope 实例为键（依赖对象身份），值为浅拷贝的字典
+        # 以 Scope 值语义为键（已实现 __hash__/__eq__ 基于 key+parent），逻辑重复去重
         self._store: Dict[Scope, Dict[str, Any]] = {}
 
     def set(self, scope: Scope, vals: Dict[str, Any]) -> None:
@@ -63,13 +100,20 @@ class ScopedLayers:
         """返回从根到叶的链路（含自身），用于按序合并。"""
         chain: List[Scope] = []
         cur: Optional[Scope] = scope
-        # 环检测：避免父链误配置导致无限循环
+        # 环检测：raise on cycle to surface misconfiguration (previously silent truncation)
         seen: set[int] = set()
+        seen_eq: set[Scope] = set()
         while cur is not None:
             cid = id(cur)
             if cid in seen:
-                break
+                logger.error("cycle detected in chain_layers for scope %r", getattr(scope, "key", None))
+                raise ValueError(f"cycle detected in scope chain at {cur.key!r}")
+            # also detect logical cycle via == (covers identity-keyed duplicates)
+            if cur in seen_eq:
+                logger.error("cycle detected (logical) in chain_layers for scope %r", getattr(scope, "key", None))
+                raise ValueError(f"cycle detected (logical) in scope chain at {cur.key!r}")
             seen.add(cid)
+            seen_eq.add(cur)
             chain.append(cur)
             cur = getattr(cur, "parent", None)
         chain.reverse()
