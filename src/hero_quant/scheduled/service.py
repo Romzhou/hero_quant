@@ -6,12 +6,14 @@
 """
 
 from __future__ import annotations
+import logging
 
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+logger = logging.getLogger("hero_quant.scheduled.service")
 
 
 # ---------- cron 解析 ----------
@@ -198,8 +200,9 @@ def get_next_trigger(cron_expr: str, tz_name: str, after: Optional[datetime] = N
             # 规范化 DST：确保返回为目标 ZoneInfo
             try:
                 candidate = candidate.astimezone(tz)
-            except Exception:
-                pass
+            except Exception as _exc:
+                logger.debug("silent handled: offline-safe: scheduled DST normalize", exc_info=_exc)  # intentional: offline-safe: scheduled DST normalize
+                pass  # intentional offline-safe: scheduled DST normalize
             return candidate
         candidate += timedelta(minutes=1)
 

@@ -14,6 +14,8 @@ from hero_quant.tools.registry import TOOL_REGISTRY, tool
 
 def _make_registry():
     """创建已注册 Tencent + Yahoo 的 MarketDataRegistry（双源 fallback 链）。"""
+    import logging as _logging
+    _logger = _logging.getLogger(__name__)
     from hero_quant.data.registry import MarketDataRegistry
 
     reg = MarketDataRegistry()
@@ -21,14 +23,14 @@ def _make_registry():
         from hero_quant.data.loaders.tencent import TencentLoader
 
         reg.register(TencentLoader())
-    except Exception:
-        pass
+    except Exception as e:
+        _logger.warning("failed to register TencentLoader: %s", e, exc_info=e)
     try:
         from hero_quant.data.loaders.yahoo import YahooLoader
 
         reg.register(YahooLoader())
-    except Exception:
-        pass
+    except Exception as e:
+        _logger.warning("failed to register YahooLoader: %s", e, exc_info=e)
     return reg
 
 
@@ -100,7 +102,13 @@ def get_market_data(
             provenance["extra"] = prov.extra
         return {"bars": bars, "provenance": provenance, "ok": True, "concurrency_safe": is_safe}
     except Exception as e:
-        # 异常时仍返回合成数据并附带错误信息，避免 Agent 中断
+        # CrossSourceError 必须透传，不得静默回退合成
+        from hero_quant.data.registry import CrossSourceError as _CSE
+        if isinstance(e, _CSE):
+            import logging as _logging2
+            _logging2.getLogger(__name__).warning("cross_source check blocked get_market_data for %s: %s", symbol, e, exc_info=e)
+            raise
+        # 异常时仍返回合成数据并附带错误信息，避免 Agent 中断（非校验错误）
         bars = _synthetic_fallback(symbol, start, end)
         return {
             "bars": bars,

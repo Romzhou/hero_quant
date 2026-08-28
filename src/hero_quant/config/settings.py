@@ -111,7 +111,8 @@ class Settings:
     llm_model_quick: str = field(default_factory=lambda: _llm_model_slot_from_env("HERO_LLM_MODEL_QUICK"))
     api_key: str | None = field(default_factory=lambda: os.getenv("HERO_API_KEY"))  # type: ignore[arg-type]
     data_default_market: str = field(default_factory=lambda: os.getenv("HERO_DATA_MARKET", "CN"))
-    data_mode: str = field(default_factory=lambda: os.getenv("HERO_DATA_MODE", "synthetic"))
+    data_mode: str = field(default_factory=lambda: os.getenv("HERO_DATA_MODE", "live"))
+    # data_mode 默认 live（生产安全）：禁止 live 失败静默回退合成；仅当 HERO_DATA_MODE=synthetic 显式指定时允许合成
     # 基准指数映射：用于多市场回测时选择对照指数，默认覆盖常见后缀
     benchmark_ticker: str | None = field(default_factory=lambda: os.getenv("HERO_BENCHMARK_TICKER") or None)  # type: ignore[arg-type]
     benchmark_map: dict = field(

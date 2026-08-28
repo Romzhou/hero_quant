@@ -179,6 +179,7 @@ export default function Live() {
           <p className="mt-1 text-sm text-slate-400">events.jsonl offset 实时 SSE · OTel 三档遥测 · 成本熔断</p>
         </div>
         <div className="flex items-center gap-2">
+          <span className={"hidden md:inline-flex items-center gap-1.5 rounded-full border px-3 py-1 text-xs font-medium " + (paused ? "border-slate-500/20 bg-white/5 text-slate-400" : "border-emerald-400/20 bg-emerald-400/10 text-emerald-300")}><span className={"h-1.5 w-1.5 rounded-full " + (paused ? "bg-slate-400" : "bg-emerald-400 animate-pulse")} />{paused ? "已暂停" : "● 实时连接"}</span>
           <span className="rounded-full border border-white/10 bg-white/5 px-3 py-1 font-mono text-xs text-slate-300">offset: {offset}</span>
           <span className={"rounded-full border px-3 py-1 text-xs font-semibold " + (breakerState === "OPEN" ? "border-red-400/30 bg-red-400/15 text-red-300" : breakerState === "HALF_OPEN" ? "border-amber-400/30 bg-amber-400/15 text-amber-300" : "border-emerald-400/20 bg-emerald-400/10 text-emerald-300")}>{breakerState}</span>
           <button onClick={() => setPaused(p => !p)} className={"rounded-xl px-3.5 py-1.5 text-xs font-semibold transition " + (paused ? "bg-white text-ink-900" : "bg-white/10 text-mist hover:bg-white/15")}>{paused ? "▶ 恢复" : "⏸ 暂停"}</button>
@@ -225,7 +226,13 @@ export default function Live() {
             <div className="sticky top-0 bg-ink-900/80 backdrop-blur border-b border-white/5 px-3 py-1.5 flex gap-4 text-[11px] text-slate-500">
               <span className="w-16">offset</span><span className="w-20">type</span><span>message</span>
             </div>
-            {events.map(e => (
+            {events.length === 0 ? (
+              <div className="p-10 text-center">
+                <div className="mx-auto h-8 w-8 rounded-lg border border-dashed border-white/10 grid place-items-center text-slate-500">◌</div>
+                <p className="mt-2 text-xs text-slate-400">等待 trace … 暂无事件 · 将通过 offset 增量推送</p>
+                <p className="mt-1 font-mono text-[11px] text-slate-500">events.jsonl · tail -f</p>
+              </div>
+            ) : events.map(e => (
               <div key={e.offset} className="flex gap-4 px-3 py-1.5 border-b border-white/[0.03] hover:bg-white/[0.03] transition">
                 <span className="w-16 shrink-0 text-slate-500">{e.offset}</span>
                 <span className={"w-20 shrink-0 rounded-full px-1.5 py-0.5 text-center text-[10px] font-semibold " + (e.type === "tool" ? "bg-amber-500/15 text-amber-300 border border-amber-500/20" : e.type === "otel" ? "bg-sky-500/15 text-sky-300 border border-sky-500/20" : e.type === "circuit" ? "bg-red-500/15 text-red-300 border border-red-500/20" : "bg-white/5 text-slate-300 border border-white/10")}>{e.type}{e.tool ? `:${e.tool}` : ""}</span>

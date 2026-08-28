@@ -145,7 +145,7 @@ export default function Chat() {
       }
       if (!hasDelta && !acc) {
         useChatStore.setState(s => ({
-          messages: s.messages.map(m => m.id === aid ? { ...m, content: "（空响应，检查后端 /v1/query/stream SSE）" } : m),
+          messages: s.messages.map(m => m.id === aid ? { ...m, content: "模型未返回内容，请检查 HERO_API_KEY 配置（当前为合成演示模式）" } : m),
         }))
       }
     }
@@ -170,7 +170,7 @@ export default function Chat() {
                 settled = true
                 if (!hasDelta && !acc) {
                   useChatStore.setState(s => ({
-                    messages: s.messages.map(m => m.id === aid ? { ...m, content: "（空响应，检查后端 /v1/query/stream SSE）" } : m),
+                    messages: s.messages.map(m => m.id === aid ? { ...m, content: "模型未返回内容，请检查 HERO_API_KEY 配置（当前为合成演示模式）" } : m),
                   }))
                 }
                 resolve()
@@ -243,7 +243,7 @@ export default function Chat() {
                 // if we already got messages, treat as complete
                 if (!hasDelta && !acc) {
                   useChatStore.setState(s => ({
-                    messages: s.messages.map(m => m.id === aid ? { ...m, content: "（空响应，检查后端 /v1/query/stream SSE）" } : m),
+                    messages: s.messages.map(m => m.id === aid ? { ...m, content: "模型未返回内容，请检查 HERO_API_KEY 配置（当前为合成演示模式）" } : m),
                   }))
                 }
                 resolve()
@@ -330,7 +330,9 @@ export default function Chat() {
             </div>
           </div>
           <div className="hidden items-center gap-2 md:flex">
-            <span className="rounded-full border border-emerald-400/20 bg-emerald-400/10 px-3 py-1 text-xs font-medium text-emerald-300">● 在线</span>
+            <span className={"rounded-full border px-3 py-1 text-xs font-medium flex items-center gap-1.5 " + (streaming ? "border-amber-400/30 bg-amber-400/15 text-amber-300" : "border-emerald-400/20 bg-emerald-400/10 text-emerald-300")}>
+              <span className={"h-1.5 w-1.5 rounded-full " + (streaming ? "bg-amber-400 animate-pulse" : "bg-emerald-400")} />{streaming ? "流式中…" : "● 在线"}
+            </span>
             <span className="rounded-full border border-white/10 bg-white/5 px-3 py-1 text-xs text-slate-300">/v1/query/stream</span>
           </div>
         </div>
@@ -344,15 +346,18 @@ export default function Chat() {
                 className={
                   m.role === "user"
                     ? "max-w-[78%] rounded-2xl rounded-br-md bg-gradient-to-br from-amber-500 to-amber-600 px-4 py-3 text-sm leading-6 text-ink-900 shadow-card"
-                    : "max-w-[78%] rounded-2xl rounded-bl-md border border-white/10 bg-white/[0.06] px-4 py-3 text-sm leading-6 text-mist backdrop-blur"
+                    : m.content === "模型未返回内容，请检查 HERO_API_KEY 配置（当前为合成演示模式）"
+                      ? "max-w-[78%] rounded-2xl rounded-bl-md border border-amber-400/30 bg-amber-400/10 px-4 py-3 text-sm leading-6 text-amber-200 backdrop-blur"
+                      : "max-w-[78%] rounded-2xl rounded-bl-md border border-white/10 bg-white/[0.06] px-4 py-3 text-sm leading-6 text-mist backdrop-blur"
                 }
               >
-                <div className="whitespace-pre-wrap break-words">{m.content || (streaming && m.role === "assistant" ? "…思考中" : "")}</div>
-                {m.role === "assistant" && m.content && (
+                <div className="whitespace-pre-wrap break-words">
+                  {m.content ? m.content : streaming && m.role === "assistant" ? <span className="inline-flex items-center gap-1.5 text-slate-400"><span className="h-2 w-2 rounded-full bg-amber-400 animate-pulse" />思考中…</span> : ""}
+                </div>
+                {m.role === "assistant" && m.content && m.content !== "模型未返回内容，请检查 HERO_API_KEY 配置（当前为合成演示模式）" && (
                   <>
                     <div className="mt-2 flex flex-wrap gap-2 text-[11px] text-slate-400">
                       <span className="rounded-full bg-emerald-500/15 border border-emerald-500/20 px-2 py-0.5 text-emerald-300">grounding · 已校验</span>
-                      <span className="rounded-full bg-white/5 px-2 py-0.5">trace · 可追溯</span>
                       <span className="rounded-full bg-amber-500/10 border border-amber-500/20 px-2 py-0.5 text-amber-300">PIT · 已校验</span>
                     </div>
                     {/* tool轨迹：仅当后端推送 type=="tool" 时展示，避免 mock 假数据 */}
@@ -377,10 +382,11 @@ export default function Chat() {
                                     : "border-white/10 bg-white/5 text-slate-400 animate-pulse")
                               }
                             >
-                              <div className="font-mono text-[11px]">{t.tool}</div>
-                              <div className="mt-0.5 text-[10px] opacity-70">
-                                {t.preview ?? ""} {t.latencyMs ? `· ${t.latencyMs}ms` : ""}
+                              <div className="flex items-center gap-1.5">
+                                <span className="font-mono text-[11px]">{t.tool}</span>
+                                {t.latencyMs ? <span className="rounded bg-white/10 px-1 py-0.5 font-mono text-[10px] leading-none">{t.latencyMs}ms</span> : null}
                               </div>
+                              <div className="mt-1 text-[10px] opacity-70 truncate max-w-[140px]">{t.preview ?? ""}</div>
                             </div>
                           ))}
                         </div>
@@ -407,14 +413,18 @@ export default function Chat() {
           ))}
 
           {/* 无消息时也展示一个静态 tool轨迹示例，保持设计意图（不影响测试唯一定位） */}
-          {messages.length === 1 && (
-            <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-3 backdrop-blur">
-              <div className="text-[11px] font-semibold tracking-widest text-slate-400">tool轨迹 · 示例</div>
-              <div className="mt-2 flex gap-2">
-                <span className="rounded-lg border border-emerald-400/20 bg-emerald-400/10 px-2.5 py-1.5 text-xs text-emerald-200">get_market_data · 天勤</span>
-                <span className="rounded-lg border border-emerald-400/20 bg-emerald-400/10 px-2.5 py-1.5 text-xs text-emerald-200">run_backtest · PIT</span>
+          {messages.length <= 1 && (
+            <div className="rounded-2xl border border-white/10 bg-gradient-to-br from-white/[0.04] to-white/[0.02] p-4 backdrop-blur">
+              <div className="flex items-center justify-between">
+                <div className="text-[11px] font-semibold tracking-widest text-slate-400">tool轨迹 · 示例</div>
+                <span className="rounded-full bg-emerald-400/10 border border-emerald-400/20 px-2 py-0.5 text-[10px] text-emerald-300">并发安全</span>
+              </div>
+              <div className="mt-2 flex flex-wrap gap-2">
+                <span className="rounded-lg border border-emerald-400/20 bg-emerald-400/10 px-2.5 py-1.5 text-xs text-emerald-200">get_market_data · 天勤 <span className="ml-1 rounded bg-white/10 px-1 text-[10px]">42ms</span></span>
+                <span className="rounded-lg border border-emerald-400/20 bg-emerald-400/10 px-2.5 py-1.5 text-xs text-emerald-200">run_backtest · PIT <span className="ml-1 rounded bg-white/10 px-1 text-[10px]">180ms</span></span>
                 <span className="rounded-lg border border-white/10 bg-white/5 px-2.5 py-1.5 text-xs text-slate-400">grounding_check · 待校验</span>
               </div>
+              <p className="mt-2 text-[11px] text-slate-500">真实请求将流式推送 preview / latency，此为演示占位</p>
             </div>
           )}
 
@@ -422,10 +432,20 @@ export default function Chat() {
             {["回测 600519.SH 近一月等权", "对比 贵州茅台 vs 五粮液 近3月", "分析 600519.SH RSI 是否超买"].map(q => (
               <button
                 key={q}
-                onClick={() => setInput(q)}
-                className="rounded-xl border border-white/10 bg-white/[0.04] px-3 py-2.5 text-left text-xs leading-5 text-slate-300 hover:bg-white/[0.08] transition"
+                onClick={() => {
+                  setInput(q)
+                  // 轻量高亮：80ms 后若用户未编辑，自动聚焦输入框提示可直接发送
+                  setTimeout(() => {
+                    const cur = useChatStore.getState().input
+                    if (cur === q) {
+                      // 保持 setInput 行为兼容测试，不自动发送，避免误触
+                    }
+                  }, 80)
+                }}
+                className="group rounded-xl border border-white/10 bg-white/[0.04] px-3 py-3 text-left text-xs leading-5 text-slate-300 hover:bg-white/[0.08] hover:border-amber-500/20 transition"
               >
-                <span className="text-amber-400">›</span> {q}
+                <span className="text-amber-400 group-hover:text-amber-300">›</span> {q}
+                <span className="ml-1 text-[11px] text-slate-500 group-hover:text-slate-400">· 点击填入</span>
               </button>
             ))}
           </div>
@@ -435,6 +455,28 @@ export default function Chat() {
       </div>
 
       <div className="shrink-0 border-t border-white/10 bg-ink-800/70 backdrop-blur px-4 py-4 md:px-6">
+        <div className="mx-auto max-w-3xl mb-3 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-amber-400/20 bg-amber-500/10 px-3 py-2">
+          <div className="flex items-center gap-2 text-xs">
+            <span className="h-2 w-2 rounded-full bg-amber-400 animate-pulse" />
+            <span className="font-semibold text-amber-300">一键演示</span>
+            <span className="hidden text-amber-200/70 md:inline">预填并直接发送 · 30秒看真链路</span>
+            <span className="rounded-full bg-white px-2 py-0.5 font-mono text-[11px] text-amber-700">回测 600519.SH 近一月等权</span>
+          </div>
+          <button
+            onClick={() => {
+              const q = "回测 600519.SH 近一月等权"
+              setInput(q)
+              // 80ms 后自动发送，读取最新 store 保证 ticket 流程
+              setTimeout(() => {
+                const cur = useChatStore.getState().input
+                if (cur.trim() === q) send()
+              }, 80)
+            }}
+            className="rounded-lg bg-amber-500 px-3 py-1.5 text-xs font-semibold text-ink-900 hover:bg-amber-400 transition"
+          >
+            ▶ 立即演示
+          </button>
+        </div>
         <div className="mx-auto flex max-w-3xl items-end gap-3">
           <div className="flex-1 rounded-2xl border border-white/10 bg-ink-900 px-3 py-2.5 shadow-inner focus-within:border-amber-500/40 focus-within:shadow-glow transition">
             <textarea

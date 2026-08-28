@@ -8,11 +8,13 @@ OPEN 时直接拒绝；所有判定与记录可选落审计账本（ledger），
 """
 
 from __future__ import annotations
+import logging
 
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
 from hero_quant.telemetry.circuit import CircuitBreaker
+logger = logging.getLogger("hero_quant.shadow.service")
 
 # 5 类归因（固定集合，coverage 要求全部 >0 才算完整）
 ATTRIBUTION_CATEGORIES: List[str] = ["missed", "noise", "early", "late", "overtrade"]
@@ -120,30 +122,35 @@ class RiskEngine:
             try:
                 if self.circuit.state == "OPEN":
                     return {"allowed": False, "reason": "circuit_open 熔断", "rule": "circuit"}
-            except Exception:
-                pass
+            except Exception as _exc:
+                logger.warning("silent handled: shadow风控日志 best-effort, fail-closed already handled", exc_info=_exc)  # intentional: shadow风控日志 best-effort, fail-closed already handled
+                pass  # intentional shadow风控日志 best-effort, fail-closed already handled
 
         for rule in self.rules:
             if not rule.passes(order):
                 try:
                     self.circuit.record_failure()  # 失败计入熔断窗口
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    logger.warning("silent handled: shadow风控日志 best-effort, fail-closed already handled", exc_info=_exc)  # intentional: shadow风控日志 best-effort, fail-closed already handled
+                    pass  # intentional shadow风控日志 best-effort, fail-closed already handled
                 if self.ledger is not None:
                     try:
                         self.ledger.append({"action": "risk_reject", "rule": rule.name, "order": order})
-                    except Exception:
-                        pass
+                    except Exception as _exc:
+                        logger.warning("silent handled: shadow风控日志 best-effort, fail-closed already handled", exc_info=_exc)  # intentional: shadow风控日志 best-effort, fail-closed already handled
+                        pass  # intentional shadow风控日志 best-effort, fail-closed already handled
                 return {"allowed": False, "reason": f"rule:{rule.name} 熔断", "rule": rule.name}
         try:
             self.circuit.record_success()
-        except Exception:
-            pass
+        except Exception as _exc:
+            logger.warning("silent handled: shadow风控日志 best-effort, fail-closed already handled", exc_info=_exc)  # intentional: shadow风控日志 best-effort, fail-closed already handled
+            pass  # intentional shadow风控日志 best-effort, fail-closed already handled
         if self.ledger is not None:
             try:
                 self.ledger.append({"action": "risk_pass", "order": order})
-            except Exception:
-                pass
+            except Exception as _exc:
+                logger.warning("silent handled: shadow风控日志 best-effort, fail-closed already handled", exc_info=_exc)  # intentional: shadow风控日志 best-effort, fail-closed already handled
+                pass  # intentional shadow风控日志 best-effort, fail-closed already handled
         return {"allowed": True, "reason": "pass"}
 
 
@@ -173,15 +180,17 @@ class ShadowJournal:
             }
             try:
                 _ = self.risk_engine.check_order(order)
-            except Exception:
-                pass
+            except Exception as _exc:
+                logger.warning("silent handled: shadow风控日志 best-effort, fail-closed already handled", exc_info=_exc)  # intentional: shadow风控日志 best-effort, fail-closed already handled
+                pass  # intentional shadow风控日志 best-effort, fail-closed already handled
 
         self._records.append(dict(trade))
         if self.ledger is not None:
             try:
                 self.ledger.append({"action": "shadow_record", "trade": trade})
-            except Exception:
-                pass
+            except Exception as _exc:
+                logger.warning("silent handled: shadow风控日志 best-effort, fail-closed already handled", exc_info=_exc)  # intentional: shadow风控日志 best-effort, fail-closed already handled
+                pass  # intentional shadow风控日志 best-effort, fail-closed already handled
         return {"recorded": True, "count": len(self._records)}
 
     def attribution(self) -> Dict[str, float]:

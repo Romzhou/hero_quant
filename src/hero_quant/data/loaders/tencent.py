@@ -57,18 +57,21 @@ class TencentLoader:
             try:
                 from hero_quant.config.settings import Settings
                 mode = Settings().data_mode
-            except Exception:
+            except Exception as e:
+                import logging as _lg
+                _lg.getLogger(__name__).warning("settings load failed in _rate_limit: %s", e, exc_info=e)
                 import os
-                mode = os.environ.get("HERO_DATA_MODE", "synthetic")
+                mode = os.environ.get("HERO_DATA_MODE", "live")
             if isinstance(mode, str):
                 mode = mode.strip().lower()
             else:
-                mode = "synthetic"
+                mode = "live"
             if mode == "synthetic":
                 return
             time.sleep(1)
-        except Exception:
-            pass
+        except Exception as e:
+            import logging as _lg2
+            _lg2.getLogger(__name__).warning("_rate_limit error: %s", e, exc_info=e)
 
     def get_bars(self, symbol, start, end, interval="1d"):
         """拉取行情，兼容旧参数顺序并遵循 HERO_DATA_MODE 门控。"""
@@ -79,17 +82,20 @@ class TencentLoader:
         try:
             from hero_quant.config.settings import Settings
             mode = Settings().data_mode
-        except Exception:
+        except Exception as e:
+            import logging as _lg3
+            _lg3.getLogger(__name__).warning("settings load failed in get_bars: %s", e, exc_info=e)
             import os
-            mode = os.environ.get("HERO_DATA_MODE", "synthetic")
+            mode = os.environ.get("HERO_DATA_MODE", "live")
         if isinstance(mode, str):
             mode = mode.strip().lower()
         else:
-            mode = "synthetic"
+            mode = "live"
         if mode == "synthetic":
             return self._synthetic_bars(symbol, start, end)
 
         self._rate_limit()
+        # live 模式下禁止静默回退合成：解析/网络失败必须抛出
         try:
             code = symbol.split(".")[0]
             suffix = symbol.split(".")[-1].lower() if "." in symbol else ""
@@ -138,11 +144,10 @@ class TencentLoader:
                                 })
                         if len(bars) > 0:
                             return bars
-                raise ValueError("no bars parsed, fallback")
+                raise ValueError("no bars parsed")
         except ValueError as e:
-            logger.warning("tencent parse failed for %s: %s - fallback synthetic", symbol, e)
-            return self._synthetic_bars(symbol, start, end)
+            logger.warning("tencent parse failed for %s: %s", symbol, e, exc_info=e)
+            raise RuntimeError(f"tencent fetch failed for {symbol}: {e}") from e
         except Exception as e:
-            logger.warning("tencent network error for %s: %s - fallback synthetic", symbol, e)
-            return self._synthetic_bars(symbol, start, end)
-        return self._synthetic_bars(symbol, start, end)
+            logger.warning("tencent network error for %s: %s", symbol, e, exc_info=e)
+            raise RuntimeError(f"tencent fetch failed for {symbol}: {e}") from e

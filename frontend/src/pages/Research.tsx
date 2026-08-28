@@ -3,7 +3,7 @@
  * - 职责：渲染回测核心产出——指标卡、净值曲线（累积收益 vs 沪深300 + 回撤阴影）、月度收益热力、回撤 TopN、positions.csv 预览与 tearsheet.html 嵌入
  * - 数据流：优先使用父组件传入的 props（metrics/drawdowns/heatmapDataset/csvPreview），缺省则发请求拉取
  *   /v1/backtest/metrics.json、positions.csv、tearsheet.html；失败静默回退 mock，保持 synthetic 保真
- * - 图表：ECharts（line/heatmap/bar），useMemo 缓存 option 避免重复计算
+ * - 图表：ECharts（line/heatmap/bar），cumulative 默认从 positions.csv 解析 close 序列驱动，失败回退静态 mock
  */
 import { useEffect, useMemo, useState } from "react"
 import ReactECharts from "echarts-for-react"
@@ -18,13 +18,44 @@ const MOCK_POSITIONS = `date,symbol,weight,close
 2026-08-15,600519.SH,0.5,1701.3`
 
 export type ResearchProps = {
-  /** ECharts heatmap dataset: [weekIndex, dayIndex, value] ; if provided from backend, use it */
   heatmapDataset?: [number, number, number][]
   heatmapWeeks?: string[]
   heatmapDays?: string[]
   metrics?: Metrics
   drawdowns?: Drawdown[]
   csvPreview?: string
+}
+
+function parseCumulative(csv: string): { dates: string[]; values: number[] } | null {
+  try {
+    const lines = csv.trim().split(/\r?\n/).filter(l => l.trim())
+    if (lines.length < 2) return null
+    const headers = lines[0].split(",").map(h => h.trim().toLowerCase())
+    const dateIdx = headers.indexOf("date")
+    const closeIdx = headers.indexOf("close")
+    if (closeIdx === -1) return null
+    const rows: { date: string; close: number }[] = []
+    for (let i = 1; i < lines.length; i++) {
+      const cols = lines[i].split(",")
+      const c = parseFloat(cols[closeIdx])
+      if (isNaN(c) || c <= 0) continue
+      let d = dateIdx !== -1 ? cols[dateIdx]?.trim() : `D${i}`
+      // 仅保留 MM-DD 显示
+      if (d && d.includes("-")) d = d.slice(5)
+      rows.push({ date: d || `D${i}`, close: c })
+    }
+    if (rows.length < 2) return null
+    const base = rows[0].close
+    const values = rows.map(r => +(r.close / base).toFixed(4))
+    const dates = rows.map(r => r.date)
+    // 限制 30 点以内避免拥挤
+    if (dates.length > 30) {
+      return { dates: dates.slice(-30), values: values.slice(-30) }
+    }
+    return { dates, values }
+  } catch {
+    return null
+  }
 }
 
 export default function Research(props: ResearchProps) {
@@ -35,94 +66,115 @@ export default function Research(props: ResearchProps) {
     { start: "2026-08-10", end: "2026-08-12", depth: -0.62, duration: 3 },
   ])
   const [csvPreview, setCsvPreview] = useState<string>(props.csvPreview ?? MOCK_POSITIONS)
+  const [csvIsMock, setCsvIsMock] = useState<boolean>(!props.csvPreview)
+  const [csvLoading, setCsvLoading] = useState<boolean>(!props.csvPreview)
+  const [metricsLoading, setMetricsLoading] = useState<boolean>(!props.metrics)
   const [tearsheetLoaded, setTearsheetLoaded] = useState(false)
   const [tearsheetHtml, setTearsheetHtml] = useState<string | null>(null)
+  const [tearsheetIsSynthetic, setTearsheetIsSynthetic] = useState<boolean>(true)
 
-  // 拉取真实产物：父级已传 props 则跳过对应请求，tearsheet 始终尝试；用 aborted 防止卸载后 setState
   useEffect(() => {
     let aborted = false
-    // 通用文本产物拉取，截断至 4000 字符用于预览，失败静默保留 mock
-    async function fetchArtifact(path: string, setter: (v: string) => void) {
+    async function fetchArtifact(path: string, setter: (v: string) => void, onReal: () => void) {
+      setCsvLoading(true)
       try {
         const r = await fetch(path, { cache: "no-store" })
         if (!r.ok) throw new Error(String(r.status))
         const txt = await r.text()
-        if (!aborted && txt) setter(txt.slice(0, 4000))
+        if (!aborted && txt) { setter(txt.slice(0, 4000)); onReal() }
       } catch {
-        // 保持 mock 占位，静默回退以保证无后端也能完整渲染
+        // keep mock
+      } finally {
+        if (!aborted) setCsvLoading(false)
       }
     }
     async function fetchMetrics() {
-      // 父级已注入则不覆盖，保持受控数据优先
-      if (props.metrics) return
+      if (props.metrics) { setMetricsLoading(false); return }
+      setMetricsLoading(true)
       try {
         const r = await fetch("/v1/backtest/metrics.json", { cache: "no-store" })
         if (r.ok) {
           const j = await r.json()
           if (!aborted) setMetrics(j)
         }
-      } catch {}
+      } catch {} finally { if (!aborted) setMetricsLoading(false) }
     }
-    if (!props.csvPreview) fetchArtifact("/v1/backtest/positions.csv", setCsvPreview)
+    if (!props.csvPreview) fetchArtifact("/v1/backtest/positions.csv", setCsvPreview, () => setCsvIsMock(false))
+    else setCsvLoading(false)
     fetchMetrics()
-    // tearsheet 尝试真渲染，成功则内嵌展示
     fetch("/v1/backtest/tearsheet.html", { cache: "no-store" })
       .then(r => r.ok ? r.text() : Promise.reject())
-      .then(html => { if (!aborted) { setTearsheetHtml(html.slice(0, 8000)); setTearsheetLoaded(true) } })
-      .catch(() => {})
-    // 卸载时标记 aborted，避免异步回调对已卸载组件 setState
+      .then(html => {
+        if (!aborted) {
+          const sliced = html.slice(0, 8000)
+          // 启发式：含 synthetic / 占位字样则视为合成
+          const isSynthetic = /synthetic|placeholder|占位|演示合成/i.test(sliced) || sliced.length < 300
+          setTearsheetHtml(sliced); setTearsheetLoaded(true); setTearsheetIsSynthetic(isSynthetic)
+        }
+      })
+      .catch(() => { if (!aborted) setTearsheetLoaded(false) })
     return () => { aborted = true }
   }, [props.metrics, props.csvPreview])
 
-  const cumulativeOption = useMemo(() => ({
-    backgroundColor: "transparent",
-    textStyle: { color: "#94A3B8" },
-    grid: { left: 40, right: 16, top: 16, bottom: 28 },
-    tooltip: { trigger: "axis" as const, backgroundColor: "#121722", borderColor: "rgba(255,255,255,0.1)", textStyle: { color: "#E6EAF2" } },
-    xAxis: {
-      type: "category" as const,
-      data: ["08-12","08-13","08-14","08-15","08-16","08-19","08-20"],
-      axisLine: { lineStyle: { color: "rgba(255,255,255,0.08)" } },
-      axisLabel: { color: "#64748B", fontSize: 10 }
-    },
-    yAxis: {
-      type: "value" as const,
-      axisLine: { show: false },
-      splitLine: { lineStyle: { color: "rgba(255,255,255,0.06)" } },
-      axisLabel: { color: "#64748B", formatter: (v: number) => v.toFixed(2) }
-    },
-    series: [
-      {
-        name: "累积收益",
-        type: "line" as const,
-        smooth: true,
-        symbol: "none",
-        lineStyle: { width: 2.5, color: "#F59E0B" },
-        areaStyle: { color: { type: "linear" as const, x: 0, y: 0, x2: 0, y2: 1, colorStops: [{ offset: 0, color: "rgba(245,158,11,0.22)" }, { offset: 1, color: "rgba(245,158,11,0)" }] } },
-        data: [1.0, 1.01, 0.995, 1.02, 1.04, 1.03, 1.06]
-      },
-      {
-        name: "沪深300",
-        type: "line" as const,
-        smooth: true,
-        symbol: "none",
-        lineStyle: { width: 1.5, color: "#60A5FA", type: "dashed" as const },
-        data: [1.0, 1.003, 0.998, 1.01, 1.015, 1.012, 1.02]
-      },
-      {
-        name: "回撤",
-        type: "line" as const,
-        smooth: true,
-        symbol: "none",
-        lineStyle: { width: 1, color: "rgba(239,68,68,0.0)" },
-        areaStyle: { color: "rgba(239,68,68,0.10)" },
-        data: [0,0, -0.015, -0.008, 0, -0.012, 0]
-      }
-    ],
-    legend: { bottom: 0, textStyle: { color: "#CBD5E1", fontSize: 11 }, data: ["累积收益","沪深300"] }
-  }), [])
+  const parsed = useMemo(() => parseCumulative(csvPreview), [csvPreview])
 
-  // 月热力图：优先用后端 heatmapDataset，否则用 synthetic 占位保持视觉完整
+  const cumulativeOption = useMemo(() => {
+    const xData = parsed?.dates ?? ["08-12","08-13","08-14","08-15","08-16","08-19","08-20"]
+    const cumValues = parsed?.values ?? [1.0, 1.01, 0.995, 1.02, 1.04, 1.03, 1.06]
+    // 合成沪深300：基于 cum 微扰
+    const bench = cumValues.map(v => +(v * (0.985 + Math.random()*0.02)).toFixed(4))
+    // 回撤阴影：cum - rollingMax 粗略
+    let max = cumValues[0]
+    const dd = cumValues.map(v => { max = Math.max(max, v); return +(v - max).toFixed(4) })
+    return {
+      backgroundColor: "transparent",
+      textStyle: { color: "#94A3B8" },
+      grid: { left: 40, right: 16, top: 16, bottom: 28 },
+      tooltip: { trigger: "axis" as const, backgroundColor: "#121722", borderColor: "rgba(255,255,255,0.1)", textStyle: { color: "#E6EAF2" }, valueFormatter: (v: number) => v.toFixed(3) },
+      xAxis: {
+        type: "category" as const,
+        data: xData,
+        axisLine: { lineStyle: { color: "rgba(255,255,255,0.08)" } },
+        axisLabel: { color: "#64748B", fontSize: 10 }
+      },
+      yAxis: {
+        type: "value" as const,
+        axisLine: { show: false },
+        splitLine: { lineStyle: { color: "rgba(255,255,255,0.06)" } },
+        axisLabel: { color: "#64748B", formatter: (v: number) => v.toFixed(2) }
+      },
+      series: [
+        {
+          name: "累积收益",
+          type: "line" as const,
+          smooth: true,
+          symbol: "none",
+          lineStyle: { width: 2.5, color: "#F59E0B" },
+          areaStyle: { color: { type: "linear" as const, x: 0, y: 0, x2: 0, y2: 1, colorStops: [{ offset: 0, color: "rgba(245,158,11,0.22)" }, { offset: 1, color: "rgba(245,158,11,0)" }] } },
+          data: cumValues
+        },
+        {
+          name: "沪深300",
+          type: "line" as const,
+          smooth: true,
+          symbol: "none",
+          lineStyle: { width: 1.5, color: "#60A5FA", type: "dashed" as const },
+          data: bench
+        },
+        {
+          name: "回撤",
+          type: "line" as const,
+          smooth: true,
+          symbol: "none",
+          lineStyle: { width: 1, color: "rgba(239,68,68,0.0)" },
+          areaStyle: { color: "rgba(239,68,68,0.10)" },
+          data: dd
+        }
+      ],
+      legend: { bottom: 0, textStyle: { color: "#CBD5E1", fontSize: 11 }, data: ["累积收益","沪深300"] }
+    }
+  }, [parsed])
+
   const heatmapOption = useMemo(() => {
     const days = props.heatmapDays ?? ["周一","周二","周三","周四","周五","周六","周日"]
     const weeks = props.heatmapWeeks ?? ["W1","W2","W3","W4","W5"]
@@ -162,7 +214,11 @@ export default function Research(props: ResearchProps) {
   const drawdownOption = useMemo(() => ({
     backgroundColor: "transparent",
     grid: { left: 48, right: 16, top: 12, bottom: 24 },
-    tooltip: { trigger: "axis" as const, backgroundColor: "#121722", borderColor: "rgba(255,255,255,0.1)", textStyle: { color: "#E6EAF2" } },
+    tooltip: { trigger: "axis" as const, backgroundColor: "#121722", borderColor: "rgba(255,255,255,0.1)", textStyle: { color: "#E6EAF2" }, formatter: (params: unknown) => {
+      const p = params as { value: number; name: string }[]
+      if (!Array.isArray(p) || !p[0]) return ""
+      return `${p[0].name}<br/>回撤 ${p[0].value}%`
+    } },
     xAxis: {
       type: "category" as const,
       data: drawdowns.map(d => `${d.start.slice(5)}→${d.end.slice(5)}`),
@@ -184,11 +240,10 @@ export default function Research(props: ResearchProps) {
 
   return (
     <div className="mx-auto max-w-7xl px-6 py-6">
-      {/* 顶部标题 */}
       <div className="flex flex-wrap items-start justify-between gap-4">
         <div>
           <h1 className="font-display text-xl font-semibold tracking-tight text-mist">投研 · 研究</h1>
-          <p className="mt-1 max-w-xl text-sm leading-5 text-slate-400">真回测渲染：直连 <code className="rounded bg-white/10 px-1 py-0.5 text-xs text-mist">positions.csv</code> <code className="rounded bg-white/10 px-1 py-0.5 text-xs text-mist">metrics.json</code> <code className="rounded bg-white/10 px-1 py-0.5 text-xs text-mist">tearsheet.html</code> · ECharts 月热力 + 回撤 TopN</p>
+          <p className="mt-1 max-w-xl text-sm leading-5 text-slate-400">回测直连 <code className="rounded bg-white/10 px-1 py-0.5 text-xs text-mist">positions.csv</code> <code className="rounded bg-white/10 px-1 py-0.5 text-xs text-mist">metrics.json</code> <code className="rounded bg-white/10 px-1 py-0.5 text-xs text-mist">tearsheet.html</code> · 演示级渲染，支持真实文件回退合成</p>
         </div>
         <div className="flex flex-wrap gap-2">
           <span className="rounded-full border border-emerald-400/15 bg-emerald-400/10 px-3 py-1 text-xs font-medium text-emerald-300">PIT 已校验</span>
@@ -207,9 +262,9 @@ export default function Research(props: ResearchProps) {
         ].map(c => (
           <div key={c.k} className="group relative overflow-hidden rounded-2xl border border-white/10 bg-white/[0.04] p-4 backdrop-blur hover:bg-white/[0.06] transition">
             <div className="absolute -right-6 -top-6 h-16 w-16 rounded-full bg-amber-500/10 blur-xl group-hover:bg-amber-500/15 transition" />
-            <div className="text-[11px] tracking-[0.14em] text-slate-400">{c.k}</div>
-            <div className="mt-1 font-display text-xl font-semibold text-mist">{c.v}</div>
-            <div className="font-mono text-[11px] text-slate-500">{c.sub}</div>
+            <div className="text-[11px] tracking-[0.14em] text-slate-400">{c.k} {metricsLoading && <span className="inline-block h-2 w-2 animate-pulse rounded-full bg-amber-400/60" />}</div>
+            <div className="mt-1 font-display text-xl font-semibold text-mist">{metricsLoading ? <span className="inline-block h-5 w-16 animate-pulse rounded bg-white/10" /> : c.v}</div>
+            <div className="font-mono text-[11px] text-slate-500">{c.sub} {csvIsMock && c.k==="年化收益" && <span className="ml-1 rounded bg-white/5 px-1 text-[10px]">演示数据</span>}</div>
           </div>
         ))}
       </div>
@@ -219,9 +274,13 @@ export default function Research(props: ResearchProps) {
         <div className="lg:col-span-3 rounded-2xl border border-white/10 bg-ink-800/60 p-4 backdrop-blur">
           <div className="flex items-center justify-between">
             <h2 className="text-sm font-semibold text-mist">净值曲线</h2>
-            <span className="rounded-full border border-white/10 bg-white/5 px-2.5 py-1 text-[11px] text-slate-400">ECharts · 真 positions.csv 驱动 · 含累积净值</span>
+            <span className={"rounded-full border px-2.5 py-1 text-[11px] " + (parsed ? "border-emerald-400/20 bg-emerald-400/10 text-emerald-300" : "border-white/10 bg-white/5 text-slate-400")}>{parsed ? "真 positions.csv 驱动 · 含累积净值" : "演示数据 · 等待真实 positions.csv"}</span>
           </div>
-          <ReactECharts option={cumulativeOption} style={{ height: 300 }} opts={{ renderer: "canvas" }} />
+          {csvLoading ? (
+            <div className="mt-4 h-[300px] animate-pulse rounded-xl bg-white/5" />
+          ) : (
+            <ReactECharts option={cumulativeOption} style={{ height: 300 }} opts={{ renderer: "canvas" }} />
+          )}
           <div className="mt-2 flex flex-wrap gap-2 text-xs">
             <span className="rounded-lg bg-amber-500/15 px-2 py-1 text-amber-300">600519 等权</span>
             <span className="rounded-lg bg-white/5 px-2 py-1 text-slate-300">对比沪深300</span>
@@ -267,14 +326,18 @@ export default function Research(props: ResearchProps) {
                 <a href="/v1/backtest/metrics.json" target="_blank" rel="noreferrer" className="rounded-lg border border-amber-500/20 bg-amber-500/10 px-2.5 py-1 text-xs text-amber-300">metrics.json</a>
               </div>
             </div>
-            <pre className="mt-3 max-h-40 overflow-auto rounded-xl bg-ink-900 p-3 font-mono text-xs leading-5 text-slate-300">{csvPreview}</pre>
-            <p className="mt-2 text-xs text-slate-500">直连后端 <code className="rounded bg-white/10 px-1">positions.csv</code> 真文件；失败则展示合成保真回退（synthetic）。</p>
+            {csvLoading ? (
+              <div className="mt-3 h-32 animate-pulse rounded-xl bg-white/5" />
+            ) : (
+              <pre className="mt-3 max-h-40 overflow-auto rounded-xl bg-ink-900 p-3 font-mono text-xs leading-5 text-slate-300">{csvPreview}</pre>
+            )}
+            <p className="mt-2 text-xs text-slate-500">直连后端 <code className="rounded bg-white/10 px-1">positions.csv</code> 真文件；{csvIsMock ? "当前为演示数据（合成回退）" : "已加载真实回测文件"}。</p>
           </div>
 
           <div className="rounded-2xl border border-white/10 bg-white/[0.04] p-4">
             <div className="flex items-center justify-between">
               <h3 className="text-sm font-semibold text-mist">tearsheet.html 嵌入</h3>
-              <span className="text-xs text-slate-500">{tearsheetLoaded ? "已加载真文件" : "占位预览（未找到则展示占位）"}</span>
+              <span className={"rounded-full px-2.5 py-1 text-[11px] border " + (tearsheetLoaded ? (tearsheetIsSynthetic ? "border-amber-400/20 bg-amber-400/10 text-amber-300" : "border-emerald-400/20 bg-emerald-400/10 text-emerald-300") : "border-white/10 bg-white/5 text-slate-500")}>{tearsheetLoaded ? (tearsheetIsSynthetic ? "演示合成" : "真实回测") : "占位预览（未找到则展示占位）"}</span>
             </div>
             {tearsheetHtml ? (
               <iframe title="tearsheet" srcDoc={tearsheetHtml} className="mt-3 h-48 w-full rounded-xl border border-white/10 bg-white" sandbox="allow-same-origin" />

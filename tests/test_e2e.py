@@ -1,4 +1,8 @@
-def test_e2e_query_to_report():
+def test_e2e_query_to_report(monkeypatch):
+    monkeypatch.setenv("HERO_DATA_MODE", "synthetic")
+    import importlib
+    import hero_quant.config.settings as s
+    importlib.reload(s)
     # 端到端：mock llm + 真 registry(mock http) + 真 backtest，验证最终报告含 metrics 且价格经 grounding
     from hero_quant.agent.loop import AgentLoop
     from hero_quant.data.registry import MarketDataRegistry

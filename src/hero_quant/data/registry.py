@@ -169,7 +169,8 @@ class MarketDataRegistry:
             ref_close = self._first_close(bars)
             if not ref_close:
                 return
-        except Exception:
+        except Exception as e:
+            logger.warning("cross_source check _first_close error for %s: %s", symbol, e, exc_info=e)
             return
         current_source = getattr(prov, "source", "") if prov else ""  # 跳过自身避免自比
         for loader in self._loaders:
@@ -182,12 +183,20 @@ class MarketDataRegistry:
                 continue
             try:
                 result = loader.get_bars(symbol, start, end, interval)
-            except Exception:
+            except Exception as e:
+                logger.warning("cross_source comparator %s failed for %s: %s", loader_source, symbol, e, exc_info=e)
                 continue
             if result is None:
                 continue
             other_bars = result[0] if isinstance(result, tuple) and len(result)==2 else result
             if self._bars_empty(other_bars):
+                continue
+            # 避免 synthetic vs synthetic 假通过：若任一方为 synthetic 则跳过比较并记录
+            this_is_synthetic = (current_source == "synthetic")
+            other_prov = result[1] if isinstance(result, tuple) and len(result) == 2 else None
+            other_source = getattr(other_prov, "source", loader_source) if other_prov else loader_source
+            if this_is_synthetic or other_source == "synthetic":
+                logger.warning("cross_source skip synthetic comparator for %s: %s vs %s", symbol, current_source, other_source)
                 continue
             try:
                 other_close = self._first_close(other_bars)
@@ -199,7 +208,8 @@ class MarketDataRegistry:
                         )
             except CrossSourceError:
                 raise
-            except Exception:
+            except Exception as e:
+                logger.warning("cross_source compare error for %s: %s vs %s: %s", symbol, current_source, loader_source, e, exc_info=e)
                 continue
         return
 
@@ -221,6 +231,7 @@ class MarketDataRegistry:
             try:
                 result = loader.get_bars(symbol, start, end, interval)
             except Exception as e:
+                logger.warning("loader %s failed for %s: %s", loader.__class__.__name__, symbol, e, exc_info=e)
                 # 保留可操作的 pip 安装提示，便于用户补依赖
                 if isinstance(e, ImportError) and "pip install" in str(e):
                     if "pip install hero-quant[us] or [ashare]" not in str(e):
@@ -235,16 +246,51 @@ class MarketDataRegistry:
             if isinstance(result, tuple) and len(result) == 2:
                 bars, prov = result
                 if prov is None:
-                    prov = Provenance(source="tencent", unit=getattr(loader, "unit", "shares"), symbol=symbol)
+                    # 合成不得冒充真实源：按 loader 与 data_mode 诚实标注（仅经 Settings 门控，不直读环境）
+                    try:
+                        from hero_quant.config.settings import Settings as _Settings
+                        _mode = _Settings().data_mode
+                    except Exception as _e:
+                        logger.warning("settings load failed for provenance fallback: %s", _e, exc_info=_e)
+                        _mode = "live"
+                    _mode = str(_mode).strip().lower() if isinstance(_mode, str) else "live"
+                    _lname = loader.__class__.__name__.lower()
+                    _lsrc = str(getattr(loader, "source", "")).lower()
+                    _lnm = str(getattr(loader, "name", "")).lower()
+                    is_synthetic = _mode == "synthetic" or "synthetic" in _lname or "synthetic" in _lsrc or "synthetic" in _lnm
+                    prov = Provenance(source="synthetic" if is_synthetic else self._infer_loader_source(loader), unit=getattr(loader, "unit", "shares"), symbol=symbol)
             else:
                 bars = result
                 unit = getattr(loader, "unit", "shares")
                 source = self._infer_loader_source(loader)
+                # synthetic 模式或 synthetic-like loader 必须标 synthetic
+                try:
+                    from hero_quant.config.settings import Settings as _Settings2
+                    _mode2 = _Settings2().data_mode
+                except Exception as _e2:
+                    logger.warning("settings load failed for provenance: %s", _e2, exc_info=_e2)
+                    _mode2 = "live"
+                _mode2 = str(_mode2).strip().lower() if isinstance(_mode2, str) else "live"
+                _lname2 = loader.__class__.__name__.lower()
+                if _mode2 == "synthetic" or "synthetic" in _lname2:
+                    source = "synthetic"
                 prov = Provenance(source=source, unit=unit, symbol=symbol)
             if self._bars_empty(bars):
                 continue
             if not getattr(prov, "source", None):
-                prov.source = "tencent"
+                # 诚实标注：synthetic 显式 synthetic，其余推断真实源
+                try:
+                    from hero_quant.config.settings import Settings as _Settings3
+                    _mode3 = _Settings3().data_mode
+                except Exception as _e3:
+                    logger.warning("settings load failed for provenance empty source: %s", _e3, exc_info=_e3)
+                    _mode3 = "live"
+                _mode3 = str(_mode3).strip().lower() if isinstance(_mode3, str) else "live"
+                _lname3 = loader.__class__.__name__.lower()
+                if _mode3 == "synthetic" or "synthetic" in _lname3:
+                    prov.source = "synthetic"
+                else:
+                    prov.source = self._infer_loader_source(loader)
             if not getattr(prov, "unit", None):
                 prov.unit = getattr(loader, "unit", "shares")
             # 记录审计日志：用于追踪每次成功取数的来源与单位
@@ -264,8 +310,9 @@ class MarketDataRegistry:
                 self._cross_source_check(symbol, bars, prov, interval, start, end)
             except CrossSourceError:
                 raise
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("cross_source check error for %s: %s", symbol, e, exc_info=e)
+                raise
             return bars, prov
         # 全部 loader 失败，透出最后的可操作错误
         if isinstance(last_error, ImportError) and "pip install" in str(last_error):

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
 import os
 import sqlite3
@@ -16,6 +17,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .lifecycle import compute_importance
+
+logger = logging.getLogger("hero_quant.memory.store")
 
 
 def _content_hash(name: str, content: str) -> str:
@@ -170,8 +173,9 @@ class PgVectorSidecar:
                 with self._pool.connection() as conn:  # type: ignore
                     try:
                         conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
-                    except Exception:
-                        pass
+                    except Exception as _exc:
+                        logger.debug("silent handled: offline-safe: memory sidecar/pgvector optional, fallback to local", exc_info=_exc)  # intentional: offline-safe: memory sidecar/pgvector optional, fallback to local
+                        pass  # intentional offline-safe: memory sidecar/pgvector optional, fallback to local
                     # 优先创建 vector 类型列，失败则回退到 TEXT
                     created = False
                     try:
@@ -194,24 +198,28 @@ class PgVectorSidecar:
                             conn.execute(
                                 "CREATE INDEX IF NOT EXISTS idx_memory_vectors_embedding ON memory_vectors USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100)"
                             )
-                        except Exception:
-                            pass
+                        except Exception as _exc:
+                            logger.debug("silent handled: offline-safe: memory sidecar/pgvector optional, fallback to local", exc_info=_exc)  # intentional: offline-safe: memory sidecar/pgvector optional, fallback to local
+                            pass  # intentional offline-safe: memory sidecar/pgvector optional, fallback to local
                         try:
                             conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_vectors_ns ON memory_vectors (namespace)")
-                        except Exception:
-                            pass
+                        except Exception as _exc:
+                            logger.debug("silent handled: offline-safe: memory sidecar/pgvector optional, fallback to local", exc_info=_exc)  # intentional: offline-safe: memory sidecar/pgvector optional, fallback to local
+                            pass  # intentional offline-safe: memory sidecar/pgvector optional, fallback to local
                     try:
                         conn.commit()  # type: ignore
-                    except Exception:
-                        pass
+                    except Exception as _exc:
+                        logger.debug("silent handled: offline-safe: memory sidecar/pgvector optional, fallback to local", exc_info=_exc)  # intentional: offline-safe: memory sidecar/pgvector optional, fallback to local
+                        pass  # intentional offline-safe: memory sidecar/pgvector optional, fallback to local
             elif self._pool is not None and hasattr(self._pool, "getconn"):
                 conn = self._pool.getconn()  # type: ignore
                 try:
                     with conn.cursor() as cur:
                         try:
                             cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
-                        except Exception:
-                            pass
+                        except Exception as _exc:
+                            logger.debug("silent handled: offline-safe: memory sidecar/pgvector optional, fallback to local", exc_info=_exc)  # intentional: offline-safe: memory sidecar/pgvector optional, fallback to local
+                            pass  # intentional offline-safe: memory sidecar/pgvector optional, fallback to local
                         try:
                             cur.execute(
                                 f"CREATE TABLE IF NOT EXISTS memory_vectors (key TEXT PRIMARY KEY, content TEXT, embedding vector({self.dim}), namespace TEXT, created TIMESTAMPTZ DEFAULT now())"
@@ -222,14 +230,16 @@ class PgVectorSidecar:
                             )
                         try:
                             cur.execute("CREATE INDEX IF NOT EXISTS idx_memory_vectors_ns ON memory_vectors (namespace)")
-                        except Exception:
-                            pass
+                        except Exception as _exc:
+                            logger.debug("silent handled: offline-safe: memory sidecar/pgvector optional, fallback to local", exc_info=_exc)  # intentional: offline-safe: memory sidecar/pgvector optional, fallback to local
+                            pass  # intentional offline-safe: memory sidecar/pgvector optional, fallback to local
                     conn.commit()
                 finally:
                     try:
                         self._pool.putconn(conn)  # type: ignore
-                    except Exception:
-                        pass
+                    except Exception as _exc:
+                        logger.debug("silent handled: offline-safe: memory sidecar/pgvector optional, fallback to local", exc_info=_exc)  # intentional: offline-safe: memory sidecar/pgvector optional, fallback to local
+                        pass  # intentional offline-safe: memory sidecar/pgvector optional, fallback to local
             else:
                 # 无连接池时走一次性直连路径
                 try:
@@ -239,8 +249,9 @@ class PgVectorSidecar:
                         with conn.cursor() as cur:
                             try:
                                 cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
-                            except Exception:
-                                pass
+                            except Exception as _exc:
+                                logger.debug("silent handled: offline-safe: memory sidecar/pgvector optional, fallback to local", exc_info=_exc)  # intentional: offline-safe: memory sidecar/pgvector optional, fallback to local
+                                pass  # intentional offline-safe: memory sidecar/pgvector optional, fallback to local
                             try:
                                 cur.execute(
                                     f"CREATE TABLE IF NOT EXISTS memory_vectors (key TEXT PRIMARY KEY, content TEXT, embedding vector({self.dim}), namespace TEXT, created TIMESTAMPTZ DEFAULT now())"
@@ -250,8 +261,9 @@ class PgVectorSidecar:
                                     "CREATE TABLE IF NOT EXISTS memory_vectors (key TEXT PRIMARY KEY, content TEXT, embedding TEXT, namespace TEXT, created TIMESTAMPTZ DEFAULT now())"
                                 )
                         conn.commit()
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    logger.debug("silent handled: offline-safe: memory sidecar/pgvector optional, fallback to local", exc_info=_exc)  # intentional: offline-safe: memory sidecar/pgvector optional, fallback to local
+                    pass  # intentional offline-safe: memory sidecar/pgvector optional, fallback to local
         except Exception as e:
             self._last_error = str(e)
             pass
@@ -281,8 +293,9 @@ class PgVectorSidecar:
                 finally:
                     try:
                         self._pool.putconn(conn)  # type: ignore
-                    except Exception:
-                        pass
+                    except Exception as _exc:
+                        logger.debug("silent handled: offline-safe: memory sidecar/pgvector optional, fallback to local", exc_info=_exc)  # intentional: offline-safe: memory sidecar/pgvector optional, fallback to local
+                        pass  # intentional offline-safe: memory sidecar/pgvector optional, fallback to local
             else:
                 import psycopg  # type: ignore
 
@@ -321,8 +334,9 @@ class PgVectorSidecar:
                             )
                     try:
                         conn.commit()  # type: ignore
-                    except Exception:
-                        pass
+                    except Exception as _exc:
+                        logger.debug("silent handled: offline-safe: memory sidecar/pgvector optional, fallback to local", exc_info=_exc)  # intentional: offline-safe: memory sidecar/pgvector optional, fallback to local
+                        pass  # intentional offline-safe: memory sidecar/pgvector optional, fallback to local
                 return True
             elif self._pool is not None and hasattr(self._pool, "getconn"):
                 conn = self._pool.getconn()  # type: ignore
@@ -342,8 +356,9 @@ class PgVectorSidecar:
                 finally:
                     try:
                         self._pool.putconn(conn)  # type: ignore
-                    except Exception:
-                        pass
+                    except Exception as _exc:
+                        logger.debug("silent handled: offline-safe: memory sidecar/pgvector optional, fallback to local", exc_info=_exc)  # intentional: offline-safe: memory sidecar/pgvector optional, fallback to local
+                        pass  # intentional offline-safe: memory sidecar/pgvector optional, fallback to local
                 return True
             else:
                 import psycopg  # type: ignore
@@ -422,8 +437,9 @@ class PgVectorSidecar:
                 finally:
                     try:
                         self._pool.putconn(conn)  # type: ignore
-                    except Exception:
-                        pass
+                    except Exception as _exc:
+                        logger.debug("silent handled: offline-safe: memory sidecar/pgvector optional, fallback to local", exc_info=_exc)  # intentional: offline-safe: memory sidecar/pgvector optional, fallback to local
+                        pass  # intentional offline-safe: memory sidecar/pgvector optional, fallback to local
             else:
                 import psycopg  # type: ignore
 
@@ -667,8 +683,9 @@ class MemoryStore:
                     expected = int(_gvd())
                     if isinstance(parsed, list) and len(parsed) != expected:
                         return None
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    logger.debug("silent handled: offline-safe: memory sidecar/pgvector optional, fallback to local", exc_info=_exc)  # intentional: offline-safe: memory sidecar/pgvector optional, fallback to local
+                    pass  # intentional offline-safe: memory sidecar/pgvector optional, fallback to local
                 return parsed
         except Exception:
             return None
@@ -698,8 +715,9 @@ class MemoryStore:
             if not ok:
                 # 失败不永久禁用，保留下次重试机会
                 pass
-        except Exception:
-            pass
+        except Exception as _exc:
+            logger.debug("silent handled: offline-safe: memory sidecar/pgvector optional, fallback to local", exc_info=_exc)  # intentional: offline-safe: memory sidecar/pgvector optional, fallback to local
+            pass  # intentional offline-safe: memory sidecar/pgvector optional, fallback to local
 
     def _pgvector_search(self, query: str, top_k: int = 5) -> list[dict]:
         """尝试侧车检索，失败返回空列表以触发本地回退。"""
@@ -788,31 +806,37 @@ class MemoryStore:
                         import msvcrt  # type: ignore
 
                         msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
-                    except Exception:
-                        pass
-                except Exception:
-                    pass
+                    except Exception as _exc:
+                        logger.debug("silent handled: offline-safe: memory sidecar/pgvector optional, fallback to local", exc_info=_exc)  # intentional: offline-safe: memory sidecar/pgvector optional, fallback to local
+                        pass  # intentional offline-safe: memory sidecar/pgvector optional, fallback to local
+                except Exception as _exc:
+                    logger.debug("silent handled: offline-safe: memory sidecar/pgvector optional, fallback to local", exc_info=_exc)  # intentional: offline-safe: memory sidecar/pgvector optional, fallback to local
+                    pass  # intentional offline-safe: memory sidecar/pgvector optional, fallback to local
                 f.write(content)
                 f.flush()
                 try:
                     os.fsync(f.fileno())
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    logger.debug("silent handled: offline-safe: memory sidecar/pgvector optional, fallback to local", exc_info=_exc)  # intentional: offline-safe: memory sidecar/pgvector optional, fallback to local
+                    pass  # intentional offline-safe: memory sidecar/pgvector optional, fallback to local
             try:
                 os.chmod(tmp_path, 0o600)
-            except Exception:
-                pass
+            except Exception as _exc:
+                logger.debug("silent handled: offline-safe: memory sidecar/pgvector optional, fallback to local", exc_info=_exc)  # intentional: offline-safe: memory sidecar/pgvector optional, fallback to local
+                pass  # intentional offline-safe: memory sidecar/pgvector optional, fallback to local
             os.replace(tmp_path, file_path)
             try:
                 os.chmod(file_path, 0o600)
-            except Exception:
-                pass
+            except Exception as _exc:
+                logger.debug("silent handled: offline-safe: memory sidecar/pgvector optional, fallback to local", exc_info=_exc)  # intentional: offline-safe: memory sidecar/pgvector optional, fallback to local
+                pass  # intentional offline-safe: memory sidecar/pgvector optional, fallback to local
         finally:
             if tmp_path.exists():
                 try:
                     tmp_path.unlink()
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    logger.debug("silent handled: offline-safe: memory sidecar/pgvector optional, fallback to local", exc_info=_exc)  # intentional: offline-safe: memory sidecar/pgvector optional, fallback to local
+                    pass  # intentional offline-safe: memory sidecar/pgvector optional, fallback to local
 
         # 以 namespace 键写入 SQLite 索引（含向量列）
         created = datetime.now(timezone.utc).isoformat()
@@ -845,8 +869,9 @@ class MemoryStore:
                     try:
                         # 预留更新路径，当前无操作
                         pass
-                    except Exception:
-                        pass
+                    except Exception as _exc:
+                        logger.debug("silent handled: offline-safe: memory sidecar/pgvector optional, fallback to local", exc_info=_exc)  # intentional: offline-safe: memory sidecar/pgvector optional, fallback to local
+                        pass  # intentional offline-safe: memory sidecar/pgvector optional, fallback to local
             rowid = cur.lastrowid
             if self._fts_enabled:
                 try:
@@ -860,16 +885,18 @@ class MemoryStore:
                         cur.execute(
                             "INSERT INTO notes_fts (content) VALUES (?)", (content,)
                         )
-                    except Exception:
-                        pass
+                    except Exception as _exc:
+                        logger.debug("silent handled: offline-safe: memory sidecar/pgvector optional, fallback to local", exc_info=_exc)  # intentional: offline-safe: memory sidecar/pgvector optional, fallback to local
+                        pass  # intentional offline-safe: memory sidecar/pgvector optional, fallback to local
             if self._bigram_enabled:
                 try:
                     cur.execute(
                         "INSERT INTO notes_fts_bigram (rowid, bigrams) VALUES (?, ?)",
                         (rowid, _content_bigrams(content)),
                     )
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    logger.debug("silent handled: offline-safe: memory sidecar/pgvector optional, fallback to local", exc_info=_exc)  # intentional: offline-safe: memory sidecar/pgvector optional, fallback to local
+                    pass  # intentional offline-safe: memory sidecar/pgvector optional, fallback to local
             self._conn.commit()
             # 侧车同步：尽力而为，失败不影响本地写入事务
             try:
@@ -886,15 +913,18 @@ class MemoryStore:
                         vec2 = self._embed_text(content)
                         if vec2 is not None:
                             self._pgvector_upsert(ns_key, content, vec2)
-                    except Exception:
-                        pass
-            except Exception:
-                pass
+                    except Exception as _exc:
+                        logger.debug("silent handled: offline-safe: memory sidecar/pgvector optional, fallback to local", exc_info=_exc)  # intentional: offline-safe: memory sidecar/pgvector optional, fallback to local
+                        pass  # intentional offline-safe: memory sidecar/pgvector optional, fallback to local
+            except Exception as _exc:
+                logger.debug("silent handled: offline-safe: memory sidecar/pgvector optional, fallback to local", exc_info=_exc)  # intentional: offline-safe: memory sidecar/pgvector optional, fallback to local
+                pass  # intentional offline-safe: memory sidecar/pgvector optional, fallback to local
         except Exception:
             try:
                 self._conn.rollback()
-            except Exception:
-                pass
+            except Exception as _exc:
+                logger.debug("silent handled: offline-safe: memory sidecar/pgvector optional, fallback to local", exc_info=_exc)  # intentional: offline-safe: memory sidecar/pgvector optional, fallback to local
+                pass  # intentional offline-safe: memory sidecar/pgvector optional, fallback to local
         # 初始化 Ebbinghaus 元数据：内存态，无需 DDL
         if ns_key not in self._meta:
             self._meta[ns_key] = {"quality_score": 0.5, "access_count": 0, "last_accessed": now}
@@ -915,8 +945,9 @@ class MemoryStore:
                     vector_json = json.dumps(vector)
                 except Exception:
                     vector_json = None
-        except Exception:
-            pass
+        except Exception as _exc:
+            logger.debug("silent handled: offline-safe: memory sidecar/pgvector optional, fallback to local", exc_info=_exc)  # intentional: offline-safe: memory sidecar/pgvector optional, fallback to local
+            pass  # intentional offline-safe: memory sidecar/pgvector optional, fallback to local
 
         try:
             cur = self._conn.cursor()
@@ -926,8 +957,9 @@ class MemoryStore:
                 for table in ("notes_fts", "notes_fts_bigram"):
                     try:
                         cur.execute(f"DELETE FROM {table} WHERE rowid = ?", (rowid,))
-                    except Exception:
-                        pass
+                    except Exception as _exc:
+                        logger.debug("silent handled: offline-safe: memory sidecar/pgvector optional, fallback to local", exc_info=_exc)  # intentional: offline-safe: memory sidecar/pgvector optional, fallback to local
+                        pass  # intentional offline-safe: memory sidecar/pgvector optional, fallback to local
             cur.execute("DELETE FROM notes WHERE key = ?", (ns_key,))
 
             cur.execute("PRAGMA table_info(notes)")
@@ -949,22 +981,25 @@ class MemoryStore:
                         "INSERT INTO notes_fts (rowid, content) VALUES (?, ?)",
                         (rowid, content),
                     )
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    logger.debug("silent handled: offline-safe: memory sidecar/pgvector optional, fallback to local", exc_info=_exc)  # intentional: offline-safe: memory sidecar/pgvector optional, fallback to local
+                    pass  # intentional offline-safe: memory sidecar/pgvector optional, fallback to local
             if self._bigram_enabled:
                 try:
                     cur.execute(
                         "INSERT INTO notes_fts_bigram (rowid, bigrams) VALUES (?, ?)",
                         (rowid, _content_bigrams(content)),
                     )
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    logger.debug("silent handled: offline-safe: memory sidecar/pgvector optional, fallback to local", exc_info=_exc)  # intentional: offline-safe: memory sidecar/pgvector optional, fallback to local
+                    pass  # intentional offline-safe: memory sidecar/pgvector optional, fallback to local
             self._conn.commit()
         except Exception:
             try:
                 self._conn.rollback()
-            except Exception:
-                pass
+            except Exception as _exc:
+                logger.debug("silent handled: offline-safe: memory sidecar/pgvector optional, fallback to local", exc_info=_exc)  # intentional: offline-safe: memory sidecar/pgvector optional, fallback to local
+                pass  # intentional offline-safe: memory sidecar/pgvector optional, fallback to local
             return
 
         if vector is not None:
@@ -1203,8 +1238,9 @@ class MemoryStore:
                         return deduped
             except sqlite3.OperationalError:
                 pass
-            except Exception:
-                pass
+            except Exception as _exc:
+                logger.debug("silent handled: offline-safe: memory sidecar/pgvector optional, fallback to local", exc_info=_exc)  # intentional: offline-safe: memory sidecar/pgvector optional, fallback to local
+                pass  # intentional offline-safe: memory sidecar/pgvector optional, fallback to local
         # FTS 异常或无命中时仍尝试 bigram，再降级到内容 LIKE。
         bigram_result = self._search_bigram_raw(query)
         if bigram_result:

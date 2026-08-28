@@ -1,4 +1,8 @@
-def test_ccxt_loader_binance_spot():
+def test_ccxt_loader_binance_spot(monkeypatch):
+    monkeypatch.setenv("HERO_DATA_MODE", "synthetic")
+    import importlib
+    import hero_quant.config.settings as s
+    importlib.reload(s)
     from hero_quant.data.loaders.ccxt_loader import CCXTLoader
 
     loader = CCXTLoader()
@@ -17,7 +21,11 @@ def test_ccxt_loader_binance_spot():
     assert "ccxt_available" in h or "status" in h
 
 
-def test_ccxt_loader_interval_mapping():
+def test_ccxt_loader_interval_mapping(monkeypatch):
+    monkeypatch.setenv("HERO_DATA_MODE", "synthetic")
+    import importlib
+    import hero_quant.config.settings as s
+    importlib.reload(s)
     from hero_quant.data.loaders.ccxt_loader import CCXTLoader
 
     loader = CCXTLoader()

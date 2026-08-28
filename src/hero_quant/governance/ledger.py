@@ -128,8 +128,9 @@ def _lock_exclusive(handle: BinaryIO) -> None:
     if fcntl is not None:
         try:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        except Exception:
-            pass
+        except Exception as _exc:
+            logger.warning("silent handled: governance: ledger fsync/lock best-effort, durability degraded but not silent", exc_info=_exc)  # intentional: governance: ledger fsync/lock best-effort, durability degraded but not silent
+            pass  # intentional governance: ledger fsync/lock best-effort, durability degraded but not silent
         return
     if msvcrt is not None:  # pragma: no cover
         # Windows 以字节范围锁模拟；避免写入 sentinel \x00 污染 JSONL
@@ -145,8 +146,9 @@ def _lock_exclusive(handle: BinaryIO) -> None:
                     msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
                 except OSError:
                     pass
-        except Exception:
-            pass
+        except Exception as _exc:
+            logger.warning("silent handled: governance: ledger fsync/lock best-effort, durability degraded but not silent", exc_info=_exc)  # intentional: governance: ledger fsync/lock best-effort, durability degraded but not silent
+            pass  # intentional governance: ledger fsync/lock best-effort, durability degraded but not silent
         return
 
 
@@ -155,8 +157,9 @@ def _unlock(handle: BinaryIO) -> None:
     if fcntl is not None:
         try:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-        except Exception:
-            pass
+        except Exception as _exc:
+            logger.warning("silent handled: governance: ledger fsync/lock best-effort, durability degraded but not silent", exc_info=_exc)  # intentional: governance: ledger fsync/lock best-effort, durability degraded but not silent
+            pass  # intentional governance: ledger fsync/lock best-effort, durability degraded but not silent
         return
     if msvcrt is not None:  # pragma: no cover
         try:
@@ -166,8 +169,9 @@ def _unlock(handle: BinaryIO) -> None:
             if handle.tell() > 0:
                 handle.seek(0)
                 msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-        except Exception:
-            pass
+        except Exception as _exc:
+            logger.warning("silent handled: governance: ledger fsync/lock best-effort, durability degraded but not silent", exc_info=_exc)  # intentional: governance: ledger fsync/lock best-effort, durability degraded but not silent
+            pass  # intentional governance: ledger fsync/lock best-effort, durability degraded but not silent
 
 
 def _fsync_dir(directory: Path) -> None:
@@ -193,8 +197,9 @@ def _fsync_dir(directory: Path) -> None:
     finally:
         try:
             os.close(dir_fd)
-        except Exception:
-            pass
+        except Exception as _exc:
+            logger.warning("silent handled: governance: ledger fsync/lock best-effort, durability degraded but not silent", exc_info=_exc)  # intentional: governance: ledger fsync/lock best-effort, durability degraded but not silent
+            pass  # intentional governance: ledger fsync/lock best-effort, durability degraded but not silent
 
 
 def archive_segments(path: Path) -> list[Path]:
@@ -367,8 +372,9 @@ class Ledger:
         if self.path.exists():
             try:
                 os.chmod(self.path, 0o600)
-            except Exception:
-                pass
+            except Exception as _exc:
+                logger.warning("silent handled: governance: ledger fsync/lock best-effort, durability degraded but not silent", exc_info=_exc)  # intentional: governance: ledger fsync/lock best-effort, durability degraded but not silent
+                pass  # intentional governance: ledger fsync/lock best-effort, durability degraded but not silent
 
     def _read_all(self):
         """逐行读取 JSONL，兼容旧 sentinel 残留的 NUL，损坏行以 _raw 标记。"""
@@ -447,8 +453,9 @@ class Ledger:
             if isinstance(record, dict):
                 sink = RESULT_SINK if record.get("type") == "tool_result" else ARGUMENTS_SINK
                 record = redact_payload(record, sink=sink)
-        except Exception:
-            pass
+        except Exception as _exc:
+            logger.warning("silent handled: governance: ledger fsync/lock best-effort, durability degraded but not silent", exc_info=_exc)  # intentional: governance: ledger fsync/lock best-effort, durability degraded but not silent
+            pass  # intentional governance: ledger fsync/lock best-effort, durability degraded but not silent
         # 锁保护 read-verify-append 临界区，防止并发分叉
         created = not self.path.exists()
         # 以 a+b 打开以便加锁后回读历史
@@ -507,24 +514,30 @@ class Ledger:
                     if LEDGER_APPEND_DURATION is not None:
                         try:
                             LEDGER_APPEND_DURATION.labels(tenant=str(tenant), status=_status).observe(float(_elapsed))
-                        except Exception:
-                            pass
+                        except Exception as _exc:
+                            logger.warning("silent handled: governance: ledger fsync/lock best-effort, durability degraded but not silent", exc_info=_exc)  # intentional: governance: ledger fsync/lock best-effort, durability degraded but not silent
+                            pass  # intentional governance: ledger fsync/lock best-effort, durability degraded but not silent
                     try:
                         observe_wall_time("ledger_append", float(_elapsed), status=_status)
-                    except Exception:
-                        pass
+                    except Exception as _exc:
+                        logger.warning("silent handled: governance: ledger fsync/lock best-effort, durability degraded but not silent", exc_info=_exc)  # intentional: governance: ledger fsync/lock best-effort, durability degraded but not silent
+                        pass  # intentional governance: ledger fsync/lock best-effort, durability degraded but not silent
                     try:
                         observe_ledger_append(str(tenant), float(_elapsed), status=_status)
-                    except Exception:
-                        pass
-                except Exception:
-                    pass
-            except Exception:
-                pass
+                    except Exception as _exc:
+                        logger.warning("silent handled: governance: ledger fsync/lock best-effort, durability degraded but not silent", exc_info=_exc)  # intentional: governance: ledger fsync/lock best-effort, durability degraded but not silent
+                        pass  # intentional governance: ledger fsync/lock best-effort, durability degraded but not silent
+                except Exception as _exc:
+                    logger.warning("silent handled: governance: ledger fsync/lock best-effort, durability degraded but not silent", exc_info=_exc)  # intentional: governance: ledger fsync/lock best-effort, durability degraded but not silent
+                    pass  # intentional governance: ledger fsync/lock best-effort, durability degraded but not silent
+            except Exception as _exc:
+                logger.warning("silent handled: governance: ledger fsync/lock best-effort, durability degraded but not silent", exc_info=_exc)  # intentional: governance: ledger fsync/lock best-effort, durability degraded but not silent
+                pass  # intentional governance: ledger fsync/lock best-effort, durability degraded but not silent
         try:
             os.chmod(self.path, 0o600)
-        except Exception:
-            pass
+        except Exception as _exc:
+            logger.warning("silent handled: governance: ledger fsync/lock best-effort, durability degraded but not silent", exc_info=_exc)  # intentional: governance: ledger fsync/lock best-effort, durability degraded but not silent
+            pass  # intentional governance: ledger fsync/lock best-effort, durability degraded but not silent
         if created:
             _fsync_dir(self.path.parent)
         return obj

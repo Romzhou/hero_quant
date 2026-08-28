@@ -153,9 +153,19 @@ def test_batch_frozen_identity():
     # Ensure result completed
     assert result2.terminated is True
 
-    # cleanup
+    # cleanup - restore original tools if they were popped
     for n in ["get_market_data", "assert_price"]:
         TOOL_REGISTRY.pop(n, None)
+    # restore market_data tools for subsequent tests (e.g., test_tools_entities_registered)
+    try:
+        import importlib, hero_quant.tools.market_data as _md
+        # clear any remaining dummy registrations that would clash on reload
+        for _k in list(TOOL_REGISTRY.keys()):
+            if _k in ("list_markets", "get_ticker_info", "get_fundamentals", "search_symbols", "search_symbol", "get_bars_range", "search_markets"):
+                TOOL_REGISTRY.pop(_k, None)
+        importlib.reload(_md)
+    except Exception:
+        pass
 
 
 # --- W1-A blocking regression: grounding should ignore percent/quantity/date/range ---

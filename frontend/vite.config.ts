@@ -5,10 +5,10 @@ export default defineConfig({
   plugins: [react()],
   server: {
     proxy: {
-      "/live": "http://localhost:8000",
-      "/ready": "http://localhost:8000",
-      "/metrics": "http://localhost:8000",
-      "/v1": "http://localhost:8000"
+      "/live": "http://localhost:8899",
+      "/ready": "http://localhost:8899",
+      "/metrics": "http://localhost:8899",
+      "/v1": "http://localhost:8899"
     }
   },
   test: {

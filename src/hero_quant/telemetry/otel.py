@@ -8,6 +8,8 @@
 from __future__ import annotations
 
 import os
+import structlog
+logger = structlog.get_logger("telemetry.otel")
 
 # 合法模式（小写归一），含历史别名以保证兼容
 _VALID_MODES = {"disabled", "shared", "private", "enabled", "sampling", "minimal", "full", "internal", "anonymous"}
@@ -138,10 +140,12 @@ class SessionTelemetryCoordinator:
                 except TypeError:
                     try:
                         otel_logger.emit(body)  # type: ignore
-                    except Exception:
-                        pass
-                except Exception:
-                    pass
+                    except Exception as _exc:
+                        logger.debug("silent handled: offline-safe: OTel export unavailable, telemetry best-effort", exc_info=_exc)  # intentional: offline-safe: OTel export unavailable, telemetry best-effort
+                        pass  # intentional offline-safe: OTel export unavailable, telemetry best-effort
+                except Exception as _exc:
+                    logger.debug("silent handled: offline-safe: OTel export unavailable, telemetry best-effort", exc_info=_exc)  # intentional: offline-safe: OTel export unavailable, telemetry best-effort
+                    pass  # intentional offline-safe: OTel export unavailable, telemetry best-effort
 
             # 尽力刷出与关闭，失败静默（shutdown/force_flush 兼容不同版本）
             try:
@@ -151,23 +155,26 @@ class SessionTelemetryCoordinator:
                     except TypeError:
                         try:
                             provider.shutdown(timeout_millis=3000)  # type: ignore
-                        except Exception:
-                            pass
+                        except Exception as _exc:
+                            logger.debug("silent handled: offline-safe: OTel export unavailable, telemetry best-effort", exc_info=_exc)  # intentional: offline-safe: OTel export unavailable, telemetry best-effort
+                            pass  # intentional offline-safe: OTel export unavailable, telemetry best-effort
                 elif hasattr(provider, "force_flush"):
                     try:
                         provider.force_flush()  # type: ignore
                     except TypeError:
                         provider.force_flush(timeout_millis=3000)  # type: ignore
-            except Exception:
-                pass
+            except Exception as _exc:
+                logger.debug("silent handled: offline-safe: OTel export unavailable, telemetry best-effort", exc_info=_exc)  # intentional: offline-safe: OTel export unavailable, telemetry best-effort
+                pass  # intentional offline-safe: OTel export unavailable, telemetry best-effort
             try:
                 if hasattr(processor, "shutdown"):
                     try:
                         processor.shutdown()  # type: ignore
                     except TypeError:
                         processor.shutdown(timeout_millis=3000)  # type: ignore
-            except Exception:
-                pass
+            except Exception as _exc:
+                logger.debug("silent handled: offline-safe: OTel export unavailable, telemetry best-effort", exc_info=_exc)  # intentional: offline-safe: OTel export unavailable, telemetry best-effort
+                pass  # intentional offline-safe: OTel export unavailable, telemetry best-effort
             return
         except ImportError:
             # SDK 不可用 -> 回退 urllib

@@ -6,6 +6,7 @@
 """
 
 from __future__ import annotations
+import logging
 
 import copy
 import inspect
@@ -13,6 +14,7 @@ import json
 import os
 import time
 from typing import Any, Dict, Optional
+logger = logging.getLogger("hero_quant.checkpoint.postgres")
 
 # 默认 TTL 7 天 — 控制可恢复窗口，超时自动清理避免无限堆积
 DEFAULT_TTL_SECONDS = 7 * 24 * 3600
@@ -158,8 +160,9 @@ class AsyncPostgresSaver:
                                 cur.execute(DDL_CHECKPOINTS)
                         try:
                             conn.commit()  # type: ignore
-                        except Exception:
-                            pass
+                        except Exception as _exc:
+                            logger.warning("silent handled: offline-safe: checkpoint pg fallback to memory", exc_info=_exc)  # intentional: offline-safe: checkpoint pg fallback to memory
+                            pass  # intentional offline-safe: checkpoint pg fallback to memory
                 elif hasattr(self.pool, "getconn"):
                     # 兼容遗留池接口
                     conn = self.pool.getconn()  # type: ignore
@@ -170,8 +173,9 @@ class AsyncPostgresSaver:
                     finally:
                         try:
                             self.pool.putconn(conn)  # type: ignore
-                        except Exception:
-                            pass
+                        except Exception as _exc:
+                            logger.warning("silent handled: offline-safe: checkpoint pg fallback to memory", exc_info=_exc)  # intentional: offline-safe: checkpoint pg fallback to memory
+                            pass  # intentional offline-safe: checkpoint pg fallback to memory
             except Exception:
                 # DDL 失败不阻断，回退到内存
                 pass
@@ -187,8 +191,9 @@ class AsyncPostgresSaver:
         if self.pool is not None and hasattr(self.pool, "open"):
             try:
                 await self.pool.open()  # type: ignore
-            except Exception:
-                pass
+            except Exception as _exc:
+                logger.warning("silent handled: offline-safe: checkpoint pg fallback to memory", exc_info=_exc)  # intentional: offline-safe: checkpoint pg fallback to memory
+                pass  # intentional offline-safe: checkpoint pg fallback to memory
         if self._is_pg_mode() and self._pool_is_async():
             try:
                 async with self.pool.connection() as conn:  # type: ignore
@@ -198,8 +203,9 @@ class AsyncPostgresSaver:
                     async with self.pool.connection() as conn:  # type: ignore
                         async with conn.cursor() as cur:  # type: ignore
                             await cur.execute(DDL_CHECKPOINTS)
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    logger.warning("silent handled: offline-safe: checkpoint pg fallback to memory", exc_info=_exc)  # intentional: offline-safe: checkpoint pg fallback to memory
+                    pass  # intentional offline-safe: checkpoint pg fallback to memory
         self._setup_done = True
 
     # ---- internal PG ops ----
@@ -228,8 +234,9 @@ class AsyncPostgresSaver:
                             cur.execute(sql, (thread_id, ck_json, cfg_json))
                     try:
                         conn.commit()  # type: ignore
-                    except Exception:
-                        pass
+                    except Exception as _exc:
+                        logger.warning("silent handled: offline-safe: checkpoint pg fallback to memory", exc_info=_exc)  # intentional: offline-safe: checkpoint pg fallback to memory
+                        pass  # intentional offline-safe: checkpoint pg fallback to memory
             elif hasattr(self.pool, "getconn"):
                 conn = self.pool.getconn()  # type: ignore
                 try:
@@ -239,8 +246,9 @@ class AsyncPostgresSaver:
                 finally:
                     try:
                         self.pool.putconn(conn)  # type: ignore
-                    except Exception:
-                        pass
+                    except Exception as _exc:
+                        logger.warning("silent handled: offline-safe: checkpoint pg fallback to memory", exc_info=_exc)  # intentional: offline-safe: checkpoint pg fallback to memory
+                        pass  # intentional offline-safe: checkpoint pg fallback to memory
             else:
                 return False
             return True
@@ -295,16 +303,18 @@ class AsyncPostgresSaver:
                 finally:
                     try:
                         self.pool.putconn(conn)  # type: ignore
-                    except Exception:
-                        pass
+                    except Exception as _exc:
+                        logger.warning("silent handled: offline-safe: checkpoint pg fallback to memory", exc_info=_exc)  # intentional: offline-safe: checkpoint pg fallback to memory
+                        pass  # intentional offline-safe: checkpoint pg fallback to memory
             if row is None:
                 return None
             chk = row[0] if isinstance(row, (list, tuple)) else row.get("checkpoint")  # type: ignore
             if isinstance(chk, str):
                 try:
                     chk = json.loads(chk)
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    logger.warning("silent handled: offline-safe: checkpoint pg fallback to memory", exc_info=_exc)  # intentional: offline-safe: checkpoint pg fallback to memory
+                    pass  # intentional offline-safe: checkpoint pg fallback to memory
             return copy.deepcopy(chk) if isinstance(chk, dict) else chk  # type: ignore
         except Exception:
             return None
@@ -325,8 +335,9 @@ class AsyncPostgresSaver:
                     if isinstance(chk, str):
                         try:
                             chk = json.loads(chk)
-                        except Exception:
-                            pass
+                        except Exception as _exc:
+                            logger.warning("silent handled: offline-safe: checkpoint pg fallback to memory", exc_info=_exc)  # intentional: offline-safe: checkpoint pg fallback to memory
+                            pass  # intentional offline-safe: checkpoint pg fallback to memory
                     return copy.deepcopy(chk) if isinstance(chk, dict) else chk  # type: ignore
             else:
                 return self._pg_get_sync(thread_id)
@@ -415,17 +426,20 @@ class AsyncPostgresSaver:
                     if isinstance(chk, str):
                         try:
                             chk = json.loads(chk)
-                        except Exception:
-                            pass
+                        except Exception as _exc:
+                            logger.warning("silent handled: offline-safe: checkpoint pg fallback to memory", exc_info=_exc)  # intentional: offline-safe: checkpoint pg fallback to memory
+                            pass  # intentional offline-safe: checkpoint pg fallback to memory
                     if isinstance(cfg, str):
                         try:
                             cfg = json.loads(cfg)
-                        except Exception:
-                            pass
+                        except Exception as _exc:
+                            logger.warning("silent handled: offline-safe: checkpoint pg fallback to memory", exc_info=_exc)  # intentional: offline-safe: checkpoint pg fallback to memory
+                            pass  # intentional offline-safe: checkpoint pg fallback to memory
                     if chk is not None:
                         return copy.deepcopy(chk if isinstance(chk, dict) else {}), copy.deepcopy(cfg if isinstance(cfg, dict) else {})
-            except Exception:
-                pass
+            except Exception as _exc:
+                logger.warning("silent handled: offline-safe: checkpoint pg fallback to memory", exc_info=_exc)  # intentional: offline-safe: checkpoint pg fallback to memory
+                pass  # intentional offline-safe: checkpoint pg fallback to memory
         chk = self.get(thread_id)
         if chk is None:
             return None
@@ -449,10 +463,12 @@ class AsyncPostgresSaver:
                                 cur.execute(sql, (thread_id,))
                         try:
                             conn.commit()  # type: ignore
-                        except Exception:
-                            pass
-            except Exception:
-                pass
+                        except Exception as _exc:
+                            logger.warning("silent handled: offline-safe: checkpoint pg fallback to memory", exc_info=_exc)  # intentional: offline-safe: checkpoint pg fallback to memory
+                            pass  # intentional offline-safe: checkpoint pg fallback to memory
+            except Exception as _exc:
+                logger.warning("silent handled: offline-safe: checkpoint pg fallback to memory", exc_info=_exc)  # intentional: offline-safe: checkpoint pg fallback to memory
+                pass  # intentional offline-safe: checkpoint pg fallback to memory
 
     def list_thread_ids(self) -> list[str]:
         """列出未过期的 thread_id。"""
@@ -472,8 +488,9 @@ class AsyncPostgresSaver:
                                 rows = cur.fetchall()
                 if rows:
                     return [r[0] if isinstance(r, (list, tuple)) else str(r) for r in rows]
-            except Exception:
-                pass
+            except Exception as _exc:
+                logger.warning("silent handled: offline-safe: checkpoint pg fallback to memory", exc_info=_exc)  # intentional: offline-safe: checkpoint pg fallback to memory
+                pass  # intentional offline-safe: checkpoint pg fallback to memory
         # 内存路径：清理过期后再列出
         now = time.time()
         alive = []
@@ -507,6 +524,7 @@ def get_saver(dsn: str | None = None, ttl_seconds: int | None = None, **kwargs: 
     saver = AsyncPostgresSaver(eff_dsn, ttl_seconds=eff_ttl, **kwargs)
     try:
         saver.setup()
-    except Exception:
-        pass
+    except Exception as _exc:
+        logger.warning("silent handled: offline-safe: checkpoint pg fallback to memory", exc_info=_exc)  # intentional: offline-safe: checkpoint pg fallback to memory
+        pass  # intentional offline-safe: checkpoint pg fallback to memory
     return saver

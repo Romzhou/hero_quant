@@ -5,12 +5,14 @@
 关键设计：按 symbol 聚合净持仓（含买卖方向符号）、CSV 表头兼容多别名、重复 symbol 累加；以 tolerance 判定零差额，total_diff 为绝对差之和；文件入口同时校验 ledger 完整性并受 wall-time budget 约束。
 """
 from __future__ import annotations
+import logging
 
 import csv
 import json
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any, Dict, List
+logger = logging.getLogger("hero_quant.governance.reconcile")
 
 
 @dataclass
@@ -144,8 +146,9 @@ def aggregate_shadow(
                     if isinstance(tr, dict):
                         sym, q = _shadow_qty_from_trade(tr)
                         add(sym, q)
-        except Exception:
-            pass
+        except Exception as _exc:
+            logger.warning("silent handled: governance: reconcile wall-time observe best-effort", exc_info=_exc)  # intentional: governance: reconcile wall-time observe best-effort
+            pass  # intentional governance: reconcile wall-time observe best-effort
     elif ledger_path is not None:
         lp = Path(ledger_path)
         if lp.exists():
@@ -172,14 +175,16 @@ def aggregate_shadow(
                                     if Path(journal.ledger.path).resolve() == lp.resolve():
                                         # skip ledger aggregation, will keep journal only
                                         continue
-                                except Exception:
-                                    pass
+                                except Exception as _exc:
+                                    logger.warning("silent handled: governance: reconcile wall-time observe best-effort", exc_info=_exc)  # intentional: governance: reconcile wall-time observe best-effort
+                                    pass  # intentional governance: reconcile wall-time observe best-effort
                             add(sym, q)
                     elif "symbol" in rec and ("qty" in rec or "quantity" in rec):
                         sym, q = _shadow_qty_from_trade(rec)
                         add(sym, q)
-            except Exception:
-                pass
+            except Exception as _exc:
+                logger.warning("silent handled: governance: reconcile wall-time observe best-effort", exc_info=_exc)  # intentional: governance: reconcile wall-time observe best-effort
+                pass  # intentional governance: reconcile wall-time observe best-effort
 
     # 归一化：消除 -0.0 并保留净持仓符号
     cleaned: Dict[str, float] = {}
@@ -251,8 +256,9 @@ def reconcile_files(
                     from hero_quant.metrics import inc_wall_time_exceeded
 
                     inc_wall_time_exceeded("reconcile")
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    logger.warning("silent handled: governance: reconcile wall-time observe best-effort", exc_info=_exc)  # intentional: governance: reconcile wall-time observe best-effort
+                    pass  # intentional governance: reconcile wall-time observe best-effort
                 from hero_quant.governance.wall_time import WallTimeExceeded
 
                 raise WallTimeExceeded("reconcile", float(_budget), float(_elapsed))
@@ -267,8 +273,9 @@ def reconcile_files(
             from hero_quant.metrics import observe_wall_time
 
             observe_wall_time("reconcile", float(_elapsed), status=_status)
-        except Exception:
-            pass
+        except Exception as _exc:
+            logger.warning("silent handled: governance: reconcile wall-time observe best-effort", exc_info=_exc)  # intentional: governance: reconcile wall-time observe best-effort
+            pass  # intentional governance: reconcile wall-time observe best-effort
 
 
 def daily_reconciliation(
@@ -305,8 +312,9 @@ def daily_reconciliation(
                     from hero_quant.metrics import inc_wall_time_exceeded
 
                     inc_wall_time_exceeded("daily_reconciliation")
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    logger.warning("silent handled: governance: reconcile wall-time observe best-effort", exc_info=_exc)  # intentional: governance: reconcile wall-time observe best-effort
+                    pass  # intentional governance: reconcile wall-time observe best-effort
                 from hero_quant.governance.wall_time import WallTimeExceeded
 
                 raise WallTimeExceeded("daily_reconciliation", float(_budget), float(_elapsed))
@@ -320,14 +328,16 @@ def daily_reconciliation(
             from hero_quant.metrics import observe_wall_time
 
             observe_wall_time("daily_reconciliation", float(_elapsed), status=_status)
-        except Exception:
-            pass
+        except Exception as _exc:
+            logger.warning("silent handled: governance: reconcile wall-time observe best-effort", exc_info=_exc)  # intentional: governance: reconcile wall-time observe best-effort
+            pass  # intentional governance: reconcile wall-time observe best-effort
     # capture result already computed (need to handle exception case above)
     # if we reached here, result is available
     try:
         pass
-    except Exception:
-        pass
+    except Exception as _exc:
+        logger.warning("silent handled: governance: reconcile wall-time observe best-effort", exc_info=_exc)  # intentional: governance: reconcile wall-time observe best-effort
+        pass  # intentional governance: reconcile wall-time observe best-effort
     # optional ledger verify
     verified = None
     try:

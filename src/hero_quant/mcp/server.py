@@ -6,11 +6,13 @@
 """
 
 from __future__ import annotations
+import logging
 
 import importlib
 from typing import Any, Dict, List
 
 from hero_quant.tools.registry import TOOL_REGISTRY, get_definitions, tool
+logger = logging.getLogger("hero_quant.mcp.server")
 
 # 确保核心工具已加载，使 TOOL_REGISTRY 完整
 for _mod in (
@@ -20,8 +22,9 @@ for _mod in (
 ):
     try:
         importlib.import_module(_mod)
-    except Exception:
-        pass
+    except Exception as _exc:
+        logger.debug("silent handled: offline-safe: mcp server optional", exc_info=_exc)  # intentional: offline-safe: mcp server optional
+        pass  # intentional offline-safe: mcp server optional
 
 # 补充 3 个只读期权工具以凑齐 20 个精选
 if "get_option_price" not in TOOL_REGISTRY:
@@ -197,8 +200,9 @@ class MCPServer:
                         self._fastmcp.tool()(spec.func)  # type: ignore
                     elif hasattr(self._fastmcp, "add_tool"):
                         self._fastmcp.add_tool(spec.func)  # type: ignore
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    logger.debug("silent handled: offline-safe: mcp server optional", exc_info=_exc)  # intentional: offline-safe: mcp server optional
+                    pass  # intentional offline-safe: mcp server optional
         except Exception:
             self._fastmcp = None
 

@@ -140,24 +140,25 @@ class AKShareLoader:
             from hero_quant.config.settings import Settings
 
             mode = Settings().data_mode
-        except Exception:
+        except Exception as e:
+            logger.warning("settings load failed for %s: %s", symbol, e, exc_info=e)
             import os
 
-            mode = os.environ.get("HERO_DATA_MODE", "synthetic")
+            mode = os.environ.get("HERO_DATA_MODE", "live")
         if isinstance(mode, str):
             mode = mode.strip().lower()
         else:
-            mode = "synthetic"
+            mode = "live"
         if mode == "synthetic":
             return self._synthetic_df(symbol, start, end)
 
-        # live 模式：尝试 akshare 真实拉取，失败回退合成
+        # live 模式：真实拉取，失败抛出（禁止静默回退合成）
 
         try:
             import akshare as ak  # type: ignore
         except ImportError as e:
-            logger.warning("akshare not installed for %s: %s - fallback synthetic", symbol, e)
-            return self._synthetic_df(symbol, start, end)
+            logger.warning("akshare not installed for %s: %s", symbol, e, exc_info=e)
+            raise ImportError("pip install hero-quant[ashare] - akshare not installed") from e
 
         try:
             code = symbol.split(".")[0]
@@ -179,18 +180,20 @@ class AKShareLoader:
                 try:
                     df_ak = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=start_n, end_date=end_n, adjust="qfq")
                 except Exception as e:
-                    logger.warning("akshare stock_zh_a_hist failed for %s: %s", symbol, e)
+                    logger.warning("akshare stock_zh_a_hist failed for %s: %s", symbol, e, exc_info=e)
                     df_ak = None
             except Exception as e:
-                logger.warning("akshare stock_zh_a_hist failed for %s: %s", symbol, e)
+                logger.warning("akshare stock_zh_a_hist failed for %s: %s", symbol, e, exc_info=e)
                 df_ak = None
             normalized = self._normalize_akshare(df_ak) if df_ak is not None else None
             if normalized is not None and len(normalized) > 0:
                 return normalized
-            raise ValueError("no bars parsed, fallback")
+            raise ValueError("no bars parsed")
         except ValueError as e:
-            logger.warning("akshare parse failed for %s: %s - fallback synthetic", symbol, e)
-            return self._synthetic_df(symbol, start, end)
+            logger.warning("akshare parse failed for %s: %s", symbol, e, exc_info=e)
+            raise RuntimeError(f"akshare fetch failed for {symbol}: {e}") from e
+        except ImportError:
+            raise
         except Exception as e:
-            logger.warning("akshare error for %s: %s - fallback synthetic", symbol, e)
-            return self._synthetic_df(symbol, start, end)
+            logger.warning("akshare error for %s: %s", symbol, e, exc_info=e)
+            raise RuntimeError(f"akshare fetch failed for {symbol}: {e}") from e

@@ -6,9 +6,11 @@
 """
 
 from __future__ import annotations
+import logging
 
 import collections
 import time
+logger = logging.getLogger("hero_quant.telemetry.circuit")
 
 # 熔断状态指标（Prometheus Gauge 可选，未安装时静默）
 try:
@@ -65,8 +67,9 @@ class CircuitBreaker:
         self._mutex = threading.Lock()
         try:
             self._sync_gauge()
-        except Exception:
-            pass
+        except Exception as _exc:
+            logger.debug("silent handled: offline-safe: telemetry gauge/circuit optional", exc_info=_exc)  # intentional: offline-safe: telemetry gauge/circuit optional
+            pass  # intentional offline-safe: telemetry gauge/circuit optional
 
     def _sync_gauge(self) -> None:
         """同步 Prometheus 指标与当前状态（离线安全）。"""
@@ -77,8 +80,9 @@ class CircuitBreaker:
             # 通过 state 属性触发 OPEN→HALF_OPEN 的时效转换
             cur = self.state  # triggers OPEN->HALF_OPEN if due
             CIRCUIT_STATE_GAUGE.set(mapping.get(cur, 0))
-        except Exception:
-            pass
+        except Exception as _exc:
+            logger.debug("silent handled: offline-safe: telemetry gauge/circuit optional", exc_info=_exc)  # intentional: offline-safe: telemetry gauge/circuit optional
+            pass  # intentional offline-safe: telemetry gauge/circuit optional
 
     @property
     def state(self) -> str:

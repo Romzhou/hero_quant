@@ -89,8 +89,9 @@ class MemoryLifecycle:
 
             mh = MemoryHierarchy(base)
             return mh.scan_all()
-        except Exception:
-            pass
+        except Exception as _exc:
+            logger.debug("silent handled: offline-safe: lifecycle optional", exc_info=_exc)  # intentional: offline-safe: lifecycle optional
+            pass  # intentional offline-safe: lifecycle optional
         # 回退：递归扫描并过滤系统/归档文件
         results: list[Path] = []
         if base.is_dir():
@@ -162,8 +163,9 @@ class MemoryLifecycle:
                             pass
                     if line.strip() == "---":
                         break
-        except Exception:
-            pass
+        except Exception as _exc:
+            logger.debug("silent handled: offline-safe: lifecycle optional", exc_info=_exc)  # intentional: offline-safe: lifecycle optional
+            pass  # intentional offline-safe: lifecycle optional
         return qs, ac, last
 
     def run_gc(self, dry_run: bool = True) -> list[dict]:
@@ -228,14 +230,16 @@ class MemoryLifecycle:
 
                     MemoryHierarchy(self.memory_dir)
                     # 归档后保留 SQLite 行，搜索回退仍可见，仅文件态视为已回收
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    logger.debug("silent handled: offline-safe: lifecycle optional", exc_info=_exc)  # intentional: offline-safe: lifecycle optional
+                    pass  # intentional offline-safe: lifecycle optional
             elif action == "delete":
                 dest = archive_dir / file_path.name
                 try:
                     dest.write_text(file_path.read_text(encoding="utf-8"), encoding="utf-8")
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    logger.debug("silent handled: offline-safe: lifecycle optional", exc_info=_exc)  # intentional: offline-safe: lifecycle optional
+                    pass  # intentional offline-safe: lifecycle optional
                 file_path.unlink()
         except (OSError, IOError) as exc:
             logger.warning("GC action(%s, %s) failed: %s", file_path.name, action, exc)

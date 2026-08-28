@@ -6,12 +6,14 @@
 """
 
 from __future__ import annotations
+import logging
 
 import asyncio
 import contextvars
 import threading
 import time
 from typing import Any, Dict, Optional
+logger = logging.getLogger("hero_quant.checkpoint.temporal")
 
 HEARTBEAT_INTERVAL_SECONDS = 15
 HEARTBEAT_INTERVAL = HEARTBEAT_INTERVAL_SECONDS  # 兼容别名
@@ -48,8 +50,9 @@ def heartbeat(details: Dict[str, Any] | Any = None) -> None:
     # ContextVar + thread-local 双写，保证跨线程/协程可见
     try:
         _heartbeat_details_ctx.set(payload)
-    except Exception:
-        pass
+    except Exception as _exc:
+        logger.debug("silent handled: offline-safe: temporal sidecar optional", exc_info=_exc)  # intentional: offline-safe: temporal sidecar optional
+        pass  # intentional offline-safe: temporal sidecar optional
     _set_thread_details(payload)
 
     # 真实 Temporal 分支 — 若在 Activity 上下文中则透传，否则静默忽略
@@ -58,8 +61,9 @@ def heartbeat(details: Dict[str, Any] | Any = None) -> None:
 
         # 仅在 activity 环境中有效，否则抛 RuntimeError，忽略
         temporal_activity.heartbeat(payload)  # type: ignore
-    except Exception:
-        pass
+    except Exception as _exc:
+        logger.debug("silent handled: offline-safe: temporal sidecar optional", exc_info=_exc)  # intentional: offline-safe: temporal sidecar optional
+        pass  # intentional offline-safe: temporal sidecar optional
 
 
 def get_heartbeat_details() -> Optional[Dict[str, Any]]:
@@ -69,8 +73,9 @@ def get_heartbeat_details() -> Optional[Dict[str, Any]]:
         ctx_val = _heartbeat_details_ctx.get()
         if ctx_val is not None:
             return dict(ctx_val)
-    except Exception:
-        pass
+    except Exception as _exc:
+        logger.debug("silent handled: offline-safe: temporal sidecar optional", exc_info=_exc)  # intentional: offline-safe: temporal sidecar optional
+        pass  # intentional offline-safe: temporal sidecar optional
     thread_val = _get_thread_details()
     if thread_val is not None:
         return dict(thread_val)
@@ -89,8 +94,9 @@ def get_heartbeat_details() -> Optional[Dict[str, Any]]:
                 return {"value": first}
             if isinstance(details, dict):
                 return dict(details)
-    except Exception:
-        pass
+    except Exception as _exc:
+        logger.debug("silent handled: offline-safe: temporal sidecar optional", exc_info=_exc)  # intentional: offline-safe: temporal sidecar optional
+        pass  # intentional offline-safe: temporal sidecar optional
     return None
 
 
@@ -120,8 +126,9 @@ class HeartbeatHelper:
         while not self._stop.wait(self.interval):
             try:
                 heartbeat(self._details)
-            except Exception:
-                pass
+            except Exception as _exc:
+                logger.debug("silent handled: offline-safe: temporal sidecar optional", exc_info=_exc)  # intentional: offline-safe: temporal sidecar optional
+                pass  # intentional offline-safe: temporal sidecar optional
 
     def heartbeat(self, details: Dict[str, Any] | Any) -> None:
         """手动上报一次心跳并更新本地缓存。"""
@@ -161,8 +168,9 @@ class HeartbeatHelper:
             await asyncio.sleep(self.interval)
             try:
                 heartbeat(self._details)
-            except Exception:
-                pass
+            except Exception as _exc:
+                logger.debug("silent handled: offline-safe: temporal sidecar optional", exc_info=_exc)  # intentional: offline-safe: temporal sidecar optional
+                pass  # intentional offline-safe: temporal sidecar optional
 
     async def astop(self) -> None:
         """异步停止 — 取消异步任务并回收线程。"""
@@ -170,15 +178,17 @@ class HeartbeatHelper:
         if self._async_task is not None:
             try:
                 self._async_task.cancel()
-            except Exception:
-                pass
+            except Exception as _exc:
+                logger.debug("silent handled: offline-safe: temporal sidecar optional", exc_info=_exc)  # intentional: offline-safe: temporal sidecar optional
+                pass  # intentional offline-safe: temporal sidecar optional
 
 
 # 兼容别名 — 历史导入 `HeartbeatTimer` 指向 HeartbeatHelper
 try:
     HeartbeatTimer = HeartbeatHelper  # type: ignore
-except Exception:
-    pass
+except Exception as _exc:
+    logger.debug("silent handled: offline-safe: temporal sidecar optional", exc_info=_exc)  # intentional: offline-safe: temporal sidecar optional
+    pass  # intentional offline-safe: temporal sidecar optional
 
 
 __all__ = [

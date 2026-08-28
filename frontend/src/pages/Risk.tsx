@@ -53,7 +53,10 @@ export default function Risk() {
         </div>
 
         <div className="rounded-2xl border border-white/10 bg-white/[0.04] p-4">
-          <h2 className="text-sm font-semibold text-mist">归因 · 5类 coverage&gt;0</h2>
+          <div className="flex items-center justify-between">
+            <h2 className="text-sm font-semibold text-mist">归因 · 5类 coverage&gt;0</h2>
+            <a href="/research" className="rounded-full bg-white/5 px-2.5 py-1 text-[11px] text-slate-300 hover:bg-white/10">查看研究 → tearsheet</a>
+          </div>
           <div className="mt-3 grid grid-cols-3 gap-2 text-xs">
             {[
               { k: "择时", v: "+1.2%" },
@@ -73,10 +76,14 @@ export default function Risk() {
       </div>
 
       <div className="mt-4 rounded-2xl border border-amber-400/20 bg-amber-400/10 p-4">
-        <div className="text-xs font-semibold tracking-widest text-amber-300">审计</div>
+        <div className="flex items-center justify-between">
+          <div className="text-xs font-semibold tracking-widest text-amber-300">审计 · 可追溯</div>
+          <a href="/research" className="rounded-full bg-white px-2.5 py-1 text-xs font-semibold text-amber-700 hover:bg-white/90">打开研究页 ↗</a>
+        </div>
         <p className="mt-2 text-sm leading-6 text-amber-100/90">
-          所有风控决策写入 ledger.verify() · 证据链可追溯；超阈值自动走 compensate 分支并记录 trace。
+          每笔风控决策均可回溯验证，超阈值自动进入备用路径并记录全链路。
         </p>
+        <p className="mt-1 font-mono text-xs text-amber-200/60">ledger.verify() · trace.jsonl</p>
       </div>
     </div>
   )

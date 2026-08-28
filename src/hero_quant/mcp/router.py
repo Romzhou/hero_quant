@@ -6,6 +6,7 @@
 """
 
 from __future__ import annotations
+import logging
 
 import math
 import os
@@ -20,6 +21,7 @@ except Exception:
     CURATED_TOOLS = None  # 惰性回退
 
 from hero_quant.tools.registry import TOOL_REGISTRY
+logger = logging.getLogger("hero_quant.mcp.router")
 
 # 双桶限流与熔断组件（惰性导入，避免循环依赖）
 _ROUTER_RATE_LIMITER = None  # type: ignore
@@ -122,8 +124,9 @@ def _try_acquire_or_record() -> bool:
                 if circ is not None:
                     # 轻量记录，不进慢桶，仅计数
                     pass
-            except Exception:
-                pass
+            except Exception as _exc:
+                logger.debug("silent handled: offline-safe: mcp router fallback", exc_info=_exc)  # intentional: offline-safe: mcp router fallback
+                pass  # intentional offline-safe: mcp router fallback
             return False
         return True
     except Exception:
@@ -156,8 +159,9 @@ def _ensure_corpus() -> None:
     # 确保工具已加载
     try:
         import hero_quant.mcp.server  # noqa: F401
-    except Exception:
-        pass
+    except Exception as _exc:
+        logger.debug("silent handled: offline-safe: mcp router fallback", exc_info=_exc)  # intentional: offline-safe: mcp router fallback
+        pass  # intentional offline-safe: mcp router fallback
     size = len(TOOL_REGISTRY)
     if size == _last_registry_size and _N != 0:
         return
@@ -306,8 +310,9 @@ def get_router_vector_backend() -> str:
             sc = PgVectorSidecar()
             if getattr(sc, "_enabled", False):
                 return "pgvector"
-        except Exception:
-            pass
+        except Exception as _exc:
+            logger.debug("silent handled: offline-safe: mcp router fallback", exc_info=_exc)  # intentional: offline-safe: mcp router fallback
+            pass  # intentional offline-safe: mcp router fallback
         return "pgvector"
     return "local"
 
@@ -360,13 +365,15 @@ def route(query: str, k: int = 5) -> List[str]:
             # 熔断时短路返回 curated 前 k，保证可用性
             curated = CURATED_TOOLS if isinstance(CURATED_TOOLS, list) and len(CURATED_TOOLS) else sorted(TOOL_REGISTRY.keys())
             return [n for n in curated if n in TOOL_REGISTRY][:k]
-    except Exception:
-        pass
+    except Exception as _exc:
+        logger.debug("silent handled: offline-safe: mcp router fallback", exc_info=_exc)  # intentional: offline-safe: mcp router fallback
+        pass  # intentional offline-safe: mcp router fallback
     # 确保工具已加载
     try:
         import hero_quant.mcp.server  # noqa: F401
-    except Exception:
-        pass
+    except Exception as _exc:
+        logger.debug("silent handled: offline-safe: mcp router fallback", exc_info=_exc)  # intentional: offline-safe: mcp router fallback
+        pass  # intentional offline-safe: mcp router fallback
     _ensure_corpus()
     # curated 候选集回退
     curated = CURATED_TOOLS if isinstance(CURATED_TOOLS, list) and len(CURATED_TOOLS) else sorted(TOOL_REGISTRY.keys())

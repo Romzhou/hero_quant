@@ -34,7 +34,7 @@ function Shell() {
               <div className="font-serif text-sm font-extrabold tracking-wide text-mist">真英雄量化</div>
               <div className="font-mono text-[10px] tracking-[0.18em] text-slate-400">HERO QUANT</div>
             </div>
-            <span className="ml-2 hidden rounded-full border border-white/10 bg-white/5 px-2.5 py-1 text-xs text-slate-300 md:inline">0.2.0 · slim</span>
+            <span className="ml-2 hidden items-center gap-1.5 rounded-full border border-white/10 bg-white/5 px-2.5 py-1 text-xs text-slate-300 md:inline-flex"><span className="h-1.5 w-1.5 rounded-full bg-emerald-400 animate-pulse shadow-[0_0_6px_rgba(52,211,153,0.8)]" />0.2.0 · demo-ready</span>
           </div>
 
           <nav aria-label="Primary" className="flex max-w-[60vw] items-center gap-1 overflow-x-auto rounded-2xl border border-white/10 bg-white/[0.04] p-1 backdrop-blur scrollbar-none md:max-w-none">
@@ -54,8 +54,8 @@ function Shell() {
       </header>
 
       <main className="mx-auto max-w-7xl min-h-[calc(100vh-64px)]">
-        {/* 懒加载兜底：页面分包加载时的轻量占位，避免白屏 */}
-        <Suspense fallback={<div className="p-8 text-sm text-slate-400">加载中…</div>}>
+        {/* 懒加载兜底：居中骨架 + 脉冲，避免白屏 */}
+        <Suspense fallback={<div className="p-8"><div className="mx-auto max-w-3xl rounded-2xl border border-white/10 bg-white/[0.03] p-6 animate-pulse"><div className="h-4 w-28 rounded bg-white/10" /><div className="mt-4 h-24 rounded-xl bg-white/5" /><div className="mt-3 h-3 w-1/2 rounded bg-white/5" /></div><p className="mt-3 text-center text-xs text-slate-500">加载中…</p></div>}>
           <Routes>
             <Route path="/" element={<Navigate to="/dashboard" replace />} />
             <Route path="/dashboard" element={<Dashboard />} />
@@ -71,7 +71,7 @@ function Shell() {
       </main>
 
       <footer className="border-t border-white/5 py-4 text-center text-xs text-slate-500">
-        证据优先 · 可追溯 · 不构成投资建议 — hero-quant
+        证据优先 · PIT 已校验 · Kepler — 不构成投资建议
       </footer>
     </div>
   )

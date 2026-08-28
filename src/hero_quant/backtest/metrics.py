@@ -62,7 +62,10 @@ def annual_return(equity: pd.Series, periods: int = 252) -> float:
     # CAGR 年化
     try:
         ann = (end / start) ** (periods / n) - 1
-    except Exception:
+    except (ValueError, TypeError, ZeroDivisionError, OverflowError) as e:
+        import logging
+
+        logging.getLogger(__name__).warning("annual_return computation failed: %s", e)
         ann = 0.0
     if np.isnan(ann) or np.isinf(ann):
         return 0.0
@@ -70,7 +73,13 @@ def annual_return(equity: pd.Series, periods: int = 252) -> float:
 
 
 def turnover(positions: pd.DataFrame | pd.Series | None = None, weights=None) -> float:
-    """换手率估计：有持仓时取日均绝对变动，否则为 0。"""
+    """换手率估计：有持仓时取日均绝对变动，否则为 0。
+
+    多资产场景下，对每行各标的绝对变动求和后取均值，即真实换手。
+    """
+    import logging
+
+    logger = logging.getLogger(__name__)
     if positions is not None:
         try:
             if isinstance(positions, pd.DataFrame):
@@ -82,7 +91,8 @@ def turnover(positions: pd.DataFrame | pd.Series | None = None, weights=None) ->
                 diff = positions.diff().abs().dropna()
                 if not diff.empty:
                     return float(diff.mean())
-        except Exception:
+        except (ValueError, TypeError, AttributeError) as e:
+            logger.warning("turnover computation failed: %s", e)
             return 0.0
     # 无持仓时的权重回落：稳定权重视为低换手
     if weights is not None:
@@ -90,13 +100,17 @@ def turnover(positions: pd.DataFrame | pd.Series | None = None, weights=None) ->
             _w = np.asarray(weights, dtype=float)
             # 日频再平衡代理，暂视为 0 换手
             return 0.0
-        except Exception:
+        except (ValueError, TypeError) as e:
+            logger.warning("turnover weights fallback failed: %s", e)
             return 0.0
     return 0.0
 
 
 def compute_metrics(equity_series: pd.Series | pd.DataFrame, costs: float = 0.0, positions=None, weights=None) -> dict:
     """汇总常规回测指标：sharpe/annual_return/max_drawdown/turnover/volatility/cumulative_return。"""
+    import logging
+
+    logger = logging.getLogger(__name__)
     # 归一化为 Series
     if isinstance(equity_series, pd.DataFrame):
         # 优先 equity 列，否则取首列
@@ -110,7 +124,11 @@ def compute_metrics(equity_series: pd.Series | pd.DataFrame, costs: float = 0.0,
     s = pd.Series(s) if not isinstance(s, pd.Series) else s
 
     # 数值化并剔除缺失，空序列直接回落零指标
-    s = pd.to_numeric(s, errors="coerce").dropna()
+    try:
+        s = pd.to_numeric(s, errors="coerce").dropna()
+    except (ValueError, TypeError, AttributeError) as e:
+        logger.warning("equity to_numeric failed: %s", e)
+        s = pd.Series(dtype=float)
     if s.empty:
         return {
             "sharpe": 0.0,
@@ -127,9 +145,14 @@ def compute_metrics(equity_series: pd.Series | pd.DataFrame, costs: float = 0.0,
     to = turnover(positions, weights)
 
     # 年化波动率与累计收益
-    ret = s.pct_change().dropna()
-    vol = float(ret.std(ddof=1) * np.sqrt(252)) if not ret.empty and ret.std(ddof=1) != 0 else 0.0  # 252 交易日年化
-    cum_ret = float(s.iloc[-1] / s.iloc[0] - 1) if s.iloc[0] != 0 else 0.0
+    try:
+        ret = s.pct_change().dropna()
+        vol = float(ret.std(ddof=1) * np.sqrt(252)) if not ret.empty and ret.std(ddof=1) != 0 else 0.0  # 252 交易日年化
+        cum_ret = float(s.iloc[-1] / s.iloc[0] - 1) if s.iloc[0] != 0 else 0.0
+    except (ValueError, TypeError, AttributeError, ZeroDivisionError) as e:
+        logger.warning("compute_metrics ret/vol failed: %s", e)
+        vol = 0.0
+        cum_ret = 0.0
 
     return {
         "sharpe": sr,

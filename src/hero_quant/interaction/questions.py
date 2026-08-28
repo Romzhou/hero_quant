@@ -5,9 +5,11 @@
 """
 
 from __future__ import annotations
+import logging
 
 from dataclasses import dataclass, field
 from typing import Any
+logger = logging.getLogger("hero_quant.interaction.questions")
 
 
 class AskCardInterrupt(Exception):
@@ -104,8 +106,9 @@ class UserQuestionService:
 
                     if asyncio.iscoroutine(res):
                         return asyncio.run(res)
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    logger.debug("silent handled: interaction optional", exc_info=_exc)  # intentional: interaction optional
+                    pass  # intentional interaction optional
                 return res
             raise RuntimeError("NO_PROVIDER: provider missing ask method")
         except Exception as e:

@@ -102,19 +102,20 @@ class CCXTLoader:
         }
 
     def get_bars(self, symbol: str, start: str, end: str, interval: str = "1d") -> pd.DataFrame:
-        """拉取行情，遵循 HERO_DATA_MODE 门控；live 下经 ccxt 拉取，失败回退合成。"""
+        """拉取行情，遵循 HERO_DATA_MODE 门控；live 下经 ccxt 拉取，失败抛出（禁止回退）。"""
         try:
             from hero_quant.config.settings import Settings
 
             mode = Settings().data_mode
-        except Exception:
+        except Exception as e:
+            logger.warning("settings load failed for %s: %s", symbol, e, exc_info=e)
             import os
 
-            mode = os.environ.get("HERO_DATA_MODE", "synthetic")
+            mode = os.environ.get("HERO_DATA_MODE", "live")
         if isinstance(mode, str):
             mode = mode.strip().lower()
         else:
-            mode = "synthetic"
+            mode = "live"
         if mode == "synthetic":
             return self._synthetic_df(symbol, start, end)
 
@@ -122,8 +123,8 @@ class CCXTLoader:
         try:
             import ccxt  # type: ignore
         except ImportError as e:
-            logger.warning("ccxt not installed for %s: %s - fallback synthetic", symbol, e)
-            return self._synthetic_df(symbol, start, end)
+            logger.warning("ccxt not installed for %s: %s", symbol, e, exc_info=e)
+            raise ImportError("pip install hero-quant[crypto] - ccxt not installed") from e
 
         timeframe = _TIMEFRAME_MAP.get(interval, interval)
         try:
@@ -150,7 +151,7 @@ class CCXTLoader:
             exchange = ccxt.binance()
             ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, since=since, limit=limit)
             if not ohlcv:
-                raise ValueError("empty ohlcv, fallback")
+                raise ValueError("empty ohlcv")
             # ohlcv: [timestamp, open, high, low, close, volume]
             rows = []
             idx = []
@@ -159,18 +160,21 @@ class CCXTLoader:
                     ts, o, h, lo, c, v = candle[:6]
                     idx.append(pd.to_datetime(ts, unit="ms"))
                     rows.append((float(o), float(h), float(lo), float(c), float(v)))
-                except Exception:
+                except Exception as e:
+                    logger.warning("ccxt candle parse skip for %s: %s", symbol, e, exc_info=e)
                     continue
             if not rows:
-                raise ValueError("no rows parsed, fallback")
+                raise ValueError("no rows parsed")
             df = pd.DataFrame(rows, columns=["open", "high", "low", "close", "volume"], index=pd.Index(idx))
             df = df[["open", "high", "low", "close", "volume"]]
             if len(df) == 0:
-                raise ValueError("empty df, fallback")
+                raise ValueError("empty df")
             return df
         except ValueError as e:
-            logger.warning("ccxt parse failed for %s: %s - fallback synthetic", symbol, e)
-            return self._synthetic_df(symbol, start, end)
+            logger.warning("ccxt parse failed for %s: %s", symbol, e, exc_info=e)
+            raise RuntimeError(f"ccxt fetch failed for {symbol}: {e}") from e
+        except ImportError:
+            raise
         except Exception as e:
-            logger.warning("ccxt error for %s: %s - fallback synthetic", symbol, e)
-            return self._synthetic_df(symbol, start, end)
+            logger.warning("ccxt error for %s: %s", symbol, e, exc_info=e)
+            raise RuntimeError(f"ccxt fetch failed for {symbol}: {e}") from e
