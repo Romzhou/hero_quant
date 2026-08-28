@@ -30,11 +30,18 @@ class ReconcileResult:
 
 
 def _normalize_qty(value: Any) -> float:
-    """数量归一化：非数值按 0 处理，避免脏数据中断对账。"""
+    """数量归一化：空值/非数值抛 ValueError 并 warning，避免脏数据静默。"""
+    if value is None:
+        logger.warning("invalid qty: empty None")
+        raise ValueError("qty is empty")
+    if isinstance(value, str) and not value.strip():
+        logger.warning("invalid qty: empty string %r", value)
+        raise ValueError("qty is empty")
     try:
         return float(value)
-    except Exception:
-        return 0.0
+    except (ValueError, TypeError) as exc:
+        logger.warning("invalid qty value %r: %s", value, exc)
+        raise ValueError(f"invalid qty: {value!r}") from exc
 
 
 def load_positions_csv(path: str | Path) -> Dict[str, float]:
@@ -88,8 +95,7 @@ def _shadow_qty_from_trade(trade: Dict[str, Any]) -> tuple[str, float]:
     side = str(trade.get("side", "buy")).lower()
     if side in ("sell", "short", "ask"):
         # 卖出以负数计入净持仓，便于与券商净持仓直接比对
-        q = -abs(q) if q > 0 else q
-        pass
+        q = -abs(q)
     return sym, q
 
 
@@ -106,18 +112,19 @@ def aggregate_shadow(
             return
         out[sym] = out.get(sym, 0) + float(q)
 
+    records: List[Dict[str, Any]] = []
     # 来自内存 journal：兼容 records 属性/_records/list/dict 多形态
     if journal is not None:
-        records = []
         if hasattr(journal, "records"):
             try:
                 records = list(journal.records)  # property
-            except Exception:
-                records = getattr(journal, "_records", [])
+            except (AttributeError, TypeError, ValueError) as exc:
+                logger.warning("journal records fallback: %s", exc)
+                records = list(getattr(journal, "_records", []))
         elif hasattr(journal, "_records"):
             records = list(getattr(journal, "_records", []))
         elif isinstance(journal, list):
-            records = journal
+            records = journal  # type: ignore[assignment]
         elif isinstance(journal, dict):
             records = [journal]
         for tr in records:
@@ -125,32 +132,41 @@ def aggregate_shadow(
                 sym, q = _shadow_qty_from_trade(tr)
                 add(sym, q)
 
+    # 预计算去重标记：journal 与 ledger 是否同源
+    same_ledger = journal is not None and ledger is not None and getattr(journal, "ledger", None) is ledger
+    same_file = False
+    lp: Path | None = None
+    if ledger_path is not None:
+        lp = Path(ledger_path)
+        if journal is not None and hasattr(journal, "ledger") and getattr(journal.ledger, "path", None) is not None:
+            try:
+                same_file = Path(journal.ledger.path).resolve() == lp.resolve()  # type: ignore[union-attr]
+            except (OSError, ValueError, RuntimeError) as exc:
+                logger.warning("same_file resolve failed: %s", exc)
+                same_file = False
+
     # 来自 Ledger 对象：解析 shadow_record/trade 与直接 symbol 记录
     if ledger is not None and hasattr(ledger, "_read_all"):
-        try:
-            entries = ledger._read_all()
-            for e in entries:
-                rec = e.get("record", {})
-                if rec.get("action") == "shadow_record":
-                    trade = rec.get("trade", {})
-                    if isinstance(trade, dict):
-                        sym, q = _shadow_qty_from_trade(trade)
+        if same_ledger:
+            # 已通过 journal 计数，跳过 ledger 避免双计
+            pass
+        else:
+            try:
+                entries = ledger._read_all()
+                for e in entries:
+                    rec = e.get("record", {}) if isinstance(e, dict) else {}
+                    if rec.get("action") == "shadow_record":
+                        trade = rec.get("trade", {})
+                        if isinstance(trade, dict):
+                            sym, q = _shadow_qty_from_trade(trade)
+                            add(sym, q)
+                    elif "symbol" in rec and ("qty" in rec or "quantity" in rec):
+                        sym, q = _shadow_qty_from_trade(rec)
                         add(sym, q)
-                elif "symbol" in rec and ("qty" in rec or "quantity" in rec):
-                    sym, q = _shadow_qty_from_trade(rec)
-                    add(sym, q)
-            # 去重：journal 与 Ledger 为同一实例时已重复计数，需回退到仅 journal
-            if journal is not None and getattr(journal, "ledger", None) is ledger:
-                out = {}
-                for tr in records:
-                    if isinstance(tr, dict):
-                        sym, q = _shadow_qty_from_trade(tr)
-                        add(sym, q)
-        except Exception as _exc:
-            logger.warning("silent handled: governance: reconcile wall-time observe best-effort", exc_info=_exc)  # intentional: governance: reconcile wall-time observe best-effort
-            pass  # intentional governance: reconcile wall-time observe best-effort
-    elif ledger_path is not None:
-        lp = Path(ledger_path)
+            except Exception as exc:
+                logger.warning("ledger _read_all failed: %s", exc, exc_info=exc)
+                raise
+    elif lp is not None:
         if lp.exists():
             try:
                 text = lp.read_text(encoding="utf-8")
@@ -160,31 +176,24 @@ def aggregate_shadow(
                         continue
                     try:
                         e = json.loads(line)
-                    except Exception:
+                    except (json.JSONDecodeError, ValueError):
                         continue
-                    rec = e.get("record", {})
+                    rec = e.get("record", {}) if isinstance(e, dict) else {}
                     if rec.get("action") == "shadow_record":
+                        if same_file:
+                            continue
                         trade = rec.get("trade", {})
                         if isinstance(trade, dict):
                             sym, q = _shadow_qty_from_trade(trade)
-                            # if journal already counted same trade via ledger file, avoid double
-                            # When journal was aggregated already, and ledger_path is same file as journal.ledger.path,
-                            # we would double. Check path equality
-                            if journal is not None and hasattr(journal, "ledger") and getattr(journal.ledger, "path", None) is not None:
-                                try:
-                                    if Path(journal.ledger.path).resolve() == lp.resolve():
-                                        # skip ledger aggregation, will keep journal only
-                                        continue
-                                except Exception as _exc:
-                                    logger.warning("silent handled: governance: reconcile wall-time observe best-effort", exc_info=_exc)  # intentional: governance: reconcile wall-time observe best-effort
-                                    pass  # intentional governance: reconcile wall-time observe best-effort
                             add(sym, q)
                     elif "symbol" in rec and ("qty" in rec or "quantity" in rec):
+                        if same_file:
+                            continue
                         sym, q = _shadow_qty_from_trade(rec)
                         add(sym, q)
-            except Exception as _exc:
-                logger.warning("silent handled: governance: reconcile wall-time observe best-effort", exc_info=_exc)  # intentional: governance: reconcile wall-time observe best-effort
-                pass  # intentional governance: reconcile wall-time observe best-effort
+            except Exception as exc:
+                logger.warning("ledger_path read failed: %s", exc, exc_info=exc)
+                raise
 
     # 归一化：消除 -0.0 并保留净持仓符号
     cleaned: Dict[str, float] = {}
@@ -291,9 +300,11 @@ def daily_reconciliation(
 
     _start = _t.monotonic()
     _status = "success"
+    result: ReconcileResult | None = None
     try:
-        result = reconcile_files(ledger_path, positions_csv, tolerance=tolerance, journal=journal, wall_time_budget=wall_time_budget)
-        # check budget
+        # 单次 budget：不在此处双重委托给 reconcile_files，避免双 observe/双计数
+        result = reconcile_files(ledger_path, positions_csv, tolerance=tolerance, journal=journal, wall_time_budget=None)
+        # check budget once here
         _budget = wall_time_budget
         if _budget is None:
             import os as _os2
@@ -302,7 +313,7 @@ def daily_reconciliation(
             if raw:
                 try:
                     _budget = float(raw)
-                except Exception:
+                except (ValueError, TypeError):
                     _budget = None
         if _budget is not None and _budget > 0:
             _elapsed = _t.monotonic() - _start
@@ -312,9 +323,8 @@ def daily_reconciliation(
                     from hero_quant.metrics import inc_wall_time_exceeded
 
                     inc_wall_time_exceeded("daily_reconciliation")
-                except Exception as _exc:
-                    logger.warning("silent handled: governance: reconcile wall-time observe best-effort", exc_info=_exc)  # intentional: governance: reconcile wall-time observe best-effort
-                    pass  # intentional governance: reconcile wall-time observe best-effort
+                except Exception as exc:
+                    logger.warning("inc_wall_time_exceeded failed: %s", exc)
                 from hero_quant.governance.wall_time import WallTimeExceeded
 
                 raise WallTimeExceeded("daily_reconciliation", float(_budget), float(_elapsed))
@@ -328,16 +338,10 @@ def daily_reconciliation(
             from hero_quant.metrics import observe_wall_time
 
             observe_wall_time("daily_reconciliation", float(_elapsed), status=_status)
-        except Exception as _exc:
-            logger.warning("silent handled: governance: reconcile wall-time observe best-effort", exc_info=_exc)  # intentional: governance: reconcile wall-time observe best-effort
-            pass  # intentional governance: reconcile wall-time observe best-effort
-    # capture result already computed (need to handle exception case above)
-    # if we reached here, result is available
-    try:
-        pass
-    except Exception as _exc:
-        logger.warning("silent handled: governance: reconcile wall-time observe best-effort", exc_info=_exc)  # intentional: governance: reconcile wall-time observe best-effort
-        pass  # intentional governance: reconcile wall-time observe best-effort
+        except Exception as exc:
+            logger.warning("observe_wall_time failed: %s", exc)
+    if result is None:
+        raise RuntimeError("daily_reconciliation: missing result")
     # optional ledger verify
     verified = None
     try:
