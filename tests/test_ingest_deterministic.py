@@ -28,20 +28,20 @@ def test_ingest_deterministic_key(tmp_path):
     assert store1.keys == store2.keys, "keys should be deterministic across runs"
     # Verify key uses sha256 hex not hash() overflow
     for k in store1.keys:
-        # key format stem:idx:8hex
+        # key format stem:8-16hex (sha256[:16] after fix)
         assert ":".join(k.split(":")[:2]) == f"{md.stem}:0" or md.stem in k
         hexpart = k.split(":")[-1]
-        # should be 8 hex chars (sha256[:8])
-        assert len(hexpart) == 8
+        # should be 16 hex chars (sha256[:16] 64-bit)
+        assert len(hexpart) == 16
         # should be hex
         int(hexpart, 16)
     # Verify not using built-in hash (which would be platform dependent)
     piece = "# Hello\nWorld content for ingest test."
-    # ingest splits by heading then overlapping, but single chunk; compute expected sha256[:8]
+    # ingest splits by heading then overlapping, but single chunk; compute expected sha256[:16]
     # The piece stored may be trimmed, but ensure at least one key matches sha256 of some piece
-    expected = hashlib.sha256(piece.strip().encode()).hexdigest()[:8]
+    expected = hashlib.sha256(piece.strip().encode()).hexdigest()[:16]
     # At least one key should contain a sha256-derived hex (not random)
-    assert any(expected in k or len(k.split(":")[-1]) == 8 for k in store1.keys)
+    assert any(expected in k or len(k.split(":")[-1]) == 16 for k in store1.keys)
 
 
 def test_ingest_key_is_sha256_not_hash(tmp_path):

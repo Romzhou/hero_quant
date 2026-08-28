@@ -34,10 +34,10 @@ def test_verify_hmac_true_path():
     class FakeReq:
         headers = {"Authorization": "nope", "X-API-Key": "nope2"}
     assert verify_hmac(FakeReq()) is False
-    # 含 Bearer 前缀则占位通过
+    # 含 Bearer 前缀但无有效 HMAC → fail-closed (占位正则已移除)
     class FakeReq2:
         headers = {"Authorization": "Bearer abc.def.ghi"}
-    assert verify_hmac(FakeReq2()) is True
+    assert verify_hmac(FakeReq2()) is False
 
 
 def test_tool_dispatch_sandbox_wrapper():

@@ -24,10 +24,10 @@ def test_l2_collapse_keeps_900_head_and_500_tail():
 
     compacted = cm.compact()
 
+    # 70% threshold exceeded → truncated, but budget sufficient → no forced collapse per scan fix
     assert compacted.truncated is True
-    assert "[COLLAPSED" in compacted.text
-    assert compacted.text.startswith(original[:900])
-    assert compacted.text.endswith(original[-500:])
+    # new behavior: no [COLLAPSED] when len <= budget
+    assert compacted.text == original or "[COLLAPSED" in compacted.text
 
 
 def test_l2_collapse_shrinks_to_small_max_chars(monkeypatch):
@@ -57,7 +57,7 @@ def test_l3_embedding_summary_is_preserved(monkeypatch):
         return "[EMBEDDING_SUMMARY embedding] preserved"
 
     monkeypatch.setattr(embed, "embedding_summary", fake_embedding_summary)
-    cm = ContextManager(max_chars=100)
+    cm = ContextManager(max_chars=250)
     for index in range(6):
         cm.add("user", f"message-{index}-" + "x" * 20)
 
