@@ -283,15 +283,16 @@ class TraceWriter:
         """关闭文件句柄，线程安全，幂等，关前 fsync."""
         with self._lock:
             if getattr(self, "_closed", False):
+                logger.debug("TraceWriter.close called on already closed writer %s", self.path)
                 return
             try:
                 try:
                     os.fsync(self._file.fileno())
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.warning("TraceWriter fsync before close failed for %s: %s", self.path, exc, exc_info=True)
                 self._file.close()
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("TraceWriter close failed for %s: %s", self.path, exc, exc_info=True)
             finally:
                 self._closed = True
 
@@ -300,6 +301,15 @@ class TraceWriter:
 
     def __exit__(self, *exc: Any) -> None:
         self.close()
+
+    def __del__(self) -> None:
+        # Best-effort cleanup: ensure file descriptor not leaked if caller forgets close()
+        try:
+            if not getattr(self, "_closed", False):
+                logger.warning("TraceWriter leaked without close() for %s, auto-closing", getattr(self, "path", "unknown"))
+                self.close()
+        except Exception:
+            pass
 
     def read(self, resolve_offloads: bool = False) -> List[Dict[str, Any]]:
         """读取 trace.jsonl，resolve_offloads 为 True 时回灌侧车内容并校验路径."""

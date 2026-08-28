@@ -9,8 +9,11 @@
 """
 
 import functools
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from hero_quant.skills.loader import SkillsLoader
@@ -28,20 +31,24 @@ def _cached_auto_digest() -> str:
             try:
                 if cand.exists():
                     _roots.append(str(cand))
-            except Exception:
+            except Exception as exc:
+                logger.debug("digest root check failed for %s: %s", cand, exc)
                 continue
         if _roots:
             try:
                 _auto_loader = SkillsLoader(roots=_roots)
                 return _auto_loader.get_descriptions() or ""
-            except Exception:
+            except Exception as exc:
+                logger.warning("auto digest load failed for roots %r: %s", _roots, exc, exc_info=True)
                 return ""
         try:
             _auto_loader = SkillsLoader(roots=["skills"])
             return _auto_loader.get_descriptions() or ""
-        except Exception:
+        except Exception as exc:
+            logger.debug("auto digest fallback failed: %s", exc)
             return ""
-    except Exception:
+    except Exception as exc:
+        logger.warning("cached auto digest unexpected failure: %s", exc, exc_info=True)
         return ""
 
 
@@ -57,14 +64,27 @@ class CompactResult:
 class ContextManager:
     """上下文管理器，负责追加、折叠与 prompt 集成."""
     def __init__(self, max_chars: int = 100):
+        try:
+            max_chars = int(max_chars)
+        except (ValueError, TypeError) as exc:
+            logger.warning("invalid max_chars %r: %s, using 100", max_chars, exc, exc_info=True)
+            max_chars = 100
+        if max_chars <= 0:
+            logger.warning("max_chars must be >0 got %r, clamped to 100", max_chars)
+            max_chars = 100
         self.max_chars = max_chars
+        # Defensive copy: callers must not share mutable list
         self._messages: list[dict] = []
 
     def add(self, role: str, content: str) -> None:
         allowed = ("user", "assistant", "system", "tool")
         if role not in allowed:
             raise ValueError(f"invalid role: {role!r}, allowed={allowed}")
+        if not isinstance(content, str):
+            logger.warning("content coerced from %s to str", type(content).__name__)
+            content = str(content)
         chars = len(f"{role}: {content}")
+        # Store defensive copy to avoid mutable shared state across tenants
         self._messages.append({"role": role, "content": content, "chars": chars})
 
     @staticmethod
@@ -138,12 +158,23 @@ class ContextManager:
     @staticmethod
     def _collapse(text: str, max_chars: int | None = None) -> str:
         """保留首尾窗口，并在小预算下收缩窗口以适配 max_chars."""
+        if not isinstance(text, str):
+            logger.warning("_collapse coerced text from %s", type(text).__name__)
+            text = str(text)
         if max_chars is None:
             if len(text) <= 900 + 500:
                 return text
             return f"{text[:900]}\n[COLLAPSED head=900 tail=500]\n{text[-500:]}"
 
-        budget = max(0, int(max_chars))
+        try:
+            budget = max(0, int(max_chars))
+        except (ValueError, TypeError) as exc:
+            logger.warning("invalid max_chars %r for _collapse: %s, using %d", max_chars, exc, len(text))
+            budget = len(text)
+        if budget == 0:
+            # Avoid division by zero / empty output: return marker truncated
+            marker = "[COLLAPSED head=0 tail=0]"
+            return marker[: max(0, int(max_chars) if isinstance(max_chars, int) else 0)]
         if len(text) <= budget:
             return text
 
@@ -169,7 +200,12 @@ class ContextManager:
         parts.append(marker)
         if tail_len:
             parts.append(text[-tail_len:])
-        return "\n".join(parts)
+        result = "\n".join(parts)
+        # Post-condition: guarantee len <= budget (fail-visible if violated)
+        if len(result) > budget:
+            logger.warning("_collapse budget violation: %d > %d, truncating", len(result), budget)
+            result = result[:budget]
+        return result
 
     def compact(self) -> CompactResult:
         """按 L1/L2/L3 阈值折叠上下文，保持既有 embedding summary 兼容."""
@@ -178,7 +214,8 @@ class ContextManager:
         if total_chars <= self.max_chars * 0.5:
             return CompactResult(truncated=False, banner="OK", text=text)
 
-        messages, microcompacted = self._microcompact(self._messages)
+        # Defensive copy for folding to avoid mutating original list via shared refs
+        messages, microcompacted = self._microcompact(list(self._messages))
         working_text = self._render_messages(messages)
         total_chars = len(working_text)
 
@@ -186,8 +223,8 @@ class ContextManager:
         if total_chars > self.max_chars * 0.8:
             try:
                 return self._embedding_compact(messages)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("embedding compact failed, falling back: %s", exc, exc_info=True)
 
         if total_chars > self.max_chars * 0.7:
             return CompactResult(
@@ -209,7 +246,8 @@ class ContextManager:
         """首阶段：返回技能短摘要，用于上下文注入."""
         try:
             return loader.get_descriptions()
-        except Exception:
+        except Exception as exc:
+            logger.warning("skills_digest failed: %s", exc, exc_info=True)
             return ""
 
     def inject_skill_content(self, loader: "SkillsLoader", name: str) -> str:
@@ -219,7 +257,8 @@ class ContextManager:
             safe_content = content.replace("</skill_content>", "&lt;/skill_content&gt;")
             safe_name = name.replace('"', "&quot;")
             return f"<skill_content name=\"{safe_name}\">\n{safe_content}\n</skill_content>"
-        except Exception:
+        except Exception as exc:
+            logger.warning("inject_skill_content failed for %r: %s", name, exc, exc_info=True)
             return ""
 
     def build_system_prompt(
@@ -241,12 +280,14 @@ class ContextManager:
             if _loader is not None:
                 try:
                     _digest = _loader.get_descriptions()
-                except Exception:
+                except Exception as exc:
+                    logger.warning("loader.get_descriptions failed: %s", exc, exc_info=True)
                     _digest = ""
             else:
                 try:
                     _digest = _cached_auto_digest()
-                except Exception:
+                except Exception as exc:
+                    logger.warning("auto digest failed: %s", exc, exc_info=True)
                     _digest = ""
         if _digest is None:
             _digest = ""
@@ -260,7 +301,8 @@ class ContextManager:
                 skills_digest=_digest or "",
                 extra_rules=extra_rules,
             )
-        except Exception:
+        except Exception as exc:
+            logger.warning("prompt.build_system_prompt fallback triggered: %s", exc, exc_info=True)
             block = grounding_block or (ledger.render_block() if ledger is not None and hasattr(ledger, "render_block") else "")
             rules = f"\n## Extra Rules\n{extra_rules}" if extra_rules else ""
             # include digest even in fallback for audit
@@ -287,7 +329,8 @@ def skills_snapshot(loader: "SkillsLoader") -> str:
     """返回技能摘要快照，用于变更检测."""
     try:
         return loader.snapshot()
-    except Exception:
+    except Exception as exc:
+        logger.warning("skills snapshot failed: %s", exc, exc_info=True)
         return ""
 
 
@@ -295,8 +338,8 @@ def skills_observed_invalidate(loader: "SkillsLoader", path: str) -> None:
     """观察同步失效钩子，委托 loader 处理."""
     try:
         loader.observed_invalidate(path)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("observed_invalidate failed for %r: %s", path, exc, exc_info=True)
 
 
 def build_system_prompt(
@@ -316,12 +359,14 @@ def build_system_prompt(
         if _loader is not None:
             try:
                 _digest = _loader.get_descriptions()
-            except Exception:
+            except Exception as exc:
+                logger.warning("loader.get_descriptions failed: %s", exc, exc_info=True)
                 _digest = ""
         else:
             try:
                 _digest = _cached_auto_digest()
-            except Exception:
+            except Exception as exc:
+                logger.warning("auto digest failed: %s", exc, exc_info=True)
                 _digest = ""
     if _digest is None:
         _digest = ""
@@ -335,7 +380,8 @@ def build_system_prompt(
             skills_digest=_digest or "",
             extra_rules=extra_rules,
         )
-    except Exception:
+    except Exception as exc:
+        logger.warning("prompt.build_system_prompt fallback triggered: %s", exc, exc_info=True)
         block = grounding_block or (ledger.render_block() if ledger is not None and hasattr(ledger, "render_block") else "")
         rules = f"\n## Extra Rules\n{extra_rules}" if extra_rules else ""
         if _digest:

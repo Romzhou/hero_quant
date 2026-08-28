@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 import os
 import random
@@ -18,6 +19,8 @@ import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Tuple, Type
+
+logger = logging.getLogger(__name__)
 
 
 class NodeError(Exception):
@@ -42,15 +45,19 @@ class RetryPolicy:
         try:
             retry_on = self.retry_on
             if not isinstance(retry_on, tuple):
+                logger.warning("retry_on not a tuple: %r", retry_on)
                 return False
             for t in retry_on:
                 if not isinstance(t, type):
+                    logger.warning("retry_on contains non-type: %r", t)
                     return False
-        except Exception:
+        except Exception as exc:
+            logger.warning("retry_on validation failed: %s", exc, exc_info=True)
             return False
         try:
             return isinstance(exc, retry_on)
-        except TypeError:
+        except TypeError as exc:
+            logger.warning("isinstance check failed for retry_on %r: %s", retry_on, exc, exc_info=True)
             return False
 
     def backoff(self, attempt: int) -> float:
@@ -58,7 +65,8 @@ class RetryPolicy:
         base = self.backoff_base * (self.backoff_factor ** max(0, attempt - 1))
         try:
             j = random.uniform(0, base * self.jitter)
-        except Exception:
+        except Exception as exc:
+            logger.warning("jitter calc failed: %s", exc, exc_info=True)
             j = 0
         return base + j
 
@@ -66,16 +74,16 @@ class RetryPolicy:
         d = self.backoff(attempt)
         try:
             time.sleep(d)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("RetryPolicy.sleep interrupted: %s", exc, exc_info=True)
 
     async def asleep(self, attempt: int) -> None:
         """异步退避，保留 sync sleep 供同步路径使用，async 路径 await asyncio.sleep."""
         d = self.backoff(attempt)
         try:
             await asyncio.sleep(d)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("RetryPolicy.asleep interrupted: %s", exc, exc_info=True)
 
 
 @dataclass
@@ -92,12 +100,14 @@ def _get_lg_command():
         from langgraph.types import Command as _LG  # type: ignore
 
         return _LG
-    except Exception:
+    except Exception as exc:
+        logger.debug("langgraph.types.Command import failed: %s", exc)
         try:
             from langgraph.graph import Command as _LG2  # type: ignore
 
             return _LG2
-        except Exception:
+        except Exception as exc2:
+            logger.debug("langgraph.graph.Command import failed: %s", exc2)
             return LGCommand
 
 
@@ -107,7 +117,8 @@ def error_handler(state: dict[str, Any], error: BaseException) -> Any:
     LG = _get_lg_command()
     try:
         return LG(goto=goto, update={"error": str(error)})
-    except Exception:
+    except Exception as exc:
+        logger.warning("LG Command construction failed: %s", exc, exc_info=True)
         return {"goto": goto, "update": {"error": str(error)}}
 
 
@@ -129,12 +140,14 @@ class BudgetBreaker:
         try:
             raw_in = os.environ.get("HERO_LLM_PRICE_IN", "").strip()
             price_in = float(raw_in) if raw_in else self.DEFAULT_PRICE_IN
-        except Exception:
+        except Exception as exc:
+            logger.warning("invalid HERO_LLM_PRICE_IN %r: %s", raw_in, exc, exc_info=True)
             price_in = self.DEFAULT_PRICE_IN
         try:
             raw_out = os.environ.get("HERO_LLM_PRICE_OUT", "").strip()
             price_out = float(raw_out) if raw_out else self.DEFAULT_PRICE_OUT
-        except Exception:
+        except Exception as exc:
+            logger.warning("invalid HERO_LLM_PRICE_OUT %r: %s", raw_out, exc, exc_info=True)
             price_out = self.DEFAULT_PRICE_OUT
         return price_in, price_out
 
@@ -150,11 +163,13 @@ class BudgetBreaker:
             ov = usage.get("completion_tokens", usage.get("generated_tokens", 0))
         try:
             iv_f = float(iv) if iv is not None else 0.0
-        except Exception:
+        except Exception as exc:
+            logger.warning("invalid input_tokens %r: %s", iv, exc, exc_info=True)
             iv_f = 0.0
         try:
             ov_f = float(ov) if ov is not None else 0.0
-        except Exception:
+        except Exception as exc:
+            logger.warning("invalid output_tokens %r: %s", ov, exc, exc_info=True)
             ov_f = 0.0
         price_in, price_out = self._get_prices()
         return iv_f * price_in / 1_000_000 + ov_f * price_out / 1_000_000
@@ -166,16 +181,18 @@ class BudgetBreaker:
         try:
             cf = float(cost) if cost is not None else 0.0
             if not math.isfinite(cf):
+                logger.warning("non-finite cost %r, ignoring", cost)
                 return 0.0
-        except Exception:
+        except Exception as exc:
+            logger.warning("record_usage cost parse failed %r: %s", cost, exc, exc_info=True)
             return 0.0
         # 零成本不追加 _costs，避免无界增长
         if cf <= 0:
             return cf
         try:
             self.add_cost(cf)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("add_cost failed for %r: %s", cf, exc, exc_info=True)
         return cf
 
     def _prune_locked(self) -> None:
@@ -191,9 +208,11 @@ class BudgetBreaker:
     def add_cost(self, cost: float) -> None:
         try:
             c = float(cost) if cost is not None else 0.0
-        except Exception:
+        except Exception as exc:
+            logger.warning("add_cost invalid cost %r: %s", cost, exc, exc_info=True)
             return
         if not math.isfinite(c):
+            logger.warning("add_cost non-finite cost %r ignored", cost)
             return
         with self._lock:
             self._prune_locked()
@@ -208,9 +227,11 @@ class BudgetBreaker:
         """滑动窗口熔断：单次或累计超阈即需降级。cost 默认为 0 便于查询累计状态."""
         try:
             c = float(cost) if cost is not None else 0.0
-        except Exception:
+        except Exception as exc:
+            logger.warning("should_fallback invalid cost %r: %s", cost, exc, exc_info=True)
             c = 0.0
         if not math.isfinite(c):
+            logger.warning("should_fallback non-finite cost %r coerced to 0", cost)
             c = 0.0
         if c > self.daily_limit:
             return True

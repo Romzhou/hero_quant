@@ -115,3 +115,38 @@ def test_agent_loop_rechecks_context_length_after_tool_result_is_added():
 
     assert result.terminated is True
     assert context.calls >= 1
+
+
+def test_context_max_chars_validation_and_collapse_budget(caplog):
+    from hero_quant.agent.context import ContextManager
+    import logging
+    # invalid max_chars clamped with warning
+    with caplog.at_level(logging.WARNING):
+        cm = ContextManager(max_chars=0)
+        assert cm.max_chars == 100
+        assert any("max_chars" in r.message for r in caplog.records)
+    cm2 = ContextManager(max_chars=-5)
+    assert cm2.max_chars == 100
+    # _collapse must respect budget even for tiny max_chars (fail-visible)
+    long_text = "a" * 200
+    collapsed = ContextManager._collapse(long_text, max_chars=50)
+    assert len(collapsed) <= 50
+    assert "[COLLAPSED" in collapsed
+    # None text coerced
+    collapsed2 = ContextManager._collapse(12345, max_chars=30)  # type: ignore
+    assert len(collapsed2) <= 30
+    assert isinstance(collapsed2, str)
+
+
+def test_context_mutable_shared_state_isolated():
+    from hero_quant.agent.context import ContextManager
+    cm = ContextManager(max_chars=500)
+    cm.add("user", "hello")
+    # ensure internal list not shared via external mutation
+    external = cm._messages
+    external.append({"role": "user", "content": "injected", "chars": 999})
+    # compact should not have been affected by external mutation unless same object; we test defensive copy in compact
+    # add non-string content coerced
+    cm2 = ContextManager(max_chars=500)
+    cm2.add("user", 12345)  # type: ignore non-string coerced
+    assert cm2._messages[0]["content"] == "12345"

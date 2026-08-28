@@ -216,8 +216,8 @@ def _try_sentence_transformers(text: str, dim: int) -> List[float] | None:
             from hero_quant.config.settings import Settings
 
             model_name = Settings().sbert_model
-        except (ImportError, ValueError, TypeError, AttributeError, OSError) as e:
-            logger.debug("sbert settings failed: %s", e)
+        except (ImportError, ValueError, TypeError, AttributeError, OSError) as exc:
+            logger.warning("sbert settings failed: %s", exc, exc_info=True)
             model_name = "all-MiniLM-L6-v2"
         try:
             model = _get_sbert_model(model_name)
@@ -227,11 +227,11 @@ def _try_sentence_transformers(text: str, dim: int) -> List[float] | None:
             else:
                 padded = vec + [0.0] * (dim - len(vec))
                 return _l2_normalize(padded)
-        except (OSError, ValueError, TypeError, RuntimeError) as e:
-            logger.debug("sbert encode failed: %s", e)
+        except (OSError, ValueError, TypeError, RuntimeError) as exc:
+            logger.warning("sbert encode failed: %s", exc, exc_info=True)
             return None
-    except (ImportError, OSError, ValueError, TypeError) as e:
-        logger.debug("sentence_transformers unavailable: %s", e)
+    except (ImportError, OSError, ValueError, TypeError) as exc:
+        logger.warning("sentence_transformers unavailable: %s", exc, exc_info=True)
         return None
 
 
@@ -242,8 +242,8 @@ def _try_openai(text: str, dim: int) -> List[float] | None:
         _s = Settings()
         api_key = _s.openai_api_key or ""
         model = _s.openai_embed_model
-    except (ImportError, ValueError, TypeError, AttributeError, OSError) as e:
-        logger.debug("openai settings failed: %s", e)
+    except (ImportError, ValueError, TypeError, AttributeError, OSError) as exc:
+        logger.warning("openai settings failed: %s", exc, exc_info=True)
         api_key = ""
         model = "text-embedding-3-small"
     if not api_key:
@@ -263,8 +263,8 @@ def _try_openai(text: str, dim: int) -> List[float] | None:
         else:
             v = vec + [0.0] * (dim - len(vec))
         return _l2_normalize(v)
-    except (ImportError, OSError, ValueError, TypeError, RuntimeError) as e:
-        logger.debug("openai embed failed: %s", e)
+    except (ImportError, OSError, ValueError, TypeError, RuntimeError) as exc:
+        logger.warning("openai embed failed: %s", exc, exc_info=True)
         return None
 
 
@@ -284,12 +284,14 @@ def _embed_uncached(text: str, dim: int | None = None) -> List[float]:
     else:
         try:
             dim = int(dim)
-        except (ValueError, TypeError) as e:
-            logger.debug("dim parse failed: %s", e)
+        except (ValueError, TypeError) as exc:
+            logger.warning("dim parse failed for %r: %s", dim, exc, exc_info=True)
             dim = get_vector_dim()
         if dim <= 0:
+            logger.warning("dim %r <=0, using default", dim)
             dim = get_vector_dim()
         if dim < 8 or dim > 2048:
+            logger.warning("dim %r out of [8,2048], clamped to default", dim)
             dim = get_vector_dim()
     if provider == "openai":
         v = _try_openai(text, dim)
@@ -318,10 +320,11 @@ def embed(text: str, dim: int | None = None) -> List[float]:
     else:
         try:
             eff_dim = int(dim)
-        except (ValueError, TypeError) as e:
-            logger.debug("embed dim parse failed: %s", e)
+        except (ValueError, TypeError) as exc:
+            logger.warning("embed dim parse failed for %r: %s", dim, exc, exc_info=True)
             eff_dim = get_vector_dim()
         if eff_dim <= 0 or eff_dim < 8 or eff_dim > 2048:
+            logger.warning("embed dim %r out of [8,2048], clamped to default", eff_dim)
             eff_dim = get_vector_dim()
     # provider 变化时清空缓存以避免陈旧向量（轻量检查）
     # 缓存键包含 provider 隐式通过文本+dim，但为防 provider 切换污染，检测后清除
@@ -331,11 +334,18 @@ def embed(text: str, dim: int | None = None) -> List[float]:
             # 使用函数属性记录上次 provider
             last = getattr(_embed_cached, "_last_provider", None)
             if last is not None and last != current_provider:
+                logger.info("embed provider switched %r -> %r, clearing cache", last, current_provider)
                 _embed_cached.cache_clear()
             _embed_cached._last_provider = current_provider  # type: ignore[attr-defined]
-        except (OSError, ValueError, TypeError, AttributeError, ImportError) as e:
-            logger.debug("provider cache check failed: %s", e)
-    return list(_embed_cached(str(text), int(eff_dim)))
+        except (OSError, ValueError, TypeError, AttributeError, ImportError) as exc:
+            logger.warning("provider cache check failed: %s", exc, exc_info=True)
+    try:
+        vec = _embed_cached(str(text), int(eff_dim))
+    except Exception as exc:
+        logger.warning("embed cached call failed for %r dim %r: %s", text, eff_dim, exc, exc_info=True)
+        vec = _embed_uncached(str(text), int(eff_dim))
+    # Defensive copy: caller must not mutate cached list
+    return list(vec)
 
 
 def cosine_sim(a: List[float], b: List[float]) -> float:
@@ -352,14 +362,26 @@ def cosine_sim(a: List[float], b: List[float]) -> float:
 def centroid(vectors: List[List[float]]) -> List[float]:
     if not vectors:
         return []
+    if not isinstance(vectors, list):
+        raise TypeError(f"centroid expects list, got {type(vectors).__name__}")
     dim = len(vectors[0])
+    if dim == 0:
+        raise ValueError("centroid vectors must have non-zero dim")
     for v in vectors:
+        if not isinstance(v, list):
+            raise TypeError(f"centroid vector must be list, got {type(v).__name__}")
         if len(v) != dim:
             raise ValueError(f"centroid dim mismatch: expected {dim}, got {len(v)}")
+        for x in v:
+            if not isinstance(x, (int, float)):
+                raise TypeError(f"centroid element must be numeric, got {type(x).__name__}")
+            if not math.isfinite(float(x)):
+                raise ValueError(f"centroid element non-finite: {x!r}")
     c = [0.0] * dim
     for v in vectors:
         for i, x in enumerate(v):
-            c[i] += x
+            c[i] += float(x)
+    # defensive copy length check: avoid unsafe cast of infinite/NaN
     return [x / len(vectors) for x in c]
 
 

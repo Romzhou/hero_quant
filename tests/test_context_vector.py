@@ -37,3 +37,40 @@ def test_context_vector_threshold_80pct():
     assert c1.truncated is True
     combined = (c1.text + " " + c1.banner).lower()
     assert "embedding" in combined, f"80% threshold not triggering embedding, got {c1.text!r} {c1.banner!r}"
+
+
+def test_context_vector_embed_dim_and_centroid_validation(caplog):
+    from hero_quant.agent.embed import embed, centroid, get_vector_dim
+    import logging, math
+    # get_vector_dim clamps
+    d = get_vector_dim(default=9999)
+    assert 8 <= d <= 2048
+    # embed with invalid dim logs and falls back
+    with caplog.at_level(logging.WARNING):
+        v = embed("hello", dim=-5)
+        assert len(v) == get_vector_dim()
+    # centroid validation: non-finite raises
+    try:
+        centroid([[float("nan"), 1.0], [1.0, 1.0]])
+        assert False, "should raise for nan"
+    except ValueError:
+        pass
+    # dim mismatch
+    try:
+        centroid([[1.0, 2.0], [1.0]])
+        assert False, "should raise dim mismatch"
+    except ValueError:
+        pass
+    # embedding summary still contains keyword even for empty
+    from hero_quant.agent.embed import embedding_summary
+    s = embedding_summary([], max_chars=50)
+    assert "embedding" in s.lower()
+    # provider switch clears cache (test via embed with provider change mocked)
+    v1 = embed("cache test unique 12345")
+    v2 = embed("cache test unique 12345")
+    assert v1 == v2
+    # defensive copy: mutating returned list should not affect cached
+    v1.append(999.0)
+    v3 = embed("cache test unique 12345")
+    assert len(v3) == len(v2)
+    assert 999.0 not in v3

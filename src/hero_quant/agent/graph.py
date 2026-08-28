@@ -112,7 +112,12 @@ def _leaf_subagent(name: str):
     """创建叶分析师节点，占位实现 create_agent 叶语义。"""
 
     def _run(state: State) -> Dict[str, Any]:
-        depth = int(state.get("delegation_depth", 0))
+        # Defensive copy: avoid mutable shared state mutation
+        try:
+            depth = int(state.get("delegation_depth", 0))
+        except (ValueError, TypeError, AttributeError) as exc:
+            logging.getLogger(__name__).warning("invalid delegation_depth %r: %s", state.get("delegation_depth"), exc, exc_info=True)
+            depth = 0
         if depth >= MAX_DELEGATION_DEPTH:
             return {
                 "messages": [{"role": "assistant", "content": f"{name}: delegation budget exceeded"}],
@@ -134,8 +139,8 @@ def _leaf_subagent(name: str):
                             "messages": [{"role": "assistant", "content": f"{name}: budget fallback"}],
                             "subagent_outputs": [{"agent": name, "status": "fallback"}],
                         }
-            except Exception as e:
-                logging.getLogger(__name__).warning("BudgetBreaker check failed for %s: %s", name, e)
+            except Exception as exc:
+                logging.getLogger(__name__).warning("BudgetBreaker check failed for %s: %s", name, exc, exc_info=True)
         return {
             "messages": [{"role": "assistant", "content": f"{name}: research done"}],
             "subagent_outputs": [{"agent": name, "output": f"{name} result"}],
@@ -162,7 +167,11 @@ def _lazy_command_send():
 
 def plan_node(state: State):
     """计划阶段：分解任务并通过 Send 扇出实现并行调度，超委派深度则直接返回预算提示."""
-    depth = int(state.get("delegation_depth", 0))
+    try:
+        depth = int(state.get("delegation_depth", 0))
+    except (ValueError, TypeError, AttributeError) as exc:
+        logging.getLogger(__name__).warning("invalid delegation_depth %r: %s", state.get("delegation_depth"), exc, exc_info=True)
+        depth = 0
     if depth >= MAX_DELEGATION_DEPTH:
         return {
             "messages": [{"role": "assistant", "content": "plan: delegation budget exceeded"}],
@@ -175,8 +184,8 @@ def plan_node(state: State):
             last = msgs[-1].get("content", "") or ""
         elif msgs:
             last = str(msgs[-1])
-    except (IndexError, AttributeError, TypeError, ValueError) as e:
-        logging.getLogger(__name__).warning("plan_node message extract failed: %s", e)
+    except (IndexError, AttributeError, TypeError, ValueError) as exc:
+        logging.getLogger(__name__).warning("plan_node message extract failed: %s", exc, exc_info=True)
         last = ""
     plan_text_src = state.get("plan", "") or ""
     combined = f"{plan_text_src} {last}"
@@ -203,7 +212,11 @@ def plan_node(state: State):
 
 def execute_node(state: State) -> Dict[str, Any]:
     """(已废弃遗留) 执行阶段：旧式串行扇出，保留兼容；新图已由 plan→Send 直连并行."""
-    depth = int(state.get("delegation_depth", 0))
+    try:
+        depth = int(state.get("delegation_depth", 0))
+    except (ValueError, TypeError, AttributeError) as exc:
+        logging.getLogger(__name__).warning("execute_node invalid depth %r: %s", state.get("delegation_depth"), exc, exc_info=True)
+        depth = 0
     if depth >= MAX_DELEGATION_DEPTH:
         return {
             "messages": [{"role": "assistant", "content": "execute: budget exhausted"}],
@@ -243,8 +256,17 @@ def verify_node(state: State) -> Dict[str, Any]:
     """校验阶段：汇总子代理输出做 pros/cons 多空综合与置信度合成."""
     prompt = _VERIFY_PROMPT  # noqa: F841
 
-    outputs = state.get("subagent_outputs") or state.get("intermediate_results") or []
-    n = len(outputs) if isinstance(outputs, list) else 0
+    # Avoid falsy `or` chaining that hides empty list – explicit check
+    outputs = state.get("subagent_outputs")
+    if outputs is None:
+        outputs = state.get("intermediate_results")
+    if outputs is None:
+        outputs = []
+    # Validate type to avoid unsafe cast
+    if not isinstance(outputs, list):
+        logging.getLogger(__name__).warning("verify_node outputs not list: %r, coerced to []", type(outputs).__name__)
+        outputs = []
+    n = len(outputs)
     confidence = round(min(0.85, 0.55 + 0.05 * max(1, n)), 2) if n else 0.65
     pros = [
         "多头: 趋势/动量延续或估值修复预期",
@@ -274,18 +296,26 @@ def compensate_node(state: State) -> Dict[str, Any]:
 
 def build_research_graph(selected: List[str] | None = None):
     """构建并编译研究团队图，selected 为空时默认扇出 market/sentiment/news。"""
+    if selected is not None and not isinstance(selected, list):
+        raise TypeError(f"selected must be list or None, got {type(selected).__name__}")
     normalized = _normalize_selected(selected) if selected is not None else ["market", "sentiment", "news"]
+    # Defensive copy to avoid mutable shared state
+    normalized = list(normalized)
 
     graph = StateGraph(State)
 
     def _plan(state: State):
-        depth = int(state.get("delegation_depth", 0))
+        try:
+            depth = int(state.get("delegation_depth", 0))
+        except (ValueError, TypeError, AttributeError) as exc:
+            logging.getLogger(__name__).warning("_plan invalid depth %r: %s", state.get("delegation_depth"), exc, exc_info=True)
+            depth = 0
         if depth >= MAX_DELEGATION_DEPTH:
             return {
                 "messages": [{"role": "assistant", "content": "plan: delegation budget exceeded"}],
                 "delegation_depth": depth + 1,
             }
-        targets = normalized if normalized else ["market", "sentiment", "news"]
+        targets = list(normalized) if normalized else ["market", "sentiment", "news"]
         msgs = state.get("messages", [])
         last = ""
         try:
@@ -293,8 +323,8 @@ def build_research_graph(selected: List[str] | None = None):
                 last = msgs[-1].get("content", "") or ""
             elif msgs:
                 last = str(msgs[-1])
-        except (IndexError, AttributeError, TypeError, ValueError) as e:
-            logging.getLogger(__name__).warning("_plan message extract failed: %s", e)
+        except (IndexError, AttributeError, TypeError, ValueError) as exc:
+            logging.getLogger(__name__).warning("_plan message extract failed: %s", exc, exc_info=True)
             last = ""
         plan_text = f"plan for: {last[:80]}" if last else "plan: default research"
         Cmd, Snd = _lazy_command_send()

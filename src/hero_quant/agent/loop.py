@@ -29,20 +29,40 @@ def estimate_tokens(text: Any) -> int:
     """估算文本 token 数，约 4 字符/token（JSON 序列化长度 //4 粗估）。
 
     支持 str、消息列表及其他类型，异常时回退为 str(text) 长度 //4。
+    Fail-visible: logs serialization failures instead of silent fallback.
     """
     if isinstance(text, list):
         import json
 
         try:
-            return len(json.dumps(text, ensure_ascii=False, default=str)) // 4
-        except Exception:
-            return len(str(text)) // 4
+            dumped = json.dumps(text, ensure_ascii=False, default=str)
+            # Guard against huge payloads causing negative or overflow
+            if not isinstance(dumped, str):
+                dumped = str(dumped)
+            return max(0, len(dumped) // 4)
+        except Exception as exc:
+            logging.getLogger(__name__).warning("estimate_tokens json dump failed: %s", exc, exc_info=True)
+            try:
+                return max(0, len(str(text)) // 4)
+            except Exception as exc2:
+                logging.getLogger(__name__).warning("estimate_tokens str fallback failed: %s", exc2, exc_info=True)
+                return 0
     if isinstance(text, str):
-        return len(text) // 4
+        return max(0, len(text) // 4)
+    if text is None:
+        return 0
     try:
-        return len(text) // 4  # type: ignore[arg-type]
-    except Exception:
-        return len(str(text)) // 4
+        # Handle bytes, bytearray, etc. safely
+        if isinstance(text, (bytes, bytearray)):
+            return max(0, len(text.decode("utf-8", errors="ignore")) // 4)
+        return max(0, len(text) // 4)  # type: ignore[arg-type]
+    except Exception as exc:
+        logging.getLogger(__name__).debug("estimate_tokens len failed for %r: %s", type(text).__name__, exc)
+        try:
+            return max(0, len(str(text)) // 4)
+        except Exception as exc2:
+            logging.getLogger(__name__).warning("estimate_tokens final fallback failed: %s", exc2, exc_info=True)
+            return 0
 
 
 @dataclass
@@ -93,8 +113,29 @@ class AgentLoop:
         **kwargs: Any,
     ):
         self.llm = llm
-        self.max_iterations = int(max_iterations) if max_iterations is not None else 5
-        self.token_limit = token_limit
+        # Validate max_iterations with fail-visible logging
+        try:
+            self.max_iterations = int(max_iterations) if max_iterations is not None else 5
+            if self.max_iterations <= 0:
+                logging.getLogger(__name__).warning("max_iterations %r <=0 clamped to 5", max_iterations)
+                self.max_iterations = 5
+        except (ValueError, TypeError) as exc:
+            logging.getLogger(__name__).warning("invalid max_iterations %r: %s, using 5", max_iterations, exc, exc_info=True)
+            self.max_iterations = 5
+        # Validate token_limit: must be positive int or None (unlimited). Unsafe casts coerced with warning.
+        if token_limit is None:
+            self.token_limit = None
+        else:
+            try:
+                tl = int(token_limit)
+                if tl <= 0:
+                    logging.getLogger(__name__).warning("token_limit %r <=0 treated as unlimited", token_limit)
+                    self.token_limit = None
+                else:
+                    self.token_limit = tl
+            except (ValueError, TypeError) as exc:
+                logging.getLogger(__name__).warning("invalid token_limit %r: %s, using 60000", token_limit, exc, exc_info=True)
+                self.token_limit = 60000
         self.trace = trace
         # 兼容历史别名：context / contextManager
         if context_manager is None and "context" in kwargs:
@@ -162,8 +203,8 @@ class AgentLoop:
             try:
                 if cand.exists():
                     return cand
-            except Exception:
-                pass
+            except Exception as exc:
+                logging.getLogger(__name__).warning("replays dir check failed: %s", exc, exc_info=True)
             return (Path.cwd() / "replays").resolve()
         if _replay_path is not None:
             p = Path(_replay_path).resolve()
@@ -214,7 +255,8 @@ class AgentLoop:
                 raw = _os.environ.get("HERO_WALL_TIME_BUDGET", _os.environ.get("HERO_WALL_TIME_BUDGET_SECONDS", "")).strip()
                 if raw:
                     _wt = float(raw)
-            except Exception:
+            except Exception as exc:
+                logging.getLogger(__name__).warning("wall_time env parse failed: %s", exc, exc_info=True)
                 _wt = None
         if _wt is None:
             try:
@@ -222,7 +264,8 @@ class AgentLoop:
 
                 _s = _S()
                 _wt = getattr(_s, "wall_time_budget_seconds", None) or getattr(_s, "wall_time_budget", None)
-            except Exception:
+            except Exception as exc:
+                logging.getLogger(__name__).debug("wall_time Settings fallback failed: %s", exc)
                 _wt = None
         # 归一化：0 或负数视为不限时
         try:
@@ -231,7 +274,8 @@ class AgentLoop:
                 self.wall_time_budget = _wt_f if _wt_f > 0 else None
             else:
                 self.wall_time_budget = None
-        except Exception:
+        except Exception as exc:
+            logging.getLogger(__name__).warning("wall_time budget normalize failed for %r: %s", _wt, exc, exc_info=True)
             self.wall_time_budget = None
         self.wall_time_budget_seconds = self.wall_time_budget
         # 延迟初始化轨迹写入器
@@ -258,7 +302,8 @@ class AgentLoop:
 
             p = Path(self.trace) if isinstance(self.trace, (str, Path)) else Path(str(self.trace))
             self._trace_writer = TraceWriter(p)
-        except Exception:
+        except Exception as exc:
+            logging.getLogger(__name__).warning("TraceWriter init failed for %r: %s", self.trace, exc, exc_info=True)
             self._trace_writer = None
 
     def _ensure_trace_writer(self):

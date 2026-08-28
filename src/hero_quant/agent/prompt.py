@@ -159,11 +159,16 @@ def build_system_prompt(
 
     prompt = "\n".join(parts)
 
-    # Deterministic invariants: assert instead of fragile substring duplication
-    assert "HARD RULE" in prompt, "HARD_RULE invariant broken"
-    assert HEADER in prompt, "HEADER missing"
-    # grounding fenced block must be present
-    assert fenced_grounding in prompt, "grounding block missing"
+    # Deterministic invariants: fail-visible explicit checks (assert stripped under -O)
+    if "HARD RULE" not in prompt:
+        logger.error("HARD_RULE invariant broken")
+        raise ValueError("HARD_RULE invariant broken")
+    if HEADER not in prompt:
+        logger.error("HEADER missing from prompt")
+        raise ValueError("HEADER missing")
+    if fenced_grounding not in prompt:
+        logger.error("grounding block missing from prompt")
+        raise ValueError("grounding block missing")
 
     return prompt
 
