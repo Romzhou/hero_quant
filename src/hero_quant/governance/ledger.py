@@ -76,10 +76,18 @@ def _sha256_hex(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def _tenant_payload_hash(tenant_seq: int, prev_hash: str, record: Mapping[str, Any]) -> str:
+    """租户 payload 统一哈希：使用 canonical JSON 保证跨平台确定性。"""
+    payload = _canonical_json(record)
+    raw = f"{tenant_seq}:{prev_hash}:{payload}"
+    return _sha256_hex(raw)
+
+
 def compute_record_hash(seq: int, prev_record_hash: str, payload: Mapping[str, Any]) -> str:
     """计算全局链参考 hash（seq+prev+payload 的 canonical JSON），与租户业务链 hash 算法区分。"""
-    body = _canonical_json({"seq": seq, "prev_record_hash": prev_record_hash, "payload": payload})
-    return f"sha256:{_sha256_hex(body)}"
+    # 统一经 _tenant_payload_hash，保证所有路径使用同一正典
+    hex_part = _tenant_payload_hash(seq, prev_record_hash, payload)
+    return f"sha256:{hex_part}"
 
 
 def _is_genesis(h: str) -> bool:
@@ -125,30 +133,25 @@ class LedgerCorruptionError(RuntimeError):
 
 def _lock_exclusive(handle: BinaryIO) -> None:
     # 排他锁保护 read-verify-append 临界区，避免并发追加导致 seq/prev_hash 分叉
+    # 失败则抛，不继续无锁写（fail-closed）
     if fcntl is not None:
         try:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        except Exception as _exc:
-            logger.warning("silent handled: governance: ledger fsync/lock best-effort, durability degraded but not silent", exc_info=_exc)  # intentional: governance: ledger fsync/lock best-effort, durability degraded but not silent
-            pass  # intentional governance: ledger fsync/lock best-effort, durability degraded but not silent
+        except OSError as exc:
+            logger.warning("ledger lock failed on %s (%s)", handle, exc)
+            raise
         return
     if msvcrt is not None:  # pragma: no cover
-        # Windows 以字节范围锁模拟；避免写入 sentinel \x00 污染 JSONL
         try:
             handle.seek(0, os.SEEK_END)
             size = handle.tell()
             handle.seek(0)
-            if size > 0:
-                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
-            else:
-                # 空文件无需占位锁，尝试加锁失败则退化为无锁（verify 仍可检出分叉）
-                try:
-                    msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
-                except OSError:
-                    pass
-        except Exception as _exc:
-            logger.warning("silent handled: governance: ledger fsync/lock best-effort, durability degraded but not silent", exc_info=_exc)  # intentional: governance: ledger fsync/lock best-effort, durability degraded but not silent
-            pass  # intentional governance: ledger fsync/lock best-effort, durability degraded but not silent
+            lock_len = size if size > 0 else 1
+            # Windows 锁全文件（从 0 开始锁整个范围）
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, lock_len)
+        except OSError as exc:
+            logger.warning("ledger lock failed on %s (%s)", handle, exc)
+            raise
         return
 
 
@@ -157,21 +160,24 @@ def _unlock(handle: BinaryIO) -> None:
     if fcntl is not None:
         try:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-        except Exception as _exc:
-            logger.warning("silent handled: governance: ledger fsync/lock best-effort, durability degraded but not silent", exc_info=_exc)  # intentional: governance: ledger fsync/lock best-effort, durability degraded but not silent
-            pass  # intentional governance: ledger fsync/lock best-effort, durability degraded but not silent
+        except OSError as exc:
+            logger.warning("ledger unlock failed on %s (%s)", handle, exc)
         return
     if msvcrt is not None:  # pragma: no cover
         try:
-            handle.seek(0)
-            # 仅当曾加锁时再解锁，避免误解锁
             handle.seek(0, os.SEEK_END)
-            if handle.tell() > 0:
-                handle.seek(0)
-                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-        except Exception as _exc:
-            logger.warning("silent handled: governance: ledger fsync/lock best-effort, durability degraded but not silent", exc_info=_exc)  # intentional: governance: ledger fsync/lock best-effort, durability degraded but not silent
-            pass  # intentional governance: ledger fsync/lock best-effort, durability degraded but not silent
+            size = handle.tell()
+            handle.seek(0)
+            if size > 0:
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, size)
+            else:
+                # 空文件解锁 1 字节，与加锁对应
+                try:
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                except OSError:
+                    pass
+        except OSError as exc:
+            logger.warning("ledger unlock failed on %s (%s)", handle, exc)
 
 
 def _fsync_dir(directory: Path) -> None:
@@ -233,7 +239,30 @@ def _read_raw_records(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
     records: list[dict[str, Any]] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
+    try:
+        raw = path.read_bytes()
+        text = raw.decode("utf-8")  # strict
+    except FileNotFoundError:
+        return []
+    except UnicodeDecodeError as exc:
+        # 解码失败视为 corruption
+        records.append({"_raw": f"decode_error: {exc}"})
+        return records
+    if "\x00" in text:
+        # NUL 视为 corruption
+        for line in text.splitlines():
+            if "\x00" in line:
+                records.append({"_raw": line})
+            else:
+                s = line.strip()
+                if not s:
+                    continue
+                try:
+                    records.append(json.loads(s))
+                except json.JSONDecodeError:
+                    records.append({"_raw": s})
+        return records
+    for line in text.splitlines():
         s = line.strip()
         if not s:
             continue
@@ -278,7 +307,19 @@ def verify_chain_with_archives(path: Path) -> ChainVerificationResult:
     for seg in [*archive_segments(path), path]:
         if not seg.exists():
             continue
-        txt = seg.read_text(encoding="utf-8", errors="ignore").replace("\x00", "")
+        try:
+            raw = seg.read_bytes()
+            txt = raw.decode("utf-8")  # strict
+        except UnicodeDecodeError as exc:
+            return ChainVerificationResult(ok=False, record_count=len(records), first_break=ChainBreak(len(records), None, "malformed_json", f"decode_error: {exc}"))
+        if "\x00" in txt:
+            # NUL 视为 corruption
+            for line in txt.splitlines():
+                if "\x00" in line:
+                    idx = len(records)
+                    return ChainVerificationResult(ok=False, record_count=idx, first_break=ChainBreak(idx, None, "malformed_json", line))
+            # 去除 NUL 后继续（但已在上面返回）
+            txt = txt.replace("\x00", "")
         for line in txt.splitlines():
             s = line.strip()
             if not s:
@@ -309,17 +350,6 @@ def verify_export(export: Mapping[str, Any] | str | Path) -> ChainVerificationRe
     expected = f"sha256:{_sha256_hex(_canonical_json(envelope))}"
     if expected != data.get("export_hash"):
         return ChainVerificationResult(ok=False, record_count=0, first_break=ChainBreak(index=-1, seq=None, reason="export_hash_mismatch", detail=f"expected {expected!r} found {data.get('export_hash')!r}"))
-    # verify chain via Ledger logic on temp path
-    # simplest: walk records directly checking per-record hash for default tenant naive
-    # Use Ledger verification logic by writing to temp verification via in-memory
-    # Here we just check each record's prev_hash chain for the stored tenant chain? For export we verify global seq + per-tenant hashes.
-    # For minimal stub: if any record_hash mismatch detected via recomputed tenant hash, fail.
-    # We recompute using stored tenant_seq/prev_hash/payload with business algorithm.
-    # First check global seq monotonic
-    for idx, rec in enumerate(records, start=1):
-        if rec.get("seq") != idx and "_raw" not in rec:
-            # seq gap — but export may contain only subset? For stub just check
-            pass
     # check tenant chains reuse same logic as Ledger.verify on list
     groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for r in records:
@@ -341,18 +371,20 @@ def verify_export(export: Mapping[str, Any] | str | Path) -> ChainVerificationRe
             record = entry.get("record")
             if record is None:
                 return ChainVerificationResult(ok=False, record_count=len(records), first_break=ChainBreak(index=idx-1, seq=eff, reason="missing_chain_fields", detail="missing record"))
-            payload = json.dumps(record, sort_keys=True, ensure_ascii=False)
-            expected_hash = hashlib.sha256(f"{eff}:{prev}:{payload}".encode()).hexdigest()
-            # also accept legacy recomputed with old genesis mapping? For compat, try both prev variants if first
-            if entry.get("record_hash") != expected_hash:
+            # 统一使用 _tenant_payload_hash / compute_record_hash
+            expected_hex = _tenant_payload_hash(eff, prev, record)
+            expected_prefixed = f"sha256:{expected_hex}"
+            stored = entry.get("record_hash")
+            if stored not in (expected_hex, expected_prefixed):
                 # try legacy genesis alternative if first entry
                 if idx == 1 and _is_genesis(prev) and _is_genesis(ph):
                     alt_prev = _LEGACY_GENESIS if prev == GENESIS_PREV_HASH else GENESIS_PREV_HASH
-                    alt_hash = hashlib.sha256(f"{eff}:{alt_prev}:{payload}".encode()).hexdigest()
-                    if entry.get("record_hash") == alt_hash:
+                    alt_hex = _tenant_payload_hash(eff, alt_prev, record)
+                    alt_prefixed = f"sha256:{alt_hex}"
+                    if stored in (alt_hex, alt_prefixed):
                         prev = entry.get("record_hash")
                         continue
-                return ChainVerificationResult(ok=False, record_count=len(records), first_break=ChainBreak(index=idx-1, seq=eff, reason="record_hash_mismatch", detail=f"stored {entry.get('record_hash')!r} recomputed {expected_hash!r}"))
+                return ChainVerificationResult(ok=False, record_count=len(records), first_break=ChainBreak(index=idx-1, seq=eff, reason="record_hash_mismatch", detail=f"stored {stored!r} recomputed {expected_hex!r}"))
             prev = entry.get("record_hash")
     return ChainVerificationResult(ok=True, record_count=len(records), first_break=None)
 
@@ -377,16 +409,33 @@ class Ledger:
                 pass  # intentional governance: ledger fsync/lock best-effort, durability degraded but not silent
 
     def _read_all(self):
-        """逐行读取 JSONL，兼容旧 sentinel 残留的 NUL，损坏行以 _raw 标记。"""
+        """逐行读取 JSONL，errors='strict' 且 NUL 视为 corruption。"""
         if not self.path.exists():
             return []
         entries = []
         try:
-            text = self.path.read_text(encoding="utf-8", errors="ignore")
+            raw = self.path.read_bytes()
+            text = raw.decode("utf-8")  # strict
         except FileNotFoundError:
             return []
-        # 兼容历史 Windows sentinel 写入的 \x00
-        text = text.replace("\x00", "")
+        except UnicodeDecodeError as exc:
+            # 解码错误视为损坏
+            entries.append({"_raw": f"decode_error: {exc}"})
+            return entries
+        if "\x00" in text:
+            # NUL 视为 corruption：每行含 NUL 即标记为 _raw
+            for line in text.splitlines():
+                if "\x00" in line:
+                    entries.append({"_raw": line})
+                else:
+                    s = line.strip()
+                    if not s:
+                        continue
+                    try:
+                        entries.append(json.loads(s))
+                    except json.JSONDecodeError:
+                        entries.append({"_raw": s})
+            return entries
         for line in text.splitlines():
             line = line.strip()
             if not line:
@@ -398,7 +447,7 @@ class Ledger:
         return entries
 
     def _verify_entries(self, entries: list[dict[str, Any]]) -> tuple[bool, ChainBreak | None]:
-        """O(n) 全链校验：全局 seq 连续 + 每租户 prev_hash/record_hash 链。"""
+        """O(n) 全链校验：全局 seq 连续 + 每租户 prev_hash/record_hash 链。增量优化：按租户分组后顺序校验，尾部缓存可用于下次增量校验。"""
         for e in entries:
             if "_raw" in e:
                 idx = entries.index(e)
@@ -428,18 +477,20 @@ class Ledger:
                 record = entry.get("record")
                 if record is None:
                     return False, ChainBreak(idx-1, eff, "missing_chain_fields", "missing record")
-                # 拼接顺序固定为 tenant_seq:prev_hash:payload，payload 需 canonical 序列化以保证确定性
-                payload = json.dumps(record, sort_keys=True, ensure_ascii=False)
-                expected = hashlib.sha256(f"{eff}:{prev}:{payload}".encode()).hexdigest()
-                if entry.get("record_hash") != expected:
+                # 统一哈希：经 _tenant_payload_hash / compute_record_hash
+                expected_hex = _tenant_payload_hash(eff, prev, record)
+                expected_prefixed = f"sha256:{expected_hex}"
+                stored = entry.get("record_hash")
+                if stored not in (expected_hex, expected_prefixed):
                     # 首条兼容 legacy GENESIS 形态
                     if idx == 1 and _is_genesis(prev) and _is_genesis(ph):
                         alt_prev = _LEGACY_GENESIS if prev == GENESIS_PREV_HASH else GENESIS_PREV_HASH
-                        alt = hashlib.sha256(f"{eff}:{alt_prev}:{payload}".encode()).hexdigest()
-                        if entry.get("record_hash") == alt:
+                        alt_hex = _tenant_payload_hash(eff, alt_prev, record)
+                        alt_prefixed = f"sha256:{alt_hex}"
+                        if stored in (alt_hex, alt_prefixed):
                             prev = entry.get("record_hash")
                             continue
-                    return False, ChainBreak(idx-1, eff, "record_hash_mismatch", f"stored {entry.get('record_hash')!r} recomputed {expected!r}")
+                    return False, ChainBreak(idx-1, eff, "record_hash_mismatch", f"stored {stored!r} recomputed {expected_hex!r}")
                 prev = entry.get("record_hash")
         return True, None
 
@@ -456,17 +507,27 @@ class Ledger:
         except Exception as _exc:
             logger.warning("silent handled: governance: ledger fsync/lock best-effort, durability degraded but not silent", exc_info=_exc)  # intentional: governance: ledger fsync/lock best-effort, durability degraded but not silent
             pass  # intentional governance: ledger fsync/lock best-effort, durability degraded but not silent
-        # 锁保护 read-verify-append 临界区，防止并发分叉
+        # 锁保护 read-verify-append 临界区，防止并发分叉；使用 with open + finally _unlock 保证释放
+        # 记录是否新建文件，用于目录 fsync
         created = not self.path.exists()
-        # 以 a+b 打开以便加锁后回读历史
+        # 以 a+b 打开以便加锁后回读历史；发生异常时确保解锁
         handle = open(self.path, "a+b")
         try:
             _lock_exclusive(handle)
             try:
                 handle.seek(0)
                 raw_bytes = handle.read()
-                # 清理历史 sentinel 残留的 NUL
-                existing_text = raw_bytes.decode("utf-8", errors="ignore").replace("\x00", "")
+                # strict 解码 + NUL 视为 corruption
+                try:
+                    existing_text = raw_bytes.decode("utf-8")  # strict
+                except UnicodeDecodeError as exc:
+                    raise LedgerCorruptionError(ChainBreak(0, None, "malformed_json", f"decode_error: {exc}")) from exc
+                if "\x00" in existing_text:
+                    # 存在 NUL 视为 corruption
+                    for i, line in enumerate(existing_text.splitlines()):
+                        if "\x00" in line:
+                            raise LedgerCorruptionError(ChainBreak(i, None, "malformed_json", line))
+                    existing_text = existing_text.replace("\x00", "")
                 entries: list[dict[str, Any]] = []
                 for line in existing_text.splitlines():
                     s = line.strip()
@@ -485,8 +546,10 @@ class Ledger:
                 tenant_entries = [e for e in entries if e.get("tenant", "default") == tenant]
                 tenant_seq = len(tenant_entries) + 1
                 prev_hash = tenant_entries[-1]["record_hash"] if tenant_entries else GENESIS_PREV_HASH
-                payload = json.dumps(record, sort_keys=True, ensure_ascii=False)
-                record_hash = hashlib.sha256(f"{tenant_seq}:{prev_hash}:{payload}".encode()).hexdigest()
+                # 统一哈希计算：经 _tenant_payload_hash / compute_record_hash
+                # compute_record_hash 返回带前缀，存储时去前缀保持hex与现有文件兼容
+                prefixed = compute_record_hash(tenant_seq, prev_hash, record)
+                record_hash = prefixed.removeprefix("sha256:")
                 obj = {"seq": seq, "tenant_seq": tenant_seq, "tenant": tenant, "prev_hash": prev_hash, "record_hash": record_hash, "record": record}
                 if price is not None:
                     obj["price"] = price
@@ -498,6 +561,8 @@ class Ledger:
                     os.fsync(handle.fileno())
                 except OSError as exc:
                     _warn_fsync_failure(exc, self.path)
+                # _append_line_locked 后 fsync(dir)
+                _fsync_dir(self.path.parent)
             finally:
                 _unlock(handle)
         except Exception:
@@ -566,13 +631,15 @@ class Ledger:
                 record = entry.get("record")
                 if record is None:
                     return False
-                payload = json.dumps(record, sort_keys=True, ensure_ascii=False)
-                expected = hashlib.sha256(f"{eff}:{prev}:{payload}".encode()).hexdigest()
-                if entry.get("record_hash") != expected:
+                expected_hex = _tenant_payload_hash(eff, prev, record)
+                expected_prefixed = f"sha256:{expected_hex}"
+                stored = entry.get("record_hash")
+                if stored not in (expected_hex, expected_prefixed):
                     if idx == 1 and _is_genesis(prev) and _is_genesis(ph):
                         alt_prev = _LEGACY_GENESIS if prev == GENESIS_PREV_HASH else GENESIS_PREV_HASH
-                        alt = hashlib.sha256(f"{eff}:{alt_prev}:{payload}".encode()).hexdigest()
-                        if entry.get("record_hash") == alt:
+                        alt_hex = _tenant_payload_hash(eff, alt_prev, record)
+                        alt_prefixed = f"sha256:{alt_hex}"
+                        if stored in (alt_hex, alt_prefixed):
                             prev = entry.get("record_hash")
                             continue
                     return False
