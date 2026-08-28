@@ -185,3 +185,196 @@ def test_thread_collision_disambiguation(monkeypatch):
     # cleanup
     saver.delete(tid_a)
     saver.delete(tid_b)
+
+
+# ---- P2-cb extended TDD ----
+
+def test_asetup_retry_guard_success_no_rerun():
+    """asetup retry guard: second call after success does not re-run setup."""
+    import asyncio
+
+    from hero_quant.checkpoint.postgres import AsyncPostgresSaver
+
+    class FakeAsyncPool:
+        def __init__(self):
+            self.open_calls = 0
+            self.conninfo = "postgresql://postgres:postgres@localhost:5432/hero_quant_test_asetup_guard"
+
+        async def open(self):
+            self.open_calls += 1
+
+        def connection(self):  # needed for DDL branch
+            class FakeConn:
+                async def __aenter__(self):
+                    return self
+
+                async def __aexit__(self, *a):
+                    return False
+
+                async def execute(self, sql, params=None):
+                    pass
+
+            return FakeConn()
+
+    # make pool look async via name containing Async
+    FakeAsyncPool.__name__ = "AsyncFakePool"
+    pool = FakeAsyncPool()
+    saver = AsyncPostgresSaver(
+        dsn="postgresql://postgres:postgres@localhost:5432/hero_quant_test_asetup_guard", pool=pool
+    )
+    assert saver._is_real_pg_pool() and saver._pool_is_async()
+    asyncio.run(saver.asetup())
+    first = pool.open_calls
+    assert first == 1
+    asyncio.run(saver.asetup())
+    second = pool.open_calls
+    assert second == 1, f"second asetup should not re-run, got {first}->{second}"
+
+
+def test_asetup_retry_after_failure():
+    """asetup after failure (done False) retries."""
+    import asyncio
+
+    from hero_quant.checkpoint.postgres import AsyncPostgresSaver
+
+    class FakeAsyncPool:
+        def __init__(self):
+            self.open_calls = 0
+            self.conninfo = "postgresql://postgres:postgres@localhost:5432/hero_quant_test_asetup_fail"
+
+        async def open(self):
+            self.open_calls += 1
+
+        def connection(self):
+            class FakeConn:
+                async def __aenter__(self):
+                    return self
+
+                async def __aexit__(self, *a):
+                    return False
+
+                async def execute(self, sql, params=None):
+                    pass
+
+            return FakeConn()
+
+    FakeAsyncPool.__name__ = "AsyncFakePool"
+    pool = FakeAsyncPool()
+    saver = AsyncPostgresSaver(
+        dsn="postgresql://postgres:postgres@localhost:5432/hero_quant_test_asetup_fail2", pool=pool
+    )
+    saver._setup_done = False
+    asyncio.run(saver.asetup())
+    assert pool.open_calls == 1, "retry after failure should call setup"
+
+
+def test_aput_emulated_vs_real_paths():
+    """aput PG branch tautology fixed: emulated vs real pool paths both behave per contract."""
+    import asyncio
+    import inspect
+
+    from hero_quant.checkpoint.postgres import AsyncPostgresSaver
+
+    # source must not contain tautology
+    src = inspect.getsource(AsyncPostgresSaver.aput)
+    assert "self._is_real_pg_pool() or self._is_pg_mode()" not in src
+    assert "if self._is_real_pg_pool():" in src
+
+    # emulated path still persists via global store
+    saver_em = AsyncPostgresSaver(dsn="postgresql://postgres:postgres@localhost:5432/hero_quant_test_aput_em", pool=None)
+    assert saver_em._is_pg_mode() and not saver_em._is_real_pg_pool()
+    asyncio.run(saver_em.aput("wf:runEm:tenantE", {"v": 11}))
+    val = asyncio.run(saver_em.aget("wf:runEm:tenantE"))
+    assert val is not None and val["v"] == 11
+    saver_em.delete("wf:runEm:tenantE")
+
+    # real pool path persists and still calls _pg_put_async (best-effort)
+    class FakePool2:
+        def __init__(self):
+            self.conninfo = "postgresql://postgres:postgres@localhost:5432/hero_quant_test_aput_real"
+
+        async def open(self):
+            pass
+
+        def connection(self):
+            class C:
+                async def __aenter__(self):
+                    return self
+
+                async def __aexit__(self, *a):
+                    return False
+
+                async def execute(self, sql, params=None):
+                    pass
+
+            return C()
+
+    FakePool2.__name__ = "AsyncFakePool"
+    fake = FakePool2()
+    saver_real = AsyncPostgresSaver(
+        dsn="postgresql://postgres:postgres@localhost:5432/hero_quant_test_aput_real", pool=fake
+    )
+    asyncio.run(saver_real.aput("wf:runReal:tenantE", {"v": 22}))
+    val2 = asyncio.run(saver_real.aget("wf:runReal:tenantE"))
+    assert val2 is not None and val2["v"] == 22
+    saver_real.delete("wf:runReal:tenantE")
+
+
+def test_list_thread_ids_real_pg_reconstruction_via_mapping():
+    """list_thread_ids real PG reconstruction uses _PG_RUN_BY_SEQ mapping."""
+    import hero_quant.checkpoint.postgres as pg
+    from hero_quant.checkpoint.postgres import _thread_to_keys, get_saver
+
+    dsn = "postgresql://postgres:postgres@localhost:5432/hero_quant_test_list_reconstruct"
+    # cleanup globals
+    for k in list(pg._PG_GLOBAL_STORE.keys()):
+        if k.startswith(dsn):
+            pg._PG_GLOBAL_STORE.pop(k, None)
+            pg._PG_GLOBAL_TS.pop(k, None)
+            pg._PG_GLOBAL_META.pop(k, None)
+    pg._PG_SEQ_BY_RUN.clear()
+    pg._PG_RUN_BY_SEQ.clear()
+    tid = "wf:myrun-EXT:tenantZ"
+    tenant, thread, seq = _thread_to_keys(tid)
+    # ensure mapping exists
+
+    class FakeConn:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def execute(self, sql, params=None):
+            class Cur:
+                def __init__(self, rows):
+                    self.rows = rows
+
+                def fetchall(self):
+                    return self.rows
+
+            return Cur(self.rows)
+
+        def cursor(self):
+            return self
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    class FakePool:
+        def __init__(self, rows):
+            self.rows = rows
+            self.conninfo = dsn
+
+        def connection(self):
+            return FakeConn(self.rows)
+
+    saver = get_saver(dsn=dsn, ttl_seconds=3600)
+    saver.pool = FakePool([(tenant, thread, seq)])
+    # clear emulated alive so real PG path taken
+    for k in list(pg._PG_GLOBAL_TS.keys()):
+        if k.startswith(dsn):
+            pg._PG_GLOBAL_TS.pop(k, None)
+    saver._timestamps.clear()
+    ids = saver.list_thread_ids()
+    assert tid in ids, f"real PG reconstruction failed, got {ids}, expected {tid}"

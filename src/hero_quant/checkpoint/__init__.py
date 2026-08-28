@@ -7,8 +7,11 @@
 
 from .postgres import AsyncPostgresSaver, PostgresSaver, get_saver
 from .temporal import (
+    DEFAULT_HEARTBEAT_TIMEOUT,
+    HEARTBEAT_INTERVAL,
     HEARTBEAT_INTERVAL_SECONDS,
     HeartbeatHelper,
+    HeartbeatTimer,
     get_heartbeat_details,
     heartbeat,
 )
@@ -17,8 +20,11 @@ __all__ = [
     "AsyncPostgresSaver",
     "PostgresSaver",
     "get_saver",
+    "DEFAULT_HEARTBEAT_TIMEOUT",
+    "HEARTBEAT_INTERVAL",
     "HEARTBEAT_INTERVAL_SECONDS",
     "HeartbeatHelper",
+    "HeartbeatTimer",
     "get_heartbeat_details",
     "heartbeat",
 ]

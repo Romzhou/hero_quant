@@ -244,3 +244,46 @@ def test_billing_rls_all_read_paths_filter_tenant():
         import inspect
         src = inspect.getsource(svc.get_factor)
         assert "tenant" in src.lower()
+
+
+def test_publish_factor_conflict_without_flag_raises():
+    """publish_factor overwrites existing factor_id without validation → must raise unless allow_overwrite/upsert."""
+    from hero_quant.billing.service import BillingService, _GLOBAL_FACTORS, _GLOBAL_PURCHASES
+    import inspect
+
+    # PG emulated mode
+    dsn = "postgresql://postgres:postgres@localhost:5432/hero_quant_billing_conflict_test"
+    _GLOBAL_FACTORS.pop(dsn, None)
+    _GLOBAL_PURCHASES.pop(dsn, None)
+    svc = BillingService(dsn=dsn)
+    svc.publish_factor(factor_id="conflict_f", name="F", price=10.0, tenant="prov")
+    # republish same id without flag must raise
+    try:
+        svc.publish_factor(factor_id="conflict_f", name="F2", price=20.0, tenant="prov")
+        assert False, "silent overwrite not allowed"
+    except ValueError as e:
+        assert "already exists" in str(e).lower() or "conflict" in str(e).lower()
+    # with allow_overwrite flag overwrites
+    out = svc.publish_factor(factor_id="conflict_f", name="F2", price=20.0, tenant="prov", allow_overwrite=True)
+    assert out["price"] == 20.0
+    assert svc.get_factor("conflict_f")["price"] == 20.0
+    # with upsert alias also overwrites
+    out2 = svc.publish_factor(factor_id="conflict_f", name="F3", price=30.0, tenant="prov", upsert=True)
+    assert out2["price"] == 30.0
+
+    # memory mode also forbids silent overwrite
+    svc2 = BillingService()
+    svc2.publish_factor(factor_id="mem_conflict", name="M", price=1, tenant="t1")
+    try:
+        svc2.publish_factor(factor_id="mem_conflict", name="M2", price=2, tenant="t1")
+        assert False, "memory silent overwrite not allowed"
+    except ValueError:
+        pass
+    # with flag ok
+    svc2.publish_factor(factor_id="mem_conflict", name="M2", price=2, tenant="t1", allow_overwrite=True)
+    assert svc2.get_factor("mem_conflict")["price"] == 2
+
+    # source-level check: must contain validation branch
+    src = inspect.getsource(svc.publish_factor)
+    assert "already exists" in src.lower() or "allow_overwrite" in src
+    assert "upsert" in src.lower()

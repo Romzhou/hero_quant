@@ -274,8 +274,7 @@ class AsyncPostgresSaver:
     async def asetup(self) -> None:
         """异步建表 — 真实 Postgres 时 await pool.open() 并执行 DDL。"""
         if self._setup_done:
-            if not (self._is_real_pg_pool() and self._pool_is_async()):
-                return
+            return
         if self.pool is not None and hasattr(self.pool, "open"):
             try:
                 await self.pool.open()  # type: ignore
@@ -573,7 +572,7 @@ class AsyncPostgresSaver:
             self._store[thread_id] = copy.deepcopy(checkpoint)
             self._meta[thread_id] = cfg
             self._timestamps[thread_id] = now
-            if self._is_real_pg_pool() or self._is_pg_mode():
+            if self._is_real_pg_pool():
                 await self._pg_put_async(thread_id, checkpoint, cfg)
             return
         self._store[thread_id] = copy.deepcopy(checkpoint)

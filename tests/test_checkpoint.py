@@ -6,6 +6,30 @@ def test_checkpoint_roundtrip():
     assert saver.get(tid)["step"]==1
 
 
+def test_checkpoint_public_api_reexport():
+    """checkpoint __init__ must re-export all temporal public symbols."""
+    import hero_quant.checkpoint as cp
+    import hero_quant.checkpoint.temporal as tmp
+
+    for name in tmp.__all__:
+        assert hasattr(cp, name), f"missing re-export {name} in hero_quant.checkpoint"
+        assert name in cp.__all__, f"{name} not in checkpoint __all__"
+    # also verify importable
+    from hero_quant.checkpoint import (
+        DEFAULT_HEARTBEAT_TIMEOUT,
+        HEARTBEAT_INTERVAL,
+        HEARTBEAT_INTERVAL_SECONDS,
+        HeartbeatHelper,
+        HeartbeatTimer,
+        get_heartbeat_details,
+        heartbeat,
+    )
+
+    assert HEARTBEAT_INTERVAL_SECONDS == tmp.HEARTBEAT_INTERVAL_SECONDS
+    assert HeartbeatHelper is tmp.HeartbeatHelper
+    assert HeartbeatTimer is tmp.HeartbeatTimer
+
+
 def test_sql_injection_safe():
     """expires_at must be parameterized, not interpolated; injection TTL must not execute."""
     from hero_quant.checkpoint.postgres import AsyncPostgresSaver

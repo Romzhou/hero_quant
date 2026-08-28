@@ -135,10 +135,31 @@ class BillingService:
         price: float,
         tenant: str = "default",
         description: str = "",
+        allow_overwrite: bool = False,
+        upsert: bool = False,
+        **kwargs: object,
     ) -> dict:
         """发布因子，记录归属租户与定价。PG 时写入 global emulated store + 尝试真实 PG。"""
+        # alias handling: overwrite kw
+        if kwargs.get("overwrite") is not None:
+            allow_overwrite = allow_overwrite or bool(kwargs.get("overwrite"))
         if not isinstance(tenant, str) or not tenant.strip():
             raise ValueError("tenant must be non-empty str")
+        effective_allow = bool(allow_overwrite or upsert)
+        # conflict check: if factor_id exists and not allowed, raise
+        if not effective_allow:
+            exists = False
+            if self._is_pg_mode():
+                with _GLOBAL_LOCK:
+                    if factor_id in _GLOBAL_FACTORS.get(self.dsn, {}):  # type: ignore
+                        exists = True
+                if not exists and factor_id in self._factors:
+                    exists = True
+            else:
+                if factor_id in self._factors:
+                    exists = True
+            if exists:
+                raise ValueError(f"factor_id already exists: {factor_id}; use allow_overwrite=True or upsert=True to overwrite")
         factor = {
             "factor_id": factor_id,
             "name": name,
