@@ -26,12 +26,14 @@ export default function Live() {
   const esRef = useRef<EventSource | null>(null)
   const offsetRef = useRef(offset)
   const costRef = useRef(cost)
+  const pausedRef = useRef(paused)
   const readerRef = useRef<ReadableStreamDefaultReader<Uint8Array> | null>(null)
   const abortRef = useRef<AbortController | null>(null)
 
-  // 用 ref 镜像 offset/cost，避免 SSE effect 依赖频繁变动导致重建连接
+  // 用 ref 镜像 offset/cost/paused，避免 SSE effect 依赖频繁变动导致重建连接，修复 stale closure
   useEffect(() => { offsetRef.current = offset }, [offset])
   useEffect(() => { costRef.current = cost }, [cost])
+  useEffect(() => { pausedRef.current = paused }, [paused])
 
   // 订阅实盘事件：fetch 流式优先，异常时尝试 EventSource；paused 时暂停
   useEffect(() => {
@@ -46,6 +48,10 @@ export default function Live() {
         `/v1/trace/events?offset=0`,
       ]
       for (const url of candidates) {
+        // 48-50 修复：切换候选前先 abort 上一个 controller，避免泄漏
+        if (abortRef.current) {
+          try { abortRef.current.abort() } catch {}
+        }
         const controller = new AbortController()
         abortRef.current = controller
         let reader: ReadableStreamDefaultReader<Uint8Array> | null = null
@@ -56,7 +62,7 @@ export default function Live() {
           readerRef.current = reader
           const decoder = new TextDecoder()
           let buf = ""
-          while (!aborted && !paused) {
+          while (!aborted && !pausedRef.current) {
             const { done, value } = await reader.read()
             if (done) break
             buf += decoder.decode(value, { stream: true })
@@ -125,7 +131,7 @@ export default function Live() {
     streamFetch()
     // 已通过 fetch /v1/trace/events SSE 真流驱动；移除 Math.random mock（Wave5 去 mock），保留确定性空心跳占位
     const heartbeat = setInterval(() => {
-      if (aborted || paused) return
+      if (aborted || pausedRef.current) return
       // 纯 SSE 驱动，不再注入随机 mock；确定性占位避免使用 Math.random
     }, 5000)
 

@@ -12,36 +12,54 @@ type Metrics = { annual_return?: number; sharpe?: number; max_drawdown?: number;
 
 const FALLBACK: Metrics = { annual_return: 0.184, sharpe: 1.62, max_drawdown: -0.032, turnover: 0.42 }
 
+function isFiniteNumber(v: unknown): v is number {
+  return typeof v === "number" && Number.isFinite(v)
+}
+function fmtPct(v: unknown, fallback: number): string {
+  return isFiniteNumber(v) ? `${(v * 100).toFixed(1)}%` : `${(fallback * 100).toFixed(1)}%`
+}
+function fmtFixed(v: unknown, fallback: number, digits = 2): string {
+  return isFiniteNumber(v) ? (v as number).toFixed(digits) : fallback.toFixed(digits)
+}
+
 export default function Dashboard() {
   const navigate = useNavigate()
   const [metrics, setMetrics] = useState<Metrics>(FALLBACK)
   const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
+  const [reloadKey, setReloadKey] = useState(0)
 
   useEffect(() => {
     let aborted = false
     async function load() {
+      setError(null)
+      setLoading(true)
       try {
         const r = await fetch("/v1/backtest/metrics.json", { cache: "no-store" })
         if (!r.ok) throw new Error(String(r.status))
         const j = await r.json()
         if (!aborted && j && typeof j === "object") {
           setMetrics({
-            annual_return: typeof j.annual_return === "number" ? j.annual_return : FALLBACK.annual_return,
-            sharpe: typeof j.sharpe === "number" ? j.sharpe : FALLBACK.sharpe,
-            max_drawdown: typeof j.max_drawdown === "number" ? j.max_drawdown : FALLBACK.max_drawdown,
-            turnover: typeof j.turnover === "number" ? j.turnover : FALLBACK.turnover,
-            total_equity: typeof j.total_equity === "number" ? j.total_equity : (typeof j.totalEquity === "number" ? j.totalEquity : undefined),
+            annual_return: isFiniteNumber((j as Record<string, unknown>).annual_return) ? (j as Record<string, unknown>).annual_return as number : FALLBACK.annual_return,
+            sharpe: isFiniteNumber((j as Record<string, unknown>).sharpe) ? (j as Record<string, unknown>).sharpe as number : FALLBACK.sharpe,
+            max_drawdown: isFiniteNumber((j as Record<string, unknown>).max_drawdown) ? (j as Record<string, unknown>).max_drawdown as number : FALLBACK.max_drawdown,
+            turnover: isFiniteNumber((j as Record<string, unknown>).turnover) ? (j as Record<string, unknown>).turnover as number : FALLBACK.turnover,
+            total_equity: isFiniteNumber((j as Record<string, unknown>).total_equity) ? (j as Record<string, unknown>).total_equity as number : (isFiniteNumber((j as Record<string, unknown>).totalEquity) ? (j as Record<string, unknown>).totalEquity as number : undefined),
           })
         }
-      } catch {
-        // keep fallback
+      } catch (e) {
+        if (!aborted) {
+          const msg = e instanceof Error ? e.message : String(e)
+          console.error("[Dashboard] metrics fetch failed:", msg)
+          setError(msg)
+        }
       } finally {
         if (!aborted) setLoading(false)
       }
     }
     load()
     return () => { aborted = true }
-  }, [])
+  }, [reloadKey])
 
   const handleDemo = () => {
     const q = "回测 600519.SH 近一月等权"
@@ -49,12 +67,12 @@ export default function Dashboard() {
     navigate("/backtest")
   }
 
-  const totalEquityDisplay = loading ? "…" : (metrics.total_equity != null ? `¥ ${metrics.total_equity.toLocaleString("zh-CN")}` : "—")
+  const totalEquityDisplay = loading ? "…" : (isFiniteNumber(metrics.total_equity) ? `¥ ${metrics.total_equity.toLocaleString("zh-CN")}` : "—")
   const cards = [
     { k: "总资产", v: totalEquityDisplay, sub: "含现金", accent: false, isEquity: true },
-    { k: "年化", v: loading ? "…" : `${(metrics.annual_return! * 100).toFixed(1)}%`, sub: `sharpe ${metrics.sharpe?.toFixed(2) ?? "1.62"}`, accent: true },
-    { k: "最大回撤", v: loading ? "…" : `${(metrics.max_drawdown! * 100).toFixed(1)}%`, sub: "近30日", accent: false },
-    { k: "换手率", v: loading ? "…" : String(metrics.turnover), sub: "turnover", accent: false },
+    { k: "年化", v: loading ? "…" : fmtPct(metrics.annual_return, FALLBACK.annual_return!), sub: `sharpe ${fmtFixed(metrics.sharpe, FALLBACK.sharpe!)}`, accent: true },
+    { k: "最大回撤", v: loading ? "…" : fmtPct(metrics.max_drawdown, FALLBACK.max_drawdown!), sub: "近30日", accent: false },
+    { k: "换手率", v: loading ? "…" : fmtFixed(metrics.turnover, FALLBACK.turnover!, 2), sub: "turnover", accent: false },
   ]
 
   return (
@@ -88,6 +106,25 @@ export default function Dashboard() {
         </div>
         <span className="rounded-full border border-emerald-400/20 bg-emerald-400/10 px-3 py-1 text-xs font-medium text-emerald-300">数据就绪</span>
       </div>
+
+      {error && !loading && (
+        <div
+          role="alert"
+          className="mt-4 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-3"
+        >
+          <div className="flex items-center gap-2 text-sm text-amber-200">
+            <span className="h-2 w-2 rounded-full bg-amber-400 animate-pulse" aria-hidden />
+            数据获取失败，显示为占位数据
+          </div>
+          <button
+            type="button"
+            onClick={() => setReloadKey(k => k + 1)}
+            className="rounded-full border border-amber-500/30 bg-amber-500/20 px-3 py-1 text-xs font-medium text-amber-100 hover:bg-amber-500/30"
+          >
+            重试
+          </button>
+        </div>
+      )}
 
       {/* 指标卡：骨架 + 真实指标 */}
       <div className="mt-6 grid grid-cols-2 gap-3 md:grid-cols-4">
@@ -136,7 +173,7 @@ export default function Dashboard() {
           <ul className="mt-3 space-y-2 text-xs">
             <li>
               <Link to="/research" className="flex justify-between rounded-xl bg-ink-900/60 border border-white/5 px-3 py-2 hover:border-amber-500/20 hover:bg-amber-500/5 transition">
-                <span className="text-slate-400">回测完成</span><span className="text-mist">600519.SH 等权 · {(metrics.annual_return!*100).toFixed(1)}% 年化 → 研究 ↗</span>
+                <span className="text-slate-400">回测完成</span><span className="text-mist">600519.SH 等权 · {fmtPct(metrics.annual_return, FALLBACK.annual_return!)} 年化 → 研究 ↗</span>
               </Link>
             </li>
             <li>

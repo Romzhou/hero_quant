@@ -2,7 +2,7 @@
  * Monitor 运行态监控页（与 Live 同源，布局备份）
  * - 职责：展示 events.jsonl 增量 tail、OTel 成本熔断、心跳与熔断双桶状态
  * - 数据流：轮询 /v1/trace/events 等候选地址的 SSE 流，按 offset 增量追加；失败回退 EventSource，附 mock 心跳保活
- * - 注意：effect 依赖包含 offset/cost/breakerState 以便 mock 能感知最新阈值，真实 SSE 侧以局部 curOffset 为增量游标
+ * - 修复：effect 去重连风暴 — refs 镜像 offset/cost，deps 仅 [paused]；reader/abort 完整清理
  */
 import { useEffect, useRef, useState } from "react"
 
@@ -23,12 +23,21 @@ export default function Monitor() {
   const breakerState = ratio >= 1 ? "OPEN" : ratio >= 0.8 ? "HALF_OPEN" : "CLOSED"
   const listRef = useRef<HTMLDivElement>(null)
   const esRef = useRef<EventSource | null>(null)
+  const offsetRef = useRef(offset)
+  const costRef = useRef(cost)
+  const pausedRef = useRef(paused)
+  const readerRef = useRef<ReadableStreamDefaultReader<Uint8Array> | null>(null)
+  const abortRef = useRef<AbortController | null>(null)
+
+  useEffect(() => { offsetRef.current = offset }, [offset])
+  useEffect(() => { costRef.current = cost }, [cost])
+  useEffect(() => { pausedRef.current = paused }, [paused])
 
   // 订阅 events.jsonl：fetch 流式优先，失败回退 EventSource；paused 时暂停
   useEffect(() => {
     if (paused) return
     let aborted = false
-    let curOffset = offset
+    let curOffset = offsetRef.current
 
     async function streamFetch() {
       // 按优先级尝试候选 SSE 地址，命中则进入帧解析循环
@@ -38,12 +47,21 @@ export default function Monitor() {
         `/v1/query/stream?offset=${curOffset}`,
       ]
       for (const candidate of candidates) {
+        // 切换候选前先清理上一个 controller，避免泄漏
+        if (abortRef.current) {
+          try { abortRef.current.abort() } catch {}
+        }
+        let reader: ReadableStreamDefaultReader<Uint8Array> | null = null
+        let controller: AbortController | null = null
         try {
           let url = candidate
           if (candidate.startsWith("/v1/query/stream")) {
+            controller = new AbortController()
+            abortRef.current = controller
             const ticketResp = await fetch("/v1/query/ticket", {
               method: "POST",
               headers: { Accept: "application/json" },
+              signal: controller.signal,
             })
             if (!ticketResp.ok) continue
             const payload = await ticketResp.json() as { ticket?: unknown }
@@ -51,12 +69,19 @@ export default function Monitor() {
             if (aborted) return
             url += `&ticket=${encodeURIComponent(payload.ticket)}`
           }
-          const resp = await fetch(url, { headers: { Accept: "text/event-stream" } })
+          // 非 ticket 分支也创建可追踪的 controller，便于统一清理
+          if (!controller) {
+            controller = new AbortController()
+            abortRef.current = controller
+          }
+          const resp = await fetch(url, { headers: { Accept: "text/event-stream" }, signal: controller.signal })
           if (!resp.ok || !resp.body) continue
-          const reader = resp.body.getReader()
+          reader = resp.body.getReader()
+          readerRef.current = reader
           const decoder = new TextDecoder()
           let buf = ""
-          while (!aborted && !paused) {
+          let outerDone = false
+          while (!aborted && !pausedRef.current) {
             const { done, value } = await reader.read()
             if (done) break
             buf += decoder.decode(value, { stream: true })
@@ -66,7 +91,7 @@ export default function Monitor() {
               const line = p.split("\n").find(l => l.startsWith("data:"))
               if (!line) continue
               const raw = line.replace(/^data:\s*/, "")
-              if (raw === "[DONE]") break
+              if (raw === "[DONE]") { outerDone = true; break }
               try {
                 const j = JSON.parse(raw)
                 const ev: LiveEvent = {
@@ -78,17 +103,32 @@ export default function Monitor() {
                   cost: j.cost
                 }
                 setEvents(prev => [...prev.slice(-199), ev])
-                if (typeof j.cost === "number") setCost(j.cost)
+                if (typeof j.cost === "number" && Number.isFinite(j.cost)) {
+                  costRef.current = j.cost
+                  setCost(j.cost)
+                }
                 curOffset = (j.offset ?? curOffset) + 1
+                offsetRef.current = curOffset
                 setOffset(curOffset)
               } catch {
-                setEvents(prev => [...prev.slice(-199), { ts: new Date().toISOString(), offset: curOffset++, type: "raw", msg: raw.slice(0, 160) }])
+                const next = curOffset
+                curOffset++
+                offsetRef.current = curOffset
+                setEvents(prev => [...prev.slice(-199), { ts: new Date().toISOString(), offset: next, type: "raw", msg: raw.slice(0, 160) }])
+                setOffset(curOffset)
               }
             }
+            if (outerDone) break
           }
+          // flush decoder tail
+          try { buf += decoder.decode() } catch {}
           return // 已建立流则不再尝试其他候选
         } catch {
           // 当前候选失败，静默尝试下一个
+        } finally {
+          try { await reader?.cancel() } catch {}
+          try { reader?.releaseLock() } catch {}
+          if (readerRef.current === reader) readerRef.current = null
         }
       }
       // fetch 候选均失败，回退 EventSource
@@ -98,11 +138,17 @@ export default function Monitor() {
         es.onmessage = e => {
           try {
             const j = JSON.parse(e.data)
-            setEvents(prev => [...prev.slice(-199), { ts: j.ts || new Date().toISOString(), offset: j.offset ?? curOffset, type: j.type || "event", msg: j.msg || e.data.slice(0, 120) }])
-            curOffset++
+            const nextOffset = j.offset ?? curOffset
+            setEvents(prev => [...prev.slice(-199), { ts: j.ts || new Date().toISOString(), offset: nextOffset, type: j.type || "event", msg: j.msg || e.data.slice(0, 120) }])
+            curOffset = nextOffset + 1
+            offsetRef.current = curOffset
             setOffset(curOffset)
           } catch {
-            setEvents(prev => [...prev.slice(-199), { ts: new Date().toISOString(), offset: curOffset++, type: "sse", msg: e.data.slice(0, 140) }])
+            const next = curOffset
+            curOffset++
+            offsetRef.current = curOffset
+            setEvents(prev => [...prev.slice(-199), { ts: new Date().toISOString(), offset: next, type: "sse", msg: e.data.slice(0, 140) }])
+            setOffset(curOffset)
           }
         }
         es.onerror = () => { es.close() }
@@ -113,13 +159,22 @@ export default function Monitor() {
     // SSE 已通过 fetch /v1/trace/events 真流驱动；移除 Math.random mock，保持纯 SSE（Wave5 去 mock）
     // 若需离线演示，保留确定性心跳（按 offset 轮转，无随机），避免 Math.random 污染测试
     const heartbeat = setInterval(() => {
-      if (aborted || paused) return
+      if (aborted || pausedRef.current) return
       // 仅当 SSE 30s 无数据时补充确定性心跳（此处静默，不主动增量，由 SSE 主导）
     }, 5000)
 
-    // 清理定时器与 SSE，防止切页泄漏
-    return () => { aborted = true; clearInterval(heartbeat); esRef.current?.close() }
-  }, [paused, offset, cost, breakerState])
+    // 清理定时器与 SSE/流读取器，防止切页泄漏 — 包含 reader.cancel + abort
+    return () => {
+      aborted = true
+      clearInterval(heartbeat)
+      esRef.current?.close()
+      esRef.current = null
+      try { readerRef.current?.cancel().catch(() => {}) } catch {}
+      try { readerRef.current?.releaseLock() } catch {}
+      readerRef.current = null
+      try { abortRef.current?.abort() } catch {}
+    }
+  }, [paused])
 
   // 事件追加后滚底，保持 tail -f 体验
   useEffect(() => {

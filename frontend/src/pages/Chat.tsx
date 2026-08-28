@@ -5,10 +5,44 @@
  *   约定 JSON 字段：delta/text/content/answer 为增量文本，type=="tool" 为工具轨迹，type=="error" 为错误，[DONE] 为结束
  * - 渲染：delta 逐片追加到 assistant 消息，tool 事件聚合到 traceByMsgId 渲染轨迹条；支持 AbortController 中断与空响应兜底
  */
-import { useRef, useState } from "react"
+import { useEffect, useRef, useState } from "react"
 import { useChatStore } from "../store/chat"
 
-type ToolCall = { tool: string; status: "pending" | "success" | "error"; latencyMs?: number; preview?: string }
+type ToolCall = { id: string; tool: string; status: "pending" | "success" | "error"; latencyMs?: number; preview?: string }
+
+// 纯函数：统一解析 SSE payload，fetch 回退与 EventSource 共用，满足 68-72 去重
+export function parseSseData(raw: string): { kind: "delta" | "tool" | "error"; delta?: string; tool?: { tool: string; status: ToolCall["status"]; preview?: string; latencyMs?: number; rawId?: string }; error?: string } | null {
+  if (!raw || raw === "[DONE]") return null
+  try {
+    const j = JSON.parse(raw)
+    if (j.type === "tool") {
+      const tname = (j.tool || j.name || "unknown_tool") as string
+      const status = (j.status as ToolCall["status"]) || "success"
+      const preview = j.preview ?? j.msg ?? j.detail ?? undefined
+      const latencyMs = j.latencyMs ?? j.latency ?? j.durationMs ?? undefined
+      const rawId = j.id != null ? String(j.id) : (j.tool_call_id != null ? String(j.tool_call_id) : undefined)
+      return { kind: "tool", tool: { tool: tname, status, preview, latencyMs, rawId } }
+    }
+    if (j.type === "error") {
+      return { kind: "error", error: j.msg || j.message || "stream error" }
+    }
+    // 兼容：含 tool 字段但未标 type 且无 delta 时视为轨迹
+    if (j.tool && !("delta" in j) && !("text" in j) && !("content" in j) && !("answer" in j)) {
+      const tname = (j.tool || j.name) as string
+      return { kind: "tool", tool: { tool: tname, status: (j.status as ToolCall["status"]) || "success", preview: j.preview, latencyMs: j.latencyMs, rawId: j.id != null ? String(j.id) : undefined } }
+    }
+    const delta = j.delta || j.text || j.content || j.answer || ""
+    if (delta) return { kind: "delta", delta }
+    // 无可识别字段时视为无操作，避免误判为 delta 空
+    return null
+  } catch (e) {
+    if (e instanceof SyntaxError) {
+      if (raw) return { kind: "delta", delta: raw }
+      return null
+    }
+    throw e
+  }
+}
 
 export default function Chat() {
   const { messages, input, streaming, setInput, push, setStreaming } = useChatStore()
@@ -17,17 +51,40 @@ export default function Chat() {
   const listRef = useRef<HTMLDivElement>(null)
   const abortRef = useRef<AbortController | null>(null)
   const esRef = useRef<EventSource | null>(null)
+  const rafIdsRef = useRef<number[]>([])
+  const timeoutIdsRef = useRef<number[]>([])
+  const toolSeqRef = useRef(0)
+
+  // 17-19: 卸载清理 — 关闭 SSE/Abort 并清理 pending rAF/setTimeout，避免泄漏与 setState on unmounted
+  useEffect(() => {
+    return () => {
+      abortRef.current?.abort()
+      esRef.current?.close()
+      esRef.current = null
+      rafIdsRef.current.forEach(id => cancelAnimationFrame(id))
+      timeoutIdsRef.current.forEach(id => clearTimeout(id))
+      rafIdsRef.current = []
+      timeoutIdsRef.current = []
+    }
+  }, [])
+
+  function trackRaf(id: number) {
+    rafIdsRef.current.push(id)
+  }
+  function trackTimeout(id: number) {
+    timeoutIdsRef.current.push(id)
+  }
 
   async function send() {
     const q = input.trim()
     if (!q || streaming) return
-    const userMsg = { id: String(Date.now()), role: "user" as const, content: q }
+    const userMsg = { id: crypto.randomUUID(), role: "user" as const, content: q }
     push(userMsg)
     setInput("")
     setStreaming(true)
     setError(null)
 
-    const aid = String(Date.now() + 1)
+    const aid = crypto.randomUUID()
     push({ id: aid, role: "assistant", content: "" })
     // 初始化空轨迹，占位保证 UI 结构稳定，后续由后端 type=="tool" 事件填充
     setTraceByMsgId(s => ({ ...s, [aid]: [] }))
@@ -62,51 +119,38 @@ export default function Chat() {
       useChatStore.setState(s => ({
         messages: s.messages.map(m => m.id === aid ? { ...m, content: acc } : m),
       }))
-      requestAnimationFrame(() => listRef.current?.scrollTo({ top: 99999, behavior: "smooth" }))
+      const raf = requestAnimationFrame(() => listRef.current?.scrollTo({ top: 99999, behavior: "smooth" }))
+      trackRaf(raf)
     }
 
     const handlePayload = (raw: string) => {
-      if (!raw || raw === "[DONE]") return
-      try {
-        const j = JSON.parse(raw)
-        if (j.type === "tool") {
-          const tname = (j.tool || j.name || "unknown_tool") as string
-          const status = (j.status as ToolCall["status"]) || "success"
-          const preview = j.preview ?? j.msg ?? j.detail ?? undefined
-          const latencyMs = j.latencyMs ?? j.latency ?? j.durationMs ?? undefined
-          setTraceByMsgId(prev => {
-            const cur = prev[aid] ?? []
-            const exists = cur.find(c => c.tool === tname)
+      const parsed = parseSseData(raw)
+      if (!parsed) {
+        if (raw === "[DONE]") return
+        // null means no-op (already handled) or empty
+        return
+      }
+      if (parsed.kind === "tool" && parsed.tool) {
+        const { tool: tname, status, preview, latencyMs, rawId } = parsed.tool
+        const uniqueId = rawId ?? `${tname}-${toolSeqRef.current++}-${crypto.randomUUID()}`
+        setTraceByMsgId(prev => {
+          const cur = prev[aid] ?? []
+          // 若后端提供 rawId 且已存在则更新，否则新增一条独立调用（不按 tool name 合并）
+          if (rawId) {
+            const exists = cur.find(c => c.id === rawId)
             if (exists) {
-              return { ...prev, [aid]: cur.map(c => c.tool === tname ? { ...c, status, preview: preview ?? c.preview, latencyMs: latencyMs ?? c.latencyMs } : c) }
+              return { ...prev, [aid]: cur.map(c => c.id === rawId ? { ...c, status, preview: preview ?? c.preview, latencyMs: latencyMs ?? c.latencyMs } : c) }
             }
-            return { ...prev, [aid]: [...cur, { tool: tname, status, preview, latencyMs }] }
-          })
-          return
-        }
-        // 兼容：含 tool 字段但未标 type 且无 delta 时视为轨迹
-        if (j.tool && !("delta" in j) && !("text" in j) && !("content" in j) && !("answer" in j)) {
-          const tname = (j.tool || j.name) as string
-          setTraceByMsgId(prev => {
-            const cur = prev[aid] ?? []
-            const exists = cur.find(c => c.tool === tname)
-            if (exists) return prev
-            return { ...prev, [aid]: [...cur, { tool: tname, status: (j.status as ToolCall["status"]) || "success", preview: j.preview, latencyMs: j.latencyMs }] }
-          })
-          return
-        }
-        if (j.type === "error") {
-          throw new Error(j.msg || j.message || "stream error")
-        }
-        const delta = j.delta || j.text || j.content || j.answer || ""
-        if (delta) appendDelta(delta)
-      } catch (e) {
-        if (e instanceof SyntaxError) {
-          // 非 JSON 的 data: 行按纯文本 delta 处理，兼容后端直接吐文本的降级
-          if (raw) appendDelta(raw)
-        } else {
-          throw e
-        }
+          }
+          return { ...prev, [aid]: [...cur, { id: uniqueId, tool: tname, status, preview, latencyMs }] }
+        })
+        return
+      }
+      if (parsed.kind === "error" && parsed.error) {
+        throw new Error(parsed.error)
+      }
+      if (parsed.kind === "delta" && parsed.delta) {
+        appendDelta(parsed.delta)
       }
     }
 
@@ -123,6 +167,7 @@ export default function Chat() {
       const reader = resp.body.getReader()
       const decoder = new TextDecoder()
       let buffer = ""
+      let outerDone = false
       while (true) {
         const { done, value } = await reader.read()
         if (done) break
@@ -139,9 +184,17 @@ export default function Chat() {
             .map(l => l.replace(/^data:\s*/, ""))
           if (dataLines.length === 0) continue
           const data = dataLines.join("\n")
-          if (data === "[DONE]") break
+          if (data === "[DONE]") { outerDone = true; break }
           handlePayload(data)
         }
+        if (outerDone) break
+      }
+      // 142-146 修复：flush decoder 尾部，避免末尾无 \n\n 的帧丢失
+      buffer += decoder.decode()
+      if (buffer.trim()) {
+        const tailLines = buffer.split("\n").filter(l => l.startsWith("data:")).map(l => l.replace(/^data:\s*/, ""))
+        const tailData = tailLines.join("\n").trim()
+        if (tailData && tailData !== "[DONE]") handlePayload(tailData)
       }
       if (!hasDelta && !acc) {
         useChatStore.setState(s => ({
@@ -177,46 +230,33 @@ export default function Chat() {
               }
               return
             }
-            try {
-              const j = JSON.parse(data)
-              if (j.type === "tool") {
-                const tname = (j.tool || j.name || "unknown_tool") as string
-                const status = (j.status as ToolCall["status"]) || "success"
-                const preview = j.preview ?? j.msg ?? j.detail ?? undefined
-                const latencyMs = j.latencyMs ?? j.latency ?? j.durationMs ?? undefined
-                setTraceByMsgId(prev => {
-                  const cur = prev[aid] ?? []
-                  const exists = cur.find(c => c.tool === tname)
+            const parsed = parseSseData(data)
+            if (!parsed) return
+            if (parsed.kind === "tool" && parsed.tool) {
+              const { tool: tname, status, preview, latencyMs, rawId } = parsed.tool
+              const uniqueId = rawId ?? `${tname}-${toolSeqRef.current++}-${crypto.randomUUID()}`
+              setTraceByMsgId(prev => {
+                const cur = prev[aid] ?? []
+                if (rawId) {
+                  const exists = cur.find(c => c.id === rawId)
                   if (exists) {
-                    return { ...prev, [aid]: cur.map(c => c.tool === tname ? { ...c, status, preview: preview ?? c.preview, latencyMs: latencyMs ?? c.latencyMs } : c) }
+                    return { ...prev, [aid]: cur.map(c => c.id === rawId ? { ...c, status, preview: preview ?? c.preview, latencyMs: latencyMs ?? c.latencyMs } : c) }
                   }
-                  return { ...prev, [aid]: [...cur, { tool: tname, status, preview, latencyMs }] }
-                })
-                return
-              }
-              const delta = j.delta || j.text || j.content || j.answer || ""
-              if (delta) appendDelta(delta)
-              else if (j.tool && !delta) {
-                // tool event without type
-                const tname2 = j.tool as string
-                setTraceByMsgId(prev => {
-                  const cur = prev[aid] ?? []
-                  if (cur.find(c => c.tool === tname2)) return prev
-                  return { ...prev, [aid]: [...cur, { tool: tname2, status: (j.status as ToolCall["status"]) || "success", preview: j.preview, latencyMs: j.latencyMs }] }
-                })
-              }
-            } catch (e) {
-              if (e instanceof SyntaxError) {
-                if (data) appendDelta(data)
-              } else {
-                es.close()
-                esRef.current = null
-                if (!settled) {
-                  settled = true
-                  reject(e)
                 }
-              }
+                return { ...prev, [aid]: [...cur, { id: uniqueId, tool: tname, status, preview, latencyMs }] }
+              })
+              return
             }
+            if (parsed.kind === "error" && parsed.error) {
+              es.close()
+              esRef.current = null
+              if (!settled) {
+                settled = true
+                reject(new Error(parsed.error))
+              }
+              return
+            }
+            if (parsed.kind === "delta" && parsed.delta) appendDelta(parsed.delta)
           }
           es.onerror = () => {
             es.close()
@@ -251,7 +291,7 @@ export default function Chat() {
             }
           }
           // 超时保护：1200ms 内未建连则主动回退，避免 EventSource 挂起无反馈
-          setTimeout(() => {
+          const tid = window.setTimeout(() => {
             if (!gotMessage && es.readyState !== 1 && !fallbackTriggered) {
               fallbackTriggered = true
               es.close()
@@ -271,6 +311,7 @@ export default function Chat() {
                 })
             }
           }, 1200)
+          trackTimeout(tid as unknown as number)
         } catch (err) {
           // 环境不支持 EventSource 时直接走 fetch 回退
           fetchFallback()
@@ -312,7 +353,8 @@ export default function Chat() {
       esRef.current?.close()
       esRef.current = null
       // 收尾滚动到底，确保最后 delta 可见
-      requestAnimationFrame(() => listRef.current?.scrollTo({ top: 99999, behavior: "smooth" }))
+      const raf = requestAnimationFrame(() => listRef.current?.scrollTo({ top: 99999, behavior: "smooth" }))
+      trackRaf(raf)
     }
   }
 
@@ -372,7 +414,7 @@ export default function Chat() {
                         <div className="mt-2 flex gap-1.5 overflow-x-auto pb-1">
                           {traceByMsgId[m.id].map(t => (
                             <div
-                              key={t.tool}
+                              key={t.id}
                               className={
                                 "shrink-0 rounded-lg border px-2.5 py-1.5 text-xs leading-none " +
                                 (t.status === "success"
@@ -393,7 +435,7 @@ export default function Chat() {
                         <div className="mt-2 flex gap-1">
                           {traceByMsgId[m.id].map(t => (
                             <div
-                              key={t.tool + "-dot"}
+                              key={t.id + "-dot"}
                               className={"h-1 flex-1 rounded-full " + (t.status === "success" ? "bg-emerald-400" : t.status === "error" ? "bg-red-400" : "bg-white/10")}
                             />
                           ))}
@@ -434,13 +476,13 @@ export default function Chat() {
                 key={q}
                 onClick={() => {
                   setInput(q)
-                  // 轻量高亮：80ms 后若用户未编辑，自动聚焦输入框提示可直接发送
-                  setTimeout(() => {
+                  const tid = window.setTimeout(() => {
                     const cur = useChatStore.getState().input
                     if (cur === q) {
                       // 保持 setInput 行为兼容测试，不自动发送，避免误触
                     }
                   }, 80)
+                  trackTimeout(tid as unknown as number)
                 }}
                 className="group rounded-xl border border-white/10 bg-white/[0.04] px-3 py-3 text-left text-xs leading-5 text-slate-300 hover:bg-white/[0.08] hover:border-amber-500/20 transition"
               >
@@ -466,11 +508,11 @@ export default function Chat() {
             onClick={() => {
               const q = "回测 600519.SH 近一月等权"
               setInput(q)
-              // 80ms 后自动发送，读取最新 store 保证 ticket 流程
-              setTimeout(() => {
+              const tid = window.setTimeout(() => {
                 const cur = useChatStore.getState().input
                 if (cur.trim() === q) send()
               }, 80)
+              trackTimeout(tid as unknown as number)
             }}
             className="rounded-lg bg-amber-500 px-3 py-1.5 text-xs font-semibold text-ink-900 hover:bg-amber-400 transition"
           >
