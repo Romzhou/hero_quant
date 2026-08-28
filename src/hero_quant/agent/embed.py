@@ -9,6 +9,7 @@
 """
 from __future__ import annotations
 
+import functools
 import hashlib
 import math
 import re
@@ -249,8 +250,8 @@ def embed_batch(texts: List[str], dim: int | None = None) -> List[List[float]]:
     return [embed(t, dim=eff_dim) for t in texts]
 
 
-def embed(text: str, dim: int | None = None) -> List[float]:
-    """按提供方分发嵌入，失败自动回落到语义桩或离线 hash."""
+def _embed_uncached(text: str, dim: int | None = None) -> List[float]:
+    """按提供方分发嵌入，失败自动回落到语义桩或离线 hash（无缓存内层）。"""
     provider = _active_provider_name()
     if dim is None:
         dim = get_vector_dim()
@@ -274,6 +275,38 @@ def embed(text: str, dim: int | None = None) -> List[float]:
             return v
         return _embed_semantic(text, dim)
     return _embed_offline(text, dim)
+
+
+@functools.lru_cache(maxsize=1024)
+def _embed_cached(text: str, dim: int) -> List[float]:
+    return _embed_uncached(text, dim)
+
+
+def embed(text: str, dim: int | None = None) -> List[float]:
+    """按提供方分发嵌入，失败自动回落到语义桩或离线 hash（lru_cache 1024）。"""
+    # 归一化维度与提供方，保证缓存键稳定
+    eff_dim: int
+    if dim is None:
+        eff_dim = get_vector_dim()
+    else:
+        try:
+            eff_dim = int(dim)
+        except Exception:
+            eff_dim = get_vector_dim()
+        if eff_dim <= 0 or eff_dim < 8 or eff_dim > 2048:
+            eff_dim = get_vector_dim()
+    # provider 变化时清空缓存以避免陈旧向量（轻量检查）
+    # 缓存键包含 provider 隐式通过文本+dim，但为防 provider 切换污染，检测后清除
+    try:
+        current_provider = _active_provider_name()
+        # 使用函数属性记录上次 provider
+        last = getattr(_embed_cached, "_last_provider", None)
+        if last is not None and last != current_provider:
+            _embed_cached.cache_clear()
+        _embed_cached._last_provider = current_provider  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    return list(_embed_cached(str(text), int(eff_dim)))
 
 
 def cosine_sim(a: List[float], b: List[float]) -> float:

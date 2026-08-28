@@ -61,11 +61,11 @@ except Exception:  # pragma: no cover — runner 缺失时不影响基础沙箱�
     class LandlockSandbox(BaseSandbox):  # type: ignore
         def execute_python(self, source, *a, **kw):  # type: ignore
             check_source(source)
-            raise RuntimeError("runner unavailable")
+            raise SandboxUnavailableError("runner unavailable")
 
     def execute_python(source, *a, **kw):  # type: ignore
         check_source(source)
-        raise RuntimeError("runner unavailable")
+        raise SandboxUnavailableError("runner unavailable")
 
 
 __all__ = [

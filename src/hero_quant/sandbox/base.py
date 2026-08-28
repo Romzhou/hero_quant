@@ -30,6 +30,10 @@ def _has_docker() -> bool:
         return False
 
 
+class SandboxUnavailableError(RuntimeError):
+    """Fail-closed：workspace-write 要求强隔离但 bwrap/landlock 不可用时抛出。"""
+
+
 class BaseSandbox(ABC):
     """沙箱抽象基类：定义 ``execute``/``confine``/``enforcement`` 契约。
 
@@ -41,7 +45,7 @@ class BaseSandbox(ABC):
         raise NotImplementedError
 
     def confine(self, argv: List[str], policy: dict) -> List[str]:
-        """按策略包裹 argv：workspace-write 且 bwrap 可用时添加只读根与可写绑定，否则原样返回。"""
+        """按策略包裹 argv：workspace-write 且 bwrap 可用时添加只读根与可写绑定，否则抛 SandboxUnavailableError。"""
         if not argv:
             return list(argv)
         if not isinstance(argv, list):
@@ -75,8 +79,8 @@ class BaseSandbox(ABC):
                     "--",
                 ]
                 return prefix + argv
-            # 无 bwrap 时 no-op，避免在离线环境误报已隔离
-            return list(argv)
+            # 无 bwrap 时 fail-closed：由工具调度层捕获后决定降级或拒绝
+            raise SandboxUnavailableError("bwrap unavailable: workspace-write requires bwrap but binary not found")
         # read-only / danger-full-access 在 Python 层不做包裹，由上层隔离保证
         return list(argv)
 

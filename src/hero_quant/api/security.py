@@ -78,14 +78,16 @@ def check_host(host: str, allowed_hosts: list[str] | None = None) -> bool:
     """校验 Host 是否在白名单内。
 
     - allowed_hosts 为 None 时从环境变量 HERO_HOST_WHITELIST 加载。
-    - 白名单为空时本地放行（离线/测试友好）。
-    - 否则要求去端口、大小写不敏感的精确匹配。
+    - 白名单为空时显式拒绝（fail-closed，P1 加固）。
+    - 否则要求去端口、大小写不敏感的精确匹配；空 host 直接拒绝。
     """
     if allowed_hosts is None:
         allowed_hosts = _get_whitelist_from_env()
     if not allowed_hosts:
-        return True
+        return False
     host_norm = _normalize_host(host)
+    if not host_norm:
+        return False
     allowed_norm = [_normalize_host(h) for h in allowed_hosts]
     return host_norm in allowed_norm
 
@@ -121,7 +123,30 @@ def verify_hmac(payload: bytes | Any, signature: str | None = None, secret: str 
                 combined = str(headers)
             except Exception:
                 combined = ""
-        # 通过脱敏正则判断是否含可识别前缀
+        # 真 HMAC 路径：若提供 X-HMAC-Signature 则用常量时间比较校验
+        try:
+            h2 = getattr(request, "headers", {})
+            if hasattr(h2, "get"):
+                sig_hdr = h2.get("X-HMAC-Signature") or h2.get("x-hmac-signature") or h2.get("X-Signature") or ""
+                if sig_hdr:
+                    secret_env = os.environ.get("HERO_HMAC_SECRET", "") or secret or ""
+                    if secret_env:
+                        # 约定 payload 为空时按空字节校验；否则依赖调用方传入 bytes 模式
+                        body = b""
+                        try:
+                            body = getattr(request, "body", b"") or b""
+                            if isinstance(body, str):
+                                body = body.encode()
+                        except Exception:
+                            body = b""
+                        expected_h = hmac.new(secret_env.encode(), body, hashlib.sha256).hexdigest()
+                        if hmac.compare_digest(expected_h, sig_hdr.strip()):
+                            return True
+                        # 签名不匹配则直接拒绝，不回落到正则
+                        return False
+        except Exception:
+            pass
+        # 通过脱敏正则判断是否含可识别前缀（占位鉴权）
         if _BEARER_RE.search(combined):
             return True
         if _SK_RE.search(combined):
@@ -130,7 +155,7 @@ def verify_hmac(payload: bytes | Any, signature: str | None = None, secret: str 
             return True
         if _JWT_RE.search(combined):
             return True
-        # 无可识别前缀视为鉴权缺失；本地无白名单场景由 check_host 放行，此处保持严格
+        # 无可识别前缀视为鉴权缺失；白名单为空时已显式拒绝，此处保持严格
         return False
 
     # 经典 HMAC 字节模式

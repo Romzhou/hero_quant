@@ -23,10 +23,16 @@ __all__ = [
     "DEDUP_OP_TOTAL",
     "REQUEST_DURATION",
     "REQUEST_COUNTER",
+    "LLM_RETRY_TOTAL",
+    "LLM_TIMEOUT_TOTAL",
+    "LLM_RETRY_COUNTER",
+    "LLM_TIMEOUT_COUNTER",
     "observe_wall_time",
     "inc_wall_time_exceeded",
     "observe_ledger_append",
     "inc_ledger_append",
+    "inc_llm_retry",
+    "inc_llm_timeout",
     "get_wall_time_metrics",
 ]
 
@@ -134,6 +140,23 @@ DEDUP_OP_TOTAL = _get_or_create_counter(
     ["op", "status"],
 )
 
+# LLM 可观测性（Wave6 P2）
+LLM_RETRY_TOTAL = _get_or_create_counter(
+    "hero_quant_llm_retry_total",
+    "Total LLM retry attempts",
+    ["provider", "reason"],
+)
+
+LLM_TIMEOUT_TOTAL = _get_or_create_counter(
+    "hero_quant_llm_timeout_total",
+    "Total LLM timeouts",
+    ["provider"],
+)
+
+# 兼容别名
+LLM_RETRY_COUNTER = LLM_RETRY_TOTAL
+LLM_TIMEOUT_COUNTER = LLM_TIMEOUT_TOTAL
+
 # HTTP 指标（server 已有同名 Histogram 时复用，此处为共享回退）
 REQUEST_DURATION = _get_or_create_histogram(
     "http_request_duration_seconds",
@@ -185,6 +208,24 @@ def inc_ledger_append(tenant: str, status: str = "success") -> None:
     try:
         if LEDGER_APPEND_TOTAL is not None:
             LEDGER_APPEND_TOTAL.labels(tenant=tenant, status=status).inc()
+    except Exception:
+        pass
+
+
+def inc_llm_retry(provider: str = "unknown", reason: str = "error") -> None:
+    """累计 LLM 重试次数。"""
+    try:
+        if LLM_RETRY_TOTAL is not None:
+            LLM_RETRY_TOTAL.labels(provider=provider, reason=reason).inc()
+    except Exception:
+        pass
+
+
+def inc_llm_timeout(provider: str = "unknown") -> None:
+    """累计 LLM 超时次数。"""
+    try:
+        if LLM_TIMEOUT_TOTAL is not None:
+            LLM_TIMEOUT_TOTAL.labels(provider=provider).inc()
     except Exception:
         pass
 

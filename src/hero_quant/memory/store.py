@@ -513,6 +513,45 @@ class MemoryStore:
         except Exception:
             self._pgvector = None
             self._pgvector_enabled = False
+        # 检索结果缓存（TTL 30s，Wave6 P2）—— key: (query, top_k, namespace, vector_backend)
+        self._retrieval_cache: dict[tuple, tuple[float, list[dict]]] = {}
+        self._retrieval_cache_ttl: float = 30.0
+        self._vector_cache: dict[tuple, tuple[float, list[dict]]] = {}
+        self._vector_cache_ttl: float = 30.0
+
+    def _cache_get(self, cache: dict, key: tuple, ttl: float) -> list[dict] | None:
+        try:
+            ts, val = cache.get(key, (None, None))  # type: ignore
+            if ts is None:
+                return None
+            if (time.time() - float(ts)) > ttl:
+                try:
+                    cache.pop(key, None)
+                except Exception:
+                    pass
+                return None
+            # 返回浅拷贝以防调用方篡改缓存
+            return list(val) if isinstance(val, list) else val  # type: ignore
+        except Exception:
+            return None
+
+    def _cache_set(self, cache: dict, key: tuple, val: list[dict]) -> None:
+        try:
+            cache[key] = (time.time(), list(val))
+            # 简单容量控制：超过 256 条时淘汰最早
+            if len(cache) > 256:
+                oldest = min(cache.items(), key=lambda kv: kv[1][0])[0]
+                cache.pop(oldest, None)
+        except Exception:
+            pass
+
+    def clear_retrieval_cache(self) -> None:
+        """清空检索缓存（测试/写入后失效）。"""
+        try:
+            self._retrieval_cache.clear()
+            self._vector_cache.clear()
+        except Exception:
+            pass
 
     @property
     def vector_backend(self) -> str:
@@ -931,6 +970,11 @@ class MemoryStore:
         else:
             # 已有元数据保持不变，避免覆盖外部更新的访问计数
             pass
+        # 写入后失效检索缓存，保证新笔记立即可召回
+        try:
+            self.clear_retrieval_cache()
+        except Exception:
+            pass
 
     def index_external(self, key: str, content: str) -> None:
         """索引已由外部文件持久化的内容，不重复写入记忆文件。"""
@@ -1006,6 +1050,10 @@ class MemoryStore:
             self._pgvector_upsert(ns_key, content, vector)
         if ns_key not in self._meta:
             self._meta[ns_key] = {"quality_score": 0.5, "access_count": 0, "last_accessed": now}
+        try:
+            self.clear_retrieval_cache()
+        except Exception:
+            pass
 
     def _importance_for(self, item: dict, now: float) -> float:
         """按 Ebbinghaus 14 天衰减计算单条记忆的重要性。"""
@@ -1049,19 +1097,34 @@ class MemoryStore:
         return [it for _, _, it in scored]
 
     def vector_search(self, query: str, top_k: int = 5) -> list[dict]:
-        """纯向量余弦 topK 检索，混合检索的子组件。
+        """纯向量余弦 topK 检索，混合检索的子组件（30s TTL 缓存）。
 
         优先走 pgvector 侧车，失败回退到本地向量列或即时计算；全程按 namespace 隔离。
         """
         if not query:
             return []
+        # TTL 缓存（Wave6）：命中则直接返回，避免重复 embedding/cosine
+        try:
+            _ck = (query, int(top_k), self.namespace or "", self.vector_backend)
+            _cached = self._cache_get(self._vector_cache, _ck, self._vector_cache_ttl)
+            if _cached is not None:
+                return _cached
+        except Exception:
+            _ck = None  # type: ignore
+            _cached = None  # type: ignore
         # 侧车一等公民：先尝试 pgvector，再与本地结果融合
         try:
             pg_hits = self._pgvector_search(query, top_k=top_k)
             if pg_hits:
                 # 命中充足则直接返回，否则保留以便后续与本地合并
                 if len(pg_hits) >= max(1, int(top_k)):
-                    return pg_hits[: max(1, int(top_k))]
+                    res_pg = pg_hits[: max(1, int(top_k))]
+                    try:
+                        if _ck is not None:
+                            self._cache_set(self._vector_cache, _ck, res_pg)
+                    except Exception:
+                        pass
+                    return res_pg
                 # 命中不足，稍后与本地候选合并
             else:
                 pg_hits = []
@@ -1163,12 +1226,22 @@ class MemoryStore:
             out: list[dict] = []
             for it in all_items[: max(0, top_k)]:
                 out.append({"key": it["key"], "content": it["content"], "score": float(it.get("_score", 0.0))})
+            try:
+                if _ck is not None:
+                    self._cache_set(self._vector_cache, _ck, out)
+            except Exception:
+                pass
             return out
         # 剔除内部 _score，仅暴露 score
         out: list[dict] = []
         for it in candidates[: max(0, top_k)]:
             # 保留 key/content/score 三元组
             out.append({"key": it["key"], "content": it["content"], "score": it.get("_score", 0.0)})
+        try:
+            if _ck is not None:
+                self._cache_set(self._vector_cache, _ck, out)
+        except Exception:
+            pass
         return out
 
     def _search_bigram_raw(self, query: str) -> list[dict]:
@@ -1300,9 +1373,17 @@ class MemoryStore:
             return []
 
     def search(self, query: str) -> list[dict]:
-        """混合检索：BM25 召回 + 向量余弦 via rank_fusion (0.5/0.5) + 可选 Cohere 重排."""
+        """混合检索：BM25 召回 + 向量余弦 via rank_fusion (0.5/0.5) + 可选 Cohere 重排（30s TTL）。"""
         if not query:
             return []
+        try:
+            _sck = (query, self.namespace or "", self.vector_backend)
+            _scached = self._cache_get(self._retrieval_cache, _sck, self._retrieval_cache_ttl)
+            if _scached is not None:
+                return _scached
+        except Exception:
+            _sck = None  # type: ignore
+            _scached = None  # type: ignore
         # 文本召回候选
         bm25_candidates = self._search_bm25_raw(query)
         # 向量召回候选
@@ -1333,7 +1414,13 @@ class MemoryStore:
         # 无向量能力时退化为衰减排序
         if not self._vector_enabled or not vector_candidates:
             # 命名空间已在召回时过滤，直接走衰减排序
-            return self._rank_with_decay(bm25_candidates if bm25_candidates else items)
+            _res_decay = self._rank_with_decay(bm25_candidates if bm25_candidates else items)
+            try:
+                if _sck is not None:
+                    self._cache_set(self._retrieval_cache, _sck, _res_decay)
+            except Exception:
+                pass
+            return _res_decay
 
         # 统一融合：RRF(k=60) + 归一 0.5*RRF + 0.5*cosine
         try:
@@ -1444,4 +1531,9 @@ class MemoryStore:
             if it["content"] not in seen:
                 seen[it["content"]] = it
                 deduped.append(it)
+        try:
+            if _sck is not None:
+                self._cache_set(self._retrieval_cache, _sck, deduped)
+        except Exception:
+            pass
         return deduped

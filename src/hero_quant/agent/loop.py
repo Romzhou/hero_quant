@@ -690,16 +690,26 @@ class AgentLoop:
                         except Exception:
                             pass
             if not acquired:
-                # 重试耗尽仍未获取到流
+                # 重试耗尽仍未获取到流（Wave6：超时单独 reason + 指标）
                 if last_exc is not None:
+                    is_timeout = isinstance(last_exc, TimeoutError)
+                    err_type = "llm_timeout" if is_timeout else "llm_error"
                     if trace_writer is not None:
                         try:
-                            trace_writer.append({"type": "llm_error", "iteration": iterations, "error": str(last_exc)})
+                            trace_writer.append({"type": err_type, "iteration": iterations, "error": str(last_exc), "reason": "llm_timeout" if is_timeout else "llm_error"})
                         except Exception:
                             pass
+                    # 指标
+                    try:
+                        if is_timeout:
+                            from hero_quant.metrics import inc_llm_timeout
+
+                            inc_llm_timeout(provider="loop")
+                    except Exception:
+                        pass
                     buffer += f"\n[ERROR: {last_exc}]"
                     token_count = estimate_tokens(buffer)
-                    reason = "llm_error"
+                    reason = "llm_timeout" if is_timeout else "llm_error"
                     terminated = True
                     break
                 stream = []
@@ -834,17 +844,37 @@ class AgentLoop:
                             time.sleep(0.02)
                     except Exception:
                         pass
+                    # 可观测：重试时计数
+                    try:
+                        from hero_quant.metrics import inc_llm_retry
+
+                        inc_llm_retry(provider="loop", reason=type(e).__name__)
+                        if isinstance(e, TimeoutError):
+                            from hero_quant.metrics import inc_llm_timeout
+
+                            inc_llm_timeout(provider="loop")
+                    except Exception:
+                        pass
                     # 可重试则进入下一轮循环
                     continue
                 else:
+                    is_timeout = isinstance(e, TimeoutError)
+                    err_type = "llm_timeout" if is_timeout else "llm_stream_error"
                     if trace_writer is not None:
                         try:
-                            trace_writer.append({"type": "llm_stream_error", "iteration": iterations, "error": str(e)})
+                            trace_writer.append({"type": err_type, "iteration": iterations, "error": str(e), "reason": "llm_timeout" if is_timeout else "llm_error"})
                         except Exception:
                             pass
+                    try:
+                        if is_timeout:
+                            from hero_quant.metrics import inc_llm_timeout
+
+                            inc_llm_timeout(provider="loop")
+                    except Exception:
+                        pass
                     buffer += f"\n[ERROR: {e}]"
                     token_count = estimate_tokens(buffer)
-                    reason = "llm_error"
+                    reason = "llm_timeout" if is_timeout else "llm_error"
                     terminated = True
                     break
 

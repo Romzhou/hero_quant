@@ -8,4 +8,18 @@ export default defineConfig({
   use: {
     baseURL: 'http://localhost:5173',
   },
+  projects: [
+    {
+      name: 'chat-sse',
+      testMatch: /chat\.spec\.ts/,
+    },
+    {
+      name: 'research-echarts',
+      testMatch: /research\.spec\.ts/,
+    },
+    {
+      name: 'spa-routes',
+      testMatch: /spa\.spec\.ts/,
+    },
+  ],
 });

@@ -8,6 +8,27 @@ import time
 from typing import Any
 
 
+def _inc_llm_retry(reason: str = "error") -> None:
+    try:
+        from hero_quant.metrics import inc_llm_retry
+
+        # provider 来自环境或默认
+        prov = os.environ.get("HERO_LLM_PROVIDER", "unknown")
+        inc_llm_retry(provider=prov, reason=reason)
+    except Exception:
+        pass
+
+
+def _inc_llm_timeout() -> None:
+    try:
+        from hero_quant.metrics import inc_llm_timeout
+
+        prov = os.environ.get("HERO_LLM_PROVIDER", "unknown")
+        inc_llm_timeout(provider=prov)
+    except Exception:
+        pass
+
+
 def _retry_delay(attempt: int) -> float:
     # In pytest, use fast backoff to keep suite fast; prod uses 1s*2^n+jitter
     if os.environ.get("PYTEST_CURRENT_TEST"):
@@ -50,7 +71,20 @@ class LLMClient:
                     pass
                 return
             except (ConnectionError, TimeoutError, OSError) as e:
+                # 可观测性：每次重试与超时分别计数
+                try:
+                    _inc_llm_retry(reason=type(e).__name__)
+                    if isinstance(e, TimeoutError):
+                        _inc_llm_timeout()
+                except Exception:
+                    pass
                 if attempt == self.max_retries:
+                    # 最终失败若为超时再计一次超时，保证计数可见
+                    if isinstance(e, TimeoutError):
+                        try:
+                            _inc_llm_timeout()
+                        except Exception:
+                            pass
                     raise
                 time.sleep(_retry_delay(attempt))
 
@@ -67,7 +101,18 @@ class LLMClient:
                     pass
                 return result
             except (ConnectionError, TimeoutError, OSError) as e:
+                try:
+                    _inc_llm_retry(reason=type(e).__name__)
+                    if isinstance(e, TimeoutError):
+                        _inc_llm_timeout()
+                except Exception:
+                    pass
                 if attempt == self.max_retries:
+                    if isinstance(e, TimeoutError):
+                        try:
+                            _inc_llm_timeout()
+                        except Exception:
+                            pass
                     raise
                 time.sleep(_retry_delay(attempt))
 

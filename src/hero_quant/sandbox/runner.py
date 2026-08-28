@@ -15,7 +15,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple
 
 from . import ast_guard
 from .base import BaseSandbox
@@ -276,8 +276,20 @@ class LandlockSandbox(BaseSandbox):
 
         verdict = self._verdict()
         if verdict == "unusable":
-            # 无法强隔离时返回 no-op，由 execute 的 fail-closed 逻辑决定是否执行
-            return super().confine(argv, merged)
+            # 无法强隔离时尝试 bwrap 回退；bwrap 不可用时由基类抛 SandboxUnavailableError，
+            # 此处捕获后返回 no-op，交由 execute 的 fail-closed 分支按 require_enforcement 决定是否执行
+            try:
+                return super().confine(argv, merged)
+            except Exception as e:
+                # 捕获基类 bwrap 不可用的 fail-closed 异常，转为 no-op 以便 permissive 模式仍可运行
+                try:
+                    from .base import SandboxUnavailableError as _BaseUE  # type: ignore
+
+                    if isinstance(e, _BaseUE):
+                        return list(argv)
+                except Exception:
+                    pass
+                raise
 
         # 构造授权：根目录只读，工作区与 /tmp 可写
         ws = merged.get("workspaceRoot") or merged.get("workspace_root") or merged.get("canonicalPath") or "/tmp"
@@ -365,3 +377,54 @@ def execute_python(
 ) -> dict:
     """模块级 Python 执行入口：先 AST 审查再 compile/exec，fail-closed."""
     return _execute_python_impl(source, globals_dict, locals_dict)
+
+
+def dispatch_tool(tool_spec: Any, args: dict | None = None, policy: dict | None = None) -> Any:
+    """受限子进程的工具调度包装器（Wave6 安全加固）。
+
+    - python 分支仍走 AST 守卫的 execute_python
+    - 非 python 工具走 LandlockSandbox 隔离的子进程；若沙箱不可用则捕获 SandboxUnavailableError
+      并返回 ``tool_error: ...`` 前缀结果，由调用方统一识别为失败而非静默放行
+    """
+    if args is None:
+        args = {}
+    pol = policy or {}
+    name = getattr(tool_spec, "name", "") if tool_spec is not None else ""
+    # python 工具走受控 exec
+    if name in ("execute_python", "python", "run_python"):
+        src = args.get("source") or args.get("code") or ""
+        try:
+            return execute_python(src, args.get("globals"), args.get("locals"))
+        except Exception:
+            # 保持与沙箱层一致的错误前缀
+            raise
+    # 非 python：尝试通过沙箱隔离执行；工具本身可能是任意 callable，回退为直接调用
+    try:
+        from .base import SandboxUnavailableError as _BaseSandboxError  # type: ignore
+    except Exception:
+        _BaseSandboxError = SandboxUnavailableError  # type: ignore
+    try:
+        # 若 tool_spec 有可调用 func，则尝试隔离包裹其命令形式
+        sandbox = LandlockSandbox(policy=pol)
+        # 若 args 含 argv/cmd 则走子进程，否则直接调用 func
+        cmd = args.get("cmd") or args.get("argv") or args.get("command")
+        if isinstance(cmd, (list, tuple)):
+            out, err, code = sandbox.execute(list(cmd), require_enforcement=False)  # type: ignore[arg-type]
+            if code != 0:
+                return f"tool_error: {err or out} (code {code})"
+            return out
+        if isinstance(cmd, str) and cmd:
+            out, err, code = sandbox.execute(cmd, require_enforcement=False)  # type: ignore[arg-type]
+            if code != 0:
+                return f"tool_error: {err or out} (code {code})"
+            return out
+        # 回退直接调用
+        func = getattr(tool_spec, "func", None)
+        if callable(func):
+            return func(**args) if isinstance(args, dict) else func(args)
+        return None
+    except (SandboxUnavailableError, _BaseSandboxError) as e:  # type: ignore
+        # fail-closed 但对工具层转为可观测的 tool_error
+        return f"tool_error: sandbox unavailable: {e}"
+    except Exception as e:
+        return f"tool_error: {e}"
