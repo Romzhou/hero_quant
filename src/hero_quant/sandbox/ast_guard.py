@@ -153,7 +153,8 @@ ALLOWED_ROOTS.update(_QUANTLIB_EXTRA)
 
 # 显式黑名单：拦截可导致命令执行/网络外联/底层逃逸的根模块与调用
 BANNED_IMPORT_ROOTS = {"socket", "subprocess", "ctypes", "requests", "os"}
-BANNED_CALL_NAMES = {"eval", "exec", "__import__"}  # 动态执行与导入劫持
+BANNED_CALL_NAMES = {"eval", "exec", "__import__", "compile", "open", "breakpoint"}  # 动态执行与导入劫持
+BANNED_GETATTR_NAMES = {"getattr", "setattr", "hasattr", "vars", "getattribute"}
 # 属性级黑名单：(base, attr)，防止通过 os.system 等间接执行
 BANNED_ATTRS = {
     ("os", "system"),  # shell 命令执行
@@ -251,8 +252,8 @@ def check_import_allowlist(code: str) -> bool:
                 return False
         elif isinstance(node, ast.Call):
             func = node.func
-            if isinstance(func, ast.Name) and func.id in BANNED_CALL_NAMES:
-                return False  # 拦截 eval/exec/__import__ 动态执行
+            if isinstance(func, ast.Name) and func.id in (BANNED_CALL_NAMES | BANNED_GETATTR_NAMES):
+                return False  # 拦截 eval/exec/__import__/compile/open/breakpoint/getattr 等内置封禁
             # from-import 别名直接调用：`from os import system as s; s(...)`
             if isinstance(func, ast.Name) and func.id in alias_map:
                 effective = alias_map.get(func.id, func.id)
@@ -261,8 +262,8 @@ def check_import_allowlist(code: str) -> bool:
             if isinstance(func, ast.Attribute):
                 if _is_banned_attribute(func, alias_map):
                     return False
-            # getattr/setattr/hasattr 间接调用：首参经 alias_map 解析到 banned root
-            if isinstance(func, ast.Name) and func.id in {"getattr", "setattr", "hasattr"}:
+            # getattr/setattr/hasattr/vars/getattribute 间接调用：首参经 alias_map 解析到 banned root
+            if isinstance(func, ast.Name) and func.id in BANNED_GETATTR_NAMES:
                 if node.args:
                     first = node.args[0]
                     root = _get_root_name(first)
