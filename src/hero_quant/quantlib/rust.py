@@ -86,6 +86,8 @@ def _prepare_data(series) -> list[float] | None:
 
 def sma(series, window: int = 20, *args, **kwargs) -> pd.Series:
     """SMA：优先 Rust，失败回落 Python；语义与 indicators.sma 一致。"""
+    if args:
+        raise TypeError(f"sma: unexpected positional args {args}")
     # 兼容别名
     if "n" in kwargs:
         window = kwargs["n"]
@@ -120,6 +122,8 @@ def sma(series, window: int = 20, *args, **kwargs) -> pd.Series:
 
 def ema(series, span: int = 20, *args, **kwargs) -> pd.Series:
     """EMA：优先 Rust，失败回落 Python。"""
+    if args:
+        raise TypeError(f"ema: unexpected positional args {args}")
     if "n" in kwargs:
         span = kwargs["n"]
     if "window" in kwargs:
@@ -146,6 +150,8 @@ def ema(series, span: int = 20, *args, **kwargs) -> pd.Series:
 
 def rsi(series, period: int = 14, *args, **kwargs) -> pd.Series:
     """RSI：优先 Rust，失败回落 Python；Wilder EWM 实现。"""
+    if args:
+        raise TypeError(f"rsi: unexpected positional args {args}")
     if "n" in kwargs:
         period = kwargs["n"]
     if "window" in kwargs:
@@ -172,6 +178,8 @@ def rsi(series, period: int = 14, *args, **kwargs) -> pd.Series:
 
 def bollinger(series, window: int = 20, num_std: float = 2.0, *args, **kwargs):
     """布林带：优先 Rust（无别名时），失败回落 Python。"""
+    if args:
+        raise TypeError(f"bollinger: unexpected positional args {args}")
     if _use_rust() and "n" not in kwargs and "k" not in kwargs:
         _prep = _prepare_data(series)
         if _prep is None:
@@ -197,6 +205,8 @@ def bollinger(series, window: int = 20, num_std: float = 2.0, *args, **kwargs):
 
 def macd(series, fast: int = 12, slow: int = 26, signal: int = 9, *args, **kwargs):
     """MACD：优先 Rust，失败回落 Python。"""
+    if args:
+        raise TypeError(f"macd: unexpected positional args {args}")
     if _use_rust():
         _prep = _prepare_data(series)
         if _prep is None:
