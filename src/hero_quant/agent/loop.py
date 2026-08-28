@@ -236,14 +236,45 @@ class AgentLoop:
                     hits = fn(query)
             if hits is None:
                 hits = []
-            # 透传 skills_digest 到 context prompt (best-effort)
+            # 透传 skills_digest 到 context prompt (Wave5 加固：确保 prompt 含 digest)
             if self.skills_loader is not None and self.context_manager is not None:
                 try:
                     sd = self.skills_loader.get_descriptions()
-                    # ensure not empty; also inject into trace for audit
-                    if sd and hasattr(self.context_manager, "build_system_prompt"):
-                        # best-effort warm call to verify透传
-                        pass
+                    if sd:
+                        sd_str = str(sd).strip()
+                        if sd_str:
+                            # 注入到 context_manager，确保后续 build_system_prompt 含 digest
+                            try:
+                                if hasattr(self.context_manager, "add"):
+                                    self.context_manager.add("system", f"[skills_digest] {sd_str[:2000]}")
+                            except Exception:
+                                pass
+                            # 尽力确保 build_system_prompt 透传
+                            try:
+                                if hasattr(self.context_manager, "build_system_prompt"):
+                                    # 触发一次带 skills_digest 的 prompt 构建以校验含 digest
+                                    try:
+                                        _prompt = self.context_manager.build_system_prompt(skills_digest=sd_str)
+                                        # 若仍不含则再通过 add 补偿
+                                        if sd_str not in _prompt and hasattr(self.context_manager, "add"):
+                                            self.context_manager.add("system", f"[skills_digest] {sd_str[:500]}")
+                                    except TypeError:
+                                        # 兼容无参签名
+                                        try:
+                                            _prompt2 = self.context_manager.build_system_prompt()
+                                            if sd_str not in str(_prompt2) and hasattr(self.context_manager, "add"):
+                                                self.context_manager.add("system", f"[skills_digest] {sd_str[:500]}")
+                                        except Exception:
+                                            pass
+                            except Exception:
+                                pass
+                            # trace for audit
+                            tw2 = self._ensure_trace_writer()
+                            if tw2 is not None:
+                                try:
+                                    tw2.append({"type": "skills_digest", "digest": sd_str[:500]})
+                                except Exception:
+                                    pass
                 except Exception:
                     pass
             # 注入到 context_manager

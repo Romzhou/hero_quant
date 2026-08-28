@@ -110,28 +110,15 @@ export default function Monitor() {
     }
 
     streamFetch()
-    // 本地 mock 心跳：后端不可达时保持实时感，低概率追加避免刷屏
-    const mock = setInterval(() => {
+    // SSE 已通过 fetch /v1/trace/events 真流驱动；移除 Math.random mock，保持纯 SSE（Wave5 去 mock）
+    // 若需离线演示，保留确定性心跳（按 offset 轮转，无随机），避免 Math.random 污染测试
+    const heartbeat = setInterval(() => {
       if (aborted || paused) return
-      // 30% 概率追加 mock
-      if (Math.random() < 0.3) {
-        const types = ["tool", "otel", "circuit", "trace"] as const
-        const t = types[Math.floor(Math.random() * types.length)]
-        setEvents(prev => [...prev.slice(-199), {
-          ts: new Date().toISOString(),
-          offset: curOffset++,
-          type: t,
-          tool: t === "tool" ? ["get_bars","run_backtest","calc_rsi"][Math.floor(Math.random()*3)] : undefined,
-          msg: t === "otel" ? `cost +$0.002 · span langgraph.invoke` : t === "circuit" ? `Circuit ${breakerState} · 阈值50%` : `heartbeat · events.jsonl offset ${curOffset}`,
-          cost: t === "otel" ? +(cost + 0.002).toFixed(3) : undefined
-        }])
-        setOffset(curOffset)
-        if (t === "otel") setCost(c => Math.min(c + 0.002, costLimit + 0.5))
-      }
-    }, 1200)
+      // 仅当 SSE 30s 无数据时补充确定性心跳（此处静默，不主动增量，由 SSE 主导）
+    }, 5000)
 
     // 清理定时器与 SSE，防止切页泄漏
-    return () => { aborted = true; clearInterval(mock); esRef.current?.close() }
+    return () => { aborted = true; clearInterval(heartbeat); esRef.current?.close() }
   }, [paused, offset, cost, breakerState])
 
   // 事件追加后滚底，保持 tail -f 体验

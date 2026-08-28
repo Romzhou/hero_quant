@@ -20,8 +20,8 @@ jobs:
       - name: Lint with ruff
         run: ruff check src
       - name: Run tests
-        # Coverage gate: Wave4 收口 48% (实测 48.99%，was 46 -> 50 -> 48 -> next 55)；低频 retrieval_eval 标记为 retrieval 仅周跑，不计入此门
-        run: pytest -q --cov=src --cov-report=term --cov-fail-under=48
+        # Coverage gate: Wave5 收口 50% (48.99% -> 50)；低频 retrieval_eval 标记为 retrieval 仅周跑，不计入此门
+        run: pytest -q --cov=src --cov-report=term --cov-fail-under=50
       - name: Audit dependencies
         # Blocking gate since W1-D (was "|| true")
         run: pip-audit

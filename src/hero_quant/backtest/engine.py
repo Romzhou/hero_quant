@@ -82,12 +82,11 @@ class Signal:
                     l_val = float(sma_l) if pd.notna(sma_l) else float("nan")
                 if not np.isfinite(s_val) or not np.isfinite(l_val):
                     return np.ones(n_assets, dtype=float) / n_assets
-                # 信号：短期上穿长期 -> 等权做多，否则空仓（权重为 0 -> 触发回落等权）
+                # 信号：短期上穿长期 -> 等权做多，否则空仓 0 权（bear→0，Wave5 修正）
                 if s_val > l_val:
                     return np.ones(n_assets, dtype=float) / n_assets
-                # 空仓信号：返回 0 权重，上游会回落至等权或保持空仓；此处返回零权重表示观望
-                # 为避免触发零权重回落，返回小权重
-                return np.ones(n_assets, dtype=float) / n_assets
+                # 熊市/死叉：返回 0 权重表示空仓观望（不触发等权回落，由调用方识别）
+                return np.zeros(n_assets, dtype=float)
             except (ValueError, TypeError, AttributeError, KeyError, IndexError) as e:
                 logger.warning("sma_crossover signal generation failed: %s", e)
                 return np.ones(n_assets, dtype=float) / n_assets
@@ -560,12 +559,31 @@ class BacktestEngine:
         cum = 1.0
         # 逐 Bar 累积原始目标持仓，交由 _execute_bars 做等比缩放
         raw_positions_rows: list[pd.Series] = []
+        prev_aligned_price: float | None = None
+        # 保留 turnover_rate 供 aligned 成本扣除（若有换手成本）
+        _turnover_rate = None
+        try:
+            _turnover_rate = turnover_rate  # type: ignore[name-defined]
+        except NameError:
+            _turnover_rate = None
+        except Exception:
+            _turnover_rate = None
         for i in range(len(prices)):
             bar = prices.iloc[i]
-            # 事件钩子：Bar→Signal→对齐（扩展点，当前仅透传 aligned_price）
+            # 事件钩子：Bar→Signal→对齐（Wave5：aligned_price 参与 equity 定价）
             bar_result = self.on_bar(bar, i, prices, equity_prev=(equity_vals[-1] if equity_vals else self.initial_capital), w=w, leverage=leverage)
-            _aligned_price = bar_result["aligned_price"]  # 已对齐至次日可执行价；权益仍以 close 序列计算，保持与历史实现一致
-            # 迭代计算权益：cum 复利累乘 net_ret
+            _aligned_price = bar_result["aligned_price"]  # 已对齐至次日可执行价；Wave5 起参与权益计算，保留 close 兼容
+            # 尝试使用 aligned_price 定价：若可得 aligned_ret 则覆盖 close 基 net_ret
+            aligned_ret_raw: float | None = None
+            try:
+                ap = float(_aligned_price)
+                if prev_aligned_price is not None and np.isfinite(ap) and np.isfinite(prev_aligned_price) and prev_aligned_price != 0:
+                    aligned_ret_raw = ap / prev_aligned_price - 1
+                    if not np.isfinite(aligned_ret_raw):
+                        aligned_ret_raw = None
+            except (ValueError, TypeError):
+                aligned_ret_raw = None
+            # 迭代计算权益：优先 aligned_ret（已按杠杆缩放），否则回落 close 基 net_ret
             try:
                 ret_i = float(net_ret.iloc[i])
             except (ValueError, TypeError, KeyError, IndexError, AttributeError) as e:
@@ -573,6 +591,39 @@ class BacktestEngine:
                 ret_i = 0.0
             if not np.isfinite(ret_i):
                 ret_i = 0.0  # 非有限收益置零，避免权益发散
+            # 若本 Bar 有有效 aligned_ret，则以 aligned 定价覆盖（保留成本扣除逻辑）
+            if aligned_ret_raw is not None:
+                try:
+                    if not is_multi and leverage is not None and np.isfinite(leverage) and leverage != 0:
+                        aligned_scaled = float(aligned_ret_raw * leverage)
+                    else:
+                        aligned_scaled = float(aligned_ret_raw)
+                    if _turnover_rate is not None and costs_f:
+                        try:
+                            _cost_drag = float(_turnover_rate.iloc[i]) * float(costs_f)  # type: ignore[attr-defined]
+                            if np.isfinite(_cost_drag):
+                                aligned_scaled = aligned_scaled - _cost_drag
+                        except (ValueError, TypeError, KeyError, IndexError, AttributeError):
+                            pass
+                    if np.isfinite(aligned_scaled):
+                        ret_i = aligned_scaled
+                except (ValueError, TypeError):
+                    pass
+            # 更新 prev_aligned 供下次计算（首 Bar 初始化基准）
+            try:
+                ap_cur = float(_aligned_price)
+                if np.isfinite(ap_cur) and ap_cur != 0:
+                    prev_aligned_price = ap_cur
+                elif prev_aligned_price is None:
+                    try:
+                        # 回落以 close 兜底，避免首 Bar 无基准
+                        fallback = float(prices.iloc[i].get("close", ap_cur)) if isinstance(prices.iloc[i], pd.Series) else float(ap_cur)
+                        if np.isfinite(fallback) and fallback != 0:
+                            prev_aligned_price = fallback
+                    except (ValueError, TypeError, KeyError, IndexError, AttributeError):
+                        prev_aligned_price = ap_cur
+            except (ValueError, TypeError):
+                pass
             cum = cum * (1 + ret_i)
             eq = cum * self.initial_capital
             if not np.isfinite(eq):

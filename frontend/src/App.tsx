@@ -12,6 +12,7 @@ const Research = lazy(() => import("./pages/Research"))
 const Chat = lazy(() => import("./pages/Chat"))
 const Live = lazy(() => import("./pages/Live"))
 const Risk = lazy(() => import("./pages/Risk"))
+const Monitor = lazy(() => import("./pages/Monitor"))
 const Settings = lazy(() => import("./pages/Settings"))
 
 function Shell() {
@@ -42,6 +43,7 @@ function Shell() {
             <NavLink to="/research" className={linkCls}>研究</NavLink>
             <NavLink to="/backtest" className={linkCls}>回测</NavLink>
             <NavLink to="/live" className={linkCls}>实盘</NavLink>
+            <NavLink to="/monitor" className={linkCls}>监控</NavLink>
             <NavLink to="/risk" className={linkCls}>风控</NavLink>
           </nav>
 
@@ -64,6 +66,7 @@ function Shell() {
             <Route path="/backtest" element={<Chat />} />
             <Route path="/chat" element={<Chat />} />
             <Route path="/live" element={<Live />} />
+            <Route path="/monitor" element={<Monitor />} />
             <Route path="/risk" element={<Risk />} />
             <Route path="/settings" element={<Settings />} />
           </Routes>

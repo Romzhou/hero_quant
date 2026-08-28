@@ -5,6 +5,7 @@ Splits markdown by heading + overlapping window and stores via MemoryStore.
 
 from __future__ import annotations
 
+import hashlib
 import re
 from pathlib import Path
 from typing import Union
@@ -102,8 +103,8 @@ def ingest_markdown(path: Union[str, Path], overlap: int = 64, chunk: int = 512,
 
     count = 0
     for idx, piece in enumerate(all_chunks):
-        # key derived from filename + idx
-        key = f"{p.stem}:{idx}:{abs(hash(piece)) % 100000}"
+        # key derived from filename + idx — deterministic sha256 (Wave5)
+        key = f"{p.stem}:{idx}:{hashlib.sha256(piece.encode()).hexdigest()[:8]}"
         try:
             if ms is not None and hasattr(ms, "write"):
                 ms.write(key, piece)

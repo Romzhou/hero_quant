@@ -53,7 +53,7 @@ pip install -e ".[dev,ashare,us]"
 cp .env.example .env  # 若无则直接 export
 export HERO_LLM_PROVIDER=openai
 export HERO_API_KEY=sk-...
-export HERO_DATA_MODE=synthetic   # synthetic | live  (live 才调 qt.gtimg.cn/yahoo)
+export HERO_DATA_MODE=live   # synthetic | live  (live 才调 qt.gtimg.cn/yahoo)
 export HERO_LLM_MODEL=gpt-4o-mini
 
 # 3. 跑测试
@@ -97,7 +97,7 @@ docker run -p 127.0.0.1:8899:8899 --env-file .env hero-quant:0.2.0
 | `HERO_LLM_PROVIDER` | `openai` | `openai` / `deepseek` / `anthropic` 等 |
 | `HERO_LLM_MODEL` | `gpt-4o-mini` | 模型名 |
 | `HERO_API_KEY` | — | LLM 密钥 |
-| `HERO_DATA_MODE` | `synthetic` | `synthetic` 本地合成（测试/离线）/`live` 调真实行情 |
+| `HERO_DATA_MODE` | `live` | `synthetic` 本地合成（测试/离线）/`live` 调真实行情（默认 `live`） |
 | `HERO_DATA_MARKET` | `CN` | 默认市场 |
 | `HERO_OTEL_MODE` | `disabled` | `disabled`/`shared`/`private` |
 | `HERO_TRACE_*` | `50000/500` | `TOOL_RESULT_OFFLOAD/TEXT_OFFLOAD/PREVIEW` |
@@ -126,7 +126,7 @@ pytest -q --cov=src/hero_quant --cov-fail-under=30  # core 30 起步
 npm --prefix frontend run test:run
 ```
 
-供应链：`requirements-lock.txt` 为 `uv pip compile --generate-hashes` 产物，`Dockerfile:32 pip install --require-hashes`，CI 校验 `pip-audit + gitleaks`（占位已接入）。
+供应链：`requirements-lock.txt` 为 `uv pip compile --generate-hashes` 产物（真 sha256 非占位），`Dockerfile:32 pip install --require-hashes`，CI 校验 `pip-audit + gitleaks`（已接入真 hash 全量）。
 
 ## 路线图
 
@@ -134,8 +134,8 @@ npm --prefix frontend run test:run
 - [x] 回测 PIT/多标/tearsheet
 - [x] AgentLoop 10 控制点 + LangGraph 双路由
 - [ ] Memory 多租户 namespace + Governance 跨段校验
-- [ ] Checkpoint 真 PG 落盘（当前 `memory://` 可跑）
-- [ ] `requirements-lock.txt` 真 hash 全量再生（当前含占位）
+- [ ] Checkpoint 真 PG 落盘（已默认 PG `postgresql://postgres:postgres@localhost:5432/hero_quant`，PG 不可达时回退 `memory://`）
+- [x] `requirements-lock.txt` 真 hash 全量（已 `uv pip compile --generate-hashes` 非占位）
 
 ## 致谢
 

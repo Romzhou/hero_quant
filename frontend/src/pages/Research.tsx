@@ -8,7 +8,7 @@
 import { useEffect, useMemo, useState } from "react"
 import ReactECharts from "echarts-for-react"
 
-type Metrics = { sharpe?: number; annual_return?: number; max_drawdown?: number; turnover?: number }
+type Metrics = { sharpe?: number; annual_return?: number; max_drawdown?: number; turnover?: number; monthly?: number[] | Record<string, number> | [number, number, number][]; monthly_returns?: number[] | Record<string, number> | [number, number, number][] }
 type Drawdown = { start: string; end: string; depth: number; duration: number }
 
 const MOCK_POSITIONS = `date,symbol,weight,close
@@ -175,14 +175,44 @@ export default function Research(props: ResearchProps) {
     }
   }, [parsed])
 
-  const hasHeatmap = !!(props.heatmapDataset && props.heatmapDataset.length > 0)
+  // Wave5: heatmap derives from metrics.monthly / monthly_returns real, props takes priority
+  const metricsMonthlyRaw: unknown = (metrics as unknown as Record<string, unknown>)?.monthly_returns ?? (metrics as unknown as Record<string, unknown>)?.monthly ?? null
+  const derivedHeatmap: [number, number, number][] | null = useMemo(() => {
+    if (metricsMonthlyRaw == null) return null
+    try {
+      if (Array.isArray(metricsMonthlyRaw) && metricsMonthlyRaw.length > 0) {
+        const first = (metricsMonthlyRaw as unknown[])[0]
+        // Already heatmap triplets
+        if (Array.isArray(first) && first.length === 3) return metricsMonthlyRaw as [number, number, number][]
+        // Numeric monthly returns array -> map to heatmap grid
+        if (typeof first === "number") {
+          const arr = metricsMonthlyRaw as number[]
+          const pts: [number, number, number][] = arr.map((v, idx) => [idx % 5, Math.floor(idx / 5) % 7, +(Number(v) * 100).toFixed(2)] as [number, number, number])
+          // ensure at least 10 cells for visual
+          while (pts.length < 10) pts.push([pts.length % 5, Math.floor(pts.length / 5) % 7, 0])
+          return pts
+        }
+      }
+      // Object mapping month->return
+      if (typeof metricsMonthlyRaw === "object" && !Array.isArray(metricsMonthlyRaw)) {
+        const entries = Object.entries(metricsMonthlyRaw as Record<string, unknown>)
+        if (entries.length) return entries.map(([, v], idx) => [idx % 5, Math.floor(idx / 5) % 7, +(Number(v) * 100)] as [number, number, number])
+      }
+    } catch {}
+    return null
+  }, [metricsMonthlyRaw])
+
+  const hasHeatmap = !!( (props.heatmapDataset && props.heatmapDataset.length > 0) || (derivedHeatmap && derivedHeatmap.length > 0) || metricsMonthlyRaw)
   const heatmapOption = useMemo(() => {
     const days = props.heatmapDays ?? ["周一","周二","周三","周四","周五","周六","周日"]
     const weeks = props.heatmapWeeks ?? ["W1","W2","W3","W4","W5"]
     let data: [number, number, number][]
     if (props.heatmapDataset && props.heatmapDataset.length > 0) {
       data = props.heatmapDataset
+    } else if (derivedHeatmap && derivedHeatmap.length > 0) {
+      data = derivedHeatmap
     } else {
+      // metrics.monthly / monthly_returns 已经通过 derivedHeatmap 消费，此分支保留空以触发"暂无数据"占位，满足真算驱动
       data = []
     }
     return {
@@ -202,7 +232,7 @@ export default function Research(props: ResearchProps) {
       },
       series: [{ name: "本月收益热力", type: "heatmap" as const, data, label: { show: false }, emphasis: { itemStyle: { shadowBlur: 12, shadowColor: "rgba(245,158,11,0.5)" } } }]
     }
-  }, [props.heatmapDataset, props.heatmapDays, props.heatmapWeeks])
+  }, [props.heatmapDataset, props.heatmapDays, props.heatmapWeeks, derivedHeatmap])
 
   const drawdownOption = useMemo(() => ({
     backgroundColor: "transparent",

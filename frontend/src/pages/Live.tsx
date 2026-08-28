@@ -123,41 +123,16 @@ export default function Live() {
     }
 
     streamFetch()
-    // 本地 mock 心跳：后端不可达时保持实时感，用 ref 读最新 cost/offset 避免闭包过期
-    const mock = setInterval(() => {
+    // 已通过 fetch /v1/trace/events SSE 真流驱动；移除 Math.random mock（Wave5 去 mock），保留确定性空心跳占位
+    const heartbeat = setInterval(() => {
       if (aborted || paused) return
-      if (Math.random() < 0.28) {
-        const curCost = costRef.current
-        const curRatio = Math.min(curCost / costLimit, 1)
-        const curBreaker = curRatio >= 1 ? "OPEN" : curRatio >= 0.8 ? "HALF_OPEN" : "CLOSED"
-        const types = ["tool", "otel", "circuit", "trace"] as const
-        const t = types[Math.floor(Math.random() * types.length)]
-        const nextOffset = offsetRef.current++
-        // 以 ref 自增为真源，同步到 state 触发渲染，避免并发 effect 竞态
-        setOffset(offsetRef.current)
-        setEvents(prev => [
-          ...prev.slice(-199),
-          {
-            ts: new Date().toISOString(),
-            offset: nextOffset,
-            type: t,
-            tool: t === "tool" ? ["get_bars", "run_backtest", "calc_rsi"][Math.floor(Math.random() * 3)] : undefined,
-            msg: t === "otel" ? `cost +$0.002 · span langgraph.invoke` : t === "circuit" ? `Circuit ${curBreaker} · 阈值50%` : `heartbeat · events.jsonl offset ${offsetRef.current}`,
-            cost: t === "otel" ? +(curCost + 0.002).toFixed(3) : undefined,
-          },
-        ])
-        if (t === "otel") {
-          const nxt = Math.min(curCost + 0.002, costLimit + 0.5)
-          costRef.current = nxt
-          setCost(nxt)
-        }
-      }
-    }, 1300)
+      // 纯 SSE 驱动，不再注入随机 mock；确定性占位避免使用 Math.random
+    }, 5000)
 
     // 清理：标记 aborted、清定时器、关闭 SSE/流读取器，防止切页或暂停后泄漏
     return () => {
       aborted = true
-      clearInterval(mock)
+      clearInterval(heartbeat)
       esRef.current?.close()
       try { readerRef.current?.cancel() } catch {}
       try { abortRef.current?.abort() } catch {}

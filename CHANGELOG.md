@@ -2,6 +2,28 @@
 
 All notable changes to hero-quant are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Semantic Versioning](https://semver.org/).
 
+## [0.3.0] - 2026-08-28
+
+### Supplement Wave5 — docs honesty + backtest detail + monitor + coverage
+
+> 收口 2026-08-28 supplement 审计 12 项遗漏中的 P0/P1 细节：D1 文档诚信 + B1 sma/on_bar + C1/C2 前端去 mock + D2/E1 ingest/coverage。基于 `7559422+f639a78+e79dfc2` (302 passed, 48.99% cov) 增量。
+
+### Added
+- **Docs honesty (D1)**: `README:56,100` `HERO_DATA_MODE` `synthetic→live` 与 `Settings` 一致；`README:137` `memory://→PG (fallback memory)`；`README:129` `hash占位→real hashes` 真 sha256；`docs/retrieval_eval.md` 追加 32/128/768 维度 ablation stub。
+- **Backtest detail (B1)**: `engine.py` `sma_crossover` 熊市返回 0 权重（`bear→0`）；`BacktestEngine.run` 串联 `on_bar` `aligned_price` 至 `equity` 计算（`cum*(1+aligned_ret)`，保留 close 兼容）；新增 `tests/test_golden_backtest.py` 固定 5 日 oracle 对拍 `metrics.sharpe`。
+- **Monitor + Frontend (C1/C2)**: `App.tsx` 新增 `/monitor` 路由与导航；`Monitor.tsx` 移除 `Math.random<0.3` 改 `fetch /v1/trace/events` SSE 真流；`Live.tsx` 移除 `0.28` mock 定时；`Research.tsx` 热力图由 `metrics.monthly` / `metrics.monthly_returns` 真算驱动。
+- **Coverage + Ingest (D2/E1)**: `ingest.py` key 生成改 `hashlib.sha256(piece.encode()).hexdigest()[:8]` 确定性；`loop` 注入 `skills_digest` 并断言 prompt 含 digest；`tests/test_backtest_engine.py` 增厚多资产/转仓用例提覆盖率；抬 `cov fail_under 48→50`。
+
+### Changed
+- `pyproject.toml` / `.github/workflows/test.yml` `fail_under` 48→50。
+- `frontend/src/App.tsx` 导航 5→6（含 Monitor）。
+- `requirements-lock.txt` 状态描述去“占位”，改为真 hash。
+
+### Verification
+- `pytest -q --cov-fail-under=50` PASS (≥50%)
+- `ruff check src` 0 error
+- `npm --prefix frontend run test:run` 5+ files PASS
+
 ## [0.2.0] - 2026-08-21
 
 ### Release harness polish — Wave G (deploy-ready)
@@ -43,5 +65,6 @@ All notable changes to hero-quant are documented here. Format follows [Keep a Ch
 ### Added
 - Initial thin-skeleton COE-quant kernel (Vibe-Trading 8 patterns, Docker 3-stage, `api/server.py:100` StaticFiles, `.dockerignore`, 44 tests green).
 
+[0.3.0]: https://github.com/your-org/hero-quant/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/your-org/hero-quant/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/your-org/hero-quant/releases/tag/v0.1.0
