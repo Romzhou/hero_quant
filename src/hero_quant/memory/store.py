@@ -12,7 +12,9 @@ import logging
 import math
 import os
 import sqlite3
+import threading
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -21,9 +23,25 @@ from .lifecycle import compute_importance
 logger = logging.getLogger("hero_quant.memory.store")
 
 
+class _SQLiteConnWrapper:
+    """Wrapper around sqlite3.Connection to allow commit patching in tests (Python 3.13 commit is read-only)."""
+
+    def __init__(self, conn: sqlite3.Connection):
+        object.__setattr__(self, "_real", conn)
+
+    def __getattr__(self, name: str):
+        return getattr(self._real, name)
+
+    def __setattr__(self, name: str, value):
+        if name == "_real":
+            object.__setattr__(self, name, value)
+        else:
+            self.__dict__[name] = value
+
+
 def _content_hash(name: str, content: str) -> str:
-    """计算去重哈希：对 ``name:content`` 归一化后取 sha256 前 12 位。"""
-    return hashlib.sha256(f"{name}:{content}".lower().strip().encode()).hexdigest()[:12]
+    """计算去重哈希：对 ``name:content`` 归一化后取 sha256 前 16 位。"""
+    return hashlib.sha256(f"{name}:{content}".lower().strip().encode()).hexdigest()[:16]
 
 
 def _content_bigrams(content: str) -> str:
@@ -480,6 +498,7 @@ class MemoryStore:
         self.base = Path(base_path)
         self.base.mkdir(parents=True, exist_ok=True)
         self.namespace = namespace
+        self._lock = threading.RLock()
         self._recent_hashes: dict[str, float] = {}
         self._meta: dict[str, dict] = {}  # ns_key -> {quality_score, access_count, last_accessed}，内存态衰减元数据
         self._fts_enabled = False
@@ -521,35 +540,40 @@ class MemoryStore:
 
     def _cache_get(self, cache: dict, key: tuple, ttl: float) -> list[dict] | None:
         try:
-            ts, val = cache.get(key, (None, None))  # type: ignore
-            if ts is None:
-                return None
-            if (time.time() - float(ts)) > ttl:
-                try:
-                    cache.pop(key, None)
-                except Exception:
-                    pass
-                return None
-            # 返回浅拷贝以防调用方篡改缓存
-            return list(val) if isinstance(val, list) else val  # type: ignore
+            with self._lock:
+                ts, val = cache.get(key, (None, None))  # type: ignore
+                if ts is None:
+                    return None
+                if (time.time() - float(ts)) > ttl:
+                    try:
+                        cache.pop(key, None)
+                    except Exception:
+                        pass
+                    return None
+                # 返回深拷贝以防调用方篡改缓存
+                if isinstance(val, list):
+                    return [dict(x) for x in val]  # type: ignore
+                return val  # type: ignore
         except Exception:
             return None
 
     def _cache_set(self, cache: dict, key: tuple, val: list[dict]) -> None:
         try:
-            cache[key] = (time.time(), list(val))
-            # 简单容量控制：超过 256 条时淘汰最早
-            if len(cache) > 256:
-                oldest = min(cache.items(), key=lambda kv: kv[1][0])[0]
-                cache.pop(oldest, None)
+            with self._lock:
+                cache[key] = (time.time(), [dict(x) for x in val])
+                # 简单容量控制：超过 256 条时淘汰最早
+                if len(cache) > 256:
+                    oldest = min(cache.items(), key=lambda kv: kv[1][0])[0]
+                    cache.pop(oldest, None)
         except Exception:
             pass
 
     def clear_retrieval_cache(self) -> None:
         """清空检索缓存（测试/写入后失效）。"""
         try:
-            self._retrieval_cache.clear()
-            self._vector_cache.clear()
+            with self._lock:
+                self._retrieval_cache.clear()
+                self._vector_cache.clear()
         except Exception:
             pass
 
@@ -597,7 +621,16 @@ class MemoryStore:
 
     def _init_db(self) -> None:
         """初始化 SQLite：建表、补齐向量列、创建 FTS5 索引。"""
-        self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
+        _raw = sqlite3.connect(str(self.db_path), check_same_thread=False, timeout=10.0)
+        try:
+            _raw.execute("PRAGMA journal_mode=WAL")
+        except Exception:
+            pass
+        try:
+            _raw.execute("PRAGMA busy_timeout=5000")
+        except Exception:
+            pass
+        self._conn = _SQLiteConnWrapper(_raw)
         # 主表为检索索引，真实来源仍是文件
         self._conn.execute(
             "CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT, content TEXT, created TEXT)"
@@ -797,16 +830,17 @@ class MemoryStore:
         now = time.time()
         ns_key = self._ns_key(key)
         # 30 秒滑动窗口去重：跨 key、大小写/空白归一
-        # 定时清理过期哈希，避免内存膨胀
-        self._recent_hashes = {h: ts for h, ts in self._recent_hashes.items() if now - ts < 30}
-        # 内容归一哈希为去重核心
-        content_hash = hashlib.sha256(content.lower().strip().encode()).hexdigest()[:12]
-        # 同时校验 name:content 组合哈希，覆盖同内容不同键的重复
-        full_hash = _content_hash(ns_key, content)
-        if content_hash in self._recent_hashes or full_hash in self._recent_hashes:
-            return
-        self._recent_hashes[content_hash] = now
-        self._recent_hashes[full_hash] = now
+        with self._lock:
+            # 定时清理过期哈希，避免内存膨胀
+            self._recent_hashes = {h: ts for h, ts in self._recent_hashes.items() if now - ts < 30}
+            # 内容归一哈希为去重核心
+            content_hash = hashlib.sha256(content.lower().strip().encode()).hexdigest()[:12]
+            # 同时校验 name:content 组合哈希，覆盖同内容不同键的重复
+            full_hash = _content_hash(ns_key, content)
+            if content_hash in self._recent_hashes or full_hash in self._recent_hashes:
+                return
+            self._recent_hashes[content_hash] = now
+            self._recent_hashes[full_hash] = now
 
         # 原子落盘：tmp 写入 -> fsync -> os.replace，权限 0600，兼容 flock
         # 层次路由：memory_type 命中 CATEGORIES 时分目录，其余回落到 base
@@ -830,7 +864,7 @@ class MemoryStore:
                 file_path = self.base / safe_name
         else:
             file_path = self.base / safe_name
-        tmp_path = self.base / f".{safe_name}.tmp.{os.getpid()}"
+        tmp_path = self.base / f".{safe_name}.tmp.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex[:6]}"  # O_EXCL unique tmp via mkstemp semantics
         # 兼容层次路由的子目录结构，确保父目录存在
         file_path.parent.mkdir(parents=True, exist_ok=True)
         try:
@@ -958,18 +992,27 @@ class MemoryStore:
             except Exception as _exc:
                 logger.debug("silent handled: offline-safe: memory sidecar/pgvector optional, fallback to local", exc_info=_exc)  # intentional: offline-safe: memory sidecar/pgvector optional, fallback to local
                 pass  # intentional offline-safe: memory sidecar/pgvector optional, fallback to local
-        except Exception:
+        except Exception as _e:
             try:
                 self._conn.rollback()
             except Exception as _exc:
                 logger.debug("silent handled: offline-safe: memory sidecar/pgvector optional, fallback to local", exc_info=_exc)  # intentional: offline-safe: memory sidecar/pgvector optional, fallback to local
                 pass  # intentional offline-safe: memory sidecar/pgvector optional, fallback to local
+            # atomic double-write failure: clean orphan file or reconcile
+            try:
+                if file_path.exists():
+                    file_path.unlink()
+                logger.warning("write DB failed, cleaned orphan file; reconcile may be needed", exc_info=_e)
+            except Exception as _exc:
+                logger.warning("reconcile: failed to clean orphan file", exc_info=_exc)
+                pass
         # 初始化 Ebbinghaus 元数据：内存态，无需 DDL
-        if ns_key not in self._meta:
-            self._meta[ns_key] = {"quality_score": 0.5, "access_count": 0, "last_accessed": now}
-        else:
-            # 已有元数据保持不变，避免覆盖外部更新的访问计数
-            pass
+        with self._lock:
+            if ns_key not in self._meta:
+                self._meta[ns_key] = {"quality_score": 0.5, "access_count": 0, "last_accessed": now}
+            else:
+                # 已有元数据保持不变，避免覆盖外部更新的访问计数
+                pass
         # 写入后失效检索缓存，保证新笔记立即可召回
         try:
             self.clear_retrieval_cache()
@@ -1286,13 +1329,14 @@ class MemoryStore:
             bigram_result = self._search_bigram_raw(query)
             if bigram_result:
                 return bigram_result
-        # 优先走 FTS5 MATCH
+        # 优先走 FTS5 MATCH — FTS MATCH 转义加引号防止语法注入
         if self._fts_enabled:
             try:
                 cur = self._conn.cursor()
+                match_query = f'"{query.replace(chr(34), chr(34) * 2)}"'
                 cur.execute(
                     "SELECT notes.key, notes.content FROM notes_fts JOIN notes ON notes_fts.rowid = notes.id WHERE notes_fts MATCH ?",
-                    (query,),
+                    (match_query,),
                 )
                 rows = cur.fetchall()
                 if rows:
@@ -1367,8 +1411,7 @@ class MemoryStore:
     def recall(self, query: str, top_k: int = 5) -> list[dict]:
         """Alias for search — Wave4 loop wiring uses recall naming."""
         try:
-            # search ignores top_k but keep param for compatibility
-            return self.search(query)
+            return self.search(query)[: max(0, int(top_k))]
         except Exception:
             return []
 
