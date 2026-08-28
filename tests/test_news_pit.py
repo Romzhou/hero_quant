@@ -229,3 +229,57 @@ def test_load_news_mixed_timezone_aware_offsets_compare_correctly():
     out3 = load_news(rec3, trade_date="2024-01-02", snapshot_date="2024-01-01 01:00:00+00:00")
     assert out3[0]["pit"] is False
     assert out3[0]["pit_status"] == "future"
+
+
+def test_news_trade_date_filter_logs_and_schema_raise(caplog):
+    """Silent drop must log dropped counts, raise on schema anomaly and >50% missing."""
+    import logging
+    from hero_quant.data.loaders.news import load_news
+
+    caplog.set_level(logging.WARNING)
+
+    # Case 1: normal filtering should log dropped count (mismatch)
+    recs = [
+        {"id": 1, "trade_date": "2024-01-02", "publish_time": "2024-01-01 10:00:00"},
+        {"id": 2, "trade_date": "2024-01-03", "publish_time": "2024-01-01 10:00:00"},
+    ]
+    caplog.clear()
+    out = load_news(recs, trade_date="2024-01-02", snapshot_date="2024-01-02")
+    assert len(out) == 1
+    # should have logged dropped row warning
+    assert any("dropped" in r.message.lower() for r in caplog.records), f"expected dropped warning, got {[r.message for r in caplog.records]}"
+
+    # Case 2: schema anomaly - trade_date column missing entirely => raise
+    bad_recs = [
+        {"id": 1, "publish_time": "2024-01-01 10:00:00"},
+        {"id": 2, "publish_time": "2024-01-01 10:00:00"},
+    ]
+    try:
+        load_news(bad_recs, trade_date="2024-01-02", snapshot_date="2024-01-02")
+        assert False, "should raise on schema anomaly missing trade_date column"
+    except ValueError as e:
+        assert "trade_date" in str(e).lower() or "schema" in str(e).lower()
+
+    # Case 3: >50% missing trade_date should raise (bias guard)
+    many_missing = [
+        {"id": 1, "trade_date": "2024-01-02", "publish_time": "2024-01-01 10:00:00"},
+        {"id": 2, "publish_time": "2024-01-01 10:00:00"},  # missing
+        {"id": 3, "publish_time": "2024-01-01 10:00:00"},  # missing => 2/3 >50% missing
+    ]
+    try:
+        load_news(many_missing, trade_date="2024-01-02", snapshot_date="2024-01-02")
+        assert False, "should raise when >50% missing trade_date"
+    except ValueError as e:
+        assert "50%" in str(e) or "missing" in str(e).lower()
+
+    # Case 4: filtering with many records shouldn't silently drop >50% mismatch? At least log warning (not necessarily raise for mismatch)
+    # Here we keep behavior: mismatched >50% should at least warn, not silently pass
+    recs_many = [
+        {"id": i, "trade_date": "2024-01-03", "publish_time": "2024-01-01 10:00:00"} for i in range(10)
+    ] + [
+        {"id": 100, "trade_date": "2024-01-02", "publish_time": "2024-01-01 10:00:00"},
+    ]
+    caplog.clear()
+    out2 = load_news(recs_many, trade_date="2024-01-02", snapshot_date="2024-01-02")
+    assert len(out2) == 1
+    assert any("dropped" in r.message.lower() for r in caplog.records)

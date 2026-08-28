@@ -8,8 +8,11 @@
 from __future__ import annotations
 
 import copy
+import logging
 
 import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "load_news",
@@ -143,17 +146,38 @@ def load_news(
     if not records:
         return []
 
+    # Pre-check schema anomaly: if trade_date filter requested but no record has trade_date at all
+    if target_date_str is not None:
+        has_any_trade_date = False
+        for r in records:
+            if isinstance(r, dict) and _extract_trade_date(r) is not None:
+                has_any_trade_date = True
+                break
+        if not has_any_trade_date and len(records) > 0:
+            raise ValueError(
+                f"schema anomaly: trade_date column missing entirely for filter {target_date_str!r} "
+                f"(no record contains trade_date/trading_date/tradeDate/date)"
+            )
+
     out: list[dict] = []
+    dropped_missing = 0
+    dropped_mismatch = 0
+    dropped_non_dict = 0
+    total = len(records) if isinstance(records, (list, tuple)) else 0
+
     for rec in records:
         if not isinstance(rec, dict):
+            dropped_non_dict += 1
+            logger.warning("news load_news dropped non-dict record: %r", rec)
             continue
-        # trade_date 过滤
+        # trade_date 过滤 with accounting
         if target_date_str is not None:
             rec_date = _extract_trade_date(rec)
             if rec_date is None:
-                # 若记录无 trade_date 则尝试用 publish_time 的日期推断？保守：直接跳过
+                dropped_missing += 1
                 continue
             if rec_date != target_date_str:
+                dropped_mismatch += 1
                 continue
 
         # 拷贝避免污染
@@ -216,6 +240,27 @@ def load_news(
                 new_rec["pit_status"] = "unavailable"
 
         out.append(new_rec)
+
+    # log dropped counts with reasons at warning; bias guard
+    if target_date_str is not None:
+        dropped_total = dropped_missing + dropped_mismatch + dropped_non_dict
+        if dropped_total > 0:
+            logger.warning(
+                "news trade_date filtering dropped %d/%d rows for target %s: missing_trade_date=%d mismatch=%d non_dict=%d kept=%d",
+                dropped_total,
+                total,
+                target_date_str,
+                dropped_missing,
+                dropped_mismatch,
+                dropped_non_dict,
+                len(out),
+            )
+        # bias guard: missing trade_date >50% indicates schema/bias issue, raise
+        if total > 0 and dropped_missing / total > 0.5:
+            raise ValueError(
+                f"trade_date filtering dropped >50% due to missing trade_date: {dropped_missing}/{total} "
+                f"for target {target_date_str!r} (bias guard)"
+            )
 
     return out
 

@@ -6,8 +6,11 @@
 """
 
 from dataclasses import dataclass, field
+import math
+import threading
 import time
 import logging
+from collections import deque
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -100,14 +103,20 @@ class Provenance:
 
 
 class MarketDataRegistry:
-    """行情统一入口：按市场路由 loader、记录审计日志并执行跨源 1% 校验。"""
+    """行情统一入口：按市场路由 loader、记录审计日志并执行跨源 1% 校验。
+
+    audit_log 为有界线程安全环形缓冲：使用 deque(maxlen=audit_log_maxlen) + threading.Lock 保护，
+    避免长进程内存泄漏与并发竞态；默认 maxlen=1000，写入与读取均加锁。
+    """
 
     VALID_SOURCES = VALID_SOURCES
 
-    def __init__(self):
+    def __init__(self, audit_log_maxlen: int = 1000):
         self._loaders: list = []
         self._traits: dict[str, type["SourceTrait"]] = {}
-        self.audit_log: list[dict] = []
+        self._audit_lock = threading.Lock()
+        self._loaders_lock = threading.Lock()
+        self.audit_log: deque = deque(maxlen=audit_log_maxlen)
 
     def register_trait(self, name: str, trait_cls: type["SourceTrait"]) -> None:
         """注册数据源 Trait 类型，供契约校验与文档列举。"""
@@ -120,10 +129,23 @@ class MarketDataRegistry:
         return list(self._traits.keys())
 
     def register(self, loader):
-        """注册 loader 实例，需满足 markets/unit/get_bars 最小协议。"""
+        """注册 loader 实例，需满足 markets/unit/get_bars 最小协议。
+
+        会调用 trait.validate_loader 做签名与类型校验（若可用），保留 runtime_checkable 浅层检查。
+        """
+        # lightweight validate_loader if available (trait helper)
+        try:
+            from hero_quant.data.trait import validate_loader as _validate_loader
+            _validate_loader(loader)
+        except ImportError:
+            pass
+        except Exception as e:
+            # validate_loader raises ValueError/TypeError on contract violation
+            raise ValueError(f"loader trait validation failed: {e}") from e
         if not (hasattr(loader, "markets") and hasattr(loader, "unit") and hasattr(loader, "get_bars")):
             raise ValueError("loader must have markets, unit, get_bars")
-        self._loaders.append(loader)
+        with self._loaders_lock:
+            self._loaders.append(loader)
 
     def _detect_market(self, symbol: str) -> str:
         """按后缀推断市场：.SH/.SZ→CN，.US→US，其余取后缀或 UNKNOWN。"""
@@ -143,32 +165,130 @@ class MarketDataRegistry:
 
     @staticmethod
     def _bars_empty(bars) -> bool:
-        """判断 bars 是否为空，兼容 DataFrame 与 list。"""
+        """判断 bars 是否为空，兼容 DataFrame 与 list，显式处理空/格式错误并记录日志。"""
         if bars is None:
             return True
         try:
             if hasattr(bars, "empty"):
-                return bool(bars.empty)
-            return len(bars) == 0
-        except Exception:
-            return not bool(bars)
+                try:
+                    return bool(bars.empty)
+                except Exception as e:
+                    logger.warning("_bars_empty DataFrame.empty check failed: %s", e, exc_info=e)
+                    try:
+                        return len(bars) == 0  # type: ignore[arg-type]
+                    except Exception as e2:
+                        logger.warning("_bars_empty len fallback failed: %s", e2, exc_info=e2)
+                        return True
+            try:
+                return len(bars) == 0  # type: ignore[arg-type]
+            except Exception as e:
+                logger.warning("_bars_empty len check failed: %s", e, exc_info=e)
+                return not bool(bars)
+        except Exception as e:
+            logger.warning("_bars_empty fallback failed: %s", e, exc_info=e)
+            try:
+                return not bool(bars)
+            except Exception:
+                return True
 
     @staticmethod
     def _first_close(bars) -> float | None:
-        """提取首根 bar 的收盘价，用于跨源 1% 对比。"""
-        try:
-            if hasattr(bars, "iloc"):
+        """提取首根 bar 的收盘价，用于跨源 1% 对比。
+
+        显式列检查、NaN/None 处理、确定性空/畸形返回 None 并记录日志。
+        DataFrame 分支要求 'close' 列存在，否则返回 None；list 分支要求 dict 含 close。
+        """
+        if bars is None:
+            return None
+        # DataFrame branch: explicit column check
+        if hasattr(bars, "iloc") and hasattr(bars, "columns"):
+            try:
                 if hasattr(bars, "empty") and bars.empty:
                     return None
                 try:
-                    if "close" in bars.columns:
-                        return float(bars.iloc[0]["close"])
-                    return float(bars.iloc[0].iloc[0])
-                except Exception:
+                    if len(bars) == 0:
+                        return None
+                except Exception as e:
+                    logger.warning("_first_close len check failed: %s", e, exc_info=e)
                     return None
-            for b in bars[:1]:
-                return float(b.get("close", 0) if isinstance(b, dict) else 0)
-        except Exception:
+                # explicit column check - do not fallback to first column
+                try:
+                    has_close = "close" in bars.columns
+                except Exception as e:
+                    logger.warning("_first_close columns check failed: %s", e, exc_info=e)
+                    return None
+                if not has_close:
+                    try:
+                        cols = list(bars.columns) if hasattr(bars.columns, "__iter__") else []
+                    except Exception:
+                        cols = []
+                    logger.warning("_first_close DataFrame missing 'close' column, columns=%s", cols)
+                    return None
+                try:
+                    val = bars.iloc[0]["close"]
+                except Exception as e:
+                    logger.warning("_first_close DataFrame iloc access failed: %s", e, exc_info=e)
+                    return None
+                # handle pd.NA / NaN / None
+                try:
+                    import pandas as pd
+                    if pd.isna(val):
+                        return None
+                except Exception:
+                    pass
+                if val is None:
+                    return None
+                try:
+                    f = float(val)
+                except Exception as e:
+                    logger.warning("_first_close DataFrame close conversion failed: %s val=%r", e, val, exc_info=e)
+                    return None
+                if math.isnan(f):
+                    return None
+                return f
+            except Exception as e:
+                logger.warning("_first_close DataFrame branch error: %s", e, exc_info=e)
+                return None
+        # list/dict branch: explicit close key check
+        try:
+            first = None
+            try:
+                for b in bars[:1]:  # type: ignore[index]
+                    first = b
+                    break
+                else:
+                    return None
+            except Exception as e:
+                logger.warning("_first_close list slice failed: %s", e, exc_info=e)
+                return None
+            if first is None:
+                return None
+            if isinstance(first, dict):
+                if "close" not in first:
+                    logger.warning("_first_close dict missing 'close' key: %r", first)
+                    return None
+                v = first.get("close")
+                if v is None:
+                    return None
+                try:
+                    import pandas as pd
+                    if pd.isna(v):
+                        return None
+                except Exception:
+                    pass
+                try:
+                    f = float(v)
+                except Exception as e:
+                    logger.warning("_first_close dict close conversion failed: %s val=%r", e, v, exc_info=e)
+                    return None
+                if math.isnan(f):
+                    return None
+                return f
+            else:
+                logger.warning("_first_close unsupported bar type: %r", type(first))
+                return None
+        except Exception as e:
+            logger.warning("_first_close list branch error: %s", e, exc_info=e)
             return None
         return None
 
@@ -207,7 +327,9 @@ class MarketDataRegistry:
                             f"cross-source 1% check failed for {symbol}: {ref_close:.2f} vs {other_close:.2f} diff={diff*100:.2f}%"
                         )
                 return
-        if len(self._loaders) < 2 or self._bars_empty(bars):
+        with self._loaders_lock:
+            _loader_cnt = len(self._loaders)
+        if _loader_cnt < 2 or self._bars_empty(bars):
             return
         if start is None or end is None:
             return
@@ -215,13 +337,18 @@ class MarketDataRegistry:
 
         try:
             ref_close = self._first_close(bars)
-            if not ref_close:
+            if ref_close is None or ref_close == 0:
+                return
+            # NaN already normalized to None in _first_close, but guard
+            if isinstance(ref_close, float) and math.isnan(ref_close):
                 return
         except Exception as e:
             logger.warning("cross_source check _first_close error for %s: %s", symbol, e, exc_info=e)
             return
         current_source = getattr(prov, "source", "") if prov else ""  # 跳过自身避免自比
-        for loader in self._loaders:
+        with self._loaders_lock:
+            loaders_snapshot = list(self._loaders)
+        for loader in loaders_snapshot:
             loader_source = self._infer_loader_source(loader)
             if loader_source == current_source:
                 continue
@@ -266,11 +393,13 @@ class MarketDataRegistry:
         _intervals = {"1d", "1m", "5m", "15m", "30m", "1h", "1wk", "1mo", "1D", "1W"}
         if start in _intervals and "-" in str(end) and "-" in str(interval):
             start, end, interval = end, interval, start
-        if not self._loaders:
+        with self._loaders_lock:
+            loaders_snapshot = list(self._loaders)
+        if not loaders_snapshot:
             raise ImportError(f"pip install hero-quant[us] or [ashare] - no loader registered for {symbol}")
         market = self._detect_market(symbol)
         last_error = None
-        for loader in self._loaders:
+        for loader in loaders_snapshot:
             markets = getattr(loader, "markets", [])
             # 按 markets 过滤：loader 不支持该市场则跳过，避免无效请求
             if markets and market not in markets:
@@ -306,7 +435,7 @@ class MarketDataRegistry:
                 prov.source = _resolve_provenance(loader, result, prov)
             if not getattr(prov, "unit", None):
                 prov.unit = getattr(loader, "unit", "shares")
-            # 记录审计日志：用于追踪每次成功取数的来源与单位
+            # 记录审计日志：用于追踪每次成功取数的来源与单位（有界环形缓冲，线程安全）
             audit_entry = {
                 "symbol": symbol,
                 "source": getattr(prov, "source", "unknown"),
@@ -318,14 +447,16 @@ class MarketDataRegistry:
                 "loader": loader.__class__.__name__,
                 "ts": time.time(),
             }
-            self.audit_log.append(audit_entry)
+            with self._audit_lock:
+                self.audit_log.append(audit_entry)
             try:
                 self._cross_source_check(symbol, bars, prov, interval, start, end)
             except CrossSourceError:
+                # data-integrity violation is fatal per contract
                 raise
             except Exception as e:
+                # non-critical validation warnings are best-effort: log and continue (do not abort primary fetch)
                 logger.warning("cross_source check error for %s: %s", symbol, e, exc_info=e)
-                raise
             return bars, prov
         # 全部 loader 失败，透出最后的可操作错误
         if isinstance(last_error, ImportError) and "pip install" in str(last_error):
