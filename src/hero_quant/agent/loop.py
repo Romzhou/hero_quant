@@ -11,6 +11,7 @@ TraceWriter 轨迹落盘、RetryPolicy 重试与 BudgetBreaker 预算熔断。
 from __future__ import annotations
 
 import concurrent.futures
+import logging
 import re
 import time
 from dataclasses import dataclass
@@ -146,8 +147,41 @@ class AgentLoop:
         _replay_flag = kwargs.pop("replay", None)
         if _replay_path is None and isinstance(_replay_flag, (str, Path)):
             _replay_path = _replay_flag
-        # 若仅传入 replay=True 而无路径，则保持空路径
-        self._replay_path = Path(_replay_path) if _replay_path is not None else None
+        # replay 白名单：允许目录 via allow_root/replay_root 参数化，否则默认 replays 目录
+        _allow_root = kwargs.pop("allow_root", None)
+        if _allow_root is None:
+            _allow_root = kwargs.pop("replay_root", None)
+        if _allow_root is None:
+            _allow_root = kwargs.pop("replay_allow_root", None)
+        if _allow_root is None:
+            _allow_root = kwargs.pop("allow_replay_root", None)
+        def _resolve_allow_dir() -> Path:
+            if _allow_root is not None:
+                return Path(_allow_root).resolve()
+            cand = Path("replays").resolve()
+            try:
+                if cand.exists():
+                    return cand
+            except Exception:
+                pass
+            return (Path.cwd() / "replays").resolve()
+        if _replay_path is not None:
+            p = Path(_replay_path).resolve()
+            allow = _resolve_allow_dir()
+            # 校验路径穿越：必须在白名单目录内
+            try:
+                is_inside = p.is_relative_to(allow)
+            except AttributeError:
+                try:
+                    p.relative_to(allow)
+                    is_inside = True
+                except Exception:
+                    is_inside = False
+            if not is_inside:
+                raise ValueError(f"replay_path outside allowed directory: {p} not in {allow}")
+            self._replay_path = p
+        else:
+            self._replay_path = None
         self.replay_path = self._replay_path
         # 用户主动停止信号
         self._stop_requested = bool(kwargs.pop("stop_requested", False))
@@ -389,13 +423,7 @@ class AgentLoop:
             except Exception:
                 return False
 
-        def _wall_remaining() -> float | None:
-            if _wall_budget is None:
-                return None
-            try:
-                return float(_wall_budget) - (time.monotonic() - _wall_start)
-            except Exception:
-                return None
+        # _wall_remaining removed: budget check uses _wall_exceeded directly (was dead code)
 
         # 图委托路径，同样受壁时间预算约束
         if self.use_graph:
@@ -436,6 +464,7 @@ class AgentLoop:
                 res.terminated = True
             return res
 
+        # buffer uses str concat (+=) for simplicity; iterations capped so O(n^2) acceptable, alt is list+join
         buffer = ""
         iterations = 0
         token_count = 0
@@ -608,8 +637,8 @@ class AgentLoop:
                 if effective >= int(self.token_limit):
                     banner = "TRUNCATED: token_limit exceeded"
                     if "TRUNCATED" not in buffer:
-                        # 截断输出并附加截断标识，避免末尾无限增长
-                        limit = int(self.token_limit)
+                        # 截断输出并附加截断标识，token_limit转字符数 *4
+                        limit = int(self.token_limit)*4
                         buffer = buffer[:limit] + f"\n[{banner}]"
                     token_count = estimate_tokens(buffer)
                     reason = "token_limit"
@@ -652,7 +681,7 @@ class AgentLoop:
 
             # 4) LLM 流式调用，失败按 RetryPolicy 重试
             stream = None
-            last_exc: Optional[BaseException] = None
+            last_exc: Optional[Exception] = None
             # 尝试获取流：按 max_attempts 重试
             max_attempts = getattr(retry_policy, "max_attempts", 3) if retry_policy is not None else 3
             acquired = False
@@ -663,7 +692,9 @@ class AgentLoop:
                     acquired = True
                     last_exc = None
                     break
-                except BaseException as e:
+                except (KeyboardInterrupt, SystemExit, GeneratorExit):
+                    raise
+                except Exception as e:
                     last_exc = e
                     should = False
                     if retry_policy is not None:
@@ -716,7 +747,7 @@ class AgentLoop:
 
             # 5) 累积流式增量、更新 token 计数并收集工具调用
             tool_calls_this_iter: List[Dict[str, Any]] = []
-            _chunk_error: Optional[BaseException] = None
+            _chunk_error: Optional[Exception] = None
             try:
                 for chunk in stream:  # type: ignore[union-attr]
                     # chunk 可能是 dict/str/对象，需分别处理
@@ -809,11 +840,11 @@ class AgentLoop:
                         except Exception:
                             pass
 
-                    # 流中 token 熔断检查
+                    # 流中 token 熔断检查 token_limit*4 char
                     if self.token_limit is not None and estimate_tokens(buffer) >= int(self.token_limit):
                         banner = "TRUNCATED: token_limit exceeded"
                         if "TRUNCATED" not in buffer:
-                            buffer = buffer[: int(self.token_limit)] + f"\n[{banner}]"
+                            buffer = buffer[:int(self.token_limit)*4] + f"\n[{banner}]"
                         token_count = estimate_tokens(buffer)
                         reason = "token_limit"
                         terminated = True
@@ -827,7 +858,9 @@ class AgentLoop:
                 # if terminated due to token_limit mid-stream, break outer iteration handling
                 if terminated and reason == "token_limit":
                     break
-            except BaseException as e:
+            except (KeyboardInterrupt, SystemExit, GeneratorExit):
+                raise
+            except Exception as e:
                 _chunk_error = e
                 should = False
                 if retry_policy is not None:
@@ -997,11 +1030,13 @@ class AgentLoop:
                 serial_items: List[Dict[str, Any]] = [p for p in parsed if id(p) not in c_ids]
 
                 # 单个工具执行辅助：返回 (结果, 异常)
-                def _exec_spec(spec: Any, args: Dict[str, Any]) -> tuple[Any, Optional[BaseException]]:
+                def _exec_spec(spec: Any, args: Dict[str, Any]) -> tuple[Any, Optional[Exception]]:
                     try:
                         res = spec.func(**args) if isinstance(args, dict) else spec.func(args)
                         return res, None
-                    except BaseException as e:
+                    except (KeyboardInterrupt, SystemExit, GeneratorExit):
+                        raise
+                    except Exception as e:
                         return f"tool_error: {e}", e
 
                 def _redact_result(result: Any) -> str:
@@ -1019,7 +1054,7 @@ class AgentLoop:
                         except Exception:
                             return str(result)
 
-                def _handle_result(tool_name: str, result: Any, err: Optional[BaseException]):
+                def _handle_result(tool_name: str, result: Any, err: Optional[Exception]):
                     nonlocal tool_success_this_iter, _tool_success_global, buffer
                     # err 为 None 即成功，统一收敛错误分支
                     if err is None:
@@ -1054,7 +1089,7 @@ class AgentLoop:
                             fut = executor.submit(_exec_spec, item["spec"], item["args"])
                             future_map[fut] = item
                         # 按提交顺序收集结果，并强制执行 spec.timeoutMs 超时
-                        results_map: Dict[str, tuple[Any, Optional[BaseException]]] = {}
+                        results_map: Dict[str, tuple[Any, Optional[Exception]]] = {}
                         for fut, item in future_map.items():
                             t_ms = getattr(item["spec"], "timeoutMs", None)
                             try:
@@ -1065,11 +1100,10 @@ class AgentLoop:
                             except concurrent.futures.TimeoutError as e:
                                 # 超时转为 tool_error: timeout
                                 res, err = f"tool_error: timeout after {t_ms}ms", e
-                                try:
-                                    fut.cancel()
-                                except Exception:
-                                    pass
-                            except BaseException as e:
+                                # NOTE: fut.cancel() is ineffective once the thread is running; do not pretend to stop work.
+                            except (KeyboardInterrupt, SystemExit, GeneratorExit):
+                                raise
+                            except Exception as e:
                                 res, err = f"tool_error: {e}", e
                             results_map[str(id(item))] = (res, err)
                         # 按原始顺序写入 buffer，保证确定性
@@ -1083,7 +1117,7 @@ class AgentLoop:
                     args = item["args"]
                     spec = item["spec"]
                     result: Any = None
-                    _tool_error: Optional[BaseException] = None
+                    _tool_error: Optional[Exception] = None
                     if spec is not None:
                         result, _tool_error = _exec_spec(spec, args)
                     else:
@@ -1187,7 +1221,10 @@ class AgentLoop:
                             trace_writer.append({"type": "grounding", "iteration": iterations, "verified": grounding_verified})
                         except Exception:
                             pass
-                except BaseException as e:
+                except (KeyboardInterrupt, SystemExit, GeneratorExit):
+                    raise
+                except Exception as e:
+                    logging.warning("grounding verification failed: %s", e, exc_info=True)
                     grounding_verified = False
                     if trace_writer is not None:
                         try:
@@ -1195,7 +1232,7 @@ class AgentLoop:
                         except Exception:
                             pass
             else:
-                # 未配置校验则视为通过
+                # 未配置校验则视为通过，未进入校验分支不默认 True 已在 except 中设 False
                 grounding_verified = True
 
             # 8) 上下文压缩（阈值 0.8*token_limit）
@@ -1226,7 +1263,10 @@ class AgentLoop:
                                     trace_writer.append({"type": "context_compact", "iteration": iterations, "truncated": False})
                                 except Exception:
                                     pass
-                except BaseException as e:
+                except (KeyboardInterrupt, SystemExit, GeneratorExit):
+                    raise
+                except Exception as e:
+                    logging.warning("context compact failed: %s", e, exc_info=True)
                     if trace_writer is not None:
                         try:
                             trace_writer.append({"type": "context_error", "iteration": iterations, "error": str(e)})
@@ -1290,11 +1330,11 @@ class AgentLoop:
                 except Exception:
                     pass
 
-            # 迭代末尾再检 token 上限（工具输出/压缩后可能膨胀）
+            # 迭代末尾再检 token 上限（工具输出/压缩后可能膨胀） token_limit*4
             if self.token_limit is not None and estimate_tokens(buffer) >= int(self.token_limit):
                 banner = "TRUNCATED: token_limit exceeded"
                 if "TRUNCATED" not in buffer:
-                    buffer = buffer[: int(self.token_limit)] + f"\n[{banner}]"
+                    buffer = buffer[:int(self.token_limit)*4] + f"\n[{banner}]"
                 token_count = estimate_tokens(buffer)
                 reason = "token_limit"
                 terminated = True
@@ -1468,7 +1508,9 @@ class AgentLoop:
                 result = g.invoke(state)  # type: ignore[attr-defined]
             except TypeError:
                 result = g.invoke(state, config={})  # type: ignore
-        except BaseException as e:
+        except (KeyboardInterrupt, SystemExit, GeneratorExit):
+            raise
+        except Exception as e:
             if trace_writer is not None:
                 try:
                     trace_writer.append({"type": "graph_error", "error": str(e)})
