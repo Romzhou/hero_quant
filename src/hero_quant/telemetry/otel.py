@@ -170,8 +170,8 @@ class SessionTelemetryCoordinator:
             otel_logger = None
             try:
                 otel_logger = provider.get_logger("hero_quant.telemetry")  # type: ignore
-            except (AttributeError, TypeError, ValueError) as e:
-                logger.warning("otel get_logger failed: %s", e)
+            except Exception as e:  # noqa: BLE001 - 离线安全契约：telemetry 侧路永不抛错
+                logger.warning("otel get_logger failed: %s", e, exc_info=True)
                 try:
                     from opentelemetry._logs import get_logger as _api_get_logger  # type: ignore
 
@@ -201,13 +201,13 @@ class SessionTelemetryCoordinator:
                         provider.force_flush(timeout_millis=1000)  # type: ignore
                     except TypeError:
                         provider.force_flush()  # type: ignore
-            except (OSError, ValueError, TypeError) as _exc:
-                logger.warning("otel force_flush failed: %s", _exc)
+            except Exception as _exc:  # noqa: BLE001 - 离线安全契约：telemetry 侧路永不抛错
+                logger.warning("otel force_flush failed: %s", _exc, exc_info=True)
             return
         except ImportError:
             pass
-        except (OSError, ValueError, TypeError) as e:
-            logger.warning("otel sdk export failed: %s", e)
+        except Exception as e:  # noqa: BLE001 - 离线安全契约：SDK 路径失败仅告警
+            logger.warning("otel sdk export failed: %s", e, exc_info=True)
             if _sdk_available:
                 return
             pass
@@ -234,8 +234,8 @@ class SessionTelemetryCoordinator:
             req = urllib.request.Request(endpoint, data=data, headers={"Content-Type": "application/json"})
             with urllib.request.urlopen(req, timeout=0.5) as _resp:  # noqa: S310
                 pass
-        except (OSError, ValueError, TypeError) as e:
-            logger.warning("otel urllib export failed: %s", e)
+        except Exception as e:  # noqa: BLE001 - 离线安全契约：urllib 回退失败仅告警
+            logger.warning("otel urllib export failed: %s", e, exc_info=True)
             return
         return
 
