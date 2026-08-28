@@ -9,16 +9,25 @@ from pathlib import Path
 VALID_MODES = {"read-only", "workspace-write", "danger-full-access"}
 
 
+def _deduplicate_preserve_order(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for x in items:
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
+
+
 def canonical_path(p: str) -> str:
     """返回路径的真实规范路径（解析符号链接），失败时回退到原路径。"""
     try:
-        # 使用 Path.resolve() 而非 realpath，缺失路径也不抛异常
         return str(Path(p).resolve())
-    except Exception:
+    except (OSError, ValueError, RuntimeError):
         try:
-            return os.path.realpath(p)  # 兜底，仍尝试解析
-        except Exception:
-            return str(Path(p).resolve())
+            return os.path.realpath(p)
+        except (OSError, ValueError, RuntimeError):
+            return p
 
 
 def resolve_policy(mode: str, workspace_root: str | None = None) -> dict:
@@ -29,44 +38,34 @@ def resolve_policy(mode: str, workspace_root: str | None = None) -> dict:
     policy: dict = {"mode": mode}
 
     if workspace_root is not None:
+        if not isinstance(workspace_root, str) or not workspace_root.strip():
+            raise ValueError("workspace_root must be a non-empty string")
         cp = canonical_path(workspace_root)
+        if not cp or not cp.strip() or cp == ".":
+            raise ValueError("workspace_root resolves to empty path")
         policy["workspaceRoot"] = cp
         policy["canonicalPath"] = cp
         policy["workspace_root"] = cp  # snake alias for convenience
     else:
-        # still expose workspaceRoot as empty for read-only if not provided
         if mode == "workspace-write":
             raise ValueError("workspace_root required for workspace-write mode")
 
     if mode == "workspace-write":
-        roots = []
-        if workspace_root is not None:
-            roots.append(policy["workspaceRoot"])
-        # /tmp 始终可写，兼容符号链接场景同时保留字面量与规范路径
         tmp_canonical = canonical_path("/tmp") if os.path.exists("/tmp") else "/tmp"
-        if tmp_canonical not in roots:
-            roots.append(tmp_canonical)
-        if "/tmp" not in roots:
-            roots.append("/tmp")
-        # 去重并保持顺序
-        seen = set()
-        uniq = []
-        for r in roots:
-            if r not in seen:
-                uniq.append(r)
-                seen.add(r)
-        policy["writableRoots"] = uniq
+        roots = _deduplicate_preserve_order(
+            [r for r in [policy.get("workspaceRoot"), tmp_canonical, "/tmp"] if r]
+        )
+        policy["writableRoots"] = roots
         policy["enforcement"] = "full"
     elif mode == "read-only":
         tmp_canonical = canonical_path("/tmp") if os.path.exists("/tmp") else "/tmp"
-        policy["writableRoots"] = [tmp_canonical] if tmp_canonical == "/tmp" else [tmp_canonical, "/tmp"]
-        if len(policy["writableRoots"]) == 2 and policy["writableRoots"][0] == policy["writableRoots"][1]:
-            policy["writableRoots"] = ["/tmp"]
+        roots = _deduplicate_preserve_order([r for r in [tmp_canonical, "/tmp"] if r])
+        policy["writableRoots"] = roots
         policy["enforcement"] = "full"
         if "canonicalPath" not in policy:
             try:
                 policy["canonicalPath"] = str(Path.cwd().resolve())
-            except Exception:
+            except (OSError, ValueError, RuntimeError):
                 policy["canonicalPath"] = str(Path(".").resolve())
     else:  # danger-full-access
         policy["writableRoots"] = ["/"]  # 全盘可写，仅用于显式危险模式
@@ -75,22 +74,29 @@ def resolve_policy(mode: str, workspace_root: str | None = None) -> dict:
             if "canonicalPath" not in policy:
                 try:
                     policy["canonicalPath"] = str(Path.cwd().resolve())
-                except Exception:
+                except (OSError, ValueError, RuntimeError):
                     policy["canonicalPath"] = str(Path(".").resolve())
 
     return policy
 
 
 def is_path_writable(path: str, policy: dict) -> bool:
-    """判断路径是否落在可写根内（规范路径前缀匹配，防穿越）。"""
-    cp = canonical_path(path)  # 先归一化，消除符号链接与 .. 干扰
-    for root in policy.get("writableRoots", []):
-        r = canonical_path(root) if root != "/" else "/"
+    """判断路径是否落在可写根内（规范路径前缀匹配，防穿越）。
+
+    NOTE: This is a TOCTOU-prone check. Caller must not rely on it alone for
+    security; open files with O_NOFOLLOW and verify fd path via /proc/self/fd
+    or enforce via OS-level sandbox (namespaces).
+    """
+    cp = canonical_path(path)
+    cp_norm = os.path.normcase(cp)
+    for r in policy.get("writableRoots", []):
         if r == "/":
             return True  # danger-full-access 全盘可写
-        if cp == r or cp.startswith(r + os.sep):
-            return True
-        # 兼容 Windows 下 /tmp 路径分隔符差异
-        if root == "/tmp" and (cp == "/tmp" or cp.startswith("/tmp/") or cp.startswith("/tmp\\")):
+        r_norm = os.path.normcase(r)
+        try:
+            common = os.path.commonpath([cp_norm, r_norm])
+        except ValueError:
+            continue
+        if common == r_norm:
             return True
     return False
