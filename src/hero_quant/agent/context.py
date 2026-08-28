@@ -8,11 +8,41 @@
 - 两阶段技能与 Grounding：skills digest/full 按需注入，System Prompt 委托 prompt.build_system_prompt
 """
 
+import functools
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from hero_quant.skills.loader import SkillsLoader
+
+
+@functools.lru_cache(maxsize=1)
+def _cached_auto_digest() -> str:
+    """缓存 auto-discover 的 digest，避免重复扫描文件系统."""
+    try:
+        from hero_quant.skills.loader import SkillsLoader
+        from pathlib import Path as _Path
+
+        _roots: list[str] = []
+        for cand in [_Path("skills"), _Path("src/hero_quant/skills"), _Path(__file__).resolve().parents[2] / "skills"]:
+            try:
+                if cand.exists():
+                    _roots.append(str(cand))
+            except Exception:
+                continue
+        if _roots:
+            try:
+                _auto_loader = SkillsLoader(roots=_roots)
+                return _auto_loader.get_descriptions() or ""
+            except Exception:
+                return ""
+        try:
+            _auto_loader = SkillsLoader(roots=["skills"])
+            return _auto_loader.get_descriptions() or ""
+        except Exception:
+            return ""
+    except Exception:
+        return ""
 
 
 @dataclass
@@ -31,10 +61,9 @@ class ContextManager:
         self._messages: list[dict] = []
 
     def add(self, role: str, content: str) -> None:
-        # 宽松校验：未知 role 仍存储，不抛异常以保兼容
         allowed = ("user", "assistant", "system", "tool")
         if role not in allowed:
-            pass
+            raise ValueError(f"invalid role: {role!r}, allowed={allowed}")
         chars = len(f"{role}: {content}")
         self._messages.append({"role": role, "content": content, "chars": chars})
 
@@ -93,10 +122,12 @@ class ContextManager:
             head_text = "\n".join(lines_head)
             tail_text = "\n".join(lines_tail)
             reserved = len(head_text) + 1 + len(tail_text) + 1
-            remaining = self.max_chars - reserved
+            remaining = max(0, self.max_chars - reserved)
             if remaining >= len("[EMBEDDING_SUMMARY") and len(summary) > remaining:
                 summary = summary[:remaining]
                 folded_text = "\n".join(lines_head + [summary] + lines_tail)
+            if len(folded_text) > self.max_chars:
+                folded_text = self._collapse(folded_text, self.max_chars)
 
         return CompactResult(
             truncated=True,
@@ -113,7 +144,7 @@ class ContextManager:
             return f"{text[:900]}\n[COLLAPSED head=900 tail=500]\n{text[-500:]}"
 
         budget = max(0, int(max_chars))
-        if len(text) <= 900 + 500 and len(text) <= budget:
+        if len(text) <= budget:
             return text
 
         head_len = min(900, len(text))
@@ -149,6 +180,7 @@ class ContextManager:
 
         messages, microcompacted = self._microcompact(self._messages)
         working_text = self._render_messages(messages)
+        total_chars = len(working_text)
 
         # L3 remains the existing vector folding path at the old 80% threshold.
         if total_chars > self.max_chars * 0.8:
@@ -184,7 +216,9 @@ class ContextManager:
         """二阶段：按需返回完整技能内容，包为 <skill_content>."""
         try:
             content = loader.get_content(name)
-            return f"<skill_content name=\"{name}\">\n{content}\n</skill_content>"
+            safe_content = content.replace("</skill_content>", "&lt;/skill_content&gt;")
+            safe_name = name.replace('"', "&quot;")
+            return f"<skill_content name=\"{safe_name}\">\n{safe_content}\n</skill_content>"
         except Exception:
             return ""
 
@@ -210,32 +244,8 @@ class ContextManager:
                 except Exception:
                     _digest = ""
             else:
-                # auto-discover loader from default skills roots
                 try:
-                    from hero_quant.skills.loader import SkillsLoader
-                    from pathlib import Path as _Path
-
-                    # try common locations
-                    _roots = []
-                    for cand in [_Path("skills"), _Path("src/hero_quant/skills"), _Path(__file__).resolve().parents[2] / "skills"]:
-                        try:
-                            if cand.exists():
-                                _roots.append(str(cand))
-                        except Exception:
-                            continue
-                    if _roots:
-                        try:
-                            _auto_loader = SkillsLoader(roots=_roots)
-                            _digest = _auto_loader.get_descriptions()
-                        except Exception:
-                            _digest = ""
-                    else:
-                        # fallback: empty but try calling loader with no roots (may still have skills via file)
-                        try:
-                            _auto_loader = SkillsLoader(roots=["skills"])
-                            _digest = _auto_loader.get_descriptions()
-                        except Exception:
-                            _digest = ""
+                    _digest = _cached_auto_digest()
                 except Exception:
                     _digest = ""
         if _digest is None:
@@ -252,10 +262,11 @@ class ContextManager:
             )
         except Exception:
             block = grounding_block or (ledger.render_block() if ledger is not None and hasattr(ledger, "render_block") else "")
+            rules = f"\n## Extra Rules\n{extra_rules}" if extra_rules else ""
             # include digest even in fallback for audit
             if _digest:
-                return f"## Skills\n{_digest}\n## Grounding\n{block}\n## HARD RULE\nHARD RULE: Never quote price not in evidence."
-            return f"## Grounding\n{block}\n## HARD RULE\nHARD RULE: Never quote price not in evidence."
+                return f"## Skills\n{_digest}\n## Grounding\n{block}{rules}\n## HARD RULE\nHARD RULE: Never quote price not in evidence."
+            return f"## Grounding\n{block}{rules}\n## HARD RULE\nHARD RULE: Never quote price not in evidence."
 
     def get_system_prompt(
         self,
@@ -263,12 +274,13 @@ class ContextManager:
         grounding_block: str = "",
         *,
         ledger=None,
+        extra_rules: str = "",
         skills_digest: str | None = None,
         skills_loader=None,
         loader=None,
     ) -> str:
         """build_system_prompt 的别名."""
-        return self.build_system_prompt(skill_count=skill_count, grounding_block=grounding_block, ledger=ledger, skills_digest=skills_digest, skills_loader=skills_loader, loader=loader)
+        return self.build_system_prompt(skill_count=skill_count, grounding_block=grounding_block, ledger=ledger, extra_rules=extra_rules, skills_digest=skills_digest, skills_loader=skills_loader, loader=loader)
 
 
 def skills_snapshot(loader: "SkillsLoader") -> str:
@@ -300,11 +312,17 @@ def build_system_prompt(
     """模块级便捷入口，委托 prompt.build_system_prompt."""
     _loader = skills_loader if skills_loader is not None else loader
     _digest = skills_digest
-    if _digest is None and _loader is not None:
-        try:
-            _digest = _loader.get_descriptions()
-        except Exception:
-            _digest = ""
+    if _digest is None:
+        if _loader is not None:
+            try:
+                _digest = _loader.get_descriptions()
+            except Exception:
+                _digest = ""
+        else:
+            try:
+                _digest = _cached_auto_digest()
+            except Exception:
+                _digest = ""
     if _digest is None:
         _digest = ""
     try:
@@ -319,4 +337,7 @@ def build_system_prompt(
         )
     except Exception:
         block = grounding_block or (ledger.render_block() if ledger is not None and hasattr(ledger, "render_block") else "")
-        return f"## Grounding\n{block}\n## HARD RULE\nHARD RULE: Never quote price not in evidence."
+        rules = f"\n## Extra Rules\n{extra_rules}" if extra_rules else ""
+        if _digest:
+            return f"## Skills\n{_digest}\n## Grounding\n{block}{rules}\n## HARD RULE\nHARD RULE: Never quote price not in evidence."
+        return f"## Grounding\n{block}{rules}\n## HARD RULE\nHARD RULE: Never quote price not in evidence."
