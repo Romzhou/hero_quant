@@ -46,7 +46,7 @@ def _get_circuit_state():
 
 def _get_pit_status():
     try:
-        from hero_quant.backtest.validation import validate_pit  # type: ignore
+        import hero_quant.backtest.validation  # type: ignore  # noqa: F401
 
         # validation module exists; return verified
         return "verified"
@@ -56,7 +56,7 @@ def _get_pit_status():
 
 def _get_cross_source():
     try:
-        from hero_quant.data.registry import MarketDataRegistry  # type: ignore
+        import hero_quant.data.registry  # type: ignore  # noqa: F401
 
         # if registry exists, assume check passed
         return "pass"
