@@ -8,8 +8,11 @@ requests/os 等）优先于白名单；深层遍历捕获嵌套函数/类中的�
 from __future__ import annotations
 
 import ast
+import logging
 import re
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # 基础白名单 —— 基于 pyproject.toml 与 quantlib 扩展手工同步，保持显式可审计
@@ -107,17 +110,17 @@ def _dist_to_import(dist: str) -> str:
 def _load_pyproject_roots() -> set[str]:
     """解析 pyproject.toml 依赖并返回导入根集合（尽力而为，失败返回空集）。"""
     roots: set[str] = set()
-    # 向上查找 pyproject.toml，兼容不同安装布局
-    candidates = [
-        Path(__file__).resolve().parents[3] / "pyproject.toml",  # src/hero_quant/sandbox -> repo root
-        Path(__file__).resolve().parents[2] / "pyproject.toml",
-        Path.cwd() / "pyproject.toml",
-    ]
+    # 向上迭代 parents 直到根，兼容不同安装布局
     pyproject = None
-    for c in candidates:
-        if c.exists():
-            pyproject = c
+    for parent in Path(__file__).resolve().parents:
+        candidate = parent / "pyproject.toml"
+        if candidate.is_file():
+            pyproject = candidate
             break
+    if pyproject is None:
+        cwd_candidate = Path.cwd() / "pyproject.toml"
+        if cwd_candidate.is_file():
+            pyproject = cwd_candidate
     if pyproject is None:
         return roots
     try:
@@ -127,7 +130,9 @@ def _load_pyproject_roots() -> set[str]:
             import tomli as tomllib  # type: ignore  # 兼容低版本
 
         data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
-    except Exception:
+    except (OSError, ValueError) as e:
+        # 窄化为 OSError / TOMLDecodeError（ValueError 覆盖 TOMLDecodeError）
+        logger.warning("failed to load pyproject %s: %s", pyproject, e)
         return roots
     deps: list[str] = []
     deps.extend(data.get("project", {}).get("dependencies", []) or [])
@@ -145,14 +150,38 @@ def _load_pyproject_roots() -> set[str]:
 
 
 # 静态与动态白名单取并集，保证与 pyproject 同步且不因漂移丢失条目
-_DYNAMIC_ROOTS = _load_pyproject_roots()
-ALLOWED_ROOTS: set[str] = set(_STATIC_ALLOWED) | set(_DYNAMIC_ROOTS) | set(_QUANTLIB_EXTRA)
+# 懒加载 _DYNAMIC_ROOTS 通过 _get_allowed_roots() 按需初始化，避免导入时 I/O 副作用
+_DYNAMIC_ROOTS: set[str] | None = None
 
-# 再次确保 quantlib 扩展始终存在
-ALLOWED_ROOTS.update(_QUANTLIB_EXTRA)
+
+def _get_dynamic_roots() -> set[str]:
+    """懒加载动态根集合，首次调用时解析 pyproject。"""
+    global _DYNAMIC_ROOTS
+    if _DYNAMIC_ROOTS is None:
+        _DYNAMIC_ROOTS = _load_pyproject_roots()
+    return _DYNAMIC_ROOTS
+
+
+def _get_allowed_roots() -> set[str]:
+    """返回完整的白名单集合（静态+动态+扩展），用于懒加载初始化。"""
+    return set(_STATIC_ALLOWED) | set(_QUANTLIB_EXTRA) | set(_get_dynamic_roots())
+
+
+ALLOWED_ROOTS: set[str] = _get_allowed_roots()
 
 # 显式黑名单：拦截可导致命令执行/网络外联/底层逃逸的根模块与调用
-BANNED_IMPORT_ROOTS = {"socket", "subprocess", "ctypes", "requests", "os"}
+BANNED_IMPORT_ROOTS = {
+    "socket",
+    "subprocess",
+    "ctypes",
+    "requests",
+    "os",
+    "sys",
+    "importlib",
+    "importlib.util",
+    "io",
+    "builtins",
+}
 BANNED_CALL_NAMES = {"eval", "exec", "__import__", "compile", "open", "breakpoint"}  # 动态执行与导入劫持
 BANNED_GETATTR_NAMES = {"getattr", "setattr", "hasattr", "vars", "getattribute"}
 # 属性级黑名单：(base, attr)，防止通过 os.system 等间接执行
@@ -307,11 +336,12 @@ def check_source(source: str) -> None:
 
 def get_allowed_roots() -> set[str]:
     """返回当前白名单的拷贝，供测试与自检使用。"""
-    return set(ALLOWED_ROOTS)
+    return set(_get_allowed_roots())
 
 
 def is_allowlist_synced_with_pyproject() -> tuple[bool, list[str]]:
     """检查白名单与 pyproject 的同步状态，返回 (是否同步, 缺失列表)。"""
     dynamic = _load_pyproject_roots()
-    missing = [r for r in dynamic if r not in ALLOWED_ROOTS]
+    expected = set(_STATIC_ALLOWED) | set(_QUANTLIB_EXTRA)
+    missing = [r for r in dynamic if r not in expected]
     return (len(missing) == 0, missing)
