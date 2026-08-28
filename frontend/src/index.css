@@ -1,3 +1,5 @@
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Noto+Serif+SC:wght@600;800&family=Space+Grotesk:wght@400;500;600;700&display=swap');
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
@@ -5,30 +7,46 @@
 :root {
   --bg: #0B0E14;
   --panel: #121722;
+  color-scheme: dark;
 }
 
-* { scrollbar-width: thin; scrollbar-color: #2E3B56 transparent; }
-::-webkit-scrollbar { width: 6px; height: 6px; }
-::-webkit-scrollbar-thumb { background: #2E3B56; border-radius: 999px; }
+html { scrollbar-width: thin; scrollbar-color: #2E3B56 transparent; scrollbar-gutter: stable; color-scheme: dark; }
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #2E3B56; border-radius: 999px; border: 2px solid transparent; background-clip: content-box; }
 
 body {
   background: radial-gradient(1200px 600px at 20% -10%, rgba(245,158,11,0.12), transparent 60%),
               radial-gradient(900px 500px at 90% 10%, rgba(59,130,246,0.10), transparent 60%),
               var(--bg);
   color: #E6EAF2;
-  font-family: "Space Grotesk", system-ui, sans-serif;
+  font-family: "Space Grotesk", system-ui, -apple-system, "Segoe UI", sans-serif;
+  font-synthesis-weight: none;
 }
 
-@keyframes fadeIn { from { opacity: 0; transform: translateY(6px) } to { opacity: 1; transform: translateY(0) } }
+@media (prefers-reduced-motion: no-preference) {
+  @keyframes fadeIn { from { opacity: 0; transform: translateY(6px) } to { opacity: 1; transform: translateY(0) } }
+  .animate-fadeIn { animation: fadeIn 0.3s ease-out; }
+}
 .scrollbar-none::-webkit-scrollbar { display: none; }
-.scrollbar-none { scrollbar-width: none; }
+.scrollbar-none { scrollbar-width: none; -ms-overflow-style: none; }
+@media (hover: none) { .scrollbar-none { scrollbar-width: thin; } }
 
-/* grain overlay */
+/* grain overlay - optimized: contain + will-change + z-index behind */
 body::before {
   content: "";
   position: fixed;
   inset: 0;
   pointer-events: none;
+  contain: strict;
+  z-index: -1;
   opacity: 0.04;
+  will-change: transform;
+  transform: translateZ(0);
   background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noise'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noise)' opacity='0.4'/%3E%3C/svg%3E");
+  background-repeat: repeat;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  body::before { display: none; }
 }

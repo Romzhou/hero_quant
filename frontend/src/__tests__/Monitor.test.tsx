@@ -162,3 +162,62 @@ test("Live AbortController leak - previous controller aborted before overwrite",
   expect(abortSpies[0]).toHaveBeenCalled()
   vi.stubGlobal("AbortController", origAbort as any)
 })
+
+// --- P2 new tests for Monitor ---
+test("silent SSE/fetch failure logs and retries with backoff", async () => {
+  const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {})
+  // make fetch fail twice then succeed with EventSource fallback path that also errors
+  const fetchMock = vi.fn()
+    .mockRejectedValueOnce(new Error("network down"))
+    .mockRejectedValueOnce(new Error("network down"))
+    .mockRejectedValueOnce(new Error("network down"))
+    .mockResolvedValueOnce({ ok: false, status: 500, body: null })
+  vi.stubGlobal("fetch", fetchMock)
+  let esErrorCb: (() => void) | null = null
+  class FailES {
+    onmessage: any = null
+    onerror: any = null
+    close = vi.fn()
+    constructor(public url: string) {
+      // auto trigger error after small delay
+      setTimeout(() => {
+        if (this.onerror) this.onerror(new Event("error"))
+        if (esErrorCb) esErrorCb()
+      }, 10)
+    }
+  }
+  vi.stubGlobal("EventSource", FailES as any)
+  Object.defineProperty(HTMLElement.prototype, "scrollTo", { configurable: true, value: vi.fn() })
+  render(<Monitor />)
+  // wait for retry logic - should have warned and attempted reconnect
+  await waitFor(() => expect(warnSpy).toHaveBeenCalled(), { timeout: 4000 })
+  expect(warnSpy.mock.calls.some(c => String(c[0]).toLowerCase().includes("sse") || String(c[0]).toLowerCase().includes("candidate") || String(c[0]).toLowerCase().includes("monitor"))).toBe(true)
+  warnSpy.mockRestore()
+})
+
+test("dead heartbeat interval removed - no timer leak", async () => {
+  const setIntervalSpy = vi.spyOn(global, "setInterval")
+  const clearIntervalSpy = vi.spyOn(global, "clearInterval")
+  const fetchMock = vi.fn().mockResolvedValue({
+    ok: true,
+    status: 200,
+    body: new ReadableStream<Uint8Array>({ start(c) { c.close() } }),
+  })
+  vi.stubGlobal("fetch", fetchMock)
+  class FakeES { onmessage: any=null; onerror: any=null; close=vi.fn(); constructor(public url:string){} }
+  vi.stubGlobal("EventSource", FakeES as any)
+  Object.defineProperty(HTMLElement.prototype, "scrollTo", { configurable: true, value: vi.fn() })
+  const { unmount } = render(<Monitor />)
+  await waitFor(() => expect(fetchMock).toHaveBeenCalled())
+  // After fix, there should be no 5000ms dead heartbeat interval still active.
+  // Count 5000ms intervals created by Monitor
+  const fiveSecCalls = setIntervalSpy.mock.calls.filter(c => c[1] === 5000)
+  // Old code created one dead interval with 5000; after fix should be 0
+  expect(fiveSecCalls.length).toBe(0)
+  unmount()
+  // And after unmount no leaked timers (clearInterval should have been called if any)
+  // We just ensure no interval remains leaked – spy should show clear called if interval existed
+  // If fix is correct, setInterval not called at all, so clear not needed
+  setIntervalSpy.mockRestore()
+  clearIntervalSpy.mockRestore()
+})

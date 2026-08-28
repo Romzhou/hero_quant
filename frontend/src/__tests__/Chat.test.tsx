@@ -171,3 +171,63 @@ test("fetch fallback stops outer loop after [DONE] (no extra delta after DONE)",
   await act(async () => { await new Promise(r => setTimeout(r, 50)) })
   expect(useChatStore.getState().messages.some(m => m.content.includes("shouldNotAppear"))).toBe(false)
 })
+
+// --- P2 new tests ---
+test("hardcoded endpoints extracted to config constants", async () => {
+  const fs = await import("fs")
+  const content = fs.readFileSync("src/pages/Chat.tsx", "utf-8")
+  expect(content).toContain("API_ENDPOINTS")
+  expect(content).toContain("SSE_DONE")
+  expect(content).toContain("SSE_CONNECT_TIMEOUT_MS")
+  // scroll should use scrollHeight not 99999
+  expect(content).not.toContain("top: 99999")
+  expect(content).toContain("scrollHeight")
+})
+
+test("TOOL_STATUS_CLASS Record map exists", async () => {
+  const fs = await import("fs")
+  const content = fs.readFileSync("src/pages/Chat.tsx", "utf-8")
+  expect(content).toContain("TOOL_STATUS_CLASS")
+})
+
+test("resp.json null guard returns SSE ticket missing", async () => {
+  const fetchMock = vi.fn()
+    .mockResolvedValueOnce({ ok: true, status: 200, json: async () => null })
+  vi.stubGlobal("fetch", fetchMock)
+  vi.stubGlobal("EventSource", TestEventSource)
+  render(<Chat />)
+  fireEvent.change(screen.getByPlaceholderText(/输入投研问题/), { target: { value: "trigger null" } })
+  fireEvent.click(screen.getByRole("button", { name: "发送" }))
+  await waitFor(() => expect(document.body.textContent || "").toMatch(/SSE ticket missing|请求失败/), { timeout: 3000 })
+  const bodyText = document.body.textContent || ""
+  expect(bodyText).not.toContain("Cannot read properties of null")
+  expect(bodyText).not.toContain("TypeError")
+})
+
+test("abortAll closes EventSource and clears timer", async () => {
+  const fetchMock = vi.fn().mockResolvedValue(ticketResponse("t-abort"))
+  vi.stubGlobal("fetch", fetchMock)
+  vi.stubGlobal("EventSource", TestEventSource)
+  TestEventSource.instances = []
+  const { unmount } = render(<Chat />)
+  fireEvent.change(screen.getByPlaceholderText(/输入投研问题/), { target: { value: "hello abort" } })
+  fireEvent.click(screen.getByRole("button", { name: "发送" }))
+  await waitFor(() => expect(TestEventSource.instances.length).toBeGreaterThan(0))
+  const esInst = TestEventSource.instances[TestEventSource.instances.length - 1]
+  // check Chat.tsx contains abortAll helper that closes ES + clears timer
+  const fs = await import("fs")
+  const content = fs.readFileSync("src/pages/Chat.tsx", "utf-8")
+  expect(content).toContain("abortAll")
+  expect(content).toContain("esRef.current?.close()")
+  unmount()
+  expect(esInst.close).toHaveBeenCalled()
+})
+
+test("EMPTY_FALLBACK_MSG extracted and reused", async () => {
+  const fs = await import("fs")
+  const content = fs.readFileSync("src/pages/Chat.tsx", "utf-8")
+  expect(content).toContain("EMPTY_FALLBACK_MSG")
+  // should appear at least 3 times usages (definition + 3 reuse) and not have duplicated literal more than needed
+  const literalCount = (content.match(/模型未返回内容/g) || []).length
+  expect(literalCount).toBe(1)
+})

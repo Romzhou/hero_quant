@@ -10,9 +10,24 @@ import { useChatStore } from "../store/chat"
 
 type ToolCall = { id: string; tool: string; status: "pending" | "success" | "error"; latencyMs?: number; preview?: string }
 
+export const API_ENDPOINTS = {
+  TICKET: "/v1/query/ticket",
+  STREAM: "/v1/query/stream",
+} as const
+export const SSE_DONE = "[DONE]"
+export const SSE_CONNECT_TIMEOUT_MS = 1200
+export const SSE_FILL_DELAY_MS = 80
+export const EMPTY_FALLBACK_MSG = "模型未返回内容，请检查 HERO_API_KEY 配置（当前为合成演示模式）"
+
+export const TOOL_STATUS_CLASS: Record<ToolCall["status"], string> = {
+  success: "border-emerald-400/20 bg-emerald-400/10 text-emerald-200",
+  error: "border-red-400/20 bg-red-400/10 text-red-200",
+  pending: "border-white/10 bg-white/5 text-slate-400 animate-pulse",
+}
+
 // 纯函数：统一解析 SSE payload，fetch 回退与 EventSource 共用，满足 68-72 去重
 export function parseSseData(raw: string): { kind: "delta" | "tool" | "error"; delta?: string; tool?: { tool: string; status: ToolCall["status"]; preview?: string; latencyMs?: number; rawId?: string }; error?: string } | null {
-  if (!raw || raw === "[DONE]") return null
+  if (!raw || raw === SSE_DONE) return null
   try {
     const j = JSON.parse(raw)
     if (j.type === "tool") {
@@ -55,24 +70,38 @@ export default function Chat() {
   const timeoutIdsRef = useRef<number[]>([])
   const toolSeqRef = useRef(0)
 
-  // 17-19: 卸载清理 — 关闭 SSE/Abort 并清理 pending rAF/setTimeout，避免泄漏与 setState on unmounted
-  useEffect(() => {
-    return () => {
-      abortRef.current?.abort()
-      esRef.current?.close()
-      esRef.current = null
-      rafIdsRef.current.forEach(id => cancelAnimationFrame(id))
-      timeoutIdsRef.current.forEach(id => clearTimeout(id))
-      rafIdsRef.current = []
-      timeoutIdsRef.current = []
-    }
-  }, [])
-
   function trackRaf(id: number) {
     rafIdsRef.current.push(id)
   }
   function trackTimeout(id: number) {
     timeoutIdsRef.current.push(id)
+  }
+
+  function abortAll() {
+    try { abortRef.current?.abort() } catch {}
+    if (esRef.current) {
+      try { esRef.current.close() } catch {}
+      esRef.current = null
+    }
+    rafIdsRef.current.forEach(id => cancelAnimationFrame(id))
+    timeoutIdsRef.current.forEach(id => clearTimeout(id))
+    rafIdsRef.current = []
+    timeoutIdsRef.current = []
+  }
+
+  // 卸载清理 — 关闭 SSE/Abort 并清理 pending rAF/setTimeout，避免泄漏与 setState on unmounted
+  useEffect(() => {
+    return () => {
+      abortAll()
+    }
+  }, [])
+
+  function scrollToBottom() {
+    const el = listRef.current
+    if (!el) return
+    const top = el.scrollHeight
+    if (el.scrollTo) el.scrollTo({ top, behavior: "smooth" })
+    else el.scrollTop = top
   }
 
   async function send() {
@@ -89,22 +118,21 @@ export default function Chat() {
     // 初始化空轨迹，占位保证 UI 结构稳定，后续由后端 type=="tool" 事件填充
     setTraceByMsgId(s => ({ ...s, [aid]: [] }))
 
-    // 中断上一轮未结束的流，避免并发 SSE 串扰
-    abortRef.current?.abort()
-    esRef.current?.close()
+    // 中断上一轮未结束的流，避免并发 SSE 串扰 — 必须同时关闭 EventSource
+    abortAll()
     const controller = new AbortController()
     abortRef.current = controller
 
     const issueSseTicket = async () => {
-      const resp = await fetch("/v1/query/ticket", {
+      const resp = await fetch(API_ENDPOINTS.TICKET, {
         method: "POST",
         headers: { Accept: "application/json" },
         signal: controller.signal,
       })
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
-      const payload = await resp.json() as { ticket?: unknown }
-      if (typeof payload.ticket !== "string" || !payload.ticket) throw new Error("SSE ticket missing")
-      return payload.ticket
+      const payload = await resp.json() as { ticket?: unknown } | null
+      if (!payload || typeof payload !== "object" || typeof (payload as any).ticket !== "string" || !(payload as any).ticket) throw new Error("SSE ticket missing")
+      return (payload as { ticket: string }).ticket
     }
 
     let acc = ""
@@ -119,14 +147,14 @@ export default function Chat() {
       useChatStore.setState(s => ({
         messages: s.messages.map(m => m.id === aid ? { ...m, content: acc } : m),
       }))
-      const raf = requestAnimationFrame(() => listRef.current?.scrollTo({ top: 99999, behavior: "smooth" }))
+      const raf = requestAnimationFrame(() => scrollToBottom())
       trackRaf(raf)
     }
 
     const handlePayload = (raw: string) => {
       const parsed = parseSseData(raw)
       if (!parsed) {
-        if (raw === "[DONE]") return
+        if (raw === SSE_DONE) return
         // null means no-op (already handled) or empty
         return
       }
@@ -157,7 +185,7 @@ export default function Chat() {
     // fetch 回退：手动解析 SSE 帧，兼容不支持 EventSource 或代理缓冲的场景
     const fetchFallback = async () => {
       const ticket = await issueSseTicket()
-      const url = `/v1/query/stream?q=${encodeURIComponent(q)}&ticket=${encodeURIComponent(ticket)}`
+      const url = `${API_ENDPOINTS.STREAM}?q=${encodeURIComponent(q)}&ticket=${encodeURIComponent(ticket)}`
       const resp = await fetch(url, {
         method: "GET",
         headers: { Accept: "text/event-stream" },
@@ -184,21 +212,21 @@ export default function Chat() {
             .map(l => l.replace(/^data:\s*/, ""))
           if (dataLines.length === 0) continue
           const data = dataLines.join("\n")
-          if (data === "[DONE]") { outerDone = true; break }
+          if (data === SSE_DONE) { outerDone = true; break }
           handlePayload(data)
         }
         if (outerDone) break
       }
-      // 142-146 修复：flush decoder 尾部，避免末尾无 \n\n 的帧丢失
+      // flush decoder 尾部，避免末尾无 \n\n 的帧丢失
       buffer += decoder.decode()
       if (buffer.trim()) {
         const tailLines = buffer.split("\n").filter(l => l.startsWith("data:")).map(l => l.replace(/^data:\s*/, ""))
         const tailData = tailLines.join("\n").trim()
-        if (tailData && tailData !== "[DONE]") handlePayload(tailData)
+        if (tailData && tailData !== SSE_DONE) handlePayload(tailData)
       }
       if (!hasDelta && !acc) {
         useChatStore.setState(s => ({
-          messages: s.messages.map(m => m.id === aid ? { ...m, content: "模型未返回内容，请检查 HERO_API_KEY 配置（当前为合成演示模式）" } : m),
+          messages: s.messages.map(m => m.id === aid ? { ...m, content: EMPTY_FALLBACK_MSG } : m),
         }))
       }
     }
@@ -209,21 +237,21 @@ export default function Chat() {
       return new Promise<void>((resolve, reject) => {
         let gotMessage = false
         let fallbackTriggered = false
-        const url = `/v1/query/stream?q=${encodeURIComponent(q)}&ticket=${encodeURIComponent(ticket)}`
+        const url = `${API_ENDPOINTS.STREAM}?q=${encodeURIComponent(q)}&ticket=${encodeURIComponent(ticket)}`
         try {
           const es = new EventSource(url)
           esRef.current = es
           es.onmessage = (ev) => {
             gotMessage = true
             const data: string = ev.data
-            if (data === "[DONE]") {
+            if (data === SSE_DONE) {
               es.close()
               esRef.current = null
               if (!settled) {
                 settled = true
                 if (!hasDelta && !acc) {
                   useChatStore.setState(s => ({
-                    messages: s.messages.map(m => m.id === aid ? { ...m, content: "模型未返回内容，请检查 HERO_API_KEY 配置（当前为合成演示模式）" } : m),
+                    messages: s.messages.map(m => m.id === aid ? { ...m, content: EMPTY_FALLBACK_MSG } : m),
                   }))
                 }
                 resolve()
@@ -283,14 +311,14 @@ export default function Chat() {
                 // if we already got messages, treat as complete
                 if (!hasDelta && !acc) {
                   useChatStore.setState(s => ({
-                    messages: s.messages.map(m => m.id === aid ? { ...m, content: "模型未返回内容，请检查 HERO_API_KEY 配置（当前为合成演示模式）" } : m),
+                    messages: s.messages.map(m => m.id === aid ? { ...m, content: EMPTY_FALLBACK_MSG } : m),
                   }))
                 }
                 resolve()
               }
             }
           }
-          // 超时保护：1200ms 内未建连则主动回退，避免 EventSource 挂起无反馈
+          // 超时保护：SSE_CONNECT_TIMEOUT_MS 内未建连则主动回退，避免 EventSource 挂起无反馈
           const tid = window.setTimeout(() => {
             if (!gotMessage && es.readyState !== 1 && !fallbackTriggered) {
               fallbackTriggered = true
@@ -310,7 +338,7 @@ export default function Chat() {
                   }
                 })
             }
-          }, 1200)
+          }, SSE_CONNECT_TIMEOUT_MS)
           trackTimeout(tid as unknown as number)
         } catch (err) {
           // 环境不支持 EventSource 时直接走 fetch 回退
@@ -353,7 +381,7 @@ export default function Chat() {
       esRef.current?.close()
       esRef.current = null
       // 收尾滚动到底，确保最后 delta 可见
-      const raf = requestAnimationFrame(() => listRef.current?.scrollTo({ top: 99999, behavior: "smooth" }))
+      const raf = requestAnimationFrame(() => scrollToBottom())
       trackRaf(raf)
     }
   }
@@ -375,7 +403,7 @@ export default function Chat() {
             <span className={"rounded-full border px-3 py-1 text-xs font-medium flex items-center gap-1.5 " + (streaming ? "border-amber-400/30 bg-amber-400/15 text-amber-300" : "border-emerald-400/20 bg-emerald-400/10 text-emerald-300")}>
               <span className={"h-1.5 w-1.5 rounded-full " + (streaming ? "bg-amber-400 animate-pulse" : "bg-emerald-400")} />{streaming ? "流式中…" : "● 在线"}
             </span>
-            <span className="rounded-full border border-white/10 bg-white/5 px-3 py-1 text-xs text-slate-300">/v1/query/stream</span>
+            <span className="rounded-full border border-white/10 bg-white/5 px-3 py-1 text-xs text-slate-300">{API_ENDPOINTS.STREAM}</span>
           </div>
         </div>
       </div>
@@ -388,7 +416,7 @@ export default function Chat() {
                 className={
                   m.role === "user"
                     ? "max-w-[78%] rounded-2xl rounded-br-md bg-gradient-to-br from-amber-500 to-amber-600 px-4 py-3 text-sm leading-6 text-ink-900 shadow-card"
-                    : m.content === "模型未返回内容，请检查 HERO_API_KEY 配置（当前为合成演示模式）"
+                    : m.content === EMPTY_FALLBACK_MSG
                       ? "max-w-[78%] rounded-2xl rounded-bl-md border border-amber-400/30 bg-amber-400/10 px-4 py-3 text-sm leading-6 text-amber-200 backdrop-blur"
                       : "max-w-[78%] rounded-2xl rounded-bl-md border border-white/10 bg-white/[0.06] px-4 py-3 text-sm leading-6 text-mist backdrop-blur"
                 }
@@ -396,7 +424,7 @@ export default function Chat() {
                 <div className="whitespace-pre-wrap break-words">
                   {m.content ? m.content : streaming && m.role === "assistant" ? <span className="inline-flex items-center gap-1.5 text-slate-400"><span className="h-2 w-2 rounded-full bg-amber-400 animate-pulse" />思考中…</span> : ""}
                 </div>
-                {m.role === "assistant" && m.content && m.content !== "模型未返回内容，请检查 HERO_API_KEY 配置（当前为合成演示模式）" && (
+                {m.role === "assistant" && m.content && m.content !== EMPTY_FALLBACK_MSG && (
                   <>
                     <div className="mt-2 flex flex-wrap gap-2 text-[11px] text-slate-400">
                       <span className="rounded-full bg-emerald-500/15 border border-emerald-500/20 px-2 py-0.5 text-emerald-300">grounding · 已校验</span>
@@ -416,12 +444,7 @@ export default function Chat() {
                             <div
                               key={t.id}
                               className={
-                                "shrink-0 rounded-lg border px-2.5 py-1.5 text-xs leading-none " +
-                                (t.status === "success"
-                                  ? "border-emerald-400/20 bg-emerald-400/10 text-emerald-200"
-                                  : t.status === "error"
-                                    ? "border-red-400/20 bg-red-400/10 text-red-200"
-                                    : "border-white/10 bg-white/5 text-slate-400 animate-pulse")
+                                "shrink-0 rounded-lg border px-2.5 py-1.5 text-xs leading-none " + TOOL_STATUS_CLASS[t.status]
                               }
                             >
                               <div className="flex items-center gap-1.5">
@@ -481,7 +504,7 @@ export default function Chat() {
                     if (cur === q) {
                       // 保持 setInput 行为兼容测试，不自动发送，避免误触
                     }
-                  }, 80)
+                  }, SSE_FILL_DELAY_MS)
                   trackTimeout(tid as unknown as number)
                 }}
                 className="group rounded-xl border border-white/10 bg-white/[0.04] px-3 py-3 text-left text-xs leading-5 text-slate-300 hover:bg-white/[0.08] hover:border-amber-500/20 transition"
@@ -511,7 +534,7 @@ export default function Chat() {
               const tid = window.setTimeout(() => {
                 const cur = useChatStore.getState().input
                 if (cur.trim() === q) send()
-              }, 80)
+              }, SSE_FILL_DELAY_MS)
               trackTimeout(tid as unknown as number)
             }}
             className="rounded-lg bg-amber-500 px-3 py-1.5 text-xs font-semibold text-ink-900 hover:bg-amber-400 transition"

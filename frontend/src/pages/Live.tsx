@@ -9,6 +9,20 @@ import { useEffect, useRef, useState } from "react"
 
 type LiveEvent = { ts: string; offset: number; type: string; tool?: string; msg?: string; cost?: number }
 
+export const COST_LIMIT_USD = 5.0
+export const BREAKER_HALF_OPEN_RATIO = 0.8
+export const BREAKER_OPEN_RATIO = 1.0
+export const MAX_EVENTS = 200
+export const MAX_MSG_LEN = 120
+export const MAX_RAW_LEN = 160
+export const MAX_SSE_LEN = 140
+
+function getBreakerState(ratio: number): string {
+  if (ratio >= BREAKER_OPEN_RATIO) return "OPEN"
+  if (ratio >= BREAKER_HALF_OPEN_RATIO) return "HALF_OPEN"
+  return "CLOSED"
+}
+
 export default function Live() {
   const [events, setEvents] = useState<LiveEvent[]>(() => [
     { ts: new Date().toISOString(), offset: 0, type: "trace", msg: "TraceWriter init · sidecar阈值50k" },
@@ -19,9 +33,9 @@ export default function Live() {
   const [offset, setOffset] = useState(4)
   const [paused, setPaused] = useState(false)
   const [cost, setCost] = useState(3.2)
-  const costLimit = 5.0
+  const costLimit = COST_LIMIT_USD
   const ratio = Math.min(cost / costLimit, 1)
-  const breakerState = ratio >= 1 ? "OPEN" : ratio >= 0.8 ? "HALF_OPEN" : "CLOSED"
+  const breakerState = getBreakerState(ratio)
   const listRef = useRef<HTMLDivElement>(null)
   const esRef = useRef<EventSource | null>(null)
   const offsetRef = useRef(offset)
@@ -48,7 +62,7 @@ export default function Live() {
         `/v1/trace/events?offset=0`,
       ]
       for (const url of candidates) {
-        // 48-50 修复：切换候选前先 abort 上一个 controller，避免泄漏
+        // 切换候选前先 abort 上一个 controller，避免泄漏
         if (abortRef.current) {
           try { abortRef.current.abort() } catch {}
         }
@@ -80,11 +94,11 @@ export default function Live() {
                   offset: j.offset ?? curOffset,
                   type: j.type || "event",
                   tool: j.tool,
-                  msg: j.msg || j.delta || raw.slice(0, 120),
+                  msg: j.msg || j.delta || raw.slice(0, MAX_MSG_LEN),
                   cost: j.cost
                 }
-                setEvents(prev => [...prev.slice(-199), ev])
-                if (typeof j.cost === "number") {
+                setEvents(prev => [...prev.slice(-(MAX_EVENTS - 1)), ev])
+                if (typeof j.cost === "number" && Number.isFinite(j.cost)) {
                   costRef.current = j.cost
                   setCost(j.cost)
                 }
@@ -94,7 +108,7 @@ export default function Live() {
               } catch {
                 const next = curOffset++
                 offsetRef.current = curOffset
-                setEvents(prev => [...prev.slice(-199), { ts: new Date().toISOString(), offset: next, type: "raw", msg: raw.slice(0, 160) }])
+                setEvents(prev => [...prev.slice(-(MAX_EVENTS - 1)), { ts: new Date().toISOString(), offset: next, type: "raw", msg: raw.slice(0, MAX_RAW_LEN) }])
               }
             }
           }
@@ -114,14 +128,19 @@ export default function Live() {
           try {
             const j = JSON.parse(e.data)
             const nextOffset = j.offset ?? curOffset
-            setEvents(prev => [...prev.slice(-199), { ts: j.ts || new Date().toISOString(), offset: nextOffset, type: j.type || "event", msg: j.msg || e.data.slice(0, 120) }])
+            const ev: LiveEvent = { ts: j.ts || new Date().toISOString(), offset: nextOffset, type: j.type || "event", msg: j.msg || e.data.slice(0, MAX_MSG_LEN), cost: j.cost }
+            setEvents(prev => [...prev.slice(-(MAX_EVENTS - 1)), ev])
+            if (typeof j.cost === "number" && Number.isFinite(j.cost)) {
+              costRef.current = j.cost
+              setCost(j.cost)
+            }
             curOffset = nextOffset + 1
             offsetRef.current = curOffset
             setOffset(curOffset)
           } catch {
             const next = curOffset++
             offsetRef.current = curOffset
-            setEvents(prev => [...prev.slice(-199), { ts: new Date().toISOString(), offset: next, type: "sse", msg: e.data.slice(0, 140) }])
+            setEvents(prev => [...prev.slice(-(MAX_EVENTS - 1)), { ts: new Date().toISOString(), offset: next, type: "sse", msg: e.data.slice(0, MAX_SSE_LEN) }])
           }
         }
         es.onerror = () => { es.close() }
@@ -129,28 +148,33 @@ export default function Live() {
     }
 
     streamFetch()
-    // 已通过 fetch /v1/trace/events SSE 真流驱动；移除 Math.random mock（Wave5 去 mock），保留确定性空心跳占位
-    const heartbeat = setInterval(() => {
-      if (aborted || pausedRef.current) return
-      // 纯 SSE 驱动，不再注入随机 mock；确定性占位避免使用 Math.random
-    }, 5000)
 
     // 清理：标记 aborted、清定时器、关闭 SSE/流读取器，防止切页或暂停后泄漏
     return () => {
       aborted = true
-      clearInterval(heartbeat)
       esRef.current?.close()
       try { readerRef.current?.cancel() } catch {}
       try { abortRef.current?.abort() } catch {}
     }
   }, [paused])
 
-  // 事件追加后自动滚底，保持最新 offset 可见；兼容无 scrollTo 的容器
+  // 事件追加后自动滚底，保持最新 offset 可见
   useEffect(() => {
-    const el = listRef.current as unknown as { scrollTo?: (o: unknown) => void; scrollTop?: number; scrollHeight?: number } | null
-    if (el?.scrollTo) el.scrollTo({ top: el.scrollHeight, behavior: "smooth" })
-    else if (el && typeof el.scrollTop === "number") el.scrollTop = el.scrollHeight ?? 0
+    const el = listRef.current
+    if (el?.scrollTo) {
+      el.scrollTo({ top: el.scrollHeight, behavior: "smooth" })
+    } else if (el && typeof el.scrollTop === "number") {
+      el.scrollTop = el.scrollHeight ?? 0
+    }
   }, [events])
+
+  const handleClear = () => {
+    setEvents([])
+    setOffset(0)
+    setCost(0)
+    offsetRef.current = 0
+    costRef.current = 0
+  }
 
   return (
     <div className="mx-auto max-w-7xl px-6 py-6">
@@ -164,7 +188,7 @@ export default function Live() {
           <span className="rounded-full border border-white/10 bg-white/5 px-3 py-1 font-mono text-xs text-slate-300">offset: {offset}</span>
           <span className={"rounded-full border px-3 py-1 text-xs font-semibold " + (breakerState === "OPEN" ? "border-red-400/30 bg-red-400/15 text-red-300" : breakerState === "HALF_OPEN" ? "border-amber-400/30 bg-amber-400/15 text-amber-300" : "border-emerald-400/20 bg-emerald-400/10 text-emerald-300")}>{breakerState}</span>
           <button onClick={() => setPaused(p => !p)} className={"rounded-xl px-3.5 py-1.5 text-xs font-semibold transition " + (paused ? "bg-white text-ink-900" : "bg-white/10 text-mist hover:bg-white/15")}>{paused ? "▶ 恢复" : "⏸ 暂停"}</button>
-          <button onClick={() => setEvents([])} className="hidden rounded-xl border border-white/10 bg-white/5 px-3 py-1.5 text-xs text-slate-300 hover:bg-white/10 md:inline">清空</button>
+          <button onClick={handleClear} className="hidden rounded-xl border border-white/10 bg-white/5 px-3 py-1.5 text-xs text-slate-300 hover:bg-white/10 md:inline">清空</button>
         </div>
       </div>
 
@@ -174,12 +198,12 @@ export default function Live() {
           <span className="font-mono text-xs text-slate-400">daily {cost.toFixed(3)} / {costLimit.toFixed(1)} USD · {breakerState}</span>
         </div>
         <div className="mt-3 h-3 w-full overflow-hidden rounded-full bg-ink-900 border border-white/5">
-          <div className={"h-full rounded-full transition-all duration-700 " + (ratio >= 1 ? "bg-gradient-to-r from-red-500 to-red-600" : ratio >= 0.8 ? "bg-gradient-to-r from-amber-400 to-orange-500" : "bg-gradient-to-r from-emerald-400 to-teal-500")} style={{ width: `${Math.min(ratio * 100, 100)}%` }} />
+          <div className={"h-full rounded-full transition-all duration-700 " + (ratio >= BREAKER_OPEN_RATIO ? "bg-gradient-to-r from-red-500 to-red-600" : ratio >= BREAKER_HALF_OPEN_RATIO ? "bg-gradient-to-r from-amber-400 to-orange-500" : "bg-gradient-to-r from-emerald-400 to-teal-500")} style={{ width: `${Math.min(ratio * 100, 100)}%` }} />
         </div>
         <div className="mt-2 flex justify-between text-[11px] text-slate-500">
           <span>0</span>
-          <span className={ratio >= 0.8 ? "text-amber-300 font-semibold" : ""}>阈值 80% 预警</span>
-          <span className={ratio >= 1 ? "text-red-300 font-semibold" : ""}>熔断 {costLimit.toFixed(1)}</span>
+          <span className={ratio >= BREAKER_HALF_OPEN_RATIO ? "text-amber-300 font-semibold" : ""}>阈值 80% 预警</span>
+          <span className={ratio >= BREAKER_OPEN_RATIO ? "text-red-300 font-semibold" : ""}>熔断 {costLimit.toFixed(1)}</span>
         </div>
         <div className="mt-3 grid grid-cols-3 gap-2 text-xs md:gap-3">
           <div className="rounded-xl bg-white/[0.04] border border-white/5 p-3">
@@ -213,8 +237,8 @@ export default function Live() {
                 <p className="mt-2 text-xs text-slate-400">等待 trace … 暂无事件 · 将通过 offset 增量推送</p>
                 <p className="mt-1 font-mono text-[11px] text-slate-500">events.jsonl · tail -f</p>
               </div>
-            ) : events.map(e => (
-              <div key={e.offset} className="flex gap-4 px-3 py-1.5 border-b border-white/[0.03] hover:bg-white/[0.03] transition">
+            ) : events.map((e, idx) => (
+              <div key={`${e.ts}-${e.offset}-${idx}`} className="flex gap-4 px-3 py-1.5 border-b border-white/[0.03] hover:bg-white/[0.03] transition">
                 <span className="w-16 shrink-0 text-slate-500">{e.offset}</span>
                 <span className={"w-20 shrink-0 rounded-full px-1.5 py-0.5 text-center text-[10px] font-semibold " + (e.type === "tool" ? "bg-amber-500/15 text-amber-300 border border-amber-500/20" : e.type === "otel" ? "bg-sky-500/15 text-sky-300 border border-sky-500/20" : e.type === "circuit" ? "bg-red-500/15 text-red-300 border border-red-500/20" : "bg-white/5 text-slate-300 border border-white/10")}>{e.type}{e.tool ? `:${e.tool}` : ""}</span>
                 <span className="flex-1 truncate text-slate-300">{e.msg}</span>
@@ -234,7 +258,7 @@ export default function Live() {
             <div className="mt-3 space-y-2 text-xs">
               <div className="flex justify-between rounded-xl bg-ink-900/60 border border-white/5 px-3 py-2"><span className="text-slate-400">HeartbeatTimer</span><span className="text-emerald-300">daemon · 0.5s 看门狗</span></div>
               <div className="flex justify-between rounded-xl bg-ink-900/60 border border-white/5 px-3 py-2"><span className="text-slate-400">CircuitBreaker</span><span className="font-mono text-mist">50% / 30s open</span></div>
-              <div className="flex justify-between rounded-xl bg-amber-500/10 border border-amber-500/20 px-3 py-2"><span className="text-amber-300">OTel 熔断</span><span className="font-mono text-amber-100">{ratio >= 0.8 ? "将触发 fallback" : "正常"}</span></div>
+              <div className="flex justify-between rounded-xl bg-amber-500/10 border border-amber-500/20 px-3 py-2"><span className="text-amber-300">OTel 熔断</span><span className="font-mono text-amber-100">{ratio >= BREAKER_HALF_OPEN_RATIO ? "将触发 fallback" : "正常"}</span></div>
             </div>
             <div className="mt-3 rounded-xl border border-white/5 bg-ink-900/50 p-3 text-xs leading-5 text-slate-400">熔断状态由 <code className="rounded bg-white/10 px-1 text-mist">BudgetBreaker</code> 与 <code className="rounded bg-white/10 px-1 text-mist">CircuitBreaker</code> 共同决定；达阈值时图执行走 <span className="text-amber-300">compensate</span> 分支。</div>
           </div>

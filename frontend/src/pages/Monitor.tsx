@@ -1,8 +1,8 @@
 /**
  * Monitor 运行态监控页（与 Live 同源，布局备份）
  * - 职责：展示 events.jsonl 增量 tail、OTel 成本熔断、心跳与熔断双桶状态
- * - 数据流：轮询 /v1/trace/events 等候选地址的 SSE 流，按 offset 增量追加；失败回退 EventSource，附 mock 心跳保活
- * - 修复：effect 去重连风暴 — refs 镜像 offset/cost，deps 仅 [paused]；reader/abort 完整清理
+ * - 数据流：轮询 /v1/trace/events 等候选地址的 SSE 流，按 offset 增量追加；失败回退 EventSource，附带重试与日志
+ * - 修复：effect 去重连风暴 — refs 镜像 offset/cost，deps 仅 [paused]；reader/abort 完整清理；无空心跳泄漏
  */
 import { useEffect, useRef, useState } from "react"
 
@@ -18,6 +18,7 @@ export default function Monitor() {
   const [offset, setOffset] = useState(4)
   const [paused, setPaused] = useState(false)
   const [cost, setCost] = useState(3.2)
+  const [errorMsg, setErrorMsg] = useState<string | null>(null)
   const costLimit = 5.0
   const ratio = Math.min(cost / costLimit, 1)
   const breakerState = ratio >= 1 ? "OPEN" : ratio >= 0.8 ? "HALF_OPEN" : "CLOSED"
@@ -28,6 +29,8 @@ export default function Monitor() {
   const pausedRef = useRef(paused)
   const readerRef = useRef<ReadableStreamDefaultReader<Uint8Array> | null>(null)
   const abortRef = useRef<AbortController | null>(null)
+  const retryTimerRef = useRef<number | null>(null)
+  const retryCountRef = useRef(0)
 
   useEffect(() => { offsetRef.current = offset }, [offset])
   useEffect(() => { costRef.current = cost }, [cost])
@@ -40,14 +43,12 @@ export default function Monitor() {
     let curOffset = offsetRef.current
 
     async function streamFetch() {
-      // 按优先级尝试候选 SSE 地址，命中则进入帧解析循环
       const candidates = [
         `/v1/trace/events?offset=${curOffset}`,
         `/v1/events?offset=${curOffset}`,
         `/v1/query/stream?offset=${curOffset}`,
       ]
       for (const candidate of candidates) {
-        // 切换候选前先清理上一个 controller，避免泄漏
         if (abortRef.current) {
           try { abortRef.current.abort() } catch {}
         }
@@ -63,19 +64,27 @@ export default function Monitor() {
               headers: { Accept: "application/json" },
               signal: controller.signal,
             })
-            if (!ticketResp.ok) continue
+            if (!ticketResp.ok) {
+              console.warn(`[Monitor] SSE candidate failed: ${candidate} ticket status ${ticketResp.status}`)
+              continue
+            }
             const payload = await ticketResp.json() as { ticket?: unknown }
-            if (typeof payload.ticket !== "string" || !payload.ticket) continue
+            if (typeof payload.ticket !== "string" || !payload.ticket) {
+              console.warn(`[Monitor] SSE candidate failed: ${candidate} missing ticket`)
+              continue
+            }
             if (aborted) return
             url += `&ticket=${encodeURIComponent(payload.ticket)}`
           }
-          // 非 ticket 分支也创建可追踪的 controller，便于统一清理
           if (!controller) {
             controller = new AbortController()
             abortRef.current = controller
           }
           const resp = await fetch(url, { headers: { Accept: "text/event-stream" }, signal: controller.signal })
-          if (!resp.ok || !resp.body) continue
+          if (!resp.ok || !resp.body) {
+            console.warn(`[Monitor] SSE candidate failed: ${candidate} status ${resp.status}`)
+            continue
+          }
           reader = resp.body.getReader()
           readerRef.current = reader
           const decoder = new TextDecoder()
@@ -120,53 +129,72 @@ export default function Monitor() {
             }
             if (outerDone) break
           }
-          // flush decoder tail
           try { buf += decoder.decode() } catch {}
-          return // 已建立流则不再尝试其他候选
-        } catch {
-          // 当前候选失败，静默尝试下一个
+          retryCountRef.current = 0
+          setErrorMsg(null)
+          return
+        } catch (err) {
+          console.warn(`[Monitor] SSE candidate failed: ${candidate}`, err)
+          setErrorMsg(`连接 ${candidate} 失败，正在重试…`)
         } finally {
           try { await reader?.cancel() } catch {}
           try { reader?.releaseLock() } catch {}
           if (readerRef.current === reader) readerRef.current = null
         }
       }
-      // fetch 候选均失败，回退 EventSource
-      try {
-        const es = new EventSource(`/v1/trace/events?offset=${curOffset}`)
-        esRef.current = es
-        es.onmessage = e => {
-          try {
-            const j = JSON.parse(e.data)
-            const nextOffset = j.offset ?? curOffset
-            setEvents(prev => [...prev.slice(-199), { ts: j.ts || new Date().toISOString(), offset: nextOffset, type: j.type || "event", msg: j.msg || e.data.slice(0, 120) }])
-            curOffset = nextOffset + 1
-            offsetRef.current = curOffset
-            setOffset(curOffset)
-          } catch {
-            const next = curOffset
-            curOffset++
-            offsetRef.current = curOffset
-            setEvents(prev => [...prev.slice(-199), { ts: new Date().toISOString(), offset: next, type: "sse", msg: e.data.slice(0, 140) }])
-            setOffset(curOffset)
+      // fetch 候选均失败，回退 EventSource with retry
+      const connectES = () => {
+        if (aborted || pausedRef.current) return
+        try {
+          const es = new EventSource(`/v1/trace/events?offset=${curOffset}`)
+          esRef.current = es
+          es.onmessage = e => {
+            try {
+              const j = JSON.parse(e.data)
+              const nextOffset = j.offset ?? curOffset
+              setEvents(prev => [...prev.slice(-199), { ts: j.ts || new Date().toISOString(), offset: nextOffset, type: j.type || "event", msg: j.msg || e.data.slice(0, 120) }])
+              curOffset = nextOffset + 1
+              offsetRef.current = curOffset
+              setOffset(curOffset)
+              retryCountRef.current = 0
+              setErrorMsg(null)
+            } catch {
+              const next = curOffset
+              curOffset++
+              offsetRef.current = curOffset
+              setEvents(prev => [...prev.slice(-199), { ts: new Date().toISOString(), offset: next, type: "sse", msg: e.data.slice(0, 140) }])
+              setOffset(curOffset)
+            }
           }
+          es.onerror = () => {
+            console.warn(`[Monitor] EventSource error, retry ${retryCountRef.current + 1}/3`)
+            es.close()
+            if (esRef.current === es) esRef.current = null
+            if (retryCountRef.current < 3 && !aborted && !pausedRef.current) {
+              retryCountRef.current += 1
+              setErrorMsg(`SSE 连接失败，${3 - retryCountRef.current + 1}秒后重试 (${retryCountRef.current}/3)`)
+              if (retryTimerRef.current) window.clearTimeout(retryTimerRef.current)
+              retryTimerRef.current = window.setTimeout(() => {
+                if (!aborted && !pausedRef.current) connectES()
+              }, 3000)
+            } else {
+              setErrorMsg("SSE 连接失败，已达最大重试次数")
+            }
+          }
+        } catch (err) {
+          console.warn("[Monitor] EventSource creation failed", err)
+          setErrorMsg("SSE 初始化失败")
         }
-        es.onerror = () => { es.close() }
-      } catch {}
+      }
+      connectES()
     }
 
     streamFetch()
-    // SSE 已通过 fetch /v1/trace/events 真流驱动；移除 Math.random mock，保持纯 SSE（Wave5 去 mock）
-    // 若需离线演示，保留确定性心跳（按 offset 轮转，无随机），避免 Math.random 污染测试
-    const heartbeat = setInterval(() => {
-      if (aborted || pausedRef.current) return
-      // 仅当 SSE 30s 无数据时补充确定性心跳（此处静默，不主动增量，由 SSE 主导）
-    }, 5000)
 
     // 清理定时器与 SSE/流读取器，防止切页泄漏 — 包含 reader.cancel + abort
     return () => {
       aborted = true
-      clearInterval(heartbeat)
+      if (retryTimerRef.current) { window.clearTimeout(retryTimerRef.current); retryTimerRef.current = null }
       esRef.current?.close()
       esRef.current = null
       try { readerRef.current?.cancel().catch(() => {}) } catch {}
@@ -195,6 +223,8 @@ export default function Monitor() {
           <button onClick={() => setEvents([])} className="rounded-xl border border-white/10 bg-white/5 px-3 py-1.5 text-xs text-slate-300 hover:bg-white/10">清空</button>
         </div>
       </div>
+
+      {errorMsg && <div className="mt-4 rounded-xl border border-amber-400/20 bg-amber-400/10 px-4 py-2 text-xs text-amber-200">{errorMsg}</div>}
 
       {/* OTel cost 熔断条 */}
       <div className="mt-6 rounded-2xl border border-white/10 bg-ink-800/60 p-4 backdrop-blur">
@@ -241,7 +271,7 @@ export default function Monitor() {
               <span className="w-16">offset</span><span className="w-20">type</span><span>message</span>
             </div>
             {events.map(e => (
-              <div key={e.offset} className="flex gap-4 px-3 py-1.5 border-b border-white/[0.03] hover:bg-white/[0.03] transition">
+              <div key={`${e.ts}-${e.offset}`} className="flex gap-4 px-3 py-1.5 border-b border-white/[0.03] hover:bg-white/[0.03] transition">
                 <span className="w-16 shrink-0 text-slate-500">{e.offset}</span>
                 <span className={
                   "w-20 shrink-0 rounded-full px-1.5 py-0.5 text-center text-[10px] font-semibold " +
