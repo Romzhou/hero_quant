@@ -7,15 +7,18 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict
 
 from hero_quant.tools.registry import TOOL_REGISTRY, tool
 
+_logger = logging.getLogger(__name__)
+
+_shared_registry = None
+
 
 def _make_registry():
     """创建已注册 Tencent + Yahoo 的 MarketDataRegistry（双源 fallback 链）。"""
-    import logging as _logging
-    _logger = _logging.getLogger(__name__)
     from hero_quant.data.registry import MarketDataRegistry
 
     reg = MarketDataRegistry()
@@ -24,27 +27,44 @@ def _make_registry():
 
         reg.register(TencentLoader())
     except Exception as e:
-        _logger.warning("failed to register TencentLoader: %s", e, exc_info=e)
+        _logger.warning("failed to register TencentLoader: %s", e, exc_info=True)
     try:
         from hero_quant.data.loaders.yahoo import YahooLoader
 
         reg.register(YahooLoader())
     except Exception as e:
-        _logger.warning("failed to register YahooLoader: %s", e, exc_info=e)
+        _logger.warning("failed to register YahooLoader: %s", e, exc_info=True)
     return reg
 
 
-def _synthetic_fallback(symbol: str, start: str, end: str):
-    """合成兜底：复用 TencentLoader 的合成逻辑，保证离线可运行。"""
-    try:
-        from hero_quant.data.loaders.tencent import TencentLoader
+def _get_shared_registry():
+    global _shared_registry
+    if _shared_registry is None:
+        _shared_registry = _make_registry()
+    return _shared_registry
 
-        return TencentLoader()._synthetic_bars(symbol, start, end)
-    except Exception:
-        # minimal 3 bars
+
+def _synthetic_fallback(symbol: str, start: str, end: str):
+    """合成兜底：优先使用公开 generate_synthetic_bars，否则本地最小合成，保证离线可运行。"""
+    try:
+        from hero_quant.data.loaders.tencent import generate_synthetic_bars  # type: ignore
+
+        return generate_synthetic_bars(symbol, start, end)
+    except Exception as e:
+        _logger.debug("public synthetic helper not available: %s", e, exc_info=True)
+    # local minimal fallback — standalone, no private loader reach
+    import datetime
+
+    try:
+        # try to produce two bars with given dates
         return [
             {"date": start, "open": 100.0, "close": 100.5, "high": 101.0, "low": 99.5, "volume": 100},
             {"date": end, "open": 100.5, "close": 101.0, "high": 101.5, "low": 100.0, "volume": 110},
+        ]
+    except Exception as e:
+        _logger.debug("local synthetic fallback failed: %s", e, exc_info=True)
+        return [
+            {"date": start, "open": 100.0, "close": 100.0, "high": 100.0, "low": 100.0, "volume": 100},
         ]
 
 
@@ -93,7 +113,18 @@ def get_market_data(
     # Try registry with both loaders
     try:
         reg = _make_registry()
-        if not reg._loaders:
+        # use public API instead of private _loaders
+        try:
+            is_empty = len(reg) == 0
+        except Exception:
+            # fallback to check via get_bars failure
+            is_empty = False
+            try:
+                # if __len__ not supported, try attribute
+                is_empty = not getattr(reg, "_loaders", [])
+            except Exception:
+                is_empty = False
+        if is_empty:
             raise ImportError("pip install hero-quant[us] or [ashare] - no loader registered")
         bars, prov = reg.get_bars(symbol, interval, start, end)
         provenance = {"source": getattr(prov, "source", "unknown"), "unit": getattr(prov, "unit", "shares")}
@@ -105,10 +136,13 @@ def get_market_data(
         # CrossSourceError 必须透传，不得静默回退合成
         from hero_quant.data.registry import CrossSourceError as _CSE
         if isinstance(e, _CSE):
-            import logging as _logging2
-            _logging2.getLogger(__name__).warning("cross_source check blocked get_market_data for %s: %s", symbol, e, exc_info=e)
+            _logger.warning("cross_source check blocked get_market_data for %s: %s", symbol, e, exc_info=True)
             raise
+        # misconfiguration should fail fast, not synthesize
+        if isinstance(e, ImportError) or "no loader" in str(e).lower():
+            raise RuntimeError("market data misconfigured: no loader available") from e
         # 异常时仍返回合成数据并附带错误信息，避免 Agent 中断（非校验错误）
+        _logger.warning("get_market_data fallback to synthetic for %s: %s", symbol, e, exc_info=True)
         bars = _synthetic_fallback(symbol, start, end)
         return {
             "bars": bars,
@@ -209,7 +243,7 @@ def search_symbols(keyword: str) -> Dict[str, Any]:
         stem = kw.upper().replace(" ", "_")
         for suffix in [".SH", ".US", ""]:
             candidates.append({"symbol": f"{stem}{suffix}", "name": f"{kw} mock {suffix or 'generic'}"})
-    return {"symbols": candidates, "candidates": candidates, "ok": True, "keyword": keyword}
+    return {"symbols": candidates, "candidates": candidates, "ok": True}
 
 
 @tool(
@@ -262,12 +296,19 @@ def get_bars_range(
     start: str = "2026-08-01",
     end: str = "2026-08-03",
 ) -> Dict[str, Any]:
-    """批量拉取多标的行情，逐个调用 get_market_data 并聚合结果。"""
+    """批量拉取多标的行情，逐个调用 get_market_data 并聚合结果 — reuse shared registry."""
     data: Dict[str, Any] = {}
+    reg = _get_shared_registry()
     for sym in symbols or []:
         try:
-            res = get_market_data(sym, interval=interval, start=start, end=end)
-            data[sym] = res
+            bars, prov = reg.get_bars(sym, interval, start, end)
+            provenance = {"source": getattr(prov, "source", "unknown"), "unit": getattr(prov, "unit", "shares")}
+            data[sym] = {"bars": bars, "provenance": provenance, "ok": True}
         except Exception as e:
-            data[sym] = {"bars": [], "ok": False, "error": str(e)}
+            # fallback to synthetic per-symbol but with error context
+            try:
+                bars_fb = _synthetic_fallback(sym, start, end)
+                data[sym] = {"bars": bars_fb, "provenance": {"source": "synthetic", "unit": "shares"}, "ok": False, "error": str(e)}
+            except Exception as e2:
+                data[sym] = {"bars": [], "ok": False, "error": str(e2)}
     return {"data": data, "ok": True}

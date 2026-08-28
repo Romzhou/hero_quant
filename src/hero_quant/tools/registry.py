@@ -12,32 +12,61 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Any
 import inspect
+import threading
+
+_REGISTRY_LOCK = threading.RLock()
+
+
+def _assert_schema(schema: Dict[str, Any], path: str = "$") -> None:
+    """Recursively validate JSON Schema subset."""
+    if not isinstance(schema, dict):
+        raise ValueError(f"{path}: schema must be dict")
+    if "type" not in schema:
+        raise ValueError(f"{path}: schema must have 'type'")
+    t = schema["type"]
+    if t not in ("object", "array", "string", "number", "integer", "boolean", "null"):
+        raise ValueError(f"{path}: unsupported json schema type: {t}")
+    if t == "object":
+        props = schema.get("properties")
+        if props is not None and not isinstance(props, dict):
+            raise ValueError(f"{path}: properties must be dict")
+        if "additionalProperties" in schema and not isinstance(schema["additionalProperties"], bool):
+            raise ValueError(f"{path}: additionalProperties must be bool")
+        if "required" in schema:
+            if not isinstance(schema["required"], list):
+                raise ValueError(f"{path}: required must be list")
+            # required entries must be strings and exist in properties
+            for idx, req in enumerate(schema["required"]):
+                if not isinstance(req, str):
+                    raise ValueError(f"{path}.required[{idx}]: must be string")
+                if isinstance(props, dict) and req not in props:
+                    # allow but warn via error: drift to runtime
+                    pass
+            # ensure enum/additionalProperties schema etc if present are valid
+        if "required" in schema and isinstance(schema.get("required"), list):
+            for r in schema["required"]:
+                if not isinstance(r, str):
+                    raise ValueError(f"{path}: required entries must be strings")
+        if isinstance(props, dict):
+            for k, v in props.items():
+                _assert_schema(v, f"{path}.properties.{k}")
+        # additionalProperties as schema object case
+        ap = schema.get("additionalProperties")
+        if isinstance(ap, dict):
+            _assert_schema(ap, f"{path}.additionalProperties")
+    elif t == "array":
+        if "items" in schema:
+            items = schema["items"]
+            if isinstance(items, dict):
+                _assert_schema(items, f"{path}.items")
+            elif isinstance(items, list):
+                for i, it in enumerate(items):
+                    _assert_schema(it, f"{path}.items[{i}]")
 
 
 def assertSupportedJsonSchema(schema: Dict[str, Any]) -> None:
     """校验最小可用 JSON Schema 子集，不支持的类型抛出 ValueError。"""
-    if not isinstance(schema, dict):
-        raise ValueError("schema must be dict")
-    if "type" not in schema:
-        raise ValueError("schema must have 'type'")
-    t = schema["type"]
-    if t not in ("object", "array", "string", "number", "integer", "boolean", "null"):
-        raise ValueError(f"unsupported json schema type: {t}")
-    if t == "object":
-        props = schema.get("properties")
-        if props is not None and not isinstance(props, dict):
-            raise ValueError("properties must be dict")
-        if "additionalProperties" in schema and not isinstance(schema["additionalProperties"], bool):
-            raise ValueError("additionalProperties must be bool")
-        if "required" in schema and not isinstance(schema["required"], list):
-            raise ValueError("required must be list")
-        # validate property schemas shallow
-        if isinstance(props, dict):
-            for k, v in props.items():
-                if not isinstance(v, dict) or "type" not in v:
-                    raise ValueError(f"property {k} must be schema dict with type")
-                if v["type"] not in ("object", "array", "string", "number", "integer", "boolean", "null"):
-                    raise ValueError(f"unsupported property type {v['type']} for {k}")
+    _assert_schema(schema, "$")
 
 
 def _normalize_concurrency_safe(fn: Callable | bool | None) -> Callable[[Dict[str, Any]], bool]:
@@ -86,7 +115,16 @@ def tool(
     parameters/output 为 JSON Schema，注册期即校验；timeoutMs 与
     presentAs 为可选扩展，支持下划线/驼峰别名兼容。
     """
-    # 兼容下划线/驼峰等别名写法
+    # 兼容下划线/驼峰等别名写法 — detect conflicting aliases
+    timeout_aliases = []
+    if "timeout_ms" in kwargs:
+        timeout_aliases.append("timeout_ms")
+    if "timeoutms" in kwargs:
+        timeout_aliases.append("timeoutms")
+    if "timeout" in kwargs:
+        timeout_aliases.append("timeout")
+    if len(timeout_aliases) > 1:
+        raise ValueError(f"conflicting timeout aliases: {timeout_aliases}")
     if timeoutMs is None:
         if "timeout_ms" in kwargs:
             timeoutMs = kwargs.pop("timeout_ms")
@@ -97,20 +135,39 @@ def tool(
     if is_concurrency_safe is None and "concurrency_safe" in kwargs:
         is_concurrency_safe = kwargs.pop("concurrency_safe")
 
+    # presentAs handling — pop early for unknown-kwargs detection
+    present_as_raw = "native"
+    if "presentAs" in kwargs:
+        present_as_raw = kwargs.pop("presentAs")
+    elif "present_as" in kwargs:
+        present_as_raw = kwargs.pop("present_as")
+    if present_as_raw not in ("native", "code", "both"):
+        raise ValueError(f"unsupported presentAs={present_as_raw!r}")
+
+    # fail-fast on typos / unknown kwargs
+    if kwargs:
+        raise ValueError(f"unknown tool() kwargs: {list(kwargs)}")
+
     if not description:
         raise ValueError("description must be non-empty")
-    if name in TOOL_REGISTRY:
-        raise ValueError(f"tool name '{name}' already registered")
+    with _REGISTRY_LOCK:
+        if name in TOOL_REGISTRY:
+            raise ValueError(f"tool name '{name}' already registered")
 
     # 注册期即校验 Schema， fail-fast 避免运行时合约漂移
     if parameters is not None:
         assertSupportedJsonSchema(parameters)
     if output is not None:
-        assertSupportedJsonSchema(output)
+        # validate after unwrapping decision — support wrapped form
+        if isinstance(output, dict) and "schema" in output and "render" in output:
+            assertSupportedJsonSchema(output["schema"])
+        else:
+            assertSupportedJsonSchema(output)
 
     def decorator(func: Callable) -> Callable:
-        if name in TOOL_REGISTRY:
-            raise ValueError(f"tool name '{name}' already registered")
+        with _REGISTRY_LOCK:
+            if name in TOOL_REGISTRY:
+                raise ValueError(f"tool name '{name}' already registered")
         if not description:
             raise ValueError("description must be non-empty")
 
@@ -125,14 +182,16 @@ def tool(
         else:
             output_wrapped = None
 
-        present_as = kwargs.get("presentAs", kwargs.get("present_as", "native"))
+        present_as = present_as_raw
 
         t_ms = None
         if timeoutMs is not None:
             try:
                 t_ms = int(timeoutMs)
-            except Exception:
-                t_ms = None
+            except (TypeError, ValueError) as e:
+                raise ValueError(f"timeoutMs must be int-convertible, got {timeoutMs!r}") from e
+            if t_ms < 0:
+                raise ValueError("timeoutMs must be >=0")
 
         spec = ToolSpec(
             name=name,
@@ -145,7 +204,10 @@ def tool(
             timeoutMs=t_ms,
             presentAs=present_as,
         )
-        TOOL_REGISTRY[name] = spec
+        with _REGISTRY_LOCK:
+            if name in TOOL_REGISTRY:
+                raise ValueError(f"tool name '{name}' already registered")
+            TOOL_REGISTRY[name] = spec
         return func
 
     return decorator
@@ -154,20 +216,20 @@ def tool(
 def get_definitions(presentAs: str = "native") -> list[Dict[str, Any]]:
     """按名称排序返回工具定义，保证 KV-cache 稳定；presentAs 为展示形态桩。"""
     # 按名称排序：避免注册顺序抖动导致 KV-cache 失效
+    if presentAs not in ("native", "code", "both"):
+        raise ValueError(f"unsupported presentAs={presentAs!r}")
+    if presentAs != "native":
+        raise NotImplementedError(f"presentAs={presentAs!r} not yet implemented")
 
-    defs: list[Dict[str, Any]] = []
-    for tool_name in sorted(TOOL_REGISTRY.keys()):
-        spec = TOOL_REGISTRY[tool_name]
-        params = spec.parameters if spec.parameters is not None else {"type": "object", "properties": {}}
-        func_def: Dict[str, Any] = {
-            "name": spec.name,
-            "description": spec.description,
-            "parameters": params,
-        }
-        defs.append({"type": "function", "function": func_def})
-    # presentAs 桩：当前保持 native 稳定，code/both 预留扩展
-    if presentAs == "code":
-        pass
-    elif presentAs == "both":
-        pass
-    return defs
+    with _REGISTRY_LOCK:
+        items = sorted(TOOL_REGISTRY.items())
+        defs: list[Dict[str, Any]] = []
+        for tool_name, spec in items:
+            params = spec.parameters if spec.parameters is not None else {"type": "object", "properties": {}}
+            func_def: Dict[str, Any] = {
+                "name": spec.name,
+                "description": spec.description,
+                "parameters": params,
+            }
+            defs.append({"type": "function", "function": func_def})
+        return defs
