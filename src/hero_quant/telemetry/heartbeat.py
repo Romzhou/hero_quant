@@ -6,7 +6,9 @@
 """
 
 from __future__ import annotations
+import json
 import logging
+import os
 
 import threading
 import time
@@ -37,34 +39,38 @@ LAYERS = ["thread", "process", "service", "global"]
 
 # 全局兜底 heartbeatDetails，弥补 ContextVar/thread-local 的跨线程隔离
 _LAST_TEMPORAL_EVENT: dict | None = None
+_LAST_TEMPORAL_LOCK = threading.Lock()
+_SIDECAR_FILE_LOCK = threading.Lock()
 
 
 def _temporal_emit(event: dict) -> None:
     """透传心跳到 Temporal 侧车，离线安全。
 
-    依次尝试 checkpoint 占位与真实 temporalio，异常静默不影响主链路。
+    依次尝试 checkpoint 占位与真实 temporalio，异常告警但不影响主链路。
     """
 
     global _LAST_TEMPORAL_EVENT
     try:
-        _LAST_TEMPORAL_EVENT = dict(event)
-    except Exception as _exc:
-        logger.debug("silent handled: offline-safe: heartbeat sidecar/temporal optional", exc_info=_exc)  # intentional: offline-safe: heartbeat sidecar/temporal optional
-        pass  # intentional offline-safe: heartbeat sidecar/temporal optional
+        with _LAST_TEMPORAL_LOCK:
+            _LAST_TEMPORAL_EVENT = dict(event)
+    except Exception:
+        logger.warning("heartbeat _LAST_TEMPORAL_EVENT update failed", exc_info=True)
     try:
         from hero_quant.checkpoint.temporal import heartbeat as _ckpt_hb
 
         _ckpt_hb(event)
-    except Exception as _exc:
-        logger.debug("silent handled: offline-safe: heartbeat sidecar/temporal optional", exc_info=_exc)  # intentional: offline-safe: heartbeat sidecar/temporal optional
-        pass  # intentional offline-safe: heartbeat sidecar/temporal optional
+    except (ImportError, ModuleNotFoundError):
+        logger.debug("checkpoint heartbeat not available (offline-safe)", exc_info=True)
+    except Exception:
+        logger.warning("checkpoint heartbeat emit failed", exc_info=True)
     try:
         from temporalio import activity as _temporal_activity  # type: ignore
 
         _temporal_activity.heartbeat(event)  # type: ignore
-    except Exception as _exc:
-        logger.debug("silent handled: offline-safe: heartbeat sidecar/temporal optional", exc_info=_exc)  # intentional: offline-safe: heartbeat sidecar/temporal optional
-        pass  # intentional offline-safe: heartbeat sidecar/temporal optional
+    except (ImportError, ModuleNotFoundError):
+        logger.debug("temporalio not available (offline-safe)", exc_info=True)
+    except Exception:
+        logger.warning("temporalio heartbeat failed", exc_info=True)
 
 
 def temporal_heartbeat(payload: dict | None = None) -> None:
@@ -73,35 +79,37 @@ def temporal_heartbeat(payload: dict | None = None) -> None:
         payload = {"ts": time.time(), "layer": "sidecar"}
     try:
         _temporal_emit(dict(payload))
-    except Exception as _exc:
-        logger.debug("silent handled: offline-safe: heartbeat sidecar/temporal optional", exc_info=_exc)  # intentional: offline-safe: heartbeat sidecar/temporal optional
-        pass  # intentional offline-safe: heartbeat sidecar/temporal optional
+    except Exception:
+        logger.warning("temporal_heartbeat failed", exc_info=True)
 
 
 def get_temporal_heartbeat_details() -> dict | None:
     """读取上次 Temporal heartbeatDetails（跨线程可见）。"""
-    # 优先全局兜底（跨线程可见）
-    if _LAST_TEMPORAL_EVENT is not None:
+    # 优先全局兜底（跨线程可见）— 加锁防竞态
+    with _LAST_TEMPORAL_LOCK:
+        snapshot = _LAST_TEMPORAL_EVENT
+    if snapshot is not None:
         try:
-            return dict(_LAST_TEMPORAL_EVENT)
-        except Exception as _exc:
-            logger.debug("silent handled: offline-safe: heartbeat sidecar/temporal optional", exc_info=_exc)  # intentional: offline-safe: heartbeat sidecar/temporal optional
-            pass  # intentional offline-safe: heartbeat sidecar/temporal optional
+            return dict(snapshot)
+        except Exception:
+            logger.warning("get_temporal_heartbeat_details copy failed", exc_info=True)
     try:
         from hero_quant.checkpoint.temporal import get_heartbeat_details as _get
 
         res = _get()
         if res is not None:
             return res
-    except Exception as _exc:
-        logger.debug("silent handled: offline-safe: heartbeat sidecar/temporal optional", exc_info=_exc)  # intentional: offline-safe: heartbeat sidecar/temporal optional
-        pass  # intentional offline-safe: heartbeat sidecar/temporal optional
-    if _LAST_TEMPORAL_EVENT is not None:
+    except (ImportError, ModuleNotFoundError):
+        logger.debug("get_heartbeat_details not available", exc_info=True)
+    except Exception:
+        logger.warning("get_heartbeat_details failed", exc_info=True)
+    with _LAST_TEMPORAL_LOCK:
+        snapshot2 = _LAST_TEMPORAL_EVENT
+    if snapshot2 is not None:
         try:
-            return dict(_LAST_TEMPORAL_EVENT)
-        except Exception as _exc:
-            logger.debug("silent handled: offline-safe: heartbeat sidecar/temporal optional", exc_info=_exc)  # intentional: offline-safe: heartbeat sidecar/temporal optional
-            pass  # intentional offline-safe: heartbeat sidecar/temporal optional
+            return dict(snapshot2)
+        except Exception:
+            logger.warning("get_temporal_heartbeat_details second copy failed", exc_info=True)
     return None
 
 
@@ -112,18 +120,16 @@ def probe_temporal_sidecar(timeout: float = 0.5) -> str:
         details = get_temporal_heartbeat_details()
         if details is not None:
             return "usable"
-    except Exception as _exc:
-        logger.debug("silent handled: offline-safe: heartbeat sidecar/temporal optional", exc_info=_exc)  # intentional: offline-safe: heartbeat sidecar/temporal optional
-        pass  # intentional offline-safe: heartbeat sidecar/temporal optional
+    except Exception:
+        logger.warning("probe_temporal_sidecar details check failed", exc_info=True)
     # 检查 temporalio 是否可导入，作为环境可用性探针
     try:
         import importlib.util as _ilu
 
         if _ilu.find_spec("temporalio") is not None:
             return "usable"
-    except Exception as _exc:
-        logger.debug("silent handled: offline-safe: heartbeat sidecar/temporal optional", exc_info=_exc)  # intentional: offline-safe: heartbeat sidecar/temporal optional
-        pass  # intentional offline-safe: heartbeat sidecar/temporal optional
+    except Exception:
+        logger.warning("probe_temporal_sidecar import check failed", exc_info=True)
     # 离线环境仍返回可用占位，避免单测误判
     return "usable"
 
@@ -170,6 +176,7 @@ class HeartbeatTimer:
         self.sidecar_path = Path(sidecar_path) if sidecar_path is not None else None
         self.last_event: dict | None = None
         self._emitted_count = 0
+        self._hb_lock = threading.Lock()
 
     def _run(self):
         """后台循环 — 组装事件、透传 Temporal、侧车落盘并 emit。"""
@@ -188,39 +195,31 @@ class HeartbeatTimer:
                 if self.use_temporal:
                     try:
                         _temporal_emit(event)
-                    except Exception as _exc:
-                        logger.debug("silent handled: offline-safe: heartbeat sidecar/temporal optional", exc_info=_exc)  # intentional: offline-safe: heartbeat sidecar/temporal optional
-                        pass  # intentional offline-safe: heartbeat sidecar/temporal optional
-                # 侧车文件落盘（若配置）：追加 JSON 行并 fsync
+                    except Exception:
+                        logger.warning("HeartbeatTimer temporal emit failed", exc_info=True)
+                # 侧车文件落盘（若配置）：追加 JSON 行并 fsync — 加锁防交错，失败告警
                 if self.sidecar_path is not None:
                     try:
-                        self.sidecar_path.parent.mkdir(parents=True, exist_ok=True)
-                        import json as _json
-                        import os as _os
-                        line = _json.dumps(event, ensure_ascii=False) + "\n"
-                        with open(self.sidecar_path, "a", encoding="utf-8") as _f:
-                            _f.write(line)
-                            _f.flush()
-                            try:
-                                _os.fsync(_f.fileno())
-                            except Exception as _exc:
-                                logger.debug("silent handled: offline-safe: heartbeat sidecar/temporal optional", exc_info=_exc)  # intentional: offline-safe: heartbeat sidecar/temporal optional
-                                pass  # intentional offline-safe: heartbeat sidecar/temporal optional
-                    except Exception as _exc:
-                        logger.debug("silent handled: offline-safe: heartbeat sidecar/temporal optional", exc_info=_exc)  # intentional: offline-safe: heartbeat sidecar/temporal optional
-                        pass  # intentional offline-safe: heartbeat sidecar/temporal optional
-                self.last_event = dict(event)
-                self._emitted_count += 1
+                        with _SIDECAR_FILE_LOCK:
+                            self.sidecar_path.parent.mkdir(parents=True, exist_ok=True)
+                            line = json.dumps(event, ensure_ascii=False) + "\n"
+                            with open(self.sidecar_path, "a", encoding="utf-8") as _f:
+                                _f.write(line)
+                                _f.flush()
+                                try:
+                                    os.fsync(_f.fileno())
+                                except Exception:
+                                    logger.warning("heartbeat sidecar fsync failed", exc_info=True)
+                    except Exception:
+                        logger.warning("heartbeat sidecar write failed: %s", self.sidecar_path, exc_info=True)
+                # last_event/_emitted_count 需线程安全
+                with getattr(self, "_hb_lock", None) or _LAST_TEMPORAL_LOCK:
+                    self.last_event = dict(event)
+                    self._emitted_count += 1
                 self.emit(event)
             except Exception as e:  # 写路径仅告警，不阻断循环
+                logger.warning("heartbeat emit failed: %s", e, exc_info=True)
                 warnings.warn(f"heartbeat emit failed: {e}", stacklevel=2)
-                # 读看门狗占位：可在此触发熔断（当前仅占位，避免引入循环依赖）
-                if self.read_watchdog_circuit:
-                    try:
-                        pass
-                    except Exception as _exc:
-                        logger.debug("silent handled: offline-safe: heartbeat sidecar/temporal optional", exc_info=_exc)  # intentional: offline-safe: heartbeat sidecar/temporal optional
-                        pass  # intentional offline-safe: heartbeat sidecar/temporal optional
 
     def __enter__(self):
         """进入上下文，启动 daemon 线程。"""
@@ -248,24 +247,56 @@ class HeartbeatTimer:
     # -- 扩展：探针与续跑 --
     def probe(self) -> dict:
         """四层 + Temporal 侧车探针快照。"""
+        with self._hb_lock:
+            le = dict(self.last_event) if self.last_event else None
+            emitted = self._emitted_count
         return {
             "name": self.name,
             "layers": list(self.layers),
             "temporal": probe_temporal_sidecar(),
-            "last_event": dict(self.last_event) if self.last_event else None,
-            "emitted": self._emitted_count,
+            "last_event": le,
+            "emitted": emitted,
             "sidecar_path": str(self.sidecar_path) if self.sidecar_path else None,
         }
 
     def get_heartbeat_details(self) -> dict | None:
         """读取最近 heartbeatDetails（续跑点）。"""
-        if self.last_event is not None:
-            return dict(self.last_event)
+        with self._hb_lock:
+            snap = self.last_event
+        if snap is not None:
+            return dict(snap)
         return get_temporal_heartbeat_details()
 
     def heartbeat(self, payload: dict | None = None) -> None:
-        """手动触发一次 Temporal 心跳（同步）。"""
+        """手动触发一次 Temporal 心跳（同步）。尊重 use_temporal 并更新计数。"""
         if payload is None:
             payload = {"name": self.name, "ts": time.time(), "layers": list(self.layers)}
-        _temporal_emit(dict(payload))
-        self.last_event = dict(payload)
+        if self.use_temporal:
+            _temporal_emit(dict(payload))
+        else:
+            # still update global for probe visibility but respect flag for temporal
+            with _LAST_TEMPORAL_LOCK:
+                global _LAST_TEMPORAL_EVENT
+                try:
+                    _LAST_TEMPORAL_EVENT = dict(payload)
+                except Exception:
+                    logger.warning("heartbeat manual _LAST update failed", exc_info=True)
+        with self._hb_lock:
+            self.last_event = dict(payload)
+            self._emitted_count += 1
+        # also persist to sidecar if configured
+        if self.sidecar_path is not None:
+            try:
+                with _SIDECAR_FILE_LOCK:
+                    self.sidecar_path.parent.mkdir(parents=True, exist_ok=True)
+                    line = json.dumps(payload, ensure_ascii=False) + "\n"
+                    with open(self.sidecar_path, "a", encoding="utf-8") as _f:
+                        _f.write(line)
+                        _f.flush()
+                        try:
+                            os.fsync(_f.fileno())
+                        except Exception:
+                            logger.warning("heartbeat manual fsync failed", exc_info=True)
+            except Exception:
+                logger.warning("heartbeat manual sidecar write failed", exc_info=True)
+        self.emit(payload)

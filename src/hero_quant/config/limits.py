@@ -8,7 +8,10 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
+
+logger = logging.getLogger("hero_quant.config.limits")
 
 TOOL_RESULT_LIMIT: int = 10_000  # 默认字符预算，平衡上下文长度与截断频率
 
@@ -19,16 +22,44 @@ try:
     _env_val = os.environ.get("HERO_TOOL_RESULT_LIMIT")
     if _env_val is not None and _env_val.strip() != "":
         try:
-            TOOL_RESULT_LIMIT = int(_env_val)
-        except Exception:
-            pass
-except Exception:
-    pass
+            _parsed = int(_env_val)
+            if _parsed <= 0:
+                logger.warning(
+                    "Invalid HERO_TOOL_RESULT_LIMIT=%r: must be >0, using default %d",
+                    _env_val,
+                    TOOL_RESULT_LIMIT,
+                )
+            elif _parsed > 10_000_000:
+                logger.warning(
+                    "Invalid HERO_TOOL_RESULT_LIMIT=%r: absurdly large, using default %d",
+                    _env_val,
+                    TOOL_RESULT_LIMIT,
+                )
+            else:
+                TOOL_RESULT_LIMIT = _parsed
+        except (ValueError, TypeError) as e:
+            logger.warning(
+                "Invalid HERO_TOOL_RESULT_LIMIT=%r: %s; using default %d",
+                _env_val,
+                e,
+                TOOL_RESULT_LIMIT,
+            )
+except Exception as e:
+    logger.warning("Failed to read HERO_TOOL_RESULT_LIMIT env: %s", e, exc_info=True)
 
 
 def truncate_tool_result(result: Any, limit: int | None = None) -> str:
-    """截断工具返回文本，超限追加 TRUNCATED 标记并注明 shown/total。"""
+    """截断工具返回文本，超限追加 TRUNCATED 标记并注明 shown/total。保证总长度 ≤ limit。"""
     lim = limit if limit is not None else TOOL_RESULT_LIMIT
+    # validate limit
+    try:
+        lim = int(lim)
+    except (ValueError, TypeError) as e:
+        logger.warning("Invalid truncate limit %r: %s; using TOOL_RESULT_LIMIT %d", lim, e, TOOL_RESULT_LIMIT)
+        lim = TOOL_RESULT_LIMIT
+    if lim <= 0:
+        logger.warning("Invalid truncate limit %r <=0; using default %d", lim, TOOL_RESULT_LIMIT)
+        lim = TOOL_RESULT_LIMIT
     if result is None:
         return ""
     if isinstance(result, str):
@@ -36,15 +67,38 @@ def truncate_tool_result(result: Any, limit: int | None = None) -> str:
     else:
         try:
             s = json.dumps(result, ensure_ascii=False)
-        except Exception:
+        except (TypeError, ValueError) as e:
+            logger.debug("truncate json dumps failed: %s", e, exc_info=True)
+            try:
+                s = str(result)
+            except Exception as e2:
+                logger.warning("truncate str() failed: %s", e2, exc_info=True)
+                s = ""
+        except Exception as e:
+            logger.warning("truncate unexpected error: %s", e, exc_info=True)
             s = str(result)
     if len(s) <= lim:
         return s
-    shown = lim
     total = len(s)
-    truncated = s[:lim]
-    # 追加 TRUNCATED 标记，便于审计与测试识别
-    return f"{truncated}\n...[TRUNCATED shown={shown}/total={total}]"
+    # Reserve space for marker so final length ≤ lim
+    # marker format: \n...[TRUNCATED shown=X/total=Y]
+    # shown will be avail (chars kept from s)
+    # Iterate at most twice to converge because marker length depends on shown digits
+    # First estimate with placeholder shown=lim
+    marker = f"\n...[TRUNCATED shown={lim}/total={total}]"
+    avail = lim - len(marker)
+    if avail <= 0:
+        # limit too small to even hold marker — return truncated marker itself
+        return marker[:lim]
+    # Recompute marker with actual avail, adjust if length shifted
+    marker2 = f"\n...[TRUNCATED shown={avail}/total={total}]"
+    if len(marker2) != len(marker):
+        avail = lim - len(marker2)
+        if avail <= 0:
+            return marker2[:lim]
+        marker = marker2
+    truncated = s[:avail]
+    return f"{truncated}{marker}"
 
 
 def fit_records(records: list[Any], limit: int | None = None, per_record_limit: int | None = None) -> list[str]:

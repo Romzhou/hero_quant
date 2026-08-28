@@ -83,12 +83,13 @@ class CircuitBreaker:
         self._events: collections.deque[tuple[float, bool, bool]] = collections.deque()
         import threading
 
-        self._mutex = threading.Lock()
+        self._mutex = threading.RLock()
+        # 单调时钟用于所有熔断计时，避免 NTP 跳变
+        self._use_monotonic = True
         try:
             self._sync_gauge()
-        except Exception as _exc:
-            logger.debug("silent handled: offline-safe: telemetry gauge/circuit optional", exc_info=_exc)  # intentional: offline-safe: telemetry gauge/circuit optional
-            pass  # intentional offline-safe: telemetry gauge/circuit optional
+        except Exception:
+            logger.warning("circuit _sync_gauge failed", exc_info=True)
 
     def _sync_gauge(self) -> None:
         """同步 Prometheus 指标与当前状态（离线安全）。"""
@@ -99,19 +100,29 @@ class CircuitBreaker:
             # 通过 state 属性触发 OPEN→HALF_OPEN 的时效转换
             cur = self.state  # triggers OPEN->HALF_OPEN if due
             CIRCUIT_STATE_GAUGE.set(mapping.get(cur, 0))
-        except Exception as _exc:
-            logger.debug("silent handled: offline-safe: telemetry gauge/circuit optional", exc_info=_exc)  # intentional: offline-safe: telemetry gauge/circuit optional
-            pass  # intentional offline-safe: telemetry gauge/circuit optional
+        except Exception:
+            logger.warning("circuit _sync_gauge failed", exc_info=True)
 
     @property
     def state(self) -> str:
         """当前状态，读取时自动将超时 OPEN 推进为 HALF_OPEN。"""
-        # 到期自动半开，避免永久拒流
-        if self._state == "OPEN" and self._opened_at is not None:
-            if time.time() - self._opened_at >= self.open_duration:
-                self._state = "HALF_OPEN"
-                self._half_open_calls = 0
-        return self._state
+        with self._mutex:
+            # 到期自动半开，避免永久拒流；清窗口以隔离探测
+            if self._state == "OPEN" and self._opened_at is not None:
+                now = time.monotonic()
+                if now - self._opened_at >= self.open_duration:
+                    self._state = "HALF_OPEN"
+                    self._half_open_calls = 0
+                    # Probe isolation: clear pre-trip window so HALF_OPEN evaluates only probes
+                    self._events.clear()
+                    # best-effort gauge sync without recursion
+                    try:
+                        if CIRCUIT_STATE_GAUGE is not None:
+                            mapping = {"CLOSED": 0, "HALF_OPEN": 1, "OPEN": 2}
+                            CIRCUIT_STATE_GAUGE.set(mapping.get(self._state, 0))
+                    except Exception:
+                        logger.warning("circuit gauge sync on HALF_OPEN failed", exc_info=True)
+            return self._state
 
     # 兼容别名
     @property
@@ -127,7 +138,7 @@ class CircuitBreaker:
 
     def _evaluate(self):
         """评估窗口内失败/慢调用率，必要时触发熔断。"""
-        now = time.time()
+        now = time.monotonic()
         self._prune(now)
         total = len(self._events)
         if total == 0:
@@ -144,32 +155,39 @@ class CircuitBreaker:
     def _trip_open(self, now: float | None = None):
         """切至 OPEN 并记录开启时间，重置探测计数。"""
         self._state = "OPEN"
-        self._opened_at = now if now is not None else time.time()
+        self._opened_at = now if now is not None else time.monotonic()
         self._half_open_calls = 0
-        self._sync_gauge()
+        # _sync_gauge will read state but we already hold mutex in caller; avoid recursion deadlock via direct set
+        try:
+            if CIRCUIT_STATE_GAUGE is not None:
+                CIRCUIT_STATE_GAUGE.set(2)
+        except Exception:
+            logger.warning("circuit gauge trip_open failed", exc_info=True)
         # 熔断告警计数（按 source=unknown 兜底，调用方可覆盖 label）
         try:
             if data_source_circuit_open_total is not None:
                 data_source_circuit_open_total.labels(source="unknown").inc()
-        except Exception as _exc:
-            logger.debug("silent handled: offline-safe: circuit counter inc", exc_info=_exc)  # intentional: offline-safe
-            pass  # intentional offline-safe
+        except Exception:
+            logger.warning("circuit counter inc failed", exc_info=True)
 
     def record_failure(self, duration: float | None = None):
         """记录一次失败（可选携带耗时以判定慢调用）。"""
         with self._mutex:
-            # OPEN 态拒流期间不重复计数
+            # OPEN 态拒流期间不重复计数 — use internal state to avoid re-entrance but property is re-entrant via RLock
             if self.state == "OPEN":
                 return
             # HALF_OPEN 探测失败立即重熔断
             if self.state == "HALF_OPEN":
                 self._trip_open()
                 return
-            now = time.time()
+            now = time.monotonic()
             is_slow = duration is not None and duration >= self.slow_duration_threshold
             self._events.append((now, True, bool(is_slow)))
             self._evaluate()
-            self._sync_gauge()
+            try:
+                self._sync_gauge()
+            except Exception:
+                logger.warning("record_failure gauge sync failed", exc_info=True)
 
     def record_success(self, duration: float | None = None):
         """记录一次成功，HALF_OPEN 下需累计探测后评估是否闭合。"""
@@ -179,11 +197,11 @@ class CircuitBreaker:
             if self.state == "HALF_OPEN":
                 # 半开探测：需连续 half_open_max_calls 次成功且双桶达标才闭合
                 self._half_open_calls += 1
-                now = time.time()
+                now = time.monotonic()
                 is_slow = duration is not None and duration >= self.slow_duration_threshold
                 self._events.append((now, False, bool(is_slow)))
                 if self._half_open_calls >= self.half_open_max_calls:
-                    # 窗口重评估：双桶均低于阈值才闭合，否则重开
+                    # Probe-isolated evaluation: only consider probe results (HALF_OPEN window already cleared on entry)
                     self._prune(now)
                     total = len(self._events)
                     failures = sum(1 for _, f, _ in self._events if f)
@@ -194,16 +212,23 @@ class CircuitBreaker:
                         self._state = "CLOSED"
                         self._opened_at = None
                         self._half_open_calls = 0
-                        self._sync_gauge()
+                        try:
+                            if CIRCUIT_STATE_GAUGE is not None:
+                                CIRCUIT_STATE_GAUGE.set(0)
+                        except Exception:
+                            logger.warning("circuit gauge close failed", exc_info=True)
                     else:
                         self._trip_open(now)
                 # 探测次数不足时保持 HALF_OPEN
                 return
-            now = time.time()
+            now = time.monotonic()
             is_slow = duration is not None and duration >= self.slow_duration_threshold
             self._events.append((now, False, bool(is_slow)))
             self._evaluate()
-            self._sync_gauge()
+            try:
+                self._sync_gauge()
+            except Exception:
+                logger.warning("record_success gauge sync failed", exc_info=True)
 
     def record_slow(self, duration: float | None = None):
         """显式记录慢调用（计为成功但慢桶）。"""
@@ -211,13 +236,17 @@ class CircuitBreaker:
 
     def allow(self) -> bool:
         """是否允许通过（CLOSED 放行，HALF_OPEN 限探测数，OPEN 拒绝）。"""
-        self._sync_gauge()
-        s = self.state
-        if s == "CLOSED":
-            return True
-        if s == "HALF_OPEN":
-            return self._half_open_calls < self.half_open_max_calls
-        return False
+        with self._mutex:
+            try:
+                self._sync_gauge()
+            except Exception:
+                logger.warning("allow gauge sync failed", exc_info=True)
+            s = self.state
+            if s == "CLOSED":
+                return True
+            if s == "HALF_OPEN":
+                return self._half_open_calls < self.half_open_max_calls
+            return False
 
     def is_closed(self) -> bool:
         """是否为 CLOSED。"""
@@ -323,17 +352,28 @@ class DualBucketRateLimiter:
         self.burst_refill_per_sec = float(burst_refill_per_sec)
 
     def try_acquire(self, tokens: int = 1) -> bool:
-        """双桶原子获取，失败时回滚已扣的 burst。"""
-        burst_ok = self.burst.try_acquire(tokens)
-        if not burst_ok:
-            return False
-        sustained_ok = self.sustained.try_acquire(tokens)
-        if not sustained_ok:
-            # 回滚 burst，保证原子性
-            with self.burst._lock:
-                self.burst.tokens = min(self.burst.capacity, self.burst.tokens + tokens)
-            return False
-        return True
+        """双桶原子获取 — 同时持有双锁并正确 refill/更新 _last。"""
+        # Acquire in consistent order to avoid deadlock: burst then sustained
+        # Use manual refill under both locks to keep _last coherent
+        with self.burst._lock:
+            with self.sustained._lock:
+                # refill both under lock
+                now = time.monotonic()
+                # burst refill
+                elapsed_b = now - self.burst._last
+                if elapsed_b > 0:
+                    self.burst.tokens = min(self.burst.capacity, self.burst.tokens + elapsed_b * self.burst.refill_per_sec)
+                    self.burst._last = now
+                # sustained refill
+                elapsed_s = now - self.sustained._last
+                if elapsed_s > 0:
+                    self.sustained.tokens = min(self.sustained.capacity, self.sustained.tokens + elapsed_s * self.sustained.refill_per_sec)
+                    self.sustained._last = now
+                if self.burst.tokens < tokens or self.sustained.tokens < tokens:
+                    return False
+                self.burst.tokens -= tokens
+                self.sustained.tokens -= tokens
+                return True
 
     def allow(self, tokens: int = 1) -> bool:
         """allow 别名，等价 try_acquire。"""

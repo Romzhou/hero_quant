@@ -22,9 +22,11 @@ for _mod in (
 ):
     try:
         importlib.import_module(_mod)
+    except (ImportError, ModuleNotFoundError) as _exc:
+        logger.warning("mcp server optional import failed for %s: %s", _mod, _exc, exc_info=True)
     except Exception as _exc:
-        logger.debug("silent handled: offline-safe: mcp server optional", exc_info=_exc)  # intentional: offline-safe: mcp server optional
-        pass  # intentional offline-safe: mcp server optional
+        logger.warning("mcp server unexpected import error for %s: %s", _mod, _exc, exc_info=True)
+        raise
 
 # 补充 3 个只读期权工具以凑齐 20 个精选
 if "get_option_price" not in TOOL_REGISTRY:
@@ -60,7 +62,8 @@ if "get_option_price" not in TOOL_REGISTRY:
             p = bs_price(S=S, K=K, T=T, r=r, sigma=sigma, option_type=option_type)
             return {"price": float(p), "ok": True}
         except Exception as e:
-            return {"price": 0.0, "ok": False, "error": str(e)}
+            logger.warning("get_option_price failed: %s", e, exc_info=True)
+            return {"price": 0.0, "ok": False}
 
 
 if "get_greeks" not in TOOL_REGISTRY:
@@ -96,7 +99,8 @@ if "get_greeks" not in TOOL_REGISTRY:
             g = bs_greeks(S=S, K=K, T=T, r=r, sigma=sigma, option_type=option_type)
             return {"greeks": g, "ok": True}
         except Exception as e:
-            return {"greeks": {}, "ok": False, "error": str(e)}
+            logger.warning("get_greeks failed: %s", e, exc_info=True)
+            return {"greeks": {}, "ok": False}
 
 
 if "get_implied_vol" not in TOOL_REGISTRY:
@@ -132,7 +136,8 @@ if "get_implied_vol" not in TOOL_REGISTRY:
             v = implied_volatility(price, S=S, K=K, T=T, r=r, option_type=option_type)
             return {"iv": float(v), "ok": True}
         except Exception as e:
-            return {"iv": 0.0, "ok": False, "error": str(e)}
+            logger.warning("get_implied_vol failed: %s", e, exc_info=True)
+            return {"iv": 0.0, "ok": False}
 
 
 # 20 个精选只读工具：覆盖行情、因子、回测与期权定价，按名称排序以稳定 KV 缓存
@@ -158,8 +163,9 @@ CURATED_TOOLS: List[str] = [
     "search_symbols",
     "validate_backtest",
 ]
-# 校验数量为 20
-assert len(CURATED_TOOLS) == 20, "CURATED must be 20"
+# 校验数量为 20 — explicit check (assert stripped under -O)
+if len(CURATED_TOOLS) != 20:
+    raise ValueError(f"CURATED must be 20, got {len(CURATED_TOOLS)}")
 
 
 def get_curated_definitions(presentAs: str = "native") -> List[Dict[str, Any]]:
@@ -179,7 +185,16 @@ class MCPServer:
     """最小 MCP 服务端：封装精选只读工具，FastMCP 可用时委托，否则提供本地存根。"""
 
     def __init__(self, tools: List[str] | None = None):
-        self.curated = tools or CURATED_TOOLS
+        # Fix: explicit None check, copy, validate against read-only allowlist
+        if tools is None:
+            self.curated = list(CURATED_TOOLS)
+        else:
+            # validate: must be subset of CURATED_TOOLS and registered read-only tools
+            curated_set = set(CURATED_TOOLS)
+            invalid = [t for t in tools if t not in curated_set]
+            if invalid:
+                raise ValueError(f"tools override contains non-curated names: {invalid}")
+            self.curated = list(tools)
         self._fastmcp = None
         try:
             from mcp.server.fastmcp import FastMCP  # type: ignore
@@ -189,6 +204,7 @@ class MCPServer:
             for name in self.curated:
                 spec = TOOL_REGISTRY.get(name)
                 if spec is None:
+                    logger.warning("mcp tool %s not in registry, skipping FastMCP registration", name)
                     continue
 
                 # 通过 FastMCP 装饰器/方法注册
@@ -200,10 +216,16 @@ class MCPServer:
                         self._fastmcp.tool()(spec.func)  # type: ignore
                     elif hasattr(self._fastmcp, "add_tool"):
                         self._fastmcp.add_tool(spec.func)  # type: ignore
+                except (ImportError, ModuleNotFoundError, ValueError, TypeError) as _exc:
+                    logger.warning("FastMCP registration failed for %s: %s", name, _exc, exc_info=True)
                 except Exception as _exc:
-                    logger.debug("silent handled: offline-safe: mcp server optional", exc_info=_exc)  # intentional: offline-safe: mcp server optional
-                    pass  # intentional offline-safe: mcp server optional
-        except Exception:
+                    logger.warning("FastMCP unexpected error for %s: %s", name, _exc, exc_info=True)
+                    raise
+        except (ImportError, ModuleNotFoundError) as _exc:
+            logger.warning("FastMCP not available, using local stub: %s", _exc, exc_info=True)
+            self._fastmcp = None
+        except Exception as _exc:
+            logger.warning("FastMCP init failed: %s", _exc, exc_info=True)
             self._fastmcp = None
 
     def list_tools(self) -> List[str]:
@@ -211,14 +233,42 @@ class MCPServer:
         return list(self.curated)
 
     def call_tool(self, name: str, arguments: Dict[str, Any] | None = None) -> Any:
-        """调用精选工具；不在精选内则抛错，仅允许只读调用。"""
+        """调用精选工具；不在精选内则抛错，仅允许只读调用。带参数校验。"""
         if name not in self.curated:
             raise ValueError(f"tool {name} not in curated 20")
         spec = TOOL_REGISTRY.get(name)
         if spec is None:
             raise ValueError(f"tool {name} not registered")
-        # 只读守卫：is_concurrency_safe 为可选检查，此处直接调用
-        return spec.func(**(arguments or {}))
+        args = arguments or {}
+        # Validate arguments against JSON Schema if present
+        if spec.parameters is not None:
+            try:
+                required = spec.parameters.get("required", [])
+                props = spec.parameters.get("properties", {})
+                for req in required:
+                    if req not in args:
+                        raise ValueError(f"missing required param '{req}' for tool {name}")
+                # check unknown props when additionalProperties is False
+                if spec.parameters.get("additionalProperties") is False:
+                    extra = set(args.keys()) - set(props.keys())
+                    if extra:
+                        raise ValueError(f"extra params {extra} not allowed for tool {name}")
+            except ValueError:
+                raise
+            except Exception as e:
+                logger.warning("tool %s param validation error: %s", name, e, exc_info=True)
+                raise ValueError(f"invalid arguments for {name}: {e}") from e
+        # concurrency-safe check is advisory; log if unsafe
+        try:
+            if not spec.is_concurrency_safe(args):
+                logger.debug("tool %s called with potentially unsafe args %s", name, args)
+        except Exception as e:
+            logger.warning("is_concurrency_safe check failed for %s: %s", name, e, exc_info=True)
+        try:
+            return spec.func(**args)
+        except TypeError as e:
+            logger.warning("tool %s call failed due to arg mismatch: %s args=%s", name, e, args, exc_info=True)
+            raise ValueError(f"tool {name} argument error: {e}") from e
 
     def get_fastmcp(self):
         """返回底层 FastMCP 实例（若可用）。"""
