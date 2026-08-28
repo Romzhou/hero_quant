@@ -48,14 +48,38 @@ class LLMClient:
 
     def stream_chat(self, prompt: str, timeout: int | None = None):
         t = timeout if timeout is not None else self.timeout
+        yielded = False
         for attempt in range(self.max_retries + 1):
+            gen = None
             try:
                 try:
                     gen = self._chat.stream_chat(prompt, timeout=t)
                 except TypeError:
                     gen = self._chat.stream_chat(prompt)
-                for chunk in gen:
-                    yield chunk
+                try:
+                    for chunk in gen:
+                        yielded = True
+                        yield chunk
+                finally:
+                    if gen is not None:
+                        try:
+                            close_fn = getattr(gen, "close", None)
+                            if callable(close_fn):
+                                close_fn()
+                        except Exception:
+                            pass
+                        try:
+                            aclose_fn = getattr(gen, "aclose", None)
+                            if callable(aclose_fn):
+                                res = aclose_fn()
+                                # if coroutine, best-effort close without await
+                                if hasattr(res, "close"):
+                                    try:
+                                        res.close()
+                                    except Exception:
+                                        pass
+                        except Exception:
+                            pass
                 # usage capture after successful iteration
                 try:
                     usage = getattr(self._chat, "usage", None)
@@ -71,6 +95,8 @@ class LLMClient:
                     pass
                 return
             except (ConnectionError, TimeoutError, OSError) as e:
+                if yielded:
+                    raise
                 # 可观测性：每次重试与超时分别计数
                 try:
                     _inc_llm_retry(reason=type(e).__name__)

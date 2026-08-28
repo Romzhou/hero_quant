@@ -17,7 +17,7 @@ from hero_quant.tools.registry import tool
 
 
 def _fetch_closes(symbol: str, start: str, end: str):
-    """拉取收盘价序列，失败回退 40 点等差序列以保证指标可算。"""
+    """拉取收盘价序列，失败直接抛出由调用方返回 ok=False，永不返回合成数据冒充真实。"""
     try:
         from hero_quant.data.registry import MarketDataRegistry
         from hero_quant.data.loaders.tencent import TencentLoader
@@ -28,16 +28,64 @@ def _fetch_closes(symbol: str, start: str, end: str):
             from hero_quant.data.loaders.yahoo import YahooLoader
 
             reg.register(YahooLoader())
-        except Exception:
-            pass
+        except ImportError as e:
+            import logging as _logging
+
+            _logging.getLogger(__name__).debug("YahooLoader not available for %s: %s", symbol, e)
+        except Exception as e:
+            import logging as _logging
+
+            _logging.getLogger(__name__).warning("YahooLoader register failed: %s", e, exc_info=True)
         bars, _ = reg.get_bars(symbol, "1d", start, end)
-        closes = [float(b.get("close", 100)) for b in bars] if bars else []
+        closes: list[float] = []
+        for b in bars or []:
+            c = b.get("close")
+            if c is None:
+                continue
+            try:
+                v = float(c)
+            except (TypeError, ValueError):
+                continue
+            if v != v:  # NaN
+                continue
+            closes.append(v)
         if closes:
             return closes
-    except Exception:
-        pass
-    # 无可用行情时提供等差序列兜底（与 quantlib_tool._fetch_closes 同策略）
-    return [100 + i * 0.5 for i in range(40)]
+        raise ValueError(f"no valid closes for {symbol} {start}->{end}")
+    except Exception as e:
+        # synthetic only when explicitly enabled via Settings.data_mode == 'synthetic' and provenance marked
+        try:
+            from hero_quant.config.settings import Settings
+
+            if getattr(Settings(), "data_mode", "live") == "synthetic":
+                import logging as _logging
+
+                _logging.getLogger(__name__).warning(
+                    "synthetic fallback enabled for %s, returning synthetic closes", symbol, exc_info=True
+                )
+                try:
+                    import structlog as _structlog  # type: ignore
+
+                    _structlog.get_logger(__name__).warning(
+                        "synthetic fallback enabled", symbol=symbol, error=str(e), exc_info=True
+                    )
+                except Exception:
+                    pass
+                return [100 + i * 0.5 for i in range(40)]
+        except Exception:
+            pass
+        import logging as _logging
+
+        _logging.getLogger(__name__).warning("fetch closes failed for %s: %s", symbol, e, exc_info=True)
+        try:
+            import structlog as _structlog  # type: ignore
+
+            _structlog.get_logger(__name__).warning(
+                "fetch closes failed", symbol=symbol, error=str(e), exc_info=True
+            )
+        except Exception:
+            pass
+        raise
 
 
 @tool(
@@ -103,4 +151,17 @@ def compute_correlation(
             }
         return {"correlation": corr, "points": int(m), "ok": True}
     except Exception as e:
-        return {"correlation": 0.0, "points": 0, "ok": False, "error": str(e)}
+        import logging as _logging
+
+        _logging.getLogger(__name__).warning(
+            "compute_correlation failed for %s/%s: %s", symbol_a, symbol_b, e, exc_info=True
+        )
+        try:
+            import structlog as _structlog  # type: ignore
+
+            _structlog.get_logger(__name__).warning(
+                "compute_correlation failed", symbol_a=symbol_a, symbol_b=symbol_b, error=str(e), exc_info=True
+            )
+        except Exception:
+            pass
+        return {"correlation": 0.0, "points": 0, "ok": False, "error": f"{type(e).__name__}: {e}"}

@@ -101,3 +101,60 @@ def test_shadow_ledger_integration_if_present():
         # ledger should have at least one entry if integration present, verify passes
         # allow empty ledger too but verify must be True
         assert ledger.verify() is True
+
+
+# Task 6 TDD: fail-closed on breaker exception
+def test_check_order_fail_closed_on_allow_exception():
+    from hero_quant.shadow import RiskEngine
+    from hero_quant.telemetry.circuit import CircuitBreaker
+    from unittest import mock
+
+    cb = CircuitBreaker()
+    engine = RiskEngine(circuit=cb)
+    cb.allow = mock.MagicMock(side_effect=RuntimeError("breaker unhealthy"))
+    result = engine.check_order({"symbol": "AAPL", "qty": 10, "price": 10, "side": "buy"})
+    assert result["allowed"] is False
+    assert "circuit" in result["reason"].lower() or "熔断" in result["reason"]
+    assert result.get("rule") == "circuit"
+
+
+def test_check_order_fail_closed_on_allow_exception_is_open_also_raises():
+    from hero_quant.shadow import RiskEngine
+    from hero_quant.telemetry.circuit import CircuitBreaker
+    from unittest import mock
+
+    cb = CircuitBreaker()
+    engine = RiskEngine(circuit=cb)
+    cb.allow = mock.MagicMock(side_effect=OSError("is_open also fails"))
+    cb.is_open = mock.MagicMock(side_effect=OSError("is_open fails"))
+    result = engine.check_order({"symbol": "AAPL", "qty": 10, "price": 10, "side": "buy"})
+    assert result["allowed"] is False
+
+
+def test_check_order_reject_when_circuit_open():
+    from hero_quant.shadow import RiskEngine
+    from hero_quant.telemetry.circuit import CircuitBreaker
+
+    cb = CircuitBreaker(failure_threshold=0.5, window=60, open_duration=30)
+    for _ in range(5):
+        cb.record_failure()
+    # ensure breaker is OPEN
+    assert cb.state == "OPEN"
+    engine = RiskEngine(circuit=cb)
+    result = engine.check_order({"symbol": "600519.SH", "qty": 100, "price": 10, "side": "buy"})
+    assert result["allowed"] is False
+    assert "circuit" in result["reason"].lower() or "熔断" in result["reason"]
+
+
+def test_check_order_mock_state_open_via_allow():
+    from hero_quant.shadow import RiskEngine
+    from hero_quant.telemetry.circuit import CircuitBreaker
+
+    cb = CircuitBreaker()
+    # mock to simulate OPEN state via allow returning False
+    orig_allow = cb.allow
+    cb.allow = lambda: False
+    engine = RiskEngine(circuit=cb)
+    result = engine.check_order({"symbol": "600519.SH", "qty": 10, "price": 10, "side": "buy"})
+    assert result["allowed"] is False
+    cb.allow = orig_allow  # restore

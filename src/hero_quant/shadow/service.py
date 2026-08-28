@@ -114,17 +114,21 @@ class RiskEngine:
 
     def check_order(self, order: Dict[str, Any]) -> Dict[str, Any]:
         """风控检查：熔断优先，命中任一规则即拒绝并落审计。"""
-        # 熔断优先于规则，避免风暴中继续放行
+        # 熔断优先于规则，避免风暴中继续放行 — fail-closed on any breaker health error
         try:
-            if not self.circuit.allow() or self.circuit.is_open():
+            if not self.circuit.allow():
                 return {"allowed": False, "reason": "circuit_open 熔断", "rule": "circuit"}
         except Exception:
+            logger.warning("circuit breaker check failed, fail-closed", exc_info=True)
             try:
-                if self.circuit.state == "OPEN":
-                    return {"allowed": False, "reason": "circuit_open 熔断", "rule": "circuit"}
-            except Exception as _exc:
-                logger.warning("silent handled: shadow风控日志 best-effort, fail-closed already handled", exc_info=_exc)  # intentional: shadow风控日志 best-effort, fail-closed already handled
-                pass  # intentional shadow风控日志 best-effort, fail-closed already handled
+                import structlog  # type: ignore
+
+                structlog.get_logger(__name__).warning(
+                    "circuit breaker check failed, fail-closed", exc_info=True
+                )
+            except Exception:
+                pass
+            return {"allowed": False, "reason": "circuit_open 熔断", "rule": "circuit"}
 
         for rule in self.rules:
             if not rule.passes(order):

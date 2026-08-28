@@ -59,28 +59,29 @@ def test_export_with_endpoint_uses_batch_not_throw(monkeypatch):
     api_logs_mod = types.ModuleType("opentelemetry._logs")
     api_logs_mod.get_logger = mock.MagicMock(return_value=fake_otel_logger)
 
-    # use patch.dict so that after test modules are restored
-    original_modules = dict(sys.modules)
-    try:
-        for name in [
-            "opentelemetry",
-            "opentelemetry.sdk",
-            "opentelemetry.sdk._logs",
-            "opentelemetry.sdk._logs.export",
-            "opentelemetry.exporter",
-            "opentelemetry.exporter.otlp",
-            "opentelemetry.exporter.otlp.proto",
-            "opentelemetry.exporter.otlp.proto.http",
-            "opentelemetry.exporter.otlp.proto.http._log_exporter",
-            "opentelemetry._logs",
-        ]:
-            if name not in sys.modules:
-                sys.modules[name] = types.ModuleType(name)
-        sys.modules["opentelemetry.sdk._logs"] = sdk_logs_mod
-        sys.modules["opentelemetry.sdk._logs.export"] = sdk_logs_export_mod
-        sys.modules["opentelemetry.exporter.otlp.proto.http._log_exporter"] = exporter_mod
-        sys.modules["opentelemetry._logs"] = api_logs_mod
-
+    fake_modules = {
+        "opentelemetry.sdk._logs": sdk_logs_mod,
+        "opentelemetry.sdk._logs.export": sdk_logs_export_mod,
+        "opentelemetry.exporter.otlp.proto.http._log_exporter": exporter_mod,
+        "opentelemetry._logs": api_logs_mod,
+    }
+    _patch_dict = {}
+    for _name in [
+        "opentelemetry",
+        "opentelemetry.sdk",
+        "opentelemetry.sdk._logs",
+        "opentelemetry.sdk._logs.export",
+        "opentelemetry.exporter",
+        "opentelemetry.exporter.otlp",
+        "opentelemetry.exporter.otlp.proto",
+        "opentelemetry.exporter.otlp.proto.http",
+        "opentelemetry.exporter.otlp.proto.http._log_exporter",
+        "opentelemetry._logs",
+    ]:
+        if _name not in sys.modules:
+            _patch_dict[_name] = types.ModuleType(_name)
+    _patch_dict.update(fake_modules)
+    with mock.patch.dict(sys.modules, _patch_dict):
         SessionTelemetryCoordinator = _reload_otel()
         coord = SessionTelemetryCoordinator(mode="private")
         with mock.patch("urllib.request.urlopen") as mock_urlopen:
@@ -90,11 +91,7 @@ def test_export_with_endpoint_uses_batch_not_throw(monkeypatch):
             mock_urlopen.assert_not_called()
             fake_provider_instance.add_log_record_processor.assert_called()
             assert fake_otel_logger.emit.called or fake_provider_instance.get_logger.called
-    finally:
-        # restore sys.modules to original, keeping real api if it existed before
-        sys.modules.clear()
-        sys.modules.update(original_modules)
-        _cleanup_fake_otel()
+    _cleanup_fake_otel()
 
 
 def test_export_offline_safe_when_batch_raises(monkeypatch):
@@ -117,30 +114,34 @@ def test_export_offline_safe_when_batch_raises(monkeypatch):
     api_logs_mod = types.ModuleType("opentelemetry._logs")
     api_logs_mod.get_logger = mock.MagicMock(return_value=mock.MagicMock())
 
-    original_modules = dict(sys.modules)
-    try:
-        sys.modules["opentelemetry.sdk._logs"] = sdk_logs_mod
-        sys.modules["opentelemetry.sdk._logs.export"] = sdk_logs_export_mod
-        sys.modules["opentelemetry.exporter.otlp.proto.http._log_exporter"] = exporter_mod
-        sys.modules["opentelemetry._logs"] = api_logs_mod
-        for name in [
-            "opentelemetry",
-            "opentelemetry.sdk",
-            "opentelemetry.exporter",
-            "opentelemetry.exporter.otlp",
-            "opentelemetry.exporter.otlp.proto",
-            "opentelemetry.exporter.otlp.proto.http",
-        ]:
-            if name not in sys.modules:
-                sys.modules[name] = types.ModuleType(name)
+    fake_modules2 = {
+        "opentelemetry.sdk._logs": sdk_logs_mod,
+        "opentelemetry.sdk._logs.export": sdk_logs_export_mod,
+        "opentelemetry.exporter.otlp.proto.http._log_exporter": exporter_mod,
+        "opentelemetry._logs": api_logs_mod,
+    }
+    _patch_dict2 = {}
+    for _name in [
+        "opentelemetry",
+        "opentelemetry.sdk",
+        "opentelemetry.exporter",
+        "opentelemetry.exporter.otlp",
+        "opentelemetry.exporter.otlp.proto",
+        "opentelemetry.exporter.otlp.proto.http",
+        "opentelemetry.sdk._logs",
+        "opentelemetry.sdk._logs.export",
+        "opentelemetry.exporter.otlp.proto.http._log_exporter",
+        "opentelemetry._logs",
+    ]:
+        if _name not in sys.modules:
+            _patch_dict2[_name] = types.ModuleType(_name)
+    _patch_dict2.update(fake_modules2)
+    with mock.patch.dict(sys.modules, _patch_dict2):
         SessionTelemetryCoordinator = _reload_otel()
         coord = SessionTelemetryCoordinator(mode="private")
         coord.export({"path": "/live"})
         assert True
-    finally:
-        sys.modules.clear()
-        sys.modules.update(original_modules)
-        _cleanup_fake_otel()
+    _cleanup_fake_otel()
 
 
 def test_export_fallback_to_urllib_when_sdk_missing(monkeypatch):
