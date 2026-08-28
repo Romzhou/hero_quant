@@ -535,20 +535,17 @@ def query(q: str = "", use_graph: bool = False, replay_path: str | None = None, 
                     return self.stream_chat(goal)
 
             llm = _FakeLLM()
-        import tempfile
-        import pathlib as _pl
-
         trace = None
         trace_dir_path = None
         _tmp_dir_obj = None
         try:
             from hero_quant.agent.trace import TraceWriter
             if trace_dir:
-                trace_dir_path = _pl.Path(trace_dir)
+                trace_dir_path = pathlib.Path(trace_dir)
                 trace_dir_path.mkdir(parents=True, exist_ok=True)
             else:
                 _tmp_dir_obj = tempfile.TemporaryDirectory(prefix="hq_trace_")
-                trace_dir_path = _pl.Path(_tmp_dir_obj.name)
+                trace_dir_path = pathlib.Path(_tmp_dir_obj.name)
                 try:
                     background_tasks.add_task(_tmp_dir_obj.cleanup)
                 except Exception:

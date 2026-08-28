@@ -330,7 +330,6 @@ class AsyncPostgresSaver:
             try:
                 tenant, thread, seq = _thread_to_keys(thread_id)
                 ck_json = json.dumps(checkpoint, ensure_ascii=False)
-                cfg_json = json.dumps(config, ensure_ascii=False) if config else json.dumps({}, ensure_ascii=False)
                 expires_at_sql = "now() + interval '%s seconds'" % int(self.ttl_seconds) if self.ttl_seconds > 0 else "NULL"
                 sql_new = f"""
                     INSERT INTO checkpoints (tenant, thread, seq, checkpoint, expires_at)
