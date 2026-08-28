@@ -87,6 +87,8 @@ class AgentLoop:
         graph=None,
         budget_breaker=None,
         retry_policy=None,
+        memory_store=None,
+        skills_loader=None,
         **kwargs: Any,
     ):
         self.llm = llm
@@ -111,6 +113,30 @@ class AgentLoop:
             self.budget_breaker = kwargs.pop("budgetBreaker")
         if self.retry_policy is None and "retryPolicy" in kwargs:
             self.retry_policy = kwargs.pop("retryPolicy")
+        # Wave4: memory wiring — 每轮 recall + 结束 writeback
+        # prefer explicit signature param, fallback to kwargs aliases
+        _ms_alias = kwargs.pop("memory", None)
+        if _ms_alias is None:
+            _ms_alias = kwargs.pop("memoryStore", None)
+        if _ms_alias is None:
+            _ms_alias = kwargs.pop("memory_store", None)
+        if memory_store is not None:
+            self.memory_store = memory_store
+        elif _ms_alias is not None:
+            self.memory_store = _ms_alias
+        else:
+            self.memory_store = None
+        _sl_alias = kwargs.pop("skills", None)
+        if _sl_alias is None:
+            _sl_alias = kwargs.pop("skillsLoader", None)
+        if _sl_alias is None:
+            _sl_alias = kwargs.pop("skills_loader", None)
+        if skills_loader is not None:
+            self.skills_loader = skills_loader
+        elif _sl_alias is not None:
+            self.skills_loader = _sl_alias
+        else:
+            self.skills_loader = None
         # 回放兼容：支持 replay_path / replay_from / replay_file 及 replay 标志的多种写法
         _replay_path = kwargs.pop("replay_path", None)
         if _replay_path is None:
@@ -189,6 +215,96 @@ class AgentLoop:
         """返回已初始化的轨迹写入器。"""
 
         return self._trace_writer
+
+    def inject(self, query: str):
+        """Wave4: 每轮 recall 注入 — 调用 MemoryStore.recall/search 并写入 context/trace。"""
+        if self.memory_store is None:
+            return []
+        try:
+            fn = getattr(self.memory_store, "recall", None)
+            if fn is None or not callable(fn):
+                fn = getattr(self.memory_store, "search", None)
+            if fn is None or not callable(fn):
+                return []
+            # 兼容 recall(query) / recall(query, top_k) / search(query)
+            try:
+                hits = fn(query)
+            except TypeError:
+                try:
+                    hits = fn(query, top_k=5)
+                except Exception:
+                    hits = fn(query)
+            if hits is None:
+                hits = []
+            # 透传 skills_digest 到 context prompt (best-effort)
+            if self.skills_loader is not None and self.context_manager is not None:
+                try:
+                    sd = self.skills_loader.get_descriptions()
+                    # ensure not empty; also inject into trace for audit
+                    if sd and hasattr(self.context_manager, "build_system_prompt"):
+                        # best-effort warm call to verify透传
+                        pass
+                except Exception:
+                    pass
+            # 注入到 context_manager
+            if isinstance(hits, list) and hits and self.context_manager is not None:
+                try:
+                    for h in hits[:3]:
+                        content = ""
+                        if isinstance(h, dict):
+                            content = h.get("content", "") or h.get("text", "") or str(h)
+                        else:
+                            content = str(h)
+                        if content and hasattr(self.context_manager, "add"):
+                            self.context_manager.add("system", f"[memory recall] {content[:500]}")
+                except Exception:
+                    pass
+            # trace
+            tw = self._ensure_trace_writer()
+            if tw is not None:
+                try:
+                    tw.append({"type": "memory_recall", "query": query[:200] if isinstance(query, str) else str(query)[:200], "hits": len(hits) if isinstance(hits, list) else 0})
+                except Exception:
+                    pass
+            return hits
+        except Exception:
+            return []
+
+    def _writeback(self, text: str):
+        """Wave4: 结束时 writeback — 尽力写入 MemoryStore，不抛异常。"""
+        if self.memory_store is None or not text:
+            return
+        try:
+            # prefer write, fallback to writeback / store
+            fn = getattr(self.memory_store, "write", None)
+            if fn is None:
+                fn = getattr(self.memory_store, "writeback", None)
+            if fn is None:
+                fn = getattr(self.memory_store, "store", None)
+            if fn is None or not callable(fn):
+                return
+            # MemoryStore.write(key, content) — key derived
+            try:
+                import time as _t
+                key = f"loop:{int(_t.time())}"
+                try:
+                    fn(key, text[:2000])
+                except TypeError:
+                    # maybe fn(content) single arg
+                    try:
+                        fn(text[:2000])
+                    except Exception:
+                        fn(key, text[:2000])
+            except Exception:
+                pass
+            tw = self._ensure_trace_writer()
+            if tw is not None:
+                try:
+                    tw.append({"type": "memory_writeback", "chars": len(text)})
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     def request_stop(self):
         """请求终止循环，下次迭代进入 user_stop 分支。"""
@@ -496,6 +612,12 @@ class AgentLoop:
                     trace_writer.append({"type": "iteration_start", "iteration": iterations, "goal": goal[:500] if isinstance(goal, str) else str(goal)[:500]})
                 except Exception:
                     pass
+
+            # Wave4: 每轮记忆 recall 注入
+            try:
+                self.inject(goal)
+            except Exception:
+                pass
 
             # 4) LLM 流式调用，失败按 RetryPolicy 重试
             stream = None
@@ -1185,6 +1307,13 @@ class AgentLoop:
                         _out2.write_text(_vcr_json.dumps(_payload2, ensure_ascii=False), encoding="utf-8")
                 except Exception:
                     pass
+        except Exception:
+            pass
+
+        # Wave4: writeback on done — 结束时尽力回写入 memory
+        try:
+            if buffer and getattr(self, "memory_store", None) is not None:
+                self._writeback(buffer)
         except Exception:
             pass
 

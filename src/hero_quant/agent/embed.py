@@ -230,7 +230,7 @@ def _try_openai(text: str, dim: int) -> List[float] | None:
         from openai import OpenAI  # type: ignore
 
         client = OpenAI(api_key=api_key)
-        resp = client.embeddings.create(input=text, model=model)  # type: ignore
+        resp = client.embeddings.create(input=text, model=model, timeout=30)  # type: ignore
         vec = resp.data[0].embedding  # type: ignore
         if len(vec) >= dim:
             v = vec[:dim]

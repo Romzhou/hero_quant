@@ -51,3 +51,7 @@ line-length = 120
 [tool.ruff.lint]
 select = ["E", "F", "W"]
 ignore = ["E501"]
+
+[tool.coverage.report]
+# Wave4 收口: --cov-fail-under 50 (next 55)，CI 见 .github/workflows/test.yml
+fail_under = 50

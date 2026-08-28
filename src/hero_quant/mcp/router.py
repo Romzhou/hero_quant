@@ -2,7 +2,7 @@
 
 职责：为自然语言查询返回最相关的 TopK 工具；以 BM25 为主、向量余弦为辅做混合重排。
 架构位置：MCP 工具选型的路由层，上游为 Agent，下游为 TOOL_REGISTRY 与可选的向量侧车。
-关键设计：BM25（K1=1.5, B=0.75）基于全量 tool.description 预计算 IDF/平均文档长度；混合分 0.6*归一化 BM25 + 0.4*cosine，失败回退纯 BM25；双桶限流与熔断（try_acquire 计数、OPEN 时短路返回 curated 列表）不破坏召回可用性。
+关键设计：BM25（K1=1.5, B=0.75）基于全量 tool.description 预计算 IDF/平均文档长度；混合分 via rank_fusion RRF(k=60)+0.5/0.5 归一，失败回退纯 BM25；双桶限流与熔断（try_acquire 计数、OPEN 时短路返回 curated 列表）不破坏召回可用性。
 """
 
 from __future__ import annotations
@@ -318,7 +318,7 @@ def get_router_vector_backend() -> str:
 
 
 def router_hybrid_scores(query: str, candidates: List[str]) -> Dict[str, float]:
-    """为候选工具计算混合分数（0.6*归一化 BM25 + 0.4*cosine），供测试/观测使用。"""
+    """为候选工具计算混合分数 via rank_fusion (RRF k=60 + 0.5/0.5)，供测试/观测使用。"""
     if not candidates:
         return {}
     query_lower = (query or "").lower()
@@ -329,24 +329,44 @@ def router_hybrid_scores(query: str, candidates: List[str]) -> Dict[str, float]:
         spec = TOOL_REGISTRY.get(name)
         desc = getattr(spec, "description", "") if spec else ""
         bm25_raw[name] = _score_tool(query_tokens, query_lower, name, desc)
-    max_bm25 = max(bm25_raw.values()) if bm25_raw else 1.0
+    # 向量余弦分
     qvec = _get_query_embedding(query) if _is_router_vector_enabled() else None
-    out: Dict[str, float] = {}
-    for name in candidates:
-        norm_bm25 = (bm25_raw[name] / max_bm25) if max_bm25 > 0 else 0.0
-        vscore = 0.0
-        if qvec is not None:
+    vec_raw: Dict[str, float] = {}
+    if qvec is not None:
+        for name in candidates:
             spec = TOOL_REGISTRY.get(name)
             desc = getattr(spec, "description", "") if spec else ""
             vscore = _vector_score_for_tool(qvec, name, desc)
-            # 将余弦从 [-1,1] 截断到 [0,1]
             if vscore < 0:
                 vscore = 0.0
             if vscore > 1:
                 vscore = 1.0
-        hybrid = 0.6 * norm_bm25 + 0.4 * vscore if qvec is not None else norm_bm25
-        out[name] = hybrid
-    return out
+            vec_raw[name] = vscore
+    # 统一通过 rank_fusion 融合，若失败则回退旧公式
+    try:
+        from hero_quant.memory.rank_fusion import rank_fusion as _rank_fusion
+
+        bm25_tuples = [(n, float(bm25_raw.get(n, 0.0))) for n in candidates]
+        vec_tuples = [(n, float(vec_raw.get(n, 0.0))) for n in candidates] if qvec is not None else []
+        fused = _rank_fusion(bm25_tuples, vec_tuples, k=60)
+        out = {k: v for k, v in fused}
+        # rank_fusion 可能未包含全部 candidates（若无 vec），补齐
+        for n in candidates:
+            if n not in out:
+                # 回退：BM25 归一化分数
+                max_bm25 = max(bm25_raw.values()) if bm25_raw else 1.0
+                out[n] = (bm25_raw.get(n, 0.0) / max_bm25) if max_bm25 > 0 else 0.0
+        return out
+    except Exception:
+        # 回退：归一化 BM25，含向量时与 cosine 均分（避免旧 0.6/0.4 偏置）
+        max_bm25 = max(bm25_raw.values()) if bm25_raw else 1.0
+        out: Dict[str, float] = {}
+        for name in candidates:
+            norm_bm25 = (bm25_raw[name] / max_bm25) if max_bm25 > 0 else 0.0
+            vscore = vec_raw.get(name, 0.0) if qvec is not None else 0.0
+            hybrid = (norm_bm25 + vscore) / 2 if qvec is not None else norm_bm25
+            out[name] = hybrid
+        return out
 
 
 def route(query: str, k: int = 5) -> List[str]:
@@ -394,30 +414,75 @@ def route(query: str, k: int = 5) -> List[str]:
         qvec = None
     scored: List[tuple[float, str]] = []
     if qvec is not None:
-        # 使用归一化 BM25 + 余弦混合，兼顾精确匹配与语义
-        # 先计算原始 BM25 以得最大值做归一化
-        bm25_raw: Dict[str, float] = {}
-        for name in candidates:
-            spec = TOOL_REGISTRY.get(name)
-            desc = getattr(spec, "description", "") if spec else ""
-            bm25_raw[name] = _score_tool(query_tokens, query_lower, name, desc)
-        max_bm25 = max(bm25_raw.values()) if bm25_raw else 1.0
-        if max_bm25 <= 0:
-            max_bm25 = 1.0
-        for name in candidates:
-            spec = TOOL_REGISTRY.get(name)
-            desc = getattr(spec, "description", "") if spec else ""
-            bm25 = bm25_raw.get(name, 0.0)
-            norm_bm25 = bm25 / max_bm25 if max_bm25 > 0 else 0.0
-            vscore = _vector_score_for_tool(qvec, name, desc)
-            # 将余弦截断到 [0,1]
-            if vscore < 0:
-                vscore = 0.0
-            elif vscore > 1:
-                vscore = 1.0
-            hybrid = 0.6 * norm_bm25 + 0.4 * vscore
-            # 混合权重已让 BM25 占 60%，保持精确匹配主导
-            scored.append((hybrid, name))
+        # 统一融合 via rank_fusion (0.5*RRF + 0.5*cosine)
+        try:
+            from hero_quant.memory.rank_fusion import rank_fusion as _rank_fusion
+
+            bm25_raw2: Dict[str, float] = {}
+            for name in candidates:
+                spec = TOOL_REGISTRY.get(name)
+                desc = getattr(spec, "description", "") if spec else ""
+                bm25_raw2[name] = _score_tool(query_tokens, query_lower, name, desc)
+            vec_raw2: Dict[str, float] = {}
+            for name in candidates:
+                spec = TOOL_REGISTRY.get(name)
+                desc = getattr(spec, "description", "") if spec else ""
+                vscore = _vector_score_for_tool(qvec, name, desc)
+                if vscore < 0:
+                    vscore = 0.0
+                elif vscore > 1:
+                    vscore = 1.0
+                vec_raw2[name] = vscore
+            bm25_tuples = [(n, float(bm25_raw2.get(n, 0.0))) for n in candidates]
+            vec_tuples = [(n, float(vec_raw2.get(n, 0.0))) for n in candidates]
+            fused = _rank_fusion(bm25_tuples, vec_tuples, k=60)
+            # fused is list[(name, hybrid)] sorted desc
+            fused_map = {k: v for k, v in fused}
+            for name in candidates:
+                hybrid = fused_map.get(name, 0.0)
+                scored.append((hybrid, name))
+            # 可选 Cohere rerank：若配置 key 则对 scored 精排
+            try:
+                from hero_quant.config.settings import Settings as _Settings
+
+                _ck = (_Settings().cohere_api_key or "").strip()
+            except Exception:
+                _ck = ""
+            if _ck and scored:
+                try:
+                    from hero_quant.memory.rerank import CohereReranker as _Reranker
+
+                    reranker = _Reranker(api_key=_ck, timeout=5)
+                    cands = [(n, float(s)) for s, n in scored]
+                    reranked = reranker.rerank(query_lower, cands)
+                    if reranked:
+                        # reranker returns [(key, relevance)] sorted
+                        scored = [(float(rel), key) for key, rel in reranked]
+                except Exception as _exc:
+                    logger.debug("silent handled: router rerank fallback", exc_info=_exc)
+                    pass
+        except Exception:
+            # 回退：归一化 BM25 与 cosine 均分，避免旧 0.6/0.4 权重
+            bm25_raw: Dict[str, float] = {}
+            for name in candidates:
+                spec = TOOL_REGISTRY.get(name)
+                desc = getattr(spec, "description", "") if spec else ""
+                bm25_raw[name] = _score_tool(query_tokens, query_lower, name, desc)
+            max_bm25 = max(bm25_raw.values()) if bm25_raw else 1.0
+            if max_bm25 <= 0:
+                max_bm25 = 1.0
+            for name in candidates:
+                spec = TOOL_REGISTRY.get(name)
+                desc = getattr(spec, "description", "") if spec else ""
+                bm25 = bm25_raw.get(name, 0.0)
+                norm_bm25 = bm25 / max_bm25 if max_bm25 > 0 else 0.0
+                vscore = _vector_score_for_tool(qvec, name, desc)
+                if vscore < 0:
+                    vscore = 0.0
+                elif vscore > 1:
+                    vscore = 1.0
+                hybrid = (norm_bm25 + vscore) / 2
+                scored.append((hybrid, name))
     else:
         for name in candidates:
             spec = TOOL_REGISTRY.get(name)

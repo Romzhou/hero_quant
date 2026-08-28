@@ -1,0 +1,30 @@
+{"query": "unique_token_00 momentum factor", "expected_key": "note_00", "content": "note_00 unique_token_00 momentum factor backtest sharpe alpha research quant outlier synthetic seed 00"}
+{"query": "unique_token_01 momentum factor", "expected_key": "note_01", "content": "note_01 unique_token_01 momentum factor backtest sharpe alpha research quant outlier synthetic seed 01"}
+{"query": "unique_token_02 volatility hedging", "expected_key": "note_02", "content": "note_02 unique_token_02 volatility hedging risk parity drawdown correlation synthetic seed 02"}
+{"query": "unique_token_03 volatility hedging", "expected_key": "note_03", "content": "note_03 unique_token_03 volatility hedging risk parity drawdown correlation synthetic seed 03"}
+{"query": "unique_token_04 correlation matrix", "expected_key": "note_04", "content": "note_04 unique_token_04 correlation matrix covariance eigenvalues portfolio synthetic seed 04"}
+{"query": "unique_token_05 correlation matrix", "expected_key": "note_05", "content": "note_05 unique_token_05 correlation matrix covariance eigenvalues portfolio synthetic seed 05"}
+{"query": "unique_token_06 order execution", "expected_key": "note_06", "content": "note_06 unique_token_06 order execution slippage market impact twap vwap synthetic seed 06"}
+{"query": "unique_token_07 order execution", "expected_key": "note_07", "content": "note_07 unique_token_07 order execution slippage market impact twap vwap synthetic seed 07"}
+{"query": "unique_token_08 risk budgeting", "expected_key": "note_08", "content": "note_08 unique_token_08 risk budgeting var cvar tail exposure synthetic seed 08"}
+{"query": "unique_token_09 risk budgeting", "expected_key": "note_09", "content": "note_09 unique_token_09 risk budgeting var cvar tail exposure synthetic seed 09"}
+{"query": "unique_token_10 factor decay", "expected_key": "note_10", "content": "note_10 unique_token_10 factor decay alpha turnover ic ir synthetic seed 10"}
+{"query": "unique_token_11 factor decay", "expected_key": "note_11", "content": "note_11 unique_token_11 factor decay alpha turnover ic ir synthetic seed 11"}
+{"query": "unique_token_12 regime detection", "expected_key": "note_12", "content": "note_12 unique_token_12 regime detection markov hidden state transition synthetic seed 12"}
+{"query": "unique_token_13 regime detection", "expected_key": "note_13", "content": "note_13 unique_token_13 regime detection markov hidden state transition synthetic seed 13"}
+{"query": "unique_token_14 backtest overfitting", "expected_key": "note_14", "content": "note_14 unique_token_14 backtest overfitting walkforward crossvalidation synthetic seed 14"}
+{"query": "unique_token_15 backtest overfitting", "expected_key": "note_15", "content": "note_15 unique_token_15 backtest overfitting walkforward crossvalidation synthetic seed 15"}
+{"query": "unique_token_16 sentiment nlp", "expected_key": "note_16", "content": "note_16 unique_token_16 sentiment nlp earnings transcript embedding synthetic seed 16"}
+{"query": "unique_token_17 sentiment nlp", "expected_key": "note_17", "content": "note_17 unique_token_17 sentiment nlp earnings transcript embedding synthetic seed 17"}
+{"query": "unique_token_18 option Greeks", "expected_key": "note_18", "content": "note_18 unique_token_18 option Greeks delta gamma theta vega synthetic seed 18"}
+{"query": "unique_token_19 option Greeks", "expected_key": "note_19", "content": "note_19 unique_token_19 option Greeks delta gamma theta vega synthetic seed 19"}
+{"query": "unique_token_20 microstructure tick", "expected_key": "note_20", "content": "note_20 unique_token_20 microstructure tick orderbook spread synthetic seed 20"}
+{"query": "unique_token_21 microstructure tick", "expected_key": "note_21", "content": "note_21 unique_token_21 microstructure tick orderbook spread synthetic seed 21"}
+{"query": "unique_token_22 ledger governance", "expected_key": "note_22", "content": "note_22 unique_token_22 ledger governance audit provenance lineage synthetic seed 22"}
+{"query": "unique_token_23 ledger governance", "expected_key": "note_23", "content": "note_23 unique_token_23 ledger governance audit provenance lineage synthetic seed 23"}
+{"query": "unique_token_24 causal inference", "expected_key": "note_24", "content": "note_24 unique_token_24 causal inference double ml propensity synthetic seed 24"}
+{"query": "unique_token_25 causal inference", "expected_key": "note_25", "content": "note_25 unique_token_25 causal inference double ml propensity synthetic seed 25"}
+{"query": "unique_token_26 reinforcement trading", "expected_key": "note_26", "content": "note_26 unique_token_26 reinforcement trading policy gradient reward synthetic seed 26"}
+{"query": "unique_token_27 reinforcement trading", "expected_key": "note_27", "content": "note_27 unique_token_27 reinforcement trading policy gradient reward synthetic seed 27"}
+{"query": "unique_token_28 anomaly detection", "expected_key": "note_28", "content": "note_28 unique_token_28 anomaly detection isolation forest zscore synthetic seed 28"}
+{"query": "unique_token_29 anomaly detection", "expected_key": "note_29", "content": "note_29 unique_token_29 anomaly detection isolation forest zscore synthetic seed 29"}

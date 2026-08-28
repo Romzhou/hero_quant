@@ -8,7 +8,7 @@ import { useEffect, useState } from "react"
 import { useNavigate, Link } from "react-router-dom"
 import { useChatStore } from "../store/chat"
 
-type Metrics = { annual_return?: number; sharpe?: number; max_drawdown?: number; turnover?: number }
+type Metrics = { annual_return?: number; sharpe?: number; max_drawdown?: number; turnover?: number; total_equity?: number }
 
 const FALLBACK: Metrics = { annual_return: 0.184, sharpe: 1.62, max_drawdown: -0.032, turnover: 0.42 }
 
@@ -30,6 +30,7 @@ export default function Dashboard() {
             sharpe: typeof j.sharpe === "number" ? j.sharpe : FALLBACK.sharpe,
             max_drawdown: typeof j.max_drawdown === "number" ? j.max_drawdown : FALLBACK.max_drawdown,
             turnover: typeof j.turnover === "number" ? j.turnover : FALLBACK.turnover,
+            total_equity: typeof j.total_equity === "number" ? j.total_equity : (typeof j.totalEquity === "number" ? j.totalEquity : undefined),
           })
         }
       } catch {
@@ -48,8 +49,9 @@ export default function Dashboard() {
     navigate("/backtest")
   }
 
+  const totalEquityDisplay = loading ? "…" : (metrics.total_equity != null ? `¥ ${metrics.total_equity.toLocaleString("zh-CN")}` : "—")
   const cards = [
-    { k: "总资产", v: "¥ 1,284,520", sub: "含现金", accent: false },
+    { k: "总资产", v: totalEquityDisplay, sub: "含现金", accent: false, isEquity: true },
     { k: "年化", v: loading ? "…" : `${(metrics.annual_return! * 100).toFixed(1)}%`, sub: `sharpe ${metrics.sharpe?.toFixed(2) ?? "1.62"}`, accent: true },
     { k: "最大回撤", v: loading ? "…" : `${(metrics.max_drawdown! * 100).toFixed(1)}%`, sub: "近30日", accent: false },
     { k: "换手率", v: loading ? "…" : String(metrics.turnover), sub: "turnover", accent: false },
@@ -103,7 +105,13 @@ export default function Dashboard() {
           cards.map((c, i) => (
             <div key={c.k} style={{ animationDelay: `${i * 80}ms` }} className="group rounded-2xl border border-white/10 bg-white/[0.04] p-4 backdrop-blur transition hover:bg-white/[0.06] hover:border-white/15 hover:shadow-lg hover:-translate-y-0.5 animate-[fadeIn_0.5s_ease_both]">
               <div className="text-[11px] tracking-[0.14em] text-slate-400">{c.k}</div>
-              <div className="mt-1 font-display text-xl font-semibold text-mist group-hover:text-white transition">{c.v}</div>
+              <div className="mt-1 font-display text-xl font-semibold text-mist group-hover:text-white transition">
+                {(c as unknown as {isEquity?:boolean}).isEquity && metrics.total_equity == null ? (
+                  <span className="inline-block h-5 w-24 animate-pulse rounded bg-white/10" aria-label="skeleton" />
+                ) : (
+                  c.v
+                )}
+              </div>
               <div className="font-mono text-[11px] text-slate-500">{c.sub}</div>
             </div>
           ))

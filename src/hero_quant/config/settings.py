@@ -96,6 +96,41 @@ def _vector_dsn_from_env() -> str | None:
     return None
 
 
+def _checkpoint_dsn_from_env() -> str:
+    """PG default (not memory://) — Task7 requirement. Fallback memory only when PG unreachable at runtime."""
+    raw = os.getenv("HERO_CHECKPOINT_DSN", "")
+    if raw and raw.strip():
+        return raw.strip()
+    # also respect legacy HERO_PG_DSN alias
+    alt = os.getenv("HERO_PG_DSN", "")
+    if alt and alt.strip() and alt.strip().startswith(_PG_PREFIXES):
+        return alt.strip()
+    # default PG (not memory) — real PG path, runtime falls back to memory if unreachable
+    return "postgresql://postgres:postgres@localhost:5432/hero_quant"
+
+
+def _checkpoint_ttl_from_env() -> int:
+    """checkpoint TTL seconds, default 7d, via Settings for expires_at."""
+    raw = os.getenv("HERO_CHECKPOINT_TTL_SECONDS", "") or os.getenv("HERO_CHECKPOINT_TTL", "")
+    if raw and str(raw).strip():
+        try:
+            v = int(str(raw).strip())
+            if v > 0:
+                return v
+        except Exception:
+            pass
+    return 7 * 24 * 3600
+
+
+def _billing_dsn_from_env() -> str | None:
+    """billing PG DSN, separate env, fallback to checkpoint PG if set."""
+    for k in ("HERO_BILLING_DSN", "HERO_PG_DSN", "HERO_CHECKPOINT_DSN"):
+        raw = os.getenv(k, "") or ""
+        if isinstance(raw, str) and raw.strip() and raw.strip().startswith(_PG_PREFIXES):
+            return raw.strip()
+    return None
+
+
 def _llm_model_slot_from_env(key: str) -> str:
     """读取独立 LLM 槽位，未设置时回退到 legacy 模型配置。"""
     return os.getenv(key) or os.getenv("HERO_LLM_MODEL", "gpt-4o-mini")
@@ -142,4 +177,7 @@ class Settings:
     sbert_model: str = field(default_factory=lambda: os.getenv("HERO_SBERT_MODEL", "all-MiniLM-L6-v2"))
     openai_embed_model: str = field(default_factory=lambda: os.getenv("HERO_OPENAI_EMBED_MODEL", "text-embedding-3-small"))
     openai_api_key: str | None = field(default_factory=lambda: os.getenv("OPENAI_API_KEY") or None)  # type: ignore[arg-type]
-    checkpoint_dsn: str = field(default_factory=lambda: os.getenv("HERO_CHECKPOINT_DSN", "memory://default"))
+    checkpoint_dsn: str = field(default_factory=_checkpoint_dsn_from_env)
+    checkpoint_ttl_seconds: int = field(default_factory=_checkpoint_ttl_from_env)
+    billing_dsn: str | None = field(default_factory=_billing_dsn_from_env)
+    cohere_api_key: str = field(default_factory=lambda: os.getenv("COHERE_API_KEY", "") or "")

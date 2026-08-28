@@ -195,8 +195,51 @@ class ContextManager:
         *,
         ledger=None,
         extra_rules: str = "",
+        skills_digest: str | None = None,
+        skills_loader=None,
+        loader=None,
     ) -> str:
         """委托 prompt.build_system_prompt 组装 System Prompt，支持 Grounding 注入."""
+        # Wave4: 透传 skills_digest via SkillsLoader.get_descriptions()
+        _loader = skills_loader if skills_loader is not None else loader
+        _digest = skills_digest
+        if _digest is None:
+            if _loader is not None:
+                try:
+                    _digest = _loader.get_descriptions()
+                except Exception:
+                    _digest = ""
+            else:
+                # auto-discover loader from default skills roots
+                try:
+                    from hero_quant.skills.loader import SkillsLoader
+                    from pathlib import Path as _Path
+
+                    # try common locations
+                    _roots = []
+                    for cand in [_Path("skills"), _Path("src/hero_quant/skills"), _Path(__file__).resolve().parents[2] / "skills"]:
+                        try:
+                            if cand.exists():
+                                _roots.append(str(cand))
+                        except Exception:
+                            continue
+                    if _roots:
+                        try:
+                            _auto_loader = SkillsLoader(roots=_roots)
+                            _digest = _auto_loader.get_descriptions()
+                        except Exception:
+                            _digest = ""
+                    else:
+                        # fallback: empty but try calling loader with no roots (may still have skills via file)
+                        try:
+                            _auto_loader = SkillsLoader(roots=["skills"])
+                            _digest = _auto_loader.get_descriptions()
+                        except Exception:
+                            _digest = ""
+                except Exception:
+                    _digest = ""
+        if _digest is None:
+            _digest = ""
         try:
             from .prompt import build_system_prompt as _bsp
 
@@ -204,11 +247,14 @@ class ContextManager:
                 skill_count=skill_count,
                 grounding_block=grounding_block,
                 ledger=ledger,
-                skills_digest="",
+                skills_digest=_digest or "",
                 extra_rules=extra_rules,
             )
         except Exception:
             block = grounding_block or (ledger.render_block() if ledger is not None and hasattr(ledger, "render_block") else "")
+            # include digest even in fallback for audit
+            if _digest:
+                return f"## Skills\n{_digest}\n## Grounding\n{block}\n## HARD RULE\nHARD RULE: Never quote price not in evidence."
             return f"## Grounding\n{block}\n## HARD RULE\nHARD RULE: Never quote price not in evidence."
 
     def get_system_prompt(
@@ -217,9 +263,12 @@ class ContextManager:
         grounding_block: str = "",
         *,
         ledger=None,
+        skills_digest: str | None = None,
+        skills_loader=None,
+        loader=None,
     ) -> str:
         """build_system_prompt 的别名."""
-        return self.build_system_prompt(skill_count=skill_count, grounding_block=grounding_block, ledger=ledger)
+        return self.build_system_prompt(skill_count=skill_count, grounding_block=grounding_block, ledger=ledger, skills_digest=skills_digest, skills_loader=skills_loader, loader=loader)
 
 
 def skills_snapshot(loader: "SkillsLoader") -> str:
@@ -244,8 +293,20 @@ def build_system_prompt(
     *,
     ledger=None,
     extra_rules: str = "",
+    skills_digest: str | None = None,
+    skills_loader=None,
+    loader=None,
 ) -> str:
     """模块级便捷入口，委托 prompt.build_system_prompt."""
+    _loader = skills_loader if skills_loader is not None else loader
+    _digest = skills_digest
+    if _digest is None and _loader is not None:
+        try:
+            _digest = _loader.get_descriptions()
+        except Exception:
+            _digest = ""
+    if _digest is None:
+        _digest = ""
     try:
         from .prompt import build_system_prompt as _bsp
 
@@ -253,6 +314,7 @@ def build_system_prompt(
             skill_count=skill_count,
             grounding_block=grounding_block,
             ledger=ledger,
+            skills_digest=_digest or "",
             extra_rules=extra_rules,
         )
     except Exception:

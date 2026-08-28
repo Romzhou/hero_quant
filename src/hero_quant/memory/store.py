@@ -1291,8 +1291,16 @@ class MemoryStore:
         except Exception:
             return []
 
+    def recall(self, query: str, top_k: int = 5) -> list[dict]:
+        """Alias for search — Wave4 loop wiring uses recall naming."""
+        try:
+            # search ignores top_k but keep param for compatibility
+            return self.search(query)
+        except Exception:
+            return []
+
     def search(self, query: str) -> list[dict]:
-        """混合检索：BM25 召回 + 向量余弦重排 + Ebbinghaus 衰减加权。"""
+        """混合检索：BM25 召回 + 向量余弦 via rank_fusion (0.5/0.5) + 可选 Cohere 重排."""
         if not query:
             return []
         # 文本召回候选
@@ -1327,45 +1335,108 @@ class MemoryStore:
             # 命名空间已在召回时过滤，直接走衰减排序
             return self._rank_with_decay(bm25_candidates if bm25_candidates else items)
 
-        # 计算混合分数 0.6*cosine + 0.3*importance + 0.1*bm25_hit
-        now = time.time()
-        # 预先计算查询向量
+        # 统一融合：RRF(k=60) + 归一 0.5*RRF + 0.5*cosine
         try:
-            qvec = self._embed_text(query)
+            from hero_quant.memory.rank_fusion import rank_fusion as _rank_fusion
         except Exception:
-            qvec = None
-        # BM25 命中集合用于加权
-        bm25_keys = {it["key"] for it in bm25_candidates}
-        scored: list[tuple[float, float, float, dict]] = []
-        for it in items:
-            key = it["key"]
-            content = it["content"]
-            # 计算余弦相似度
-            cos = 0.0
+            _rank_fusion = None  # type: ignore
+        # 构建 rank_fusion 输入：bm25 按出现顺序赋分，vec 用真实 cosine
+        # bm25 候选赋予递减分数以保留排序信息
+        bm25_tuples: list[tuple[str, float]] = []
+        for idx, it in enumerate(bm25_candidates):
+            bm25_tuples.append((it["key"], float(len(bm25_candidates) - idx)))
+        # vec 候选用 vector_search 已有 score，若无则即时计算 cosine
+        vec_tuples: list[tuple[str, float]] = []
+        if vector_candidates:
+            for it in vector_candidates:
+                sc = it.get("score", 0.0)
+                try:
+                    sc_f = float(sc)
+                except Exception:
+                    sc_f = 0.0
+                vec_tuples.append((it["key"], sc_f))
+        else:
+            # 回退：为 items 即时计算 cosine 以喂入融合
+            try:
+                qvec = self._embed_text(query)
+            except Exception:
+                qvec = None
             if qvec is not None:
-                # 优先用已存向量
-                stored_vec = self._load_vector_for_key(key)
-                if stored_vec is not None:
-                    cos = self._cosine_sim(qvec, stored_vec)
-                else:
-                    # 回退到即时计算
+                for it in items:
                     try:
-                        cvec = self._embed_text(content)
-                        cos = self._cosine_sim(qvec, cvec)
+                        cvec = self._load_vector_for_key(it["key"])
+                        if cvec is None:
+                            cvec = self._embed_text(it["content"])
+                        cos = self._cosine_sim(qvec, cvec) if cvec is not None else 0.0
                     except Exception:
                         cos = 0.0
-                # 截断到 [-1,1] 并保留原值参与混合
-                if cos > 1.0:
-                    cos = 1.0
-                elif cos < -1.0:
-                    cos = -1.0
-            imp = self._importance_for(it, now)
-            bm25_hit = 1.0 if key in bm25_keys else (1.0 if query.lower() in content.lower() else 0.0)
-            hybrid = 0.6 * cos + 0.3 * imp + 0.1 * bm25_hit
-            scored.append((hybrid, cos, imp, it))
-        # 按混合分、余弦、重要性三级排序
-        scored.sort(key=lambda x: (x[0], x[1], x[2]), reverse=True)
-        result = [it for _, _, _, it in scored]
+                    if cos < 0:
+                        cos = 0.0
+                    if cos > 1:
+                        cos = 1.0
+                    vec_tuples.append((it["key"], cos))
+
+        if _rank_fusion is not None and (bm25_tuples or vec_tuples):
+            try:
+                ranked = _rank_fusion(bm25_tuples, vec_tuples, k=60)
+                # ranked is list[(key, hybrid)]
+                # Map back to dict results preserving content
+                out: list[dict] = []
+                for key, _sc in ranked:
+                    if key in merged:
+                        out.append(merged[key])
+                # Include any missing merged keys (未参与融合的) 尾部补齐
+                seen_keys = {k for k, _ in ranked}
+                for it in items:
+                    if it["key"] not in seen_keys:
+                        out.append(it)
+                result = out
+            except Exception:
+                # fallback preserve previous order
+                result = items
+        else:
+            # 极端回退：按原 items
+            result = items
+
+        # Cohere 重排增强（若配置 COHERE_API_KEY）
+        try:
+            from hero_quant.config.settings import Settings as _Settings
+
+            _cohere_key = (_Settings().cohere_api_key or "").strip()
+        except Exception:
+            _cohere_key = ""
+        if _cohere_key:
+            try:
+                from hero_quant.memory.rerank import CohereReranker as _Reranker
+
+                reranker = _Reranker(api_key=_cohere_key, timeout=5)
+                # Prepare candidates as (key, score) where score from rank_fusion
+                # Use current result order as prior score
+                cands_for_rerank: list[tuple[str, float]] = []
+                for idx, it in enumerate(result):
+                    cands_for_rerank.append((it["key"], float(len(result) - idx)))
+                reranked = reranker.rerank(query, cands_for_rerank)
+                if reranked:
+                    # Map reranked order back to dict
+                    reranked_keys = [k for k, _ in reranked]
+                    map_content = {it["key"]: it for it in result}
+                    # also fallback to merged for missing
+                    for k, v in merged.items():
+                        if k not in map_content:
+                            map_content[k] = v
+                    out2: list[dict] = []
+                    for k in reranked_keys:
+                        if k in map_content:
+                            out2.append(map_content[k])
+                    # append any not in reranked tail
+                    for it in result:
+                        if it["key"] not in reranked_keys:
+                            out2.append(it)
+                    result = out2
+            except Exception as _exc:
+                logger.debug("silent handled: rerank fallback", exc_info=_exc)  # intentional fallback
+                pass
+
         # 已做命名空间隔离，最后按内容去重
         seen: dict[str, dict] = {}
         deduped: list[dict] = []

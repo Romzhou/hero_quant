@@ -1,7 +1,7 @@
-"""腾讯行情 Loader：CN 日线、board_lots 单位与合成回退。
+"""腾讯行情 Loader：CN 日线、board_lots 单位。
 
 位于 data/loaders 层 CN 主源，markets=["CN"]、unit="board_lots"；
-live 下限流 1s 后请求腾讯 qfq 接口，任意异常回退合成；provenance
+live 下限流 1s 后请求腾讯 qfq 接口，live 失败显式抛 RuntimeError 不回退合成（仅 synthetic 模式走合成）；provenance
 的 unit 需与 A 股手语义一致。
 """
 

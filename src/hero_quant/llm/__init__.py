@@ -1,4 +1,4 @@
-"""LLM model catalog and stage-to-slot resolution without a network client."""
+"""LLM model catalog, factory and client exports."""
 
 from .catalog import (
     DEFAULT_MODEL,
@@ -9,6 +9,7 @@ from .catalog import (
     list_models,
     resolve_model,
 )
+from .client import LLMClient
 from .factory import LLMFactory, STAGE_TO_SLOT, model_for_stage, slot_for_stage
 
 __all__ = [
@@ -19,6 +20,7 @@ __all__ = [
     "get_model_info",
     "list_models",
     "resolve_model",
+    "LLMClient",
     "LLMFactory",
     "STAGE_TO_SLOT",
     "model_for_stage",

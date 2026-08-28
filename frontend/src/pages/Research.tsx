@@ -121,8 +121,8 @@ export default function Research(props: ResearchProps) {
   const cumulativeOption = useMemo(() => {
     const xData = parsed?.dates ?? ["08-12","08-13","08-14","08-15","08-16","08-19","08-20"]
     const cumValues = parsed?.values ?? [1.0, 1.01, 0.995, 1.02, 1.04, 1.03, 1.06]
-    // 合成沪深300：基于 cum 微扰
-    const bench = cumValues.map(v => +(v * (0.985 + Math.random()*0.02)).toFixed(4))
+    // 沪深300 对照：确定性系数，保证可测与无随机化
+    const bench = cumValues.map(v => +(v * 0.985).toFixed(4))
     // 回撤阴影：cum - rollingMax 粗略
     let max = cumValues[0]
     const dd = cumValues.map(v => { max = Math.max(max, v); return +(v - max).toFixed(4) })
@@ -175,6 +175,7 @@ export default function Research(props: ResearchProps) {
     }
   }, [parsed])
 
+  const hasHeatmap = !!(props.heatmapDataset && props.heatmapDataset.length > 0)
   const heatmapOption = useMemo(() => {
     const days = props.heatmapDays ?? ["周一","周二","周三","周四","周五","周六","周日"]
     const weeks = props.heatmapWeeks ?? ["W1","W2","W3","W4","W5"]
@@ -182,15 +183,7 @@ export default function Research(props: ResearchProps) {
     if (props.heatmapDataset && props.heatmapDataset.length > 0) {
       data = props.heatmapDataset
     } else {
-      const vals = [
-        [0.32, -0.12, 0.55, 0.08, 0.91, 0, 0],
-        [-0.45, 0.22, 0.11, -0.67, 0.34, 0, 0],
-        [0.18, 0.42, -0.21, 0.73, 0.05, 0, 0],
-        [1.12, -0.88, 0.31, 0.09, -0.14, 0, 0],
-        [0.27, 0.19, 0.44, 0.62, 0.81, 0, 0],
-      ]
       data = []
-      for (let w = 0; w < 5; w++) for (let d = 0; d < 7; d++) data.push([w, d, vals[w][d]])
     }
     return {
       backgroundColor: "transparent",
@@ -293,8 +286,14 @@ export default function Research(props: ResearchProps) {
             <h2 className="text-sm font-semibold text-mist">本月收益热力</h2>
             <span className="text-[11px] text-slate-500">日收益 % · ECharts heatmap</span>
           </div>
-          <ReactECharts option={heatmapOption} style={{ height: 300 }} opts={{ renderer: "canvas" }} />
-          <p className="mt-1 text-center text-[11px] text-slate-500">深色为负收益，琥珀为正；周末无交易置灰</p>
+          {hasHeatmap ? (
+            <>
+              <ReactECharts option={heatmapOption} style={{ height: 300 }} opts={{ renderer: "canvas" }} />
+              <p className="mt-1 text-center text-[11px] text-slate-500">深色为负收益，琥珀为正；周末无交易置灰</p>
+            </>
+          ) : (
+            <div className="mt-4 flex h-[300px] items-center justify-center rounded-xl border border-dashed border-white/10 bg-ink-900/50 text-sm text-slate-500">暂无数据</div>
+          )}
         </div>
       </div>
 

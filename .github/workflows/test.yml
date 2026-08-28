@@ -20,8 +20,8 @@ jobs:
       - name: Lint with ruff
         run: ruff check src
       - name: Run tests
-        # Coverage gate: 2026-08-22 实测 49% (10661 stmts, 5392 missed, 207 passed)；阈值 46 保留 ~3% headroom 且不致 CI 红
-        run: pytest -q --cov=src --cov-report=term --cov-fail-under=46
+        # Coverage gate: Wave4 收口 50% (was 46 -> 50 -> next 55)；低频 retrieval_eval 标记为 retrieval 仅周跑，不计入此门
+        run: pytest -q --cov=src --cov-report=term --cov-fail-under=50
       - name: Audit dependencies
         # Blocking gate since W1-D (was "|| true")
         run: pip-audit
