@@ -89,3 +89,56 @@ def test_run_batch_io_failure_surfaces(tmp_path):
     file_path.write_text("block")
     with pytest.raises(Exception):
         run_batch(["AAPL"], dates=["2024-01-01"], output_dir=file_path)
+
+def test_effective_benchmark_map_narrow_except():
+    """P2-7: _effective_benchmark_map must not swallow invalid Settings; should raise."""
+    from hero_quant.backtest import bench as bench_mod
+    from unittest.mock import patch
+    import pytest
+    # Simulate Settings raising ValidationError (invalid config)
+    with patch("hero_quant.config.settings.Settings", side_effect=ValueError("bad config")):
+        with pytest.raises(ValueError):
+            bench_mod._effective_benchmark_map(None)
+    # Simulate ImportError should be handled gracefully (fallback)
+    with patch("hero_quant.config.settings.Settings", side_effect=ImportError("no module")):
+        m = bench_mod._effective_benchmark_map(None)
+        assert isinstance(m, dict)
+
+def test_normalize_index_bad_date_raises():
+    """P2-8: _normalize_index must raise on unparseable dates, not silently fallback."""
+    from hero_quant.backtest.bench import _normalize_index
+    import pytest
+    with pytest.raises((ValueError, TypeError)):
+        _normalize_index(["not-a-date"])
+    with pytest.raises((ValueError, TypeError)):
+        _normalize_index(["2024-01-01", "bad-date"])
+    # valid still works
+    idx = _normalize_index(["2024-01-01", "2024-01-02"])
+    assert len(idx) == 2
+
+def test_normalize_index_sort_narrow():
+    """P2-9: sort failure should not be silently swallowed; narrow except with raise."""
+    from hero_quant.backtest.bench import _normalize_index
+    import pandas as pd
+    # normal case sorts
+    idx = _normalize_index(["2024-01-03", "2024-01-01", "2024-01-02"])
+    assert idx[0] == pd.Timestamp("2024-01-01")
+    # malformed case: ensure exception propagates (already covered by bad date)
+
+def test_default_benchmark_map_protected():
+    """P2-4 + bench map: DEFAULT_BENCHMARK_MAP mutation must not affect global (MappingProxyType)."""
+    from hero_quant.backtest import DEFAULT_BENCHMARK_MAP
+    from hero_quant.backtest.bench import DEFAULT_BENCHMARK_MAP as bench_map
+    from types import MappingProxyType
+    assert isinstance(DEFAULT_BENCHMARK_MAP, MappingProxyType)
+    # caller mutation via copy must not affect
+    copy = dict(DEFAULT_BENCHMARK_MAP)
+    copy[".NS"] = "HACKED"
+    assert bench_map[".NS"] == "^NSEI"
+    assert DEFAULT_BENCHMARK_MAP[".NS"] == "^NSEI"
+    # direct mutation should raise
+    try:
+        DEFAULT_BENCHMARK_MAP[".NS"] = "HACKED2"
+        assert False, "MappingProxyType should reject mutation"
+    except TypeError:
+        pass

@@ -133,7 +133,7 @@ DEFAULT_BENCHMARK_MAP: dict[str, str] = {
 
 
 def _effective_benchmark_map(benchmark_map: dict | None) -> dict:
-    """解析生效的基准映射：显式传入优先，否则取 Settings，否则回落默认表。"""
+    """解析生效的基准映射：显式传入优先，否则取 Settings，否则回落默认表。仅捕获预期异常，配置错误向上抛出。"""
     if benchmark_map is not None:
         return benchmark_map
     # 尝试从配置中心读取，未配置则回落默认
@@ -143,13 +143,16 @@ def _effective_benchmark_map(benchmark_map: dict | None) -> dict:
         s = Settings()
         if getattr(s, "benchmark_map", None):
             return dict(s.benchmark_map)
-    except Exception:
-        pass
+    except (ImportError, AttributeError) as e:
+        logger.debug("_effective_benchmark_map Settings unavailable: %s", e)
+    except Exception as e:
+        logger.warning("_effective_benchmark_map Settings failed: %s", e, exc_info=True)
+        raise
     return dict(DEFAULT_BENCHMARK_MAP)
 
 
 def _effective_benchmark_ticker(benchmark_ticker: str | None) -> str | None:
-    """解析生效的基准标的：显式参数覆盖 Settings。"""
+    """解析生效的基准标的：显式参数覆盖 Settings。仅捕获预期异常。"""
     if benchmark_ticker is not None:
         # 空字符串视为未覆盖，避免误用
         return benchmark_ticker if benchmark_ticker != "" else None
@@ -160,8 +163,11 @@ def _effective_benchmark_ticker(benchmark_ticker: str | None) -> str | None:
         bt = getattr(s, "benchmark_ticker", None)
         if bt:
             return str(bt)
-    except Exception:
-        pass
+    except (ImportError, AttributeError) as e:
+        logger.debug("_effective_benchmark_ticker Settings unavailable: %s", e)
+    except Exception as e:
+        logger.warning("_effective_benchmark_ticker Settings failed: %s", e, exc_info=True)
+        raise
     return None
 
 
@@ -184,23 +190,40 @@ def _resolve_benchmark(
 
 
 def _normalize_index(dates: list[str] | None) -> pd.DatetimeIndex:
-    """归一化日期序列：空/非法回落至默认 5 日；单日扩展为 5 日以保证收益可计算。"""
+    """归一化日期序列：空回落至默认 5 日；非法日期抛错（而非静默回落）；单日扩展为 5 日。"""
     if not dates:
         dates = ["2024-01-01", "2024-01-02", "2024-01-03", "2024-01-04", "2024-01-05"]
     try:
         idx = pd.to_datetime(dates)
         if not isinstance(idx, pd.DatetimeIndex):
             idx = pd.DatetimeIndex(idx)
-    except Exception:
-        idx = pd.date_range("2024-01-01", periods=5, freq="D")  # 解析失败回落
+    except (ValueError, TypeError, pd.errors.OutOfBoundsDatetime) as e:
+        logger.warning("_normalize_index unparseable dates %r: %s", dates, e, exc_info=True)
+        raise ValueError(f"unparseable dates {dates!r}: {e}") from e
+    except Exception as e:
+        logger.warning("_normalize_index unexpected error for %r: %s", dates, e, exc_info=True)
+        raise
+    # fail on NaT introduced by coercion (e.g. bad strings with errors='coerce' not used but guard)
+    try:
+        if idx.isna().any():
+            raise ValueError(f"unparseable dates {dates!r}: contains NaT")
+    except (AttributeError, ValueError):
+        raise
+    except Exception as e:
+        logger.warning("_normalize_index NaT check failed: %s", e, exc_info=True)
+        raise
     # 单日无收益，需扩展为多日序列
     if len(idx) == 1:
         idx = pd.date_range(idx[0], periods=5, freq="D")
     # 保证有序，避免后续 pct_change 错位
     try:
         idx = idx.sort_values()
-    except Exception:
-        pass
+    except (ValueError, TypeError, AttributeError) as e:
+        logger.warning("_normalize_index sort failed: %s", e, exc_info=True)
+        raise
+    except Exception as e:
+        logger.warning("_normalize_index sort unexpected: %s", e, exc_info=True)
+        raise
     return idx
 
 

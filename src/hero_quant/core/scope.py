@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import copy
 from typing import Any, Dict, List, Optional
 import logging
 
@@ -84,17 +85,19 @@ class ScopedLayers:
         self._store: Dict[Scope, Dict[str, Any]] = {}
 
     def set(self, scope: Scope, vals: Dict[str, Any]) -> None:
-        """为指定作用域写入/合并键值（同作用域内浅合并）。"""
+        """为指定作用域写入/合并键值（同作用域内浅合并，深拷贝值以隔离租户嵌套可变状态）。"""
         if scope is None:
             raise ValueError("scope must not be None")
         if not isinstance(vals, dict):
             raise TypeError("vals must be a dict")
+        # deep copy values to prevent cross-tenant nested mutation leakage
+        deep_vals = copy.deepcopy(vals)
         existing = self._store.get(scope)
         if existing is None:
-            # 拷贝避免外部后续修改影响存储
-            self._store[scope] = dict(vals)
+            # 拷贝避免外部后续修改影响存储（含嵌套可变对象）
+            self._store[scope] = deep_vals
         else:
-            existing.update(vals)
+            existing.update(deep_vals)
 
     def chain_layers(self, scope: Scope) -> List[Scope]:
         """返回从根到叶的链路（含自身），用于按序合并。"""
@@ -120,12 +123,14 @@ class ScopedLayers:
         return chain
 
     def merge(self, scope: Scope) -> Dict[str, Any]:
-        """合并链路上所有层，近端（子级）覆盖远端。"""
+        """合并链路上所有层，近端（子级）覆盖远端；深拷贝嵌套值以隔离租户。"""
         merged: Dict[str, Any] = {}
         for layer in self.chain_layers(scope):
             vals = self._store.get(layer)
             if vals:
-                merged.update(vals)
+                # deep copy each value to avoid cross-tenant nested mutation leakage via parent layer
+                for k, v in vals.items():
+                    merged[k] = copy.deepcopy(v)
         return merged
 
     # 便于上层直接取合并后的单键值

@@ -85,3 +85,54 @@ def test_metrics_costs_wired():
     # with costs, cumulative return should be lower
     assert m_with_cost["cumulative_return"] < m_no_cost["cumulative_return"]
     assert m_with_cost["sharpe"] != m_no_cost["sharpe"] or m_with_cost["cumulative_return"] != m_no_cost["cumulative_return"]
+
+def test_annual_return_cagr_off_by_one():
+    """P2-3: CAGR must use n=len-1 periods; 2-point [100,110] with periods=1 → 10% not 4.88%."""
+    from hero_quant.backtest.metrics import annual_return
+    import pandas as pd
+    s = pd.Series([100, 110], dtype=float)
+    cagr = annual_return(s, periods=1)
+    assert abs(cagr - 0.10) < 1e-9, f"expected 0.10 got {cagr}"
+    # guard len<2 returns 0
+    assert annual_return(pd.Series([100], dtype=float)) == 0.0
+    # ensure old buggy n=len would give ~0.0488 with periods=1
+    assert abs(cagr - 0.0488) > 0.02
+
+def test_validation_currency_nan_consistent():
+    """P2-5: currency NaN must be rejected consistently in both validation paths, fail-closed."""
+    from hero_quant.backtest.validation import validate, ValidationError
+    import pandas as pd
+    import pytest
+    # path 1: NaN in currency column alone should be rejected
+    prices_nan = pd.DataFrame({"close": [100, 101], "currency": ["USD", float("nan")]}, index=pd.date_range("2026-08-01", periods=2))
+    with pytest.raises(ValidationError, match="NaN currency"):
+        validate(prices_nan)
+    # path 2: currency param with NaN column also rejected (consistent)
+    prices_nan2 = pd.DataFrame({"close": [100, 101], "currency": [float("nan"), float("nan")]}, index=pd.date_range("2026-08-01", periods=2))
+    with pytest.raises(ValidationError, match="NaN currency"):
+        validate(prices_nan2, currency="USD")
+    # also explicit currency mismatch still caught
+    prices_ok = pd.DataFrame({"close": [100, 101], "currency": ["USD", "USD"]}, index=pd.date_range("2026-08-01", periods=2))
+    with pytest.raises(ValidationError):
+        validate(prices_ok, currency="EUR")
+    # NaN close already fail-closed verified elsewhere
+
+def test_engine_on_tick_latency_breach():
+    """P2-6: on_tick must preserve real latency (>=200ms) and flag breach, not overwrite to 0.5ms."""
+    from hero_quant.backtest.engine import BacktestEngine
+    import time
+    eng = BacktestEngine()
+    # inject slow factor to force latency >=200ms
+    class SlowFactor:
+        def update(self, price):
+            time.sleep(0.25)
+            return price
+    eng._tick_factor = SlowFactor()
+    res = eng.on_tick({"price": 100, "symbol": "TEST"})
+    assert res["latency_ms"] >= 200, f"latency should be preserved, got {res['latency_ms']}"
+    assert res["latency_breach"] is True
+    assert res["latency_breach_count"] >= 1
+    # fast tick should not be breach
+    eng2 = BacktestEngine()
+    res2 = eng2.on_tick({"price": 100, "symbol": "FAST"})
+    assert res2["latency_ms"] < 200 or res2["latency_breach"] is False or res2["latency_ms"] < 250

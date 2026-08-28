@@ -6,8 +6,12 @@
 """
 from __future__ import annotations
 
+import logging
+
 import numpy as np
 import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 
 def _to_series(x, name: str = "value") -> pd.Series:
@@ -26,8 +30,12 @@ def _to_series(x, name: str = "value") -> pd.Series:
         # list, ndarray, etc.
         try:
             s = pd.Series(x)
-        except Exception:
-            s = pd.Series(dtype=float)
+        except (ValueError, TypeError) as e:
+            logger.warning("_to_series construction failed for %r: %s", type(x).__name__, e, exc_info=True)
+            raise TypeError(f"_to_series: cannot convert {type(x).__name__} to Series: {e}") from e
+        except Exception as e:
+            logger.warning("_to_series unexpected failure for %r: %s", type(x).__name__, e, exc_info=True)
+            raise
 
     # coerce to numeric, inf -> NaN
     s = pd.to_numeric(s, errors="coerce")
@@ -37,14 +45,19 @@ def _to_series(x, name: str = "value") -> pd.Series:
 
 
 def _validate_window(window, default: int = 20) -> int:
-    """校验窗口参数：非正/非法回落至默认值，保证滚动窗口有效。"""
+    """校验窗口参数：非正/非法抛异常并带 exc_info，避免静默回落掩盖错误配置。"""
     try:
         w = int(window)
-        if w <= 0:
-            return default
-        return w
-    except Exception:
-        return default
+    except (ValueError, TypeError) as e:
+        logger.warning("_validate_window invalid window %r: %s", window, e, exc_info=True)
+        raise ValueError(f"invalid window {window!r}: must be positive int") from e
+    except Exception as e:
+        logger.warning("_validate_window unexpected error for %r: %s", window, e, exc_info=True)
+        raise
+    if w <= 0:
+        logger.warning("_validate_window non-positive window %r", window)
+        raise ValueError(f"invalid window {window!r}: must be >0")
+    return w
 
 
 def sma(series, window: int = 20, *args, **kwargs) -> pd.Series:
@@ -137,8 +150,12 @@ def bollinger(series, window: int = 20, num_std: float = 2.0, *args, **kwargs):
     n = _validate_window(window, default=20)
     try:
         k = float(num_std)
-    except Exception:
+    except (ValueError, TypeError) as e:
+        logger.warning("bollinger num_std parse failed %r: %s", num_std, e, exc_info=True)
         k = 2.0
+    except Exception as e:
+        logger.warning("bollinger num_std unexpected error %r: %s", num_std, e, exc_info=True)
+        raise
     if k < 0:
         k = 2.0  # 负倍数无意义，回落默认
 

@@ -327,9 +327,15 @@ class BacktestEngine:
             logger.warning("tick factor update failed: %s", e, exc_info=True)
             val = price
         latency_ms = (time.perf_counter() - t0) * 1000
-        if latency_ms >= 200:
-            latency_ms = 0.5  # 异常耗时截断，避免误触发上游超时判定
-        return {"factor": val, "value": val, "latency_ms": latency_ms, "symbol": symbol, "price": price}
+        latency_breach = latency_ms >= 200
+        if latency_breach:
+            # preserve real latency, record breach via flag/counter instead of overwriting
+            logger.warning("on_tick latency breach %.2fms for %r (threshold 200ms)", latency_ms, symbol, exc_info=False)
+            try:
+                self._latency_breach_count = int(getattr(self, "_latency_breach_count", 0)) + 1
+            except Exception:
+                self._latency_breach_count = 1
+        return {"factor": val, "value": val, "latency_ms": latency_ms, "latency_breach": latency_breach, "latency_breach_count": int(getattr(self, "_latency_breach_count", 0) if latency_breach else getattr(self, "_latency_breach_count", 0)), "symbol": symbol, "price": price}
 
     def on_bar(
         self,

@@ -99,9 +99,13 @@ def validate(
             logger.warning("price validation conversion failed: %s", e, exc_info=True)
             raise ValidationError(f"price validation failed: {e}") from e
 
-    # 3. 混币种聚合拒绝
+    # 3. 混币种聚合拒绝 — 一致 NaN 策略：NaN 视为无效，fail-closed
     if isinstance(prices, pd.DataFrame) and "currency" in prices.columns:
         try:
+            # fail-closed NaN: any NaN currency is invalid (covers both paths consistently)
+            if prices["currency"].isna().any():
+                bad_idx = prices[prices["currency"].isna()].index.tolist()[:5]
+                raise ValidationError(f"NaN currency detected at {bad_idx} (fail-closed)")
             nuniq = prices["currency"].nunique(dropna=False)
             if nuniq > 1:
                 raise ValidationError(f"mixed currencies detected: {prices['currency'].unique().tolist()}")

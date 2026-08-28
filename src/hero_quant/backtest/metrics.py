@@ -61,7 +61,10 @@ def annual_return(equity: pd.Series, periods: int = 252) -> float:
     end = float(s.iloc[-1])  # 终点净值
     if start == 0 or np.isnan(start) or np.isnan(end):
         return 0.0  # 起点为零无法定义 CAGR
-    n = len(s)
+    # guard len<2 already returned; n = number of periods = len-1 (off-by-one fix)
+    n = len(s) - 1
+    if n <= 0:
+        return 0.0
     # CAGR 年化
     try:
         ann = (end / start) ** (periods / n) - 1
