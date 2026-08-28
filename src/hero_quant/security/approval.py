@@ -112,10 +112,18 @@ class ApprovalService:
 
     def effective_policy(self, events: list[dict[str, Any]] | None = None) -> str:
         """结合历史事件折叠与当前模式，计算最终生效策略。"""
-        if events:
-            folded = effectiveApprovalPolicy(events)
-            # 服务为 never 时强制覆盖为 never，确保 fail-closed
-            if self.mode == ApprovalPolicy.NEVER:
-                return ApprovalPolicy.NEVER
-            return folded
-        return self.mode
+        if not events:
+            return self.mode
+        folded = effectiveApprovalPolicy(events)
+        # fail-closed: service mode is ceiling — return most restrictive of mode vs folded
+        # never(0) > ask(1) > auto(2)  — lower value = more restrictive
+        order = {ApprovalPolicy.NEVER: 0, ApprovalPolicy.ASK: 1, ApprovalPolicy.AUTO: 2}
+        mode_rank = order.get(self.mode, 1)
+        folded_rank = order.get(folded, 1)
+        # if folded is more permissive than service mode, clamp to service mode
+        if folded_rank > mode_rank:
+            return self.mode
+        # also explicitly forbid ask->auto escalation via untrusted events
+        if self.mode == ApprovalPolicy.ASK and folded == ApprovalPolicy.AUTO:
+            return ApprovalPolicy.ASK
+        return folded

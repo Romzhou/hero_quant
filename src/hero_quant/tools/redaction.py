@@ -12,26 +12,32 @@ from typing import Any
 
 from hero_quant.config.limits import TOOL_RESULT_LIMIT, truncate_tool_result
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 def _maybe_redact(value: Any, sink: str = "result") -> Any:
-    """委托 security.redaction 做 sink 感知的脱敏，失败则透传原值。"""
+    """委托 security.redaction 做 sink 感知的脱敏，失败则 fail-closed 返回 ***。"""
     try:
         from hero_quant.security.redaction import redact_payload
-
+    except Exception as e:
+        logger.warning("redaction module unavailable, dropping payload sink=%s err=%s", sink, e, exc_info=True)
+        return "***"
+    try:
         if isinstance(value, (dict, list)):
             return redact_payload(value, sink=sink)
         if isinstance(value, str):
             # 字符串复用 dict 脱敏路径，需包装后解包
-            from hero_quant.security.redaction import redact_payload as rp
-
             wrapped = {"_v": value}
-            redacted = rp(wrapped, sink=sink)
+            redacted = redact_payload(wrapped, sink=sink)
             if redacted.get("_v") == "***":
                 return "***"
             return redacted.get("_v", value)
-    except Exception:
-        pass
-    return value
+        return value
+    except Exception as e:
+        logger.warning("redact_payload failed sink=%s err=%s", sink, e, exc_info=True)
+        return "***"
 
 
 def redact_tool_result(result: Any, limit: int | None = None, sink: str = "result") -> str:

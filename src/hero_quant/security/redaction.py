@@ -94,13 +94,35 @@ def _scan_string(value: str, *, preserve_zero_width: bool = False) -> str:
 
 
 def _neutralize_content(value: Any) -> Any:
-    """Neutralize result content while preserving secret-like text and zero-width chars."""
+    """Neutralize result content while preserving zero-width chars but still redacting secrets."""
     if isinstance(value, str):
-        return _scan_string(value, preserve_zero_width=True)
+        # redact Bearer/JWT/AKIA patterns inside content as well
+        return _scan_string(_redact_string(value, RESULT_SINK), preserve_zero_width=True)
     if isinstance(value, dict):
-        return {key: _neutralize_content(item) for key, item in value.items()}
+        out: dict[str, Any] = {}
+        for key, item in value.items():
+            if _is_sensitive_key(key):
+                out[key] = _REDACTED
+                continue
+            if isinstance(item, str):
+                out[key] = _scan_string(_redact_string(item, RESULT_SINK), preserve_zero_width=True)
+            elif isinstance(item, dict):
+                out[key] = _neutralize_content(item)
+            elif isinstance(item, list):
+                out[key] = [_neutralize_content(x) if isinstance(x, (dict, list, str)) else x for x in item]
+            else:
+                out[key] = item
+        return out
     if isinstance(value, list):
-        return [_neutralize_content(item) for item in value]
+        res: list[Any] = []
+        for item in value:
+            if isinstance(item, str):
+                res.append(_scan_string(_redact_string(item, RESULT_SINK), preserve_zero_width=True))
+            elif isinstance(item, (dict, list)):
+                res.append(_neutralize_content(item))
+            else:
+                res.append(item)
+        return res
     return value
 
 
@@ -109,9 +131,14 @@ def redact_payload(payload: Any, sink: str = ARGUMENTS_SINK) -> Any:
     if isinstance(payload, dict):
         out: dict[str, Any] = {}
         for k, v in payload.items():
-            # RESULT_SINK 下 content 字段透传，避免误删工具正常输出
+            # RESULT_SINK content still needs redaction: check sensitive keys & patterns inside
             if sink == RESULT_SINK and k == "content":
-                out[k] = _neutralize_content(v)
+                if isinstance(v, str):
+                    out[k] = _scan_string(_redact_string(v, sink=sink), preserve_zero_width=True)
+                elif isinstance(v, (dict, list)):
+                    out[k] = _neutralize_content(v)
+                else:
+                    out[k] = _neutralize_content(v)
                 continue
             if _is_sensitive_key(k):
                 out[k] = _REDACTED

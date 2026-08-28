@@ -116,15 +116,44 @@ def resolve(ref: str) -> str:
 
 def write_credential_file(path: str | Path, content: str) -> Path:
     """写入凭据文件并置为 0600 权限，通过临时文件重命名保证原子性。"""
+    import tempfile
+
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(p.suffix + ".tmp")  # 先写临时文件再原子替换，防并发截断
-    tmp.write_text(content, encoding="utf-8")
+    # use atomic temp with random suffix in same dir, mode 0o600, no world-readable window
+    # handle multi-suffix correctly via p.name prefix, not with_suffix
+    fd, tmp_path = tempfile.mkstemp(dir=str(p.parent), prefix=p.name + ".tmp.")
+    tmp = Path(tmp_path)
+    try:
+        try:
+            os.fchmod(fd, 0o600)
+        except Exception:
+            try:
+                os.chmod(tmp_path, 0o600)
+            except Exception:
+                pass
+        os.write(fd, content.encode("utf-8"))
+        os.fsync(fd)
+    finally:
+        try:
+            os.close(fd)
+        except Exception:
+            pass
+    # ensure tmp is 0600 before replace (in case fchmod not available)
     try:
         os.chmod(tmp, 0o600)
     except Exception:
         pass
-    tmp.replace(p)
+    try:
+        # atomic replace
+        tmp.replace(p)
+    except Exception:
+        # cleanup tmp on failure
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise
     try:
         os.chmod(p, 0o600)  # 确保最终文件仅所有者可读写
     except Exception:
