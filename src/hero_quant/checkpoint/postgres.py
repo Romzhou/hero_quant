@@ -7,6 +7,7 @@ Task7: PG default (not memory://), fallback to memory only when PG unreachable, 
 """
 
 from __future__ import annotations
+import hashlib
 import logging
 
 import copy
@@ -61,6 +62,18 @@ _PG_GLOBAL_STORE: Dict[str, Dict[str, Any]] = {}
 _PG_GLOBAL_META: Dict[str, Dict[str, Any]] = {}
 _PG_GLOBAL_TS: Dict[str, float] = {}
 
+# Persist run-string -> seq mapping for deterministic seq and collision disambiguation.
+# Key: f"{tenant}::{thread}::{run}" -> seq ; reverse: f"{tenant}::{thread}::{seq}" -> run
+# NOTE: in-memory only; survives saver restart within same process via emulated store path.
+# TODO(real-PG DDL): add column `run_text TEXT` to checkpoints table or a
+#   dedicated mapping table `checkpoint_seq_map(tenant, thread, seq, run_text)` so that
+#   seq->run reconstruction survives process restart and real PG list_thread_ids can
+#   return original thread_id without fabrication. Until DDL is applied, real-PG
+#   list_thread_ids will best-effort reconstruct via this in-memory map and fall back
+#   to str(seq) with TODO warning.
+_PG_SEQ_BY_RUN: Dict[str, int] = {}
+_PG_RUN_BY_SEQ: Dict[str, str] = {}
+
 
 def _is_postgres_dsn(dsn: str) -> bool:
     """判断是否为 Postgres DSN 前缀。"""
@@ -108,14 +121,42 @@ def _validate_thread_id(thread_id: str) -> tuple[str, str, str]:
 
 
 def _thread_to_keys(thread_id: str) -> tuple[str, str, int]:
-    """Map thread_id 'workflow:run:tenant' -> (tenant, thread, seq)."""
+    """Map thread_id 'workflow:run:tenant' -> (tenant, thread, seq).
+
+    Deterministic via hashlib.sha256 (not hash()) and linear-probing collision
+    disambiguation persisted in _PG_SEQ_BY_RUN / _PG_RUN_BY_SEQ.
+    """
     wf, run, tenant = _validate_thread_id(thread_id)
     try:
-        seq = int(run)
+        base_seq = int(run)
+        is_numeric = True
     except Exception:
-        # fallback hash to int for non-numeric run ids
-        seq = abs(hash(run)) % 2147483647
-    # thread = workflow (preserve workflow as thread identifier)
+        is_numeric = False
+        base_seq = int(hashlib.sha256(run.encode()).hexdigest()[:8], 16) % 2147483647
+    key_run = f"{tenant}::{wf}::{run}"
+    # fast path: already mapped
+    if key_run in _PG_SEQ_BY_RUN:
+        return tenant, wf, _PG_SEQ_BY_RUN[key_run]
+    seq = base_seq
+    # linear probing within same (tenant, thread) to disambiguate collisions
+    # also handles numeric vs hash collisions uniformly
+    for _ in range(10000):  # bound to avoid infinite loop; 10k distinct runs per thread is ample
+        key_seq = f"{tenant}::{wf}::{seq}"
+        existing_run = _PG_RUN_BY_SEQ.get(key_seq)
+        if existing_run is None or existing_run == run:
+            _PG_SEQ_BY_RUN[key_run] = seq
+            _PG_RUN_BY_SEQ[key_seq] = run
+            return tenant, wf, seq
+        # collision with different run -> probe
+        if is_numeric:
+            seq += 1
+            if seq >= 2147483647:
+                seq %= 2147483647
+        else:
+            seq = (seq + 1) % 2147483647
+    # fallback (unlikely to reach): store and return
+    _PG_SEQ_BY_RUN[key_run] = seq
+    _PG_RUN_BY_SEQ[f"{tenant}::{wf}::{seq}"] = run
     return tenant, wf, seq
 
 
@@ -454,6 +495,11 @@ class AsyncPostgresSaver:
         cfg = copy.deepcopy(config or {})
         # PG main path with fallback to memory only when PG unreachable
         if self._is_pg_mode():
+            # ensure deterministic seq mapping is persisted (collision disambiguation)
+            try:
+                _thread_to_keys(thread_id)
+            except Exception:
+                pass
             # emulated PG global store (ensures restart not lost even without real PG)
             key = f"{self.dsn}::{thread_id}"
             _PG_GLOBAL_STORE[key] = copy.deepcopy(checkpoint)
@@ -480,6 +526,10 @@ class AsyncPostgresSaver:
         now = time.time()
         cfg = copy.deepcopy(config or {})
         if self._is_pg_mode():
+            try:
+                _thread_to_keys(thread_id)
+            except Exception:
+                pass
             key = f"{self.dsn}::{thread_id}"
             _PG_GLOBAL_STORE[key] = copy.deepcopy(checkpoint)
             _PG_GLOBAL_META[key] = copy.deepcopy(cfg)
@@ -655,8 +705,27 @@ class AsyncPostgresSaver:
                                     cur.execute(sql)
                                     rows = cur.fetchall()
                     if rows:
-                        # reconstruct thread_id as thread:seq:tenant? best-effort
-                        return [f"{r[1]}:{r[2]}:{r[0]}" for r in rows if isinstance(r, (list, tuple)) and len(r) >= 3]
+                        # reconstruct thread_id: try reverse map to recover original run string
+                        # TODO(real-PG DDL): persist run_text column; until then use in-memory reverse map.
+                        out = []
+                        for r in rows:
+                            if not isinstance(r, (list, tuple)) or len(r) < 3:
+                                continue
+                            tenant_r, thread_r, seq_r = r[0], r[1], r[2]
+                            key_seq = f"{tenant_r}::{thread_r}::{seq_r}"
+                            run_str = _PG_RUN_BY_SEQ.get(key_seq)
+                            if run_str is not None:
+                                out.append(f"{thread_r}:{run_str}:{tenant_r}")
+                            else:
+                                # no mapping: do not fabricate wrong id; fall back to seq string with warning
+                                # This avoids returning "wf:123:tenant" when original was "wf:myrun:tenant"
+                                logger.warning(
+                                    "checkpoint list_thread_ids: no run mapping for seq %s (tenant=%s thread=%s); "
+                                    "returning seq as run (may be incorrect). TODO: add run_text column.",
+                                    seq_r, tenant_r, thread_r,
+                                )
+                                out.append(f"{thread_r}:{seq_r}:{tenant_r}")
+                        return out
                 except Exception as _exc:
                     logger.warning("silent handled: offline-safe: checkpoint pg fallback to memory", exc_info=_exc)
                     pass

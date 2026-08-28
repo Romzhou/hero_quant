@@ -87,3 +87,101 @@ def test_pg_saver_memory_fallback():
 
     s = get_saver("memory://test")
     assert s is not None
+
+
+def test_thread_to_keys_deterministic():
+    """Deterministic seq via hashlib, not hash() salted."""
+    from hero_quant.checkpoint.postgres import _thread_to_keys
+    import hashlib
+
+    tid = "wf:myrun-2026:tenant1"
+    tenant, thread, seq = _thread_to_keys(tid)
+    expected = int(hashlib.sha256("myrun-2026".encode()).hexdigest()[:8], 16) % 2147483647
+    assert seq == expected, f"seq {seq} != expected hashlib {expected} — hash() is salted"
+    # same input twice -> same output
+    assert _thread_to_keys(tid) == _thread_to_keys(tid)
+    # numeric run still works
+    tenant2, thread2, seq2 = _thread_to_keys("wf:123:tenant1")
+    assert seq2 == 123
+
+
+def test_thread_roundtrip():
+    """put checkpoint with non-numeric run, list_thread_ids returns original id."""
+    from hero_quant.checkpoint.postgres import get_saver, _PG_GLOBAL_STORE, _PG_GLOBAL_TS
+    dsn = "postgresql://postgres:postgres@localhost:5432/hero_quant_test_roundtrip"
+    # cleanup any prior
+    for k in list(_PG_GLOBAL_STORE.keys()):
+        if k.startswith(dsn):
+            _PG_GLOBAL_STORE.pop(k, None)
+            _PG_GLOBAL_TS.pop(k, None)
+            from hero_quant.checkpoint.postgres import _PG_GLOBAL_META
+            _PG_GLOBAL_META.pop(k, None)
+    saver = get_saver(dsn=dsn, ttl_seconds=7 * 24 * 3600)
+    tid = "wf:myrun-2026:tenant1"
+    payload = {"step": 99}
+    saver.put(tid, payload, {})
+    # simulate restart: new saver instance same DSN should see same id
+    saver2 = get_saver(dsn=dsn, ttl_seconds=7 * 24 * 3600)
+    ids = saver2.list_thread_ids()
+    assert tid in ids, f"list_thread_ids lost original run, got {ids}"
+    assert saver2.get(tid)["step"] == 99
+    # cleanup
+    saver2.delete(tid)
+
+
+def test_thread_collision_disambiguation(monkeypatch):
+    """Two distinct runs that map to same base seq don't overwrite each other (linear probing)."""
+    import hashlib
+    import hero_quant.checkpoint.postgres as pg
+
+    # clear any prior collision state
+    if hasattr(pg, "_PG_SEQ_BY_RUN"):
+        pg._PG_SEQ_BY_RUN.clear()
+    if hasattr(pg, "_PG_RUN_BY_SEQ"):
+        pg._PG_RUN_BY_SEQ.clear()
+    # force hashlib collision: same digest -> same base seq
+    orig_sha256 = hashlib.sha256
+
+    class _FakeHash:
+        def __init__(self, data):
+            self.data = data
+
+        def hexdigest(self):
+            return "aaaaaaaa" + "0" * 56
+
+    monkeypatch.setattr(hashlib, "sha256", lambda x, _orig=orig_sha256: _FakeHash(x))
+    # also need to patch pg.hashlib reference if imported inside module
+    monkeypatch.setattr(pg.hashlib, "sha256", lambda x: _FakeHash(x))
+
+    tid_a = "wf:runA:tenantX"
+    tid_b = "wf:runB:tenantX"
+    # ensure clean state for these tenants
+    tenant_a, thread_a, seq_a = pg._thread_to_keys(tid_a)
+    tenant_b, thread_b, seq_b = pg._thread_to_keys(tid_b)
+    assert seq_a != seq_b, f"collision not disambiguated: both {seq_a}"
+    assert seq_b == (seq_a + 1) % 2147483647, f"expected linear probing, got {seq_a} vs {seq_b}"
+
+    # also verify that puts don't overwrite each other via emulated PG store
+    dsn = "postgresql://postgres:postgres@localhost:5432/hero_quant_test_collision"
+    # cleanup
+    prefix = f"{dsn}::"
+    for k in list(pg._PG_GLOBAL_STORE.keys()):
+        if k.startswith(prefix):
+            pg._PG_GLOBAL_STORE.pop(k, None)
+            pg._PG_GLOBAL_TS.pop(k, None)
+            pg._PG_GLOBAL_META.pop(k, None)
+    # clear maps again for this tenant
+    pg._PG_SEQ_BY_RUN.clear()
+    pg._PG_RUN_BY_SEQ.clear()
+    from hero_quant.checkpoint.postgres import get_saver
+
+    saver = get_saver(dsn=dsn, ttl_seconds=3600)
+    saver.put(tid_a, {"v": 1}, {})
+    saver.put(tid_b, {"v": 2}, {})
+    assert saver.get(tid_a)["v"] == 1
+    assert saver.get(tid_b)["v"] == 2
+    ids = saver.list_thread_ids()
+    assert tid_a in ids and tid_b in ids, f"both ids must survive collision, got {ids}"
+    # cleanup
+    saver.delete(tid_a)
+    saver.delete(tid_b)
