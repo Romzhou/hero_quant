@@ -1,8 +1,10 @@
 /** @type {import('tailwindcss').Config} */
+// ESM 配置：依赖 frontend/package.json "type": "module" 与 tailwindcss@3.4 ESM 支持；如需兼容 CJS 工具链可另提供 module.exports 回落（当前无需）
 export default {
+  // content 指向 frontend 根的相对路径，Vite 构建以 frontend 为根时生效；动态类通过下方 safelist 兜底，避免 purge
   content: ["./index.html", "./src/**/*.{js,ts,jsx,tsx}"],
   safelist: [
-    // ensure dynamically composed status classes are not purged
+    // ensure dynamically composed status classes are not purged (e.g. Chat/Live/Monitor 中的 bg-amber-400/15 等由三元静态字面量组成，safelist 仅为保险)
     "bg-emerald-400/10","bg-amber-400/10","bg-red-400/10","border-emerald-400/20","border-amber-400/20","border-red-400/20","text-emerald-200","text-amber-200","text-red-200"
   ],
   theme: {

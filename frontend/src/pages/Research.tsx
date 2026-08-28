@@ -31,6 +31,11 @@ const API_TEARSHEET = "/v1/backtest/tearsheet.html"
 const MAX_CSV_CHARS = 4000
 const MAX_HTML_CHARS = 8000
 
+// ECharts 容器需显式像素高度以正确测量 canvas；提取为常量避免内联对象字面量每次渲染新建身份导致额外重渲染，Tailwind h-[300px] 在 ECharts 包装层不稳定故选用 style 常量并文档化
+const CHART_STYLE_CUMULATIVE = { height: 300 } as const
+const CHART_STYLE_HEATMAP = { height: 300 } as const
+const CHART_STYLE_DRAWDOWN = { height: 220 } as const
+
 export type ResearchProps = {
   heatmapDataset?: [number, number, number][]
   heatmapWeeks?: string[]
@@ -176,45 +181,48 @@ export default function Research(props: ResearchProps) {
     const controller = new AbortController()
     const { signal } = controller
     let aborted = false
+    // 共享 fetcher：统一 cache 策略、signal 与 aborted 守卫，消除重复 boilerplate
+    const fetchNoStore = (url: string) => fetch(url, { cache: "no-store", signal } as RequestInit)
+    const isAlive = () => !aborted && !signal.aborted
 
     async function fetchArtifact(path: string, setter: (v: string) => void, onReal: () => void, maxChars: number) {
       setCsvLoading(true)
       try {
-        const r = await fetch(path, { cache: "no-store", signal } as RequestInit)
+        const r = await fetchNoStore(path)
         if (!r.ok) throw new Error(String(r.status))
         const txt = await r.text()
-        if (!aborted && !signal.aborted && txt) { setter(truncateOnLineBoundary(txt, maxChars)); onReal() }
+        if (isAlive() && txt) { setter(truncateOnLineBoundary(txt, maxChars)); onReal() }
       } catch {
         // keep mock, honest fallback handled via parsed === null
       } finally {
-        if (!aborted && !signal.aborted) setCsvLoading(false)
+        if (isAlive()) setCsvLoading(false)
       }
     }
     async function fetchMetrics() {
       if (hasMetricsProp) { setMetricsLoading(false); return }
       setMetricsLoading(true)
       try {
-        const r = await fetch(API_METRICS, { cache: "no-store", signal } as RequestInit)
+        const r = await fetchNoStore(API_METRICS)
         if (r.ok) {
           const j = await r.json()
-          if (!aborted && !signal.aborted) setMetrics(j)
+          if (isAlive()) setMetrics(j)
         }
-      } catch {} finally { if (!aborted && !signal.aborted) setMetricsLoading(false) }
+      } catch {} finally { if (isAlive()) setMetricsLoading(false) }
     }
     if (!hasCsvProp) fetchArtifact(API_POSITIONS, setCsvPreview, () => setCsvIsMock(false), MAX_CSV_CHARS)
     else setCsvLoading(false)
     fetchMetrics()
     // tearsheet 仅用于徽标判定，iframe 使用直接 src 不注入 srcDoc（防 XSS，无需 DOMPurify）
-    fetch(API_TEARSHEET, { cache: "no-store", signal } as RequestInit)
+    fetchNoStore(API_TEARSHEET)
       .then(r => r.ok ? r.text() : Promise.reject())
       .then(html => {
-        if (!aborted && !signal.aborted) {
+        if (isAlive()) {
           const sliced = truncateOnLineBoundary(html, MAX_HTML_CHARS)
           const isSynthetic = /synthetic|placeholder|占位|演示合成/i.test(sliced) || sliced.length < 300
           setTearsheetLoaded(true); setTearsheetIsSynthetic(isSynthetic)
         }
       })
-      .catch(() => { if (!aborted && !signal.aborted) setTearsheetLoaded(false) })
+      .catch(() => { if (isAlive()) setTearsheetLoaded(false) })
     return () => { aborted = true; controller.abort() }
   }, [hasMetricsProp, hasCsvProp])
 
@@ -273,7 +281,7 @@ export default function Research(props: ResearchProps) {
           data: dd
         }
       ],
-      legend: { bottom: 0, textStyle: { color: "#CBD5E1", fontSize: 11 }, data: ["累积收益","沪深300"] }
+      legend: { bottom: 0, textStyle: { color: "#CBD5E1", fontSize: 11 }, data: ["累积收益","沪深300","回撤"] }
     }
   }, [parsed, hasParsed])
 
@@ -323,9 +331,17 @@ export default function Research(props: ResearchProps) {
     }
     return {
       backgroundColor: "transparent",
-      tooltip: { position: "top" as const, formatter: (p: { data: [number, number, number] }) => {
-        const v = p.data[2]
-        return `${weeks[p.data[0]]} ${days[p.data[1]]}<br/>日收益: ${v > 0 ? "+" : ""}${v.toFixed(2)}%`
+      tooltip: { position: "top" as const, formatter: (p: unknown) => {
+        const param: unknown = Array.isArray(p) ? (p as unknown[])[0] : p
+        const raw = (param as { data?: unknown })?.data ?? (Array.isArray(p) ? (p as unknown[])[0]?.data : undefined)
+        const d = raw as unknown[]
+        if (!Array.isArray(d) || d.length < 3 || typeof d[2] !== "number" || typeof d[0] !== "number" || typeof d[1] !== "number") return ""
+        const v = d[2] as number
+        const wi = d[0] as number
+        const di = d[1] as number
+        const w = weeks[wi] ?? String(wi)
+        const day = days[di] ?? String(di)
+        return `${w} ${day}<br/>日收益: ${v > 0 ? "+" : ""}${v.toFixed(2)}%`
       }, backgroundColor: "#121722", borderColor: "rgba(255,255,255,0.1)", textStyle: { color: "#E6EAF2", fontSize: 11 } },
       grid: { left: 56, right: 12, top: 8, bottom: 36 },
       xAxis: { type: "category" as const, data: weeks, splitArea: { show: true, areaStyle: { color: ["rgba(255,255,255,0.02)","transparent"] } }, axisLabel: { color: "#64748B", fontSize: 10 }, axisTick: { show: false }, axisLine: { show: false } },
@@ -344,9 +360,10 @@ export default function Research(props: ResearchProps) {
     backgroundColor: "transparent",
     grid: { left: 48, right: 16, top: 12, bottom: 24 },
     tooltip: { trigger: "axis" as const, backgroundColor: "#121722", borderColor: "rgba(255,255,255,0.1)", textStyle: { color: "#E6EAF2" }, formatter: (params: unknown) => {
-      const p = params as { value: number; name: string }[]
-      if (!Array.isArray(p) || !p[0]) return ""
-      return `${p[0].name}<br/>回撤 ${p[0].value}%`
+      // ECharts axis 触发时 params 为数组，单项触发时为对象；均做空与类型守卫
+      const arr = Array.isArray(params) ? (params as { value: number; name: string }[]) : (params as { value: number; name: string } | null) ? [(params as { value: number; name: string })] : []
+      if (!arr.length || arr[0] == null || typeof arr[0].value !== "number") return ""
+      return `${String(arr[0].name ?? "")}<br/>回撤 ${Number(arr[0].value).toFixed(2)}%`
     } },
     xAxis: {
       type: "category" as const,
@@ -416,7 +433,7 @@ export default function Research(props: ResearchProps) {
           ) : csvLoading ? (
             <div className="mt-4 h-[300px] animate-pulse rounded-xl bg-white/5" />
           ) : (
-            <ReactECharts option={cumulativeOption} style={{ height: 300 }} opts={{ renderer: "canvas" }} />
+            <ReactECharts option={cumulativeOption} style={CHART_STYLE_CUMULATIVE} opts={{ renderer: "canvas" }} notMerge={true} lazyUpdate={true} />
           )}
           <div className="mt-2 flex flex-wrap gap-2 text-xs">
             <span className="rounded-lg bg-amber-500/15 px-2 py-1 text-amber-300">600519 等权</span>
@@ -432,7 +449,7 @@ export default function Research(props: ResearchProps) {
           </div>
           {hasHeatmap ? (
             <>
-              <ReactECharts option={heatmapOption} style={{ height: 300 }} opts={{ renderer: "canvas" }} />
+              <ReactECharts option={heatmapOption} style={CHART_STYLE_HEATMAP} opts={{ renderer: "canvas" }} notMerge={true} lazyUpdate={true} />
               <p className="mt-1 text-center text-[11px] text-slate-500">深色为负收益，琥珀为正；周末无交易置灰</p>
             </>
           ) : (
@@ -448,7 +465,7 @@ export default function Research(props: ResearchProps) {
             <h2 className="text-sm font-semibold text-mist">回撤 TopN</h2>
             <span className="text-xs text-slate-500">depth · duration</span>
           </div>
-          <ReactECharts option={drawdownOption} style={{ height: 220 }} opts={{ renderer: "canvas" }} />
+          <ReactECharts option={drawdownOption} style={CHART_STYLE_DRAWDOWN} opts={{ renderer: "canvas" }} notMerge={true} lazyUpdate={true} />
           <div className="mt-2 divide-y divide-white/5 rounded-xl border border-white/5 bg-ink-900/50">
             {drawdowns.map((d,i) => (
               <div key={i} className="flex items-center justify-between px-3 py-2 text-xs">

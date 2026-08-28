@@ -68,7 +68,8 @@ export default function Dashboard() {
   }
 
   const totalEquityDisplay = loading ? "…" : (isFiniteNumber(metrics.total_equity) ? `¥ ${metrics.total_equity.toLocaleString("zh-CN")}` : "—")
-  const cards = [
+  type Card = { k: string; v: string; sub: string; accent: boolean; isEquity?: boolean }
+  const cards: Card[] = [
     { k: "总资产", v: totalEquityDisplay, sub: "含现金", accent: false, isEquity: true },
     { k: "年化", v: loading ? "…" : fmtPct(metrics.annual_return, FALLBACK.annual_return!), sub: `sharpe ${fmtFixed(metrics.sharpe, FALLBACK.sharpe!)}`, accent: true },
     { k: "最大回撤", v: loading ? "…" : fmtPct(metrics.max_drawdown, FALLBACK.max_drawdown!), sub: "近30日", accent: false },
@@ -143,7 +144,7 @@ export default function Dashboard() {
             <div key={c.k} style={{ animationDelay: `${i * 80}ms` }} className="group rounded-2xl border border-white/10 bg-white/[0.04] p-4 backdrop-blur transition hover:bg-white/[0.06] hover:border-white/15 hover:shadow-lg hover:-translate-y-0.5 animate-[fadeIn_0.5s_ease_both]">
               <div className="text-[11px] tracking-[0.14em] text-slate-400">{c.k}</div>
               <div className="mt-1 font-display text-xl font-semibold text-mist group-hover:text-white transition">
-                {(c as unknown as {isEquity?:boolean}).isEquity && metrics.total_equity == null ? (
+                {c.isEquity && !isFiniteNumber(metrics.total_equity) ? (
                   <span className="inline-block h-5 w-24 animate-pulse rounded bg-white/10" aria-label="skeleton" />
                 ) : (
                   c.v

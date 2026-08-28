@@ -6,6 +6,7 @@
 
 :root {
   --bg: #0B0E14;
+  /* --panel 保留为设计 token，对应 Tailwind ink-800 (#121722)，用于面板/卡片底色统一；当前通过 Tailwind 类消费，保留变量便于未来 var(--panel) 主题切换 */
   --panel: #121722;
   color-scheme: dark;
 }
