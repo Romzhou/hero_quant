@@ -82,10 +82,9 @@ def test_golden_tearsheet_oracle():
     assert len(res["positions"]) == len(prices)
     assert metrics["sharpe"] is not None
     # Oracle: compute sharpe via same function and compare within 0.01 (self-consistent golden)
-    # NOTE: Golden updated 2026-08-28 — Task 13 bug fix: metrics.compute_metrics now wires `costs`
-    # into net returns (net = gross - costs). Previously costs param was ignored, causing
-    # golden to compare cost-agnostic sharpe. After fix, expected must include same costs.
-    expected = compute_metrics(equity, costs=0.0005)["sharpe"]
+    # NOTE: Golden updated 2026-08-28 — engine.run 已在主循环扣除 turnover_rate*costs（equity 为净值），
+    # compute_metrics 调用点传 costs=0 避免二次扣除；期望值同样按净值口径（costs=0）计算。
+    expected = compute_metrics(equity, costs=0.0)["sharpe"]
     assert abs(metrics["sharpe"] - expected) < 0.01, f"sharpe oracle mismatch {metrics['sharpe']} vs {expected}"
     # Also assert tearsheet contains expected sections
     html = res["tearsheet"]

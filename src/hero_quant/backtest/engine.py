@@ -703,6 +703,9 @@ class BacktestEngine:
             # 尝试使用 aligned_price 定价：若可得 aligned_ret 则覆盖 close 基 net_ret
             aligned_ret_raw: float | None = None
             # Multi-asset aligned: per-asset weighted return
+            # 杠杆语义：此处用原始 wi 加权（sum(w)>1 即按杠杆放大收益），与 positions 的
+            # wi/total_weight 归一化口径不同——positions 展示归一化配置占比，收益路径保留杠杆意图；
+            # equal_weight（sum=1）时两者一致。
             if isinstance(_aligned_price, pd.Series):
                 try:
                     if prev_aligned_price is not None and isinstance(prev_aligned_price, pd.Series):
@@ -897,8 +900,8 @@ class BacktestEngine:
             logger.warning("fills construction failed: %s", e, exc_info=True)
             fills = pd.DataFrame(index=prices.index)
 
-        # 指标计算
-        metrics = compute_metrics(equity, costs=costs_f, positions=positions, weights=w)
+        # 指标计算 — equity 已在主循环扣除 turnover_rate*costs（净值），此处传 costs=0 避免二次扣除
+        metrics = compute_metrics(equity, costs=0.0, positions=positions, weights=w)
 
         # 生成 tearsheet
         tearsheet_html = self._build_tearsheet(equity, metrics)

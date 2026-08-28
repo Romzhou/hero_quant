@@ -26,19 +26,20 @@ def test_trace_tool_result_redacts_but_content_passthrough(tmp_path):
     assert "sidecar" not in rec and "result_path" not in rec
 
 
-def test_trace_result_sink_allows_content_with_secret_pattern(tmp_path):
+def test_trace_result_sink_redacts_content_secret_pattern(tmp_path):
     from hero_quant.agent.trace import TraceWriter
 
     w = TraceWriter(tmp_path / "trace.jsonl")
-    # content contains secret pattern but should NOT be redacted under RESULT_SINK
+    # content 含密钥形态时必须脱敏（oracle 复审：content 透传是泄露通道）
     secret_in_content = "Bearer eyJ1234567890.abcdef.1234567890"
     payload = {"type": "tool_result", "content": secret_in_content, "api_key": "sk-1234567890abcdef"}
     w.append(payload)
     w.close()
     rec = json.loads((tmp_path / "trace.jsonl").read_text().strip().splitlines()[0])
-    assert rec.get("content") == secret_in_content, "RESULT_SINK must allow content passthrough"
+    assert rec.get("content") in ("***", "***REDACTED***"), "RESULT_SINK content 内密钥必须脱敏"
+    assert secret_in_content not in json.dumps(rec), "content 原文不得落盘"
     assert rec.get("api_key") in ("***", "***REDACTED***")
-    assert "sk-123" not in json.dumps({k: v for k, v in rec.items() if k != "content"})
+    assert "sk-123" not in json.dumps(rec)
 
 
 def test_trace_arguments_sink_redacts_content_secret(tmp_path):
@@ -97,16 +98,17 @@ def test_ledger_auto_redaction(tmp_path):
     assert ledger.verify() is True
 
 
-def test_ledger_result_sink_content_passthrough(tmp_path):
+def test_ledger_result_sink_content_redacted(tmp_path):
     from hero_quant.governance.ledger import Ledger
 
     ledger = Ledger(tmp_path / "ledger.jsonl")
-    # tool_result type should allow content passthrough even if content looks like secret
+    # tool_result 的 content 含密钥形态时必须脱敏（oracle 复审：透传是泄露通道）
     secret_content = "sk-1234567890abcdef"
     rec = {"type": "tool_result", "content": secret_content, "api_key": "sk-1234567890abcdef"}
     obj = ledger.append(rec)
-    # content must remain, api_key redacted
-    assert obj["record"].get("content") == secret_content
+    # content 与 api_key 均脱敏，原文不落盘
+    assert obj["record"].get("content") in ("***", "***REDACTED***")
+    assert secret_content not in json.dumps(obj["record"])
     assert obj["record"].get("api_key") in ("***", "***REDACTED***")
 
 

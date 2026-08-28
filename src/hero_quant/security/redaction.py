@@ -96,7 +96,8 @@ def _scan_string(value: str, *, preserve_zero_width: bool = False) -> str:
 def _neutralize_content(value: Any) -> Any:
     """Neutralize result content while preserving zero-width chars but still redacting secrets.
 
-    仅用于非 content 字段的历史兼容路径；RESULT_SINK 的 content 放行由 _passthrough_content 处理。
+    用于 RESULT_SINK 的 content 字段及非 content 字段的历史兼容路径：
+    敏感键一律替换为 ***，字符串值按 Bearer/JWT/AKIA 等模式脱敏，同时保留零宽字符扫描。
     """
     if isinstance(value, str):
         # redact Bearer/JWT/AKIA patterns inside content as well
@@ -129,46 +130,14 @@ def _neutralize_content(value: Any) -> Any:
     return value
 
 
-def _passthrough_content(value: Any) -> Any:
-    """RESULT_SINK content 放行：仅做 scanner 中和（保留零宽），不做任何脱敏。"""
-    if isinstance(value, str):
-        return _scan_string(value, preserve_zero_width=True)
-    if isinstance(value, dict):
-        out: dict[str, Any] = {}
-        for k, v in value.items():
-            if isinstance(v, str):
-                out[k] = _scan_string(v, preserve_zero_width=True)
-            elif isinstance(v, (dict, list)):
-                out[k] = _passthrough_content(v)
-            else:
-                out[k] = v
-        return out
-    if isinstance(value, list):
-        res: list[Any] = []
-        for item in value:
-            if isinstance(item, str):
-                res.append(_scan_string(item, preserve_zero_width=True))
-            elif isinstance(item, (dict, list)):
-                res.append(_passthrough_content(item))
-            else:
-                res.append(item)
-        return res
-    return value
-
-
 def redact_payload(payload: Any, sink: str = ARGUMENTS_SINK) -> Any:
     """按 sink 瀑布对载荷脱敏：敏感键一律替换，字符串值按模式匹配；递归处理嵌套结构。"""
     if isinstance(payload, dict):
         out: dict[str, Any] = {}
         for k, v in payload.items():
-            # RESULT_SINK: content 字段完全放行（仅 scanner 中和、保留零宽），不做正则脱敏
+            # RESULT_SINK: content 字段仍需键级脱敏 + 模式脱敏（保留零宽扫描语义），防止嵌套密钥经 content 外泄
             if sink == RESULT_SINK and k == "content":
-                if isinstance(v, str):
-                    out[k] = _scan_string(v, preserve_zero_width=True)
-                elif isinstance(v, (dict, list)):
-                    out[k] = _passthrough_content(v)
-                else:
-                    out[k] = v
+                out[k] = _neutralize_content(v)
                 continue
             if _is_sensitive_key(k):
                 out[k] = _REDACTED
