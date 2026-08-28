@@ -8,33 +8,46 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
+import threading
+import time
 from pathlib import Path
 from typing import Dict, List
+
+logger = logging.getLogger(__name__)
 
 
 def _parse_skill_file(path: Path) -> tuple[str, str]:
     """解析 SKILL.md，提取 frontmatter 中的 name 与正文。"""
     try:
         text = path.read_text(encoding="utf-8")
-    except Exception:
+    except (OSError, UnicodeDecodeError) as e:
+        logger.warning("skill read failed %s: %s", path, e)
         return path.stem, ""
-    # 前置 frontmatter 解析
+    # 前置 frontmatter 解析 — 严格按行分隔的 --- 围栏，避免误切正文中的水平线
     if text.lstrip().startswith("---"):
-        # 按 --- 切分，取首段为元信息，其余为正文
-        parts = text.split("---")
-        # 示例："---\nname: demo\n---\nbody" -> ["", "\nname: demo\n", "\nbody"]
-        if len(parts) >= 3:
-            fm = parts[1]
-            body = "---".join(parts[2:]).strip()
-            m = re.search(r"name\s*:\s*([A-Za-z0-9_\-]+)", fm)
-            name = m.group(1).strip() if m else path.stem
-            # 正文为空时回退到 frontmatter 内容
+        m = re.match(r"\s*---\s*\n(.*?)\n---\s*\n?(.*)", text, re.DOTALL)
+        if m:
+            fm, body = m.group(1), m.group(2).strip()
+            # 允许更宽松的 name：大小写、点、斜杠等非空行，取首个键值对
+            n = re.search(r"^\s*name\s*:\s*(.+?)\s*$", fm, re.MULTILINE)
+            if n:
+                raw_name = n.group(1).strip().strip("\"'")[:64]
+                # 仅保留安全字符，非法则回退 stem
+                if re.fullmatch(r"[A-Za-z0-9_\-\.]+", raw_name):
+                    name = raw_name
+                else:
+                    # 对含非法字符的 name 截断到合法前缀或回退
+                    logger.warning("skill frontmatter name contains illegal chars %r in %s", raw_name, path)
+                    name = path.stem
+            else:
+                name = path.stem
             if not body:
                 body = fm.strip()
             return name, body
     # 无 frontmatter —— 以文件名为兜底，并尝试从正文中提取 name
-    m = re.search(r"name\s*:\s*([A-Za-z0-9_\-]+)", text)
+    m = re.search(r"name\s*:\s*([A-Za-z0-9_\-\.]+)", text)
     if m:
         return m.group(1).strip(), text.strip()
     return path.stem, text.strip()
@@ -47,75 +60,129 @@ class SkillsLoader:
         self.roots: List[Path] = [Path(r) for r in (roots or [])]
         self._skills: Dict[str, Dict] = {}
         self._mtimes: Dict[str, float] = {}
+        self._lock = threading.RLock()
+        self._last_scan_ts: float = 0.0
         self._scan()
 
     def _scan(self) -> None:
-        """按多根分级扫描，后置根覆盖前置。"""
-        new_skills: Dict[str, Dict] = {}
-        new_mtimes: Dict[str, float] = {}
-        # 分级：按 roots 顺序遍历，后者覆盖前者
-        for root in self.roots:
-            if not root.exists():
-                continue
-            # 兼容目录与单文件两种根：目录则递归找 SKILL.md，无结果时放宽到 *.md
-            candidates: List[Path] = []
-            if root.is_file():
-                candidates = [root]
-            else:
-                # 递归扫描 SKILL.md
-                candidates = list(root.rglob("SKILL.md"))
-                # 若无 SKILL.md，则放宽到任意 *.md
-                if not candidates:
-                    candidates = [p for p in root.rglob("*.md") if p.is_file()]
-            for p in candidates:
-                try:
-                    name, body = _parse_skill_file(p)
-                except Exception:
+        """按多根分级扫描，后置根覆盖前置。线程安全 via copy-on-write + RLock。"""
+        with self._lock:
+            new_skills: Dict[str, Dict] = {}
+            new_mtimes: Dict[str, float] = {}
+            for root in self.roots:
+                if not root.exists():
                     continue
-                # 摘要预览：取首行前 80 字符，避免上下文过长
-                preview = body.splitlines()[0][:80] if body else ""
-                mtime = 0.0
-                try:
-                    mtime = p.stat().st_mtime
-                except Exception:
-                    pass
-                # 后置根覆盖已记录的同名技能
-                new_skills[name] = {"path": p, "body": body, "preview": preview, "mtime": mtime}
-                new_mtimes[str(p)] = mtime
-        self._skills = new_skills
-        self._mtimes = new_mtimes
+                candidates: List[Path] = []
+                if root.is_file():
+                    candidates = [root]
+                else:
+                    candidates = list(root.rglob("SKILL.md"))
+                    if not candidates:
+                        candidates = [p for p in root.rglob("*.md") if p.is_file()]
+                for p in candidates:
+                    try:
+                        name, body = _parse_skill_file(p)
+                    except (OSError, UnicodeDecodeError) as e:
+                        logger.warning("skill parse failed %s: %s", p, e)
+                        continue
+                    preview = body.splitlines()[0][:80] if body else ""
+                    # 使用 nanosecond 精度以避免跨文件系统秒级截断导致的漏失效
+                    try:
+                        mtime = float(p.stat().st_mtime_ns)
+                    except AttributeError:
+                        try:
+                            mtime = float(p.stat().st_mtime)
+                        except OSError:
+                            mtime = 0.0
+                    except OSError:
+                        mtime = 0.0
+                    new_skills[name] = {"path": p, "body": body, "preview": preview, "mtime": mtime}
+                    new_mtimes[str(p)] = mtime
+            self._skills = new_skills
+            self._mtimes = new_mtimes
+            self._last_scan_ts = time.monotonic()
 
     def _ensure_fresh(self) -> None:
-        """热失效检查：若文件 mtime 变化或新增，触发重扫。"""
+        """热失效检查：若文件 mtime 变化或新增，触发重扫。带节流与全候选覆盖。"""
+        # 节流：避免每次 get_descriptions / get_content 都递归 rglob（性能）
+        if time.monotonic() - self._last_scan_ts < 0.5:
+            # 仍需检查已索引文件的 mtime（轻量），但跳过全量 rglob
+            try:
+                with self._lock:
+                    snapshot = list(self._skills.items())
+                for name, info in snapshot:
+                    p: Path = info["path"]
+                    try:
+                        cur = float(p.stat().st_mtime_ns)  # type: ignore[attr-defined]
+                    except AttributeError:
+                        try:
+                            cur = float(p.stat().st_mtime)
+                        except OSError:
+                            self._scan()
+                            return
+                    except OSError:
+                        self._scan()
+                        return
+                    if cur != info.get("mtime", 0):
+                        self._scan()
+                        return
+            except Exception as e:
+                logger.debug("skill _ensure_fresh throttled check failed: %s", e)
+            return
         try:
-            for name, info in list(self._skills.items()):
+            with self._lock:
+                snapshot = list(self._skills.items())
+                mtimes_copy = dict(self._mtimes)
+            for name, info in snapshot:
                 p: Path = info["path"]
                 try:
-                    cur = p.stat().st_mtime
-                except Exception:
-                    # 文件已删除，视为失效
+                    cur = float(p.stat().st_mtime_ns)  # type: ignore[attr-defined]
+                except AttributeError:
+                    cur = float(p.stat().st_mtime)
+                except OSError:
                     self._scan()
                     return
                 if cur != info.get("mtime", 0):
                     self._scan()
                     return
-            # 检查是否有新增文件未被索引
+            # 检查新增/变更：覆盖单文件根与 *.md 回退路径
             for root in self.roots:
-                if root.is_dir():
-                    for p in root.rglob("SKILL.md"):
+                if root.is_file():
+                    key = str(root)
+                    if key not in mtimes_copy:
+                        self._scan()
+                        return
+                    try:
+                        cur = float(root.stat().st_mtime_ns)  # type: ignore[attr-defined]
+                    except AttributeError:
+                        cur = float(root.stat().st_mtime)
+                    except OSError:
+                        self._scan()
+                        return
+                    if cur != mtimes_copy.get(key, 0):
+                        self._scan()
+                        return
+                elif root.is_dir():
+                    # 同时探测 SKILL.md 与回退 *.md（若存在）
+                    candidates = list(root.rglob("SKILL.md"))
+                    if not candidates:
+                        candidates = [p for p in root.rglob("*.md") if p.is_file()]
+                    for p in candidates:
                         key = str(p)
-                        if key not in self._mtimes:
+                        if key not in mtimes_copy:
                             self._scan()
                             return
                         try:
-                            cur = p.stat().st_mtime
-                        except Exception:
+                            cur = float(p.stat().st_mtime_ns)  # type: ignore[attr-defined]
+                        except AttributeError:
+                            cur = float(p.stat().st_mtime)
+                        except OSError:
                             continue
-                        if cur != self._mtimes.get(key, 0):
+                        if cur != mtimes_copy.get(key, 0):
                             self._scan()
                             return
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("skill _ensure_fresh failed: %s", e)
 
     def get_descriptions(self) -> str:
         """首阶段：返回 <500 字符的技能名称+预览短摘要。"""

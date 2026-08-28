@@ -129,3 +129,57 @@ def test_scheduled_service_dispatch_timezone_aware():
     if hasattr(svc, "to_temporal_cron"):
         tc = svc.to_temporal_cron("premarket-brief")
         assert isinstance(tc, str) and len(tc.split()) == 5
+
+
+# --- P2 medium fixes ---
+
+def test_cron_step_empty_base_raises():
+    from hero_quant.scheduled.service import parse_cron, validate_cron
+    import pytest
+    # "/5" is not valid cron (should be "*/5")
+    with pytest.raises(ValueError, match="invalid step base empty"):
+        parse_cron("/5 * * * *")
+    with pytest.raises(ValueError):
+        validate_cron("/5 * * * *")
+    # "2/3" single-value step must raise
+    with pytest.raises(ValueError, match="step base must be"):
+        parse_cron("2/3 * * * *")
+
+
+def test_cron_dom_dow_or_semantics():
+    from hero_quant.scheduled.service import get_next_trigger
+    # cron 0 0 1 * 1 = 1st of month OR Monday. 2026-08-01 is Saturday, so should fire on Sat 1st (dom match) even though dow is Sat not Mon
+    after = datetime(2026, 7, 31, 23, 0, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+    nxt = get_next_trigger("0 0 1 * 1", "Asia/Shanghai", after=after)
+    # should be 2026-08-01 00:00 (dom match) not next Monday 2026-08-03
+    assert nxt.day == 1 and nxt.month == 8, f"dom OR dow failed, got {nxt}"
+    # after 2026-08-01 01:00, next should be Monday 2026-08-03
+    after2 = datetime(2026, 8, 1, 1, 0, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+    nxt2 = get_next_trigger("0 0 1 * 1", "Asia/Shanghai", after=after2)
+    assert nxt2.day == 3 and nxt2.weekday() == 0, f"expected Monday 2026-08-03, got {nxt2}"
+
+
+def test_after_naive_raises():
+    from hero_quant.scheduled.service import get_next_trigger
+    import pytest
+    naive = datetime(2026, 8, 20, 8, 0, 0)  # no tzinfo
+    with pytest.raises(ValueError, match="timezone-aware"):
+        get_next_trigger("30 8 * * *", "Asia/Shanghai", after=naive)
+
+
+def test_playbook_tags_stripped():
+    from hero_quant.scheduled.service import _build_playbooks
+    # build with tags containing spaces and empty
+    pbs = _build_playbooks()
+    for p in pbs:
+        for t in p.tags:
+            assert t == t.strip() and t != "" and " " not in t or "," not in t
+    # specific: first playbook tags should be stripped
+    pb = [p for p in pbs if p.name == "premarket-brief"][0]
+    assert "premarket" in pb.tags and "brief" in pb.tags
+    assert "" not in pb.tags
+
+
+def test_playbooks_is_tuple():
+    from hero_quant.scheduled import PLAYBOOKS
+    assert isinstance(PLAYBOOKS, tuple)

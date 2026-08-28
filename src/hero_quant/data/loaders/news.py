@@ -48,7 +48,7 @@ _SNAPSHOT_KEYS = (
 
 
 def _parse_time(value) -> pd.Timestamp | None:
-    """宽松解析时间为 Timestamp，失败返回 None。"""
+    """宽松解析时间为 Timestamp，失败返回 None。窄化异常捕获。"""
     if value is None:
         return None
     if isinstance(value, pd.Timestamp):
@@ -60,16 +60,21 @@ def _parse_time(value) -> pd.Timestamp | None:
         if pd.isna(ts):
             return None
         return ts
-    except Exception:
+    except (ValueError, TypeError, pd.errors.OutOfBoundsDatetime):
+        logger.debug("news _parse_time unparseable %r", value)
         return None
 
 
 def _extract_publish_time(record: dict) -> pd.Timestamp | None:
     for k in _PUBLISH_KEYS:
-        if k in record and record[k] is not None and str(record[k]).strip() != "":
-            ts = _parse_time(record[k])
-            if ts is not None:
-                return ts
+        if k not in record or record[k] is None:
+            continue
+        v = record[k]
+        if isinstance(v, str) and not v.strip():
+            continue
+        ts = _parse_time(v)
+        if ts is not None:
+            return ts
     return None
 
 

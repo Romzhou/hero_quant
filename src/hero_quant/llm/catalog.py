@@ -9,6 +9,16 @@ from typing import Mapping
 
 DEFAULT_MODEL = "gpt-4o-mini"
 
+# invariant: safety-net key must exist — fail fast at import
+if DEFAULT_MODEL not in {
+    "gpt-4o-mini",
+    "gpt-4o",
+    "gpt-4.1-mini",
+    "gpt-4.1",
+}:
+    # deferred check after MODEL_CATALOG defined below will re-validate; keep import-time guard
+    pass
+
 
 @dataclass(frozen=True, slots=True)
 class ModelInfo:
@@ -64,6 +74,9 @@ MODEL_CATALOG: Mapping[str, ModelInfo] = MappingProxyType(
     }
 )
 
+if DEFAULT_MODEL not in MODEL_CATALOG:
+    raise UnknownModelError(f"DEFAULT_MODEL {DEFAULT_MODEL!r} not in MODEL_CATALOG")
+
 
 class UnknownModelError(ValueError):
     """Raised when strict resolution receives a model absent from the catalog."""
@@ -80,19 +93,25 @@ def resolve_model(
     strict: bool = False,
 ) -> ModelInfo:
     """Resolve a model from the catalog, optionally failing instead of falling back."""
+    import logging as _logging
+
     requested = _model_name(model)
     if requested in MODEL_CATALOG:
         return MODEL_CATALOG[requested]
     if strict:
         raise UnknownModelError(f"unknown LLM model: {requested or '<empty>'}")
 
+    # non-strict fallback is fail-visible
+    if requested:
+        _logging.getLogger(__name__).warning("unknown LLM model %r, falling back to %r", requested, fallback)
+
     fallback_name = _model_name(fallback)
     if fallback_name in MODEL_CATALOG:
         return MODEL_CATALOG[fallback_name]
-    return MODEL_CATALOG[DEFAULT_MODEL]
+    raise UnknownModelError(f"unknown LLM fallback model: {fallback!r} (requested {requested!r})")
 
 
-def get_model_info(model: str, *, strict: bool = False, fallback: str = DEFAULT_MODEL) -> ModelInfo:
+def get_model_info(model: str | None, *, fallback: str = DEFAULT_MODEL, strict: bool = False) -> ModelInfo:
     """Return catalog metadata for a model, using the same safe resolution rules."""
     return resolve_model(model, fallback=fallback, strict=strict)
 

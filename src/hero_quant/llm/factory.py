@@ -7,12 +7,12 @@ from typing import Mapping
 
 from hero_quant.config.settings import Settings
 
-from .catalog import DEFAULT_MODEL, ModelInfo, resolve_model
+from .catalog import DEFAULT_MODEL, ModelInfo, UnknownModelError, resolve_model
 
 _ALLOWED_PROVIDERS = {"openai", "deepseek", "anthropic"}
 
 
-def _normalize_provider(raw: str | None) -> str:
+def _normalize_provider(raw: str | None, *, strict: bool = False) -> str:
     if not raw:
         return "openai"
     p = str(raw).strip().lower()
@@ -24,6 +24,11 @@ def _normalize_provider(raw: str | None) -> str:
         return "anthropic"
     if "openai" in p or "gpt" in p:
         return "openai"
+    if strict:
+        raise ValueError(f"unknown llm_provider: {raw!r}")
+    import logging as _logging
+
+    _logging.getLogger(__name__).warning("unknown llm_provider %r, falling back to openai", raw)
     return "openai"
 
 
@@ -76,7 +81,7 @@ class LLMFactory:
     @property
     def provider(self) -> str:
         raw = getattr(self.settings, "llm_provider", "openai")
-        return _normalize_provider(raw)
+        return _normalize_provider(raw, strict=self.strict)
 
     def slot_for_stage(self, stage: str) -> str:
         return slot_for_stage(stage)
@@ -94,60 +99,109 @@ class LLMFactory:
         """Create an LLMClient routed by provider with timeout=30."""
 
         # defer import to avoid circular
+        import logging as _logging
+
         from .client import LLMClient
 
         provider = self.provider
-        # resolve model
+        # resolve model — strict mode propagates UnknownModelError
         if model is None:
-            try:
+            if self.strict:
                 model = self.model_for_stage("plan").name
-            except Exception:
-                model = getattr(self.settings, "llm_model", DEFAULT_MODEL) or DEFAULT_MODEL
-        key = api_key or getattr(self.settings, "api_key", None) or getattr(self.settings, "openai_api_key", None) or os.environ.get("OPENAI_API_KEY") or os.environ.get("HERO_API_KEY") or "test"
+            else:
+                try:
+                    model = self.model_for_stage("plan").name
+                except (ValueError, UnknownModelError) as e:
+                    _logging.getLogger(__name__).warning("model_for_stage failed, fallback to settings.llm_model: %s", e)
+                    model = getattr(self.settings, "llm_model", DEFAULT_MODEL) or DEFAULT_MODEL
+        # resolve api key — fail-visible in strict mode, per-provider env fallback
+        key = api_key or getattr(self.settings, "api_key", None) or getattr(self.settings, "openai_api_key", None)
+        if not key:
+            if provider == "anthropic":
+                key = os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("CLAUDE_API_KEY")
+            elif provider == "deepseek":
+                key = os.environ.get("DEEPSEEK_API_KEY")
+            if not key:
+                key = os.environ.get("OPENAI_API_KEY") or os.environ.get("HERO_API_KEY")
+        if not key:
+            if self.strict:
+                raise ValueError("LLM api_key missing; configure api_key / OPENAI_API_KEY / provider-specific key")
+            _logging.getLogger(__name__).warning("LLM api_key missing, using dummy key for offline fallback")
+            key = "test"
         # provider-specific chat creation
         chat = None
-        # common kwargs
+        # common kwargs — pop timeout to prevent duplicate-keyword TypeError
         temperature = kwargs.pop("temperature", 0.2)
         streaming = kwargs.pop("streaming", True)
-        # try real SDK, fallback to _FallbackChat
+        timeout = kwargs.pop("timeout", 30)
+        # try real SDK, fallback to _FallbackChat only on ImportError (strict propagates)
         if provider == "openai":
             try:
                 from langchain_openai import ChatOpenAI
 
-                chat = ChatOpenAI(model=model, api_key=key, streaming=streaming, temperature=temperature, timeout=30, **kwargs)
-            except Exception:
+                chat = ChatOpenAI(model=model, api_key=key, streaming=streaming, temperature=temperature, timeout=timeout, **kwargs)
+            except ImportError as e:
+                if self.strict:
+                    raise
+                _logging.getLogger(__name__).warning("ChatOpenAI not installed, using fallback: %s", e)
+                chat = _FallbackChat(model=model)
+            except Exception as e:
+                _logging.getLogger(__name__).warning("ChatOpenAI init failed: %s", e)
+                if self.strict:
+                    raise
                 chat = _FallbackChat(model=model)
         elif provider == "deepseek":
             try:
                 from langchain_openai import ChatOpenAI
 
                 base_url = os.environ.get("DEEPSEEK_API_BASE", "https://api.deepseek.com")
-                # deepseek uses openai-compatible
-                chat = ChatOpenAI(model=model, api_key=key, base_url=base_url, streaming=streaming, temperature=temperature, timeout=30, **kwargs)
-            except Exception:
+                chat = ChatOpenAI(model=model, api_key=key, base_url=base_url, streaming=streaming, temperature=temperature, timeout=timeout, **kwargs)
+            except ImportError as e:
+                if self.strict:
+                    raise
+                _logging.getLogger(__name__).warning("ChatOpenAI for deepseek not installed: %s", e)
+                chat = _FallbackChat(model=model)
+            except Exception as e:
+                _logging.getLogger(__name__).warning("DeepSeek Chat init failed: %s", e)
+                if self.strict:
+                    raise
                 chat = _FallbackChat(model=model)
         elif provider == "anthropic":
             try:
                 from langchain_anthropic import ChatAnthropic  # type: ignore
 
-                chat = ChatAnthropic(model=model, api_key=key, streaming=streaming, temperature=temperature, timeout=30, **kwargs)  # type: ignore
-            except Exception:
+                chat = ChatAnthropic(model=model, api_key=key, streaming=streaming, temperature=temperature, timeout=timeout, **kwargs)  # type: ignore
+            except ImportError:
+                # fallback to OpenAI-compatible if anthropic SDK missing
                 try:
                     from langchain_openai import ChatOpenAI
 
-                    chat = ChatOpenAI(model=model, api_key=key, streaming=streaming, temperature=temperature, timeout=30, **kwargs)
-                except Exception:
+                    chat = ChatOpenAI(model=model, api_key=key, streaming=streaming, temperature=temperature, timeout=timeout, **kwargs)
+                except ImportError as e:
+                    if self.strict:
+                        raise
+                    _logging.getLogger(__name__).warning("no chat SDK installed: %s", e)
                     chat = _FallbackChat(model=model)
+                except Exception as e:
+                    if self.strict:
+                        raise
+                    _logging.getLogger(__name__).warning("fallback ChatOpenAI failed: %s", e)
+                    chat = _FallbackChat(model=model)
+            except Exception as e:
+                _logging.getLogger(__name__).warning("ChatAnthropic init failed: %s", e)
+                if self.strict:
+                    raise
+                chat = _FallbackChat(model=model)
         else:
             chat = _FallbackChat(model=model)
 
-        # ensure timeout attribute for introspection
+        # ensure timeout attribute for introspection (fail-visible)
         try:
             if not hasattr(chat, "timeout"):
-                setattr(chat, "timeout", 30)
-        except Exception:
-            pass
-        return LLMClient(chat, timeout=30, max_retries=3)
+                setattr(chat, "timeout", timeout)
+        except Exception as e:
+            _logging.getLogger(__name__).debug("could not set timeout on chat object %r: %s", type(chat), e)
+        return LLMClient(chat, timeout=timeout, max_retries=3)
 
 
 def model_for_stage(stage: str, settings: Settings | None = None, *, strict: bool = False) -> ModelInfo:

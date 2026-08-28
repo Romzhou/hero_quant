@@ -53,8 +53,10 @@ def _parse_field(field_str: str, min_val: int, max_val: int) -> Set[int]:
             if step <= 0:
                 raise ValueError(f"step must be >0 got {step} in {part!r}")
             base = base.strip()
-            if base == "*" or base == "":
+            if base == "*":
                 start, end = min_val, max_val
+            elif base == "":
+                raise ValueError(f"invalid step base empty in {part!r} (use '*/{step}')")
             elif "-" in base:
                 a_s, b_s = base.split("-", 1)
                 try:
@@ -64,14 +66,7 @@ def _parse_field(field_str: str, min_val: int, max_val: int) -> Set[int]:
                 if start < min_val or end > max_val or start > end:
                     raise ValueError(f"range {base!r} out of bounds [{min_val},{max_val}]")
             else:
-                # 单值带步进如 "2/3" 表示从 2 到 max 每 3
-                try:
-                    start = int(base)
-                except ValueError:
-                    raise ValueError(f"invalid base {base!r} in {part!r}")
-                if start < min_val or start > max_val:
-                    raise ValueError(f"value {start} out of bounds [{min_val},{max_val}]")
-                end = max_val
+                raise ValueError(f"step base must be '*' or range, got {base!r} in {part!r}")
             for v in range(start, end + 1):
                 if (v - start) % step == 0:
                     if min_val <= v <= max_val:
@@ -144,19 +139,41 @@ def validate_cron(cron_expr: str) -> bool:
 
 
 def _check_match(candidate: datetime, minute_set, hour_set, dom_set, month_set, dow_set) -> bool:
-    """判断候选时间是否匹配 cron 集合（candidate 已为目标时区）。"""
+    """判断候选时间是否匹配 cron 集合（candidate 已为目标时区）。
+
+    语义遵循 Vixie cron：当 DOM 与 DOW 均为受限时满足任一即触发；
+    任一为 `*`（全集）时仅校验受限字段；两者皆 `*` 时视为匹配。
+    """
     if candidate.minute not in minute_set:
         return False
     if candidate.hour not in hour_set:
-        return False
-    if candidate.day not in dom_set:
         return False
     if candidate.month not in month_set:
         return False
     # 周：Python weekday 周一 0..周日 6 转 cron 周日 0..周六 6
     py_wday = candidate.weekday()  # 0 Mon
     cron_dow = (py_wday + 1) % 7  # Mon 0->1, Sun 6->0
-    if cron_dow not in dow_set:
+    dom_match = candidate.day in dom_set
+    dow_match = cron_dow in dow_set
+    # 判定是否为 unrestricted（*）
+    # dom 全集为 1..31（31 值），dow 归一后为 0..6（7 值）
+    dom_is_star = len(dom_set) == 31 and min(dom_set) == 1 and max(dom_set) == 31
+    dow_is_star = len(dow_set) == 7 and min(dow_set) == 0 and max(dow_set) == 6
+    # 若候选集合不为完整但仍可能为 * 的另一种编码（例如通过解析得到全集），用长度判断已足够；
+    # 更严格可比较 == set(range(...))，此处保持长度快速判定并回退为集合比较
+    if len(dom_set) == 31:
+        dom_is_star = dom_set == set(range(1, 32))
+    if len(dow_set) == 7:
+        dow_is_star = dow_set == set(range(0, 7))
+    if dom_is_star and dow_is_star:
+        dom_dow_ok = True
+    elif dom_is_star:
+        dom_dow_ok = dow_match
+    elif dow_is_star:
+        dom_dow_ok = dom_match
+    else:
+        dom_dow_ok = dom_match or dow_match
+    if not dom_dow_ok:
         return False
     return True
 
@@ -171,22 +188,20 @@ def get_next_trigger(cron_expr: str, tz_name: str, after: Optional[datetime] = N
     parse_result = parse_cron(cron_expr)
     minute_set, hour_set, dom_set, month_set, dow_set = parse_result
 
-    # 校验时区
+    # 校验时区 — 仅捕获 ZoneInfoNotFoundError，编程错误直接透传
     try:
         tz = ZoneInfo(tz_name)
     except ZoneInfoNotFoundError as e:
         raise ValueError(f"invalid timezone {tz_name!r}: {e}") from e
-    except Exception as e:
-        raise ValueError(f"invalid timezone {tz_name!r}: {e}") from e
 
-    # 归一化 after：无则取当前时区时间；naive 视为目标时区
+    # 归一化 after：无则取当前时区时间；naive 视为用户错误，显式拒绝以避免 DST 歧义
     if after is None:
         after = datetime.now(tz)
     else:
         if not isinstance(after, datetime):
             raise ValueError("after must be datetime")
         if after.tzinfo is None:
-            after = after.replace(tzinfo=tz)
+            raise ValueError("after must be timezone-aware; naive wall times are ambiguous around DST")
         else:
             after = after.astimezone(tz)
 
@@ -194,16 +209,31 @@ def get_next_trigger(cron_expr: str, tz_name: str, after: Optional[datetime] = N
     candidate = after.replace(second=0, microsecond=0) + timedelta(minutes=1)
 
     horizon = candidate + timedelta(days=366)
-    # 最多 366*1440 次迭代
+    # 优化：当月/日/小时不匹配时跳跃而非逐分钟扫描，避免 52万次循环的 DoS 风险
     while candidate <= horizon:
+        # 若月份完全不匹配，直接跳至下一匹配月份的 1 日 00:00
+        if candidate.month not in month_set:
+            # 前进至下月 1 日
+            # 计算下一匹配月份
+            found_month = False
+            for _ in range(12):
+                candidate = (candidate.replace(day=1, hour=0, minute=0) + timedelta(days=32)).replace(day=1, hour=0, minute=0)
+                if candidate.month in month_set:
+                    found_month = True
+                    break
+            if not found_month:
+                break
+            continue
         if _check_match(candidate, minute_set, hour_set, dom_set, month_set, dow_set):
-            # 规范化 DST：确保返回为目标 ZoneInfo
+            # 规范化 DST：确保返回为目标 ZoneInfo（astimezone 几乎不抛异常，若抛则透传警告）
             try:
                 candidate = candidate.astimezone(tz)
-            except Exception as _exc:
-                logger.debug("silent handled: offline-safe: scheduled DST normalize", exc_info=_exc)  # intentional: offline-safe: scheduled DST normalize
-                pass  # intentional offline-safe: scheduled DST normalize
+            except (ValueError, OSError) as _exc:
+                logger.warning("scheduled DST normalize failed", exc_info=True)  # fail-visible
+                raise
             return candidate
+        # 小步进：若分钟/小时不匹配可小跳，但为保持 DOM/DOW OR 语义正确，仍逐分钟；
+        # 已通过月份跳跃大幅削减最坏情况（Feb29 等）循环次数
         candidate += timedelta(minutes=1)
 
     raise ValueError(f"no next trigger found within 366d for cron {cron_expr!r} tz {tz_name!r} after {after!r}")
@@ -288,6 +318,11 @@ def _build_playbooks() -> List[ScheduledPlaybook]:
     out: List[ScheduledPlaybook] = []
     base = Path(__file__).parent / "playbooks"
     for data in _PLAYBOOKS_DATA:
+        tags_raw = data.get("tags", "")
+        if isinstance(tags_raw, str) and tags_raw.strip():
+            tags = [t.strip() for t in tags_raw.split(",") if t.strip()]
+        else:
+            tags = []
         p = ScheduledPlaybook(
             name=data["name"],
             cron=data["cron"],
@@ -295,13 +330,13 @@ def _build_playbooks() -> List[ScheduledPlaybook]:
             description=data["description"],
             title_cn=data.get("title_cn", ""),
             file=base / f"{data['name']}.md",
-            tags=data.get("tags", "").split(",") if isinstance(data.get("tags"), str) else [],
+            tags=tags,
         )
         out.append(p)
     return out
 
 
-PLAYBOOKS: List[ScheduledPlaybook] = _build_playbooks()
+PLAYBOOKS: Tuple[ScheduledPlaybook, ...] = tuple(_build_playbooks())
 _PLAYBOOK_MAP: Dict[str, ScheduledPlaybook] = {p.name: p for p in PLAYBOOKS}
 
 

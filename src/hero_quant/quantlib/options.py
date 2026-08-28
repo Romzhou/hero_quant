@@ -18,7 +18,7 @@ try:
     def _norm_pdf(x: float) -> float:
         return float(_scipy_norm.pdf(x))
 
-except Exception:  # fallback without scipy
+except ImportError:  # fallback without scipy
 
     def _norm_cdf(x: float) -> float:
         return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
@@ -69,20 +69,20 @@ def bs_price(S=None, K=None, T=None, r: float = 0.05, sigma: float = 0.2, option
         T_f = float(T)
         r_f = float(r)
         sigma_f = float(sigma)
-    except Exception as e:
-        raise TypeError(f"invalid numeric args: {e}")
+    except (ValueError, TypeError) as e:
+        raise TypeError(f"invalid numeric args: {e}") from e
 
     is_call = str(option_type).strip().lower().startswith("c")
 
-    # 到期退化：T≤0 或极小值直接取内在价值，避免除零（阈值 1e-12）
-    if T_f <= 0 or T_f < 1e-12:
+    # 到期退化：T < 1e-12 直接取内在价值，避免除零
+    if T_f < 1e-12:
         if is_call:
             return max(S_f - K_f, 0.0)
         else:
             return max(K_f - S_f, 0.0)
 
     # 零波动退化：贴现内在价值
-    if sigma_f <= 0 or sigma_f < 1e-12:
+    if sigma_f < 1e-12:
         df = math.exp(-r_f * T_f)
         if is_call:
             return max(S_f - K_f * df, 0.0)
@@ -139,23 +139,44 @@ def bs_greeks(S=None, K=None, T=None, r: float = 0.05, sigma: float = 0.2, optio
         T_f = float(T)
         r_f = float(r)
         sigma_f = float(sigma)
-    except Exception as e:
-        raise TypeError(f"invalid numeric args: {e}")
+    except (ValueError, TypeError) as e:
+        raise TypeError(f"invalid numeric args: {e}") from e
 
     is_call = str(option_type).strip().lower().startswith("c")
 
-    # 到期退化：delta 为示性，其余希腊字母无时间价值
-    if T_f <= 0 or T_f < 1e-12:
+    # 到期退化：delta 为示性，其余希腊字母无时间价值 — 使用容差判断 ATM
+    if T_f < 1e-12:
+        atm_tol = 1e-10 * max(1.0, abs(K_f))
+        is_atm = abs(S_f - K_f) <= atm_tol
         if is_call:
-            delta = 1.0 if S_f > K_f else (0.5 if S_f == K_f else 0.0)
+            delta = 0.5 if is_atm else (1.0 if S_f > K_f else 0.0)
         else:
-            delta = -1.0 if S_f < K_f else (-0.5 if S_f == K_f else 0.0)
-            if S_f == K_f:
-                delta = -0.5  # 平值 put 的 convention 取 -0.5
+            delta = -0.5 if is_atm else (-1.0 if S_f < K_f else 0.0)
         return {"delta": float(delta), "gamma": 0.0, "vega": 0.0, "theta": 0.0, "rho": 0.0}
 
-    if sigma_f <= 0 or sigma_f < 1e-12 or S_f <= 0 or K_f <= 0:
-        return {"delta": 0.0, "gamma": 0.0, "vega": 0.0, "theta": 0.0, "rho": 0.0}  # 退化：无波动/非法标的不产生希腊暴露
+    if S_f <= 0 or K_f <= 0:
+        raise ValueError(f"invalid S/K for Greeks: S={S_f}, K={K_f}")
+    if sigma_f < 1e-12:
+        # 零波动极限：delta 为示性，gamma/vega→0，theta/rho 为贴现 carry
+        df = math.exp(-r_f * T_f)
+        itm_call = S_f > K_f * df
+        itm_put = K_f * df > S_f
+        if is_call:
+            delta = 1.0 if itm_call else 0.0
+            # ATM 时约定 0.5（与到期一致）
+            atm_tol = 1e-10 * max(1.0, abs(K_f))
+            if abs(S_f - K_f * df) <= atm_tol:
+                delta = 0.5
+            rho = K_f * T_f * df if itm_call else 0.0
+            theta = -r_f * K_f * df if itm_call else 0.0
+        else:
+            delta = -1.0 if itm_put else 0.0
+            atm_tol = 1e-10 * max(1.0, abs(K_f))
+            if abs(S_f - K_f * df) <= atm_tol:
+                delta = -0.5
+            rho = -K_f * T_f * df if itm_put else 0.0
+            theta = r_f * K_f * df if itm_put else 0.0
+        return {"delta": float(delta), "gamma": 0.0, "vega": 0.0, "theta": float(theta), "rho": float(rho)}
 
     sqrt_T = math.sqrt(T_f)
     d1 = (math.log(S_f / K_f) + (r_f + 0.5 * sigma_f * sigma_f) * T_f) / (sigma_f * sqrt_T)
@@ -205,19 +226,22 @@ def implied_volatility(price: float, S=None, K=None, T=None, r: float = 0.05, op
         K_f = float(K)
         T_f = float(T)
         r_f = float(r)
-    except Exception as e:
-        raise TypeError(f"invalid numeric args: {e}")
+    except (ValueError, TypeError) as e:
+        raise TypeError(f"invalid numeric args: {e}") from e
+
+    if S_f <= 0 or K_f <= 0:
+        raise ValueError(f"invalid S/K for implied_volatility: S={S_f}, K={K_f}")
 
     is_call = str(option_type).strip().lower().startswith("c")
 
-    if T_f <= 0 or T_f < 1e-12:
+    if T_f < 1e-12:
         return 0.0  # 无剩余期限无法反推波动率
 
-    # 内在价值下界：市价不高于此则隐含波动率为 0
+    # 内在价值下界：市价不高于此则隐含波动率为 0（使用严格 > 容差）
     intrinsic = max(S_f - K_f * math.exp(-r_f * T_f), 0.0) if is_call else max(K_f * math.exp(-r_f * T_f) - S_f, 0.0)
-    if price_f <= intrinsic + 1e-12:  # 容差避免浮点噪声
-        return 0.0
-    if price_f <= 0:
+    if price_f < intrinsic - 1e-12:
+        raise ValueError(f"price {price_f} below intrinsic {intrinsic} — arbitrage")
+    if price_f <= intrinsic + 1e-12:
         return 0.0
 
     # 二分区间：1e-6 至 500% 波动率已覆盖绝大多数标的

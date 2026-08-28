@@ -23,11 +23,25 @@ except Exception:
 from hero_quant.tools.registry import TOOL_REGISTRY
 logger = logging.getLogger("hero_quant.mcp.router")
 
+# 预编译 token 切分正则，避免热路径重复编译
+_TOKEN_RE = re.compile(r"[^a-z0-9]+")
+
+# 线程安全：语料与限流/熔断的锁
+import threading as _threading
+
+_CORPUS_LOCK = _threading.Lock()
+_LIMITER_LOCK = _threading.Lock()
+
+# 向量描述缓存，避免每候选重复 embed
+_DESC_VEC_CACHE: Dict[str, object] = {}
+_DESC_VEC_LOCK = _threading.Lock()
+
 # 双桶限流与熔断组件（惰性导入，避免循环依赖）
 _ROUTER_RATE_LIMITER = None  # type: ignore
 _ROUTER_CIRCUIT = None  # type: ignore
 _RATE_LIMITED_COUNT = 0
 _LAST_LIMITED_TS: float | None = None
+_last_registry_fingerprint: str | None = None
 
 
 def _get_router_circuit():
@@ -116,20 +130,23 @@ def _try_acquire_or_record() -> bool:
     try:
         ok = limiter.try_acquire(1)
         if not ok:
-            _RATE_LIMITED_COUNT += 1
-            _LAST_LIMITED_TS = time.time()
-            # 仅计数，不直接触发慢路径熔断，避免误伤 BM25 召回
+            with _LIMITER_LOCK:
+                _RATE_LIMITED_COUNT += 1
+                _LAST_LIMITED_TS = time.time()
+            # 转发至熔断器，使持续限流可触发 OPEN（修复 never-records-failure）
             try:
                 circ = _get_router_circuit()
-                if circ is not None:
-                    # 轻量记录，不进慢桶，仅计数
-                    pass
+                if circ is not None and hasattr(circ, "record_failure"):
+                    try:
+                        circ.record_failure()
+                    except Exception as e:
+                        logger.warning("router circuit record_failure failed: %s", e)
             except Exception as _exc:
-                logger.debug("silent handled: offline-safe: mcp router fallback", exc_info=_exc)  # intentional: offline-safe: mcp router fallback
-                pass  # intentional offline-safe: mcp router fallback
+                logger.warning("router circuit acquire failed: %s", _exc)
             return False
         return True
-    except Exception:
+    except (ValueError, TypeError, AttributeError) as e:
+        logger.warning("router limiter try_acquire failed: %s", e)
         return True
 
 # BM25 常量与语料统计（基于 TOOL_REGISTRY 全量 tool.description）
@@ -150,21 +167,32 @@ _idf = _IDF
 
 def _tokenize(text: str) -> List[str]:
     """按非字母数字切分并小写归一化。"""
-    return [t for t in re.split(r"[^a-z0-9]+", text.lower()) if t]
+    return [t for t in _TOKEN_RE.split(text.lower()) if t]
 
 
 def _ensure_corpus() -> None:
-    """按需构建/刷新 BM25 语料统计（N、avg_dl、df、idf），注册表大小不变时跳过。"""
-    global _IDF, _AVG_DL, _N, _DOC_TOKENS, _last_registry_size, _avg_dl, _idf
-    # 确保工具已加载
+    """按需构建/刷新 BM25 语料统计（N、avg_dl、df、idf），以内容指纹而非仅大小判断 stale。"""
+    global _IDF, _AVG_DL, _N, _DOC_TOKENS, _last_registry_size, _avg_dl, _idf, _last_registry_fingerprint
+    # 确保工具已加载 — 仅捕获 ImportError，其余透传
     try:
         import hero_quant.mcp.server  # noqa: F401
-    except Exception as _exc:
-        logger.debug("silent handled: offline-safe: mcp router fallback", exc_info=_exc)  # intentional: offline-safe: mcp router fallback
-        pass  # intentional offline-safe: mcp router fallback
-    size = len(TOOL_REGISTRY)
-    if size == _last_registry_size and _N != 0:
-        return
+    except ImportError as _exc:
+        logger.warning("mcp server import failed for corpus: %s", _exc)
+    # 计算内容指纹（名称+描述）
+    try:
+        import hashlib as _hashlib
+
+        fp_parts = []
+        for name in sorted(TOOL_REGISTRY.keys()):
+            desc = getattr(TOOL_REGISTRY[name], "description", "") or ""
+            fp_parts.append(f"{name}:{desc}")
+        fp = _hashlib.sha256("|".join(fp_parts).encode()).hexdigest()
+    except Exception:
+        fp = str(len(TOOL_REGISTRY))
+    with _CORPUS_LOCK:
+        if fp == _last_registry_fingerprint and _N != 0:
+            return
+        size = len(TOOL_REGISTRY)
     corpus: List[List[str]] = []
     doc_tokens: Dict[str, List[str]] = {}
     for name, spec in TOOL_REGISTRY.items():
@@ -197,6 +225,7 @@ def _ensure_corpus() -> None:
     _N = N
     _DOC_TOKENS = doc_tokens
     _last_registry_size = size
+    _last_registry_fingerprint = fp
     _avg_dl = _AVG_DL
     _idf = _IDF
 
@@ -276,17 +305,37 @@ def _cosine(a, b) -> float:
 
 
 def _vector_score_for_tool(query_vec, tool_name: str, description: str) -> float:
-    """计算查询向量与工具描述向量的余弦相似度。"""
+    """计算查询向量与工具描述向量的余弦相似度（带描述向量缓存）。"""
     if query_vec is None:
         return 0.0
+    # 缓存描述向量
+    cache_key = f"{tool_name}:{description or ''}"
+    try:
+        with _DESC_VEC_LOCK:
+            if cache_key in _DESC_VEC_CACHE:
+                dvec = _DESC_VEC_CACHE[cache_key]
+                return _cosine(query_vec, dvec)
+    except Exception:
+        pass
     try:
         from hero_quant.agent.embed import embed  # type: ignore
 
-        # 以工具描述为文档，复用与查询相同的嵌入提供方/维度
         desc = description or ""
         dvec = embed(desc)
+        try:
+            with _DESC_VEC_LOCK:
+                # 有界缓存：超过 512 条则清理一半
+                if len(_DESC_VEC_CACHE) > 512:
+                    # 简单 eviction：清空一半
+                    keys = list(_DESC_VEC_CACHE.keys())[:256]
+                    for k in keys:
+                        _DESC_VEC_CACHE.pop(k, None)
+                _DESC_VEC_CACHE[cache_key] = dvec
+        except Exception:
+            pass
         return _cosine(query_vec, dvec)
-    except Exception:
+    except (ImportError, ValueError, TypeError) as e:
+        logger.warning("vector embed failed for %s: %s", tool_name, e)
         return 0.0
 
 
@@ -489,17 +538,22 @@ def route(query: str, k: int = 5) -> List[str]:
             desc = getattr(spec, "description", "") if spec else ""
             s = _score_tool(query_tokens, query_lower, name, desc)
             scored.append((s, name))
+    # 业务加分：在排序前对 compute_factor 做 score boost（而非排序后手术式替换）
+    # 为保证含 momentum/factor 的查询仍能召回 compute_factor（原硬替换的不变量），boost 需足以进入 TopK
+    if ("momentum" in query_lower or "factor" in query_lower) and "compute_factor" in candidates:
+        boosted = []
+        max_score = max((s for s, _ in scored), default=1.0) or 1.0
+        # 若 compute_factor 分数远低于最高分，需保证进入 TopK：boost = max + 小量
+        # 保持分数可解释：仅在该查询下提升，不破坏整体排序可复现性
+        boost = max_score + 1.0  # 确保进入前列
+        for score, name in scored:
+            if name == "compute_factor":
+                score = score + boost
+            boosted.append((score, name))
+        scored = boosted
     # 按分数降序、名称升序稳定排序
     scored.sort(key=lambda x: (-x[0], x[1]))
     top = [name for _, name in scored[:k]]
-    # 兜底保证：含 momentum/factor 的查询确保 compute_factor 入选
-    if ("momentum" in query_lower or "factor" in query_lower) and "compute_factor" not in top:
-        # 用最低位替换为 compute_factor
-        if "compute_factor" in candidates:
-            if len(top) >= k:
-                top[-1] = "compute_factor"
-            else:
-                top.append("compute_factor")
     # 去重保序
     seen = set()
     out: List[str] = []
@@ -515,14 +569,6 @@ def route(query: str, k: int = 5) -> List[str]:
             seen.add(cand)
             out.append(cand)
         idx += 1
-    # 最终保证：含 momentum/factor 的查询将 compute_factor 置于首位
-    if ("momentum" in query_lower or "factor" in query_lower) and out and out[0] != "compute_factor":
-        if "compute_factor" in out:
-            out.remove("compute_factor")
-            out.insert(0, "compute_factor")
-        elif "compute_factor" in candidates:
-            out.insert(0, "compute_factor")
-            out = out[:k]
     return out[:k]
 
 

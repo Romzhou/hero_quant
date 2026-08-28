@@ -27,18 +27,20 @@ def _require_polars() -> None:
 
 
 def _validate_window(window, default: int = 20) -> int:
-    """校验窗口参数：非正/非法回落默认值。"""
+    """校验窗口参数：非正/非法抛 ValueError 由调用方处理（fail-visible）。"""
+    if window is None:
+        return default
     try:
         w = int(window)
-        if w <= 0:
-            return default
-        return w
-    except Exception:
-        return default
+    except (ValueError, TypeError) as e:
+        raise ValueError(f"invalid window {window!r}: {e}") from e
+    if w <= 0:
+        raise ValueError(f"window must be >0, got {w}")
+    return w
 
 
 def _to_series(x, name: str = "value") -> pd.Series:
-    """与 indicators._to_series 同步的归一化逻辑，保证两者对齐。"""
+    """与 indicators._to_series 同步的归一化逻辑，保证两者对齐。fail-visible on construction."""
     if isinstance(x, pd.DataFrame):
         if "close" in x.columns:
             s = x["close"]
@@ -52,8 +54,8 @@ def _to_series(x, name: str = "value") -> pd.Series:
     else:
         try:
             s = pd.Series(x)
-        except Exception:
-            s = pd.Series(dtype=float)
+        except (ValueError, TypeError) as e:
+            raise ValueError(f"cannot convert to Series: {e}") from e
     s = pd.to_numeric(s, errors="coerce")
     s = s.replace([np.inf, -np.inf], np.nan)
     return s
@@ -61,12 +63,13 @@ def _to_series(x, name: str = "value") -> pd.Series:
 
 def sma_polars(series, window: int = 20, *args, **kwargs) -> pd.Series:
     """SMA（Polars 加速）：rolling_mean(window, min_samples=n) 与 pandas 语义一致。"""
-    if "n" in kwargs:
-        window = kwargs["n"]
-    if "period" in kwargs:
-        window = kwargs["period"]
-    if "span" in kwargs:
-        window = kwargs["span"]
+    if args:
+        raise TypeError(f"sma_polars: unexpected positional args {args}")
+    alias_keys = [k for k in ("n", "period", "span") if k in kwargs]
+    if len(alias_keys) > 1:
+        raise TypeError(f"sma: conflicting aliases {alias_keys}, specify only one")
+    if alias_keys:
+        window = kwargs[alias_keys[0]]
 
     n = _validate_window(window, default=20)
     s = _to_series(series)
@@ -79,23 +82,24 @@ def sma_polars(series, window: int = 20, *args, **kwargs) -> pd.Series:
     idx = s.index
     orig_name = s.name
 
-    # 以 Float64 构造 polars 序列，避免 Int64 对 NaN 的构造错误
+    # 零拷贝构造：优先用 numpy 直通，避免 2-3 次复制
     try:
-        values = s.values.astype(float).tolist()
-    except Exception:
-        try:
-            values = [float(v) if v is not None else None for v in s.tolist()]
-        except Exception:
-            values = s.tolist()
-
-    pl_s = pl.Series("value", values, dtype=pl.Float64, strict=False)
+        arr = s.to_numpy(dtype=float, na_value=np.nan)
+        pl_s = pl.Series("value", arr, dtype=pl.Float64, strict=False)
+    except (ValueError, TypeError) as e:
+        raise ValueError(f"polars Series construction failed: {e}") from e
 
     # min_samples/min_periods 与 pandas min_periods 对齐，保证不足窗口为 null/NaN
+    # 优先检测签名而非捕获所有异常
+    res_list = None
     try:
         res_list = pl_s.rolling_mean(window_size=n, min_samples=n).to_list()
     except TypeError:
         # 兼容旧版 polars API
-        res_list = pl_s.rolling_mean(window_size=n, min_periods=n).to_list()
+        try:
+            res_list = pl_s.rolling_mean(window_size=n, min_periods=n).to_list()
+        except (ValueError, TypeError) as e:
+            raise ValueError(f"rolling_mean failed window={n}: {e}") from e
 
     # 转回 pandas 并保留索引；None 经 dtype float 自动转为 NaN
     result = pd.Series(res_list, index=idx, dtype=float)

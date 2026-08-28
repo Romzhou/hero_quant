@@ -8,8 +8,15 @@
 from __future__ import annotations
 
 import os
+import threading
 import structlog
 logger = structlog.get_logger("telemetry.otel")
+
+# 单例 Provider 缓存，避免每次 export 都创建/关闭管线（性能）
+_OTEL_PROVIDER_LOCK = threading.Lock()
+_OTEL_CACHED_PROVIDER = None  # type: ignore
+_OTEL_CACHED_PROCESSOR = None  # type: ignore
+_OTEL_CACHED_ENDPOINT: str | None = None
 
 # 合法模式（小写归一），含历史别名以保证兼容
 _VALID_MODES = {"disabled", "shared", "private", "enabled", "sampling", "minimal", "full", "internal", "anonymous"}
@@ -41,16 +48,9 @@ def _normalize_mode(raw: str | None) -> str:
 
 
 def get_otel_mode() -> str:
-    """返回当前 OTel 模式（取自 HERO_OTEL_MODE，默认 disabled）。"""
+    """返回当前 OTel 模式（取自 HERO_OTEL_MODE，默认 disabled）。fail-closed 对未知值回退 disabled。"""
     raw = os.environ.get("HERO_OTEL_MODE", _DEFAULT_MODE)
-    # 空字符串回退 disabled，避免误启用
-    if raw is None or raw == "":
-        return _DEFAULT_MODE
-    norm = raw.strip().lower()
-    if norm in _VALID_MODES:
-        return norm
-    # 非空未知值保留归一结果，未来扩展兼容
-    return norm if norm else _DEFAULT_MODE
+    return _normalize_mode(raw)
 
 
 class SessionTelemetryCoordinator:
@@ -63,13 +63,43 @@ class SessionTelemetryCoordinator:
         self.mode = _normalize_mode(mode)
 
     def sharing(self) -> str:
-        """返回共享分级：disabled / shared / private。"""
-        return _SHARING_MAP.get(self.mode, "disabled" if self.mode == "disabled" else "shared")
+        """返回共享分级：disabled / shared / private。未知值 fail-closed 为 disabled。"""
+        return _SHARING_MAP.get(self.mode, "disabled")
+
+    def _validate_endpoint(self, endpoint: str) -> bool:
+        """校验 OTLP endpoint 仅允许 http/https 且非私有元数据地址，防 SSRF。"""
+        from urllib.parse import urlparse
+        import ipaddress
+
+        try:
+            parsed = urlparse(endpoint)
+        except Exception:
+            logger.warning("invalid OTLP endpoint parse failed", endpoint=endpoint)
+            return False
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            logger.warning("invalid OTLP endpoint scheme/host", endpoint=endpoint)
+            return False
+        host = parsed.hostname or ""
+        # 拒绝元数据/私有 IP 直连（169.254.169.254, localhost 私有段可按需放行，但记录警告）
+        try:
+            ip = ipaddress.ip_address(host)
+            if ip.is_private and host == "169.254.169.254":
+                logger.warning("OTLP endpoint blocked metadata IP", endpoint=endpoint)
+                return False
+            if host in ("169.254.169.254",):
+                logger.warning("OTLP endpoint blocked metadata host", endpoint=endpoint)
+                return False
+        except ValueError:
+            pass
+        if host in ("localhost", "127.0.0.1", "::1") and parsed.scheme == "http":
+            # 允许本地但记录
+            pass
+        return True
 
     def export(self, payload: dict | None = None) -> None:
         """按档位导出遥测，离线安全。
 
-        优先 OTel SDK 批量管线，缺失时回退 urllib；任意异常均静默。
+        优先 OTel SDK 批量管线（单例复用），缺失时回退 urllib；窄化异常捕获并日志化。
         """
 
         if self.mode == "disabled":
@@ -77,15 +107,16 @@ class SessionTelemetryCoordinator:
         endpoint = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT")
         if not endpoint:
             return
+        if not self._validate_endpoint(endpoint):
+            return
         # --- 尝试 OTel SDK 批量管线 ---
         _sdk_available = False
+        global _OTEL_CACHED_PROVIDER, _OTEL_CACHED_PROCESSOR, _OTEL_CACHED_ENDPOINT
         try:
             try:
-                # capture/export 分离：管线由 BatchLogRecordProcessor 负责批处理与重试
                 from opentelemetry.sdk._logs import LoggerProvider  # type: ignore
                 from opentelemetry.sdk._logs.export import BatchLogRecordProcessor  # type: ignore
 
-                # OTLPLogExporter 多路径兼容
                 OTLPLogExporter = None
                 try:
                     from opentelemetry.exporter.otlp.proto.http._log_exporter import (  # type: ignore
@@ -105,29 +136,48 @@ class SessionTelemetryCoordinator:
                 if OTLPLogExporter is None:
                     raise ImportError("OTLPLogExporter not available")
             except ImportError:
-                # SDK / exporter 缺失 -> 回退 urllib
                 raise
             _sdk_available = True
-            # 组装管线：LoggerProvider -> BatchLogRecordProcessor -> OTLPLogExporter
-            try:
-                exporter = OTLPLogExporter(endpoint=endpoint)  # type: ignore[call-arg]
-            except TypeError:
-                # 兼容不同签名：位置参数形式
-                exporter = OTLPLogExporter(endpoint)  # type: ignore[call-arg]
-            processor = BatchLogRecordProcessor(exporter)  # type: ignore
-            provider = LoggerProvider()  # type: ignore
-            provider.add_log_record_processor(processor)  # type: ignore
+            # 单例复用：仅在 endpoint 变化或首次时创建
+            with _OTEL_PROVIDER_LOCK:
+                if _OTEL_CACHED_PROVIDER is None or _OTEL_CACHED_ENDPOINT != endpoint:
+                    # 清理旧管线
+                    if _OTEL_CACHED_PROVIDER is not None:
+                        try:
+                            if hasattr(_OTEL_CACHED_PROVIDER, "shutdown"):
+                                _OTEL_CACHED_PROVIDER.shutdown()  # type: ignore
+                        except Exception:
+                            pass
+                        try:
+                            if _OTEL_CACHED_PROCESSOR is not None and hasattr(_OTEL_CACHED_PROCESSOR, "shutdown"):
+                                _OTEL_CACHED_PROCESSOR.shutdown()  # type: ignore
+                        except Exception:
+                            pass
+                    try:
+                        exporter = OTLPLogExporter(endpoint=endpoint)  # type: ignore[call-arg]
+                    except TypeError:
+                        exporter = OTLPLogExporter(endpoint)  # type: ignore[call-arg]
+                    processor = BatchLogRecordProcessor(exporter)  # type: ignore
+                    provider = LoggerProvider()  # type: ignore
+                    provider.add_log_record_processor(processor)  # type: ignore
+                    _OTEL_CACHED_PROVIDER = provider
+                    _OTEL_CACHED_PROCESSOR = processor
+                    _OTEL_CACHED_ENDPOINT = endpoint
+                else:
+                    provider = _OTEL_CACHED_PROVIDER
+                    processor = _OTEL_CACHED_PROCESSOR
 
-            # 获取 OTel logger（优先 provider，回退 api）
             otel_logger = None
             try:
                 otel_logger = provider.get_logger("hero_quant.telemetry")  # type: ignore
-            except Exception:
+            except (AttributeError, TypeError, ValueError) as e:
+                logger.warning("otel get_logger failed: %s", e)
                 try:
                     from opentelemetry._logs import get_logger as _api_get_logger  # type: ignore
 
                     otel_logger = _api_get_logger("hero_quant.telemetry")
-                except Exception:
+                except ImportError as ie:
+                    logger.warning("otel api get_logger not available: %s", ie)
                     otel_logger = None
 
             if otel_logger is not None:
@@ -135,52 +185,29 @@ class SessionTelemetryCoordinator:
 
                 body = _json.dumps(payload or {})
                 try:
-                    # 常见签名 emit(body=...) / emit(LogRecord)
                     otel_logger.emit(body=body)  # type: ignore
                 except TypeError:
                     try:
                         otel_logger.emit(body)  # type: ignore
-                    except Exception as _exc:
-                        logger.debug("silent handled: offline-safe: OTel export unavailable, telemetry best-effort", exc_info=_exc)  # intentional: offline-safe: OTel export unavailable, telemetry best-effort
-                        pass  # intentional offline-safe: OTel export unavailable, telemetry best-effort
-                except Exception as _exc:
-                    logger.debug("silent handled: offline-safe: OTel export unavailable, telemetry best-effort", exc_info=_exc)  # intentional: offline-safe: OTel export unavailable, telemetry best-effort
-                    pass  # intentional offline-safe: OTel export unavailable, telemetry best-effort
+                    except (ValueError, TypeError, AttributeError) as _exc:
+                        logger.warning("otel emit failed: %s", _exc)
+                except (ValueError, TypeError, AttributeError, OSError) as _exc:
+                    logger.warning("otel emit failed: %s", _exc)
 
-            # 尽力刷出与关闭，失败静默（shutdown/force_flush 兼容不同版本）
+            # 批量管线复用，不在每次 export 中 shutdown；仅定期 force_flush
             try:
-                if hasattr(provider, "shutdown"):
+                if hasattr(provider, "force_flush"):
                     try:
-                        provider.shutdown()  # type: ignore
+                        provider.force_flush(timeout_millis=1000)  # type: ignore
                     except TypeError:
-                        try:
-                            provider.shutdown(timeout_millis=3000)  # type: ignore
-                        except Exception as _exc:
-                            logger.debug("silent handled: offline-safe: OTel export unavailable, telemetry best-effort", exc_info=_exc)  # intentional: offline-safe: OTel export unavailable, telemetry best-effort
-                            pass  # intentional offline-safe: OTel export unavailable, telemetry best-effort
-                elif hasattr(provider, "force_flush"):
-                    try:
                         provider.force_flush()  # type: ignore
-                    except TypeError:
-                        provider.force_flush(timeout_millis=3000)  # type: ignore
-            except Exception as _exc:
-                logger.debug("silent handled: offline-safe: OTel export unavailable, telemetry best-effort", exc_info=_exc)  # intentional: offline-safe: OTel export unavailable, telemetry best-effort
-                pass  # intentional offline-safe: OTel export unavailable, telemetry best-effort
-            try:
-                if hasattr(processor, "shutdown"):
-                    try:
-                        processor.shutdown()  # type: ignore
-                    except TypeError:
-                        processor.shutdown(timeout_millis=3000)  # type: ignore
-            except Exception as _exc:
-                logger.debug("silent handled: offline-safe: OTel export unavailable, telemetry best-effort", exc_info=_exc)  # intentional: offline-safe: OTel export unavailable, telemetry best-effort
-                pass  # intentional offline-safe: OTel export unavailable, telemetry best-effort
+            except (OSError, ValueError, TypeError) as _exc:
+                logger.warning("otel force_flush failed: %s", _exc)
             return
         except ImportError:
-            # SDK 不可用 -> 回退 urllib
             pass
-        except Exception:
-            # SDK 路径任意异常离线静默；若已可用则不再回退避免重复发送
+        except (OSError, ValueError, TypeError) as e:
+            logger.warning("otel sdk export failed: %s", e)
             if _sdk_available:
                 return
             pass
@@ -207,7 +234,8 @@ class SessionTelemetryCoordinator:
             req = urllib.request.Request(endpoint, data=data, headers={"Content-Type": "application/json"})
             with urllib.request.urlopen(req, timeout=0.5) as _resp:  # noqa: S310
                 pass
-        except Exception:
+        except (OSError, ValueError, TypeError) as e:
+            logger.warning("otel urllib export failed: %s", e)
             return
         return
 
