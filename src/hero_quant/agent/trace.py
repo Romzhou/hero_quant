@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import threading
+import time
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -37,6 +38,21 @@ def _env_int(name: str, default: int | None) -> int | None:
         return int(val)
     except (ValueError, TypeError):
         return default
+
+
+def _validate_threshold(value: int | None, name: str, default: int) -> int:
+    """Validate threshold >0 else fallback to default with warning."""
+    if value is None:
+        return default
+    try:
+        iv = int(value)  # type: ignore[arg-type]
+    except (ValueError, TypeError) as exc:
+        logger.warning("invalid %s %r, using default %d: %s", name, value, default, exc)
+        return default
+    if iv <= 0:
+        logger.warning("%s must be >0, got %d; using default %d", name, iv, default)
+        return default
+    return iv
 
 
 class TraceWriter:
@@ -104,7 +120,7 @@ class TraceWriter:
             self.path = self.dir_path / self.path.name
             self.dir_path.mkdir(parents=True, exist_ok=True)
 
-        # 阈值解析优先级：显式参数 > 环境变量 > 默认值
+        # 阈值解析优先级：显式 > 通用别名 > 环境变量 > 默认值（单链，无二次覆盖）
         env_tool = _env_int("HERO_TRACE_TOOL_RESULT_OFFLOAD", None)
         if env_tool is None:
             env_tool = _env_int("HERO_TRACE_SIDECAR_THRESHOLD", None)
@@ -113,37 +129,40 @@ class TraceWriter:
         if env_preview is None:
             env_preview = _env_int("HERO_TRACE_HARD_THRESHOLD", None)
 
-        if sidecar_threshold is not None:
-            # 通用阈值别名：同时覆盖两类分流阈值，保持旧语义一致
-            self.tool_result_offload = int(sidecar_threshold)
-            self.text_offload = int(sidecar_threshold)
-        else:
-            if tool_result_offload is not None:
-                self.tool_result_offload = int(tool_result_offload)
-            elif env_tool is not None:
-                self.tool_result_offload = int(env_tool)
-            else:
-                self.tool_result_offload = DEFAULT_TOOL_RESULT_OFFLOAD
-
-            if text_offload is not None:
-                self.text_offload = int(text_offload)
-            elif env_text is not None:
-                self.text_offload = int(env_text)
-            else:
-                self.text_offload = DEFAULT_TEXT_OFFLOAD
-
-        # 显式参数优先级高于通用别名，二次覆盖以保证精确控制
         if tool_result_offload is not None:
-            self.tool_result_offload = int(tool_result_offload)
+            self.tool_result_offload = _validate_threshold(
+                tool_result_offload, "tool_result_offload", DEFAULT_TOOL_RESULT_OFFLOAD
+            )
+        elif sidecar_threshold is not None:
+            self.tool_result_offload = _validate_threshold(
+                sidecar_threshold, "sidecar_threshold", DEFAULT_TOOL_RESULT_OFFLOAD
+            )
+        elif env_tool is not None:
+            self.tool_result_offload = _validate_threshold(
+                env_tool, "HERO_TRACE_TOOL_RESULT_OFFLOAD", DEFAULT_TOOL_RESULT_OFFLOAD
+            )
+        else:
+            self.tool_result_offload = DEFAULT_TOOL_RESULT_OFFLOAD
+
         if text_offload is not None:
-            self.text_offload = int(text_offload)
+            self.text_offload = _validate_threshold(text_offload, "text_offload", DEFAULT_TEXT_OFFLOAD)
+        elif sidecar_threshold is not None:
+            self.text_offload = _validate_threshold(
+                sidecar_threshold, "sidecar_threshold", DEFAULT_TEXT_OFFLOAD
+            )
+        elif env_text is not None:
+            self.text_offload = _validate_threshold(
+                env_text, "HERO_TRACE_TEXT_OFFLOAD", DEFAULT_TEXT_OFFLOAD
+            )
+        else:
+            self.text_offload = DEFAULT_TEXT_OFFLOAD
 
         if hard_threshold is not None:
-            self.preview_len = int(hard_threshold)
+            self.preview_len = _validate_threshold(hard_threshold, "hard_threshold", DEFAULT_PREVIEW)
         elif preview_len is not None:
-            self.preview_len = int(preview_len)
+            self.preview_len = _validate_threshold(preview_len, "preview_len", DEFAULT_PREVIEW)
         elif env_preview is not None:
-            self.preview_len = int(env_preview)
+            self.preview_len = _validate_threshold(env_preview, "HERO_TRACE_PREVIEW", DEFAULT_PREVIEW)
         else:
             self.preview_len = DEFAULT_PREVIEW
 
@@ -152,6 +171,8 @@ class TraceWriter:
         self.hard_threshold = self.preview_len
 
         self._fsync_warned = False
+        self._last_fsync_warning: float = 0.0
+        self._closed = False
         self._lock = threading.RLock()
         created = not self.path.exists()
         self._file = open(self.path, "a", encoding="utf-8")
@@ -169,9 +190,13 @@ class TraceWriter:
             if isinstance(obj, dict):
                 sink = RESULT_SINK if obj.get("type") == "tool_result" else ARGUMENTS_SINK
                 obj = redact_payload(obj, sink=sink)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("redact_payload failed (%s), dropping sensitive fields", exc)
+            # fail-closed: do not persist unredacted obj
+            obj = {"type": obj.get("type", "unknown") if isinstance(obj, dict) else "unknown", "redaction_error": True}
         with self._lock:
+            if getattr(self, "_closed", False):
+                raise ValueError("TraceWriter closed")
             # 分支1：tool_result 大 content 分流为 result_path + preview
             if isinstance(obj, dict) and obj.get("type") == "tool_result" and "content" in obj:
                 content = obj["content"]
@@ -184,10 +209,22 @@ class TraceWriter:
                         content_str = str(content)
                 if len(content_str) > self.tool_result_offload:
                     digest = hashlib.sha256(content_str.encode("utf-8")).hexdigest()
-                    sidecar_name = f"{digest[:16]}.txt"
+                    sidecar_name = f"{digest}.txt"
                     sidecar_path = self.dir_path / sidecar_name
                     if not sidecar_path.exists():
                         self._write_sidecar_durable(sidecar_path, content_str)
+                    else:
+                        try:
+                            existing = sidecar_path.read_bytes()
+                            if existing != content_str.encode("utf-8"):
+                                sidecar_name = f"{digest}_{os.urandom(4).hex()}.txt"
+                                sidecar_path = self.dir_path / sidecar_name
+                                self._write_sidecar_durable(sidecar_path, content_str)
+                        except Exception:
+                            # read验证失败时用随机后缀避免覆盖
+                            sidecar_name = f"{digest}_{os.urandom(4).hex()}.txt"
+                            sidecar_path = self.dir_path / sidecar_name
+                            self._write_sidecar_durable(sidecar_path, content_str)
                     preview = content_str[: self.preview_len]
                     rec: Dict[str, Any] = {k: v for k, v in obj.items() if k != "content"}
                     rec["result_path"] = sidecar_name
@@ -200,10 +237,21 @@ class TraceWriter:
             raw = json.dumps(obj, ensure_ascii=False)
             if len(raw) > self.text_offload:
                 digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
-                sidecar_name = f"{digest[:16]}.json"
+                sidecar_name = f"{digest}.json"
                 sidecar_path = self.dir_path / sidecar_name
                 if not sidecar_path.exists():
                     self._write_sidecar_durable(sidecar_path, raw)
+                else:
+                    try:
+                        existing = sidecar_path.read_bytes()
+                        if existing != raw.encode("utf-8"):
+                            sidecar_name = f"{digest}_{os.urandom(4).hex()}.json"
+                            sidecar_path = self.dir_path / sidecar_name
+                            self._write_sidecar_durable(sidecar_path, raw)
+                    except Exception:
+                        sidecar_name = f"{digest}_{os.urandom(4).hex()}.json"
+                        sidecar_path = self.dir_path / sidecar_name
+                        self._write_sidecar_durable(sidecar_path, raw)
                 try:
                     rel = sidecar_path.relative_to(self.dir_path)
                     rel_str = rel.as_posix()
@@ -228,14 +276,24 @@ class TraceWriter:
             os.fsync(self._file.fileno())
         except OSError as exc:
             self._warn_fsync_failure(exc, self.path)
+            return
+        self._fsync_dir(self.dir_path)
 
     def close(self) -> None:
-        """关闭文件句柄，线程安全."""
+        """关闭文件句柄，线程安全，幂等，关前 fsync."""
         with self._lock:
+            if getattr(self, "_closed", False):
+                return
             try:
+                try:
+                    os.fsync(self._file.fileno())
+                except Exception:
+                    pass
                 self._file.close()
             except Exception:
                 pass
+            finally:
+                self._closed = True
 
     def __enter__(self) -> "TraceWriter":
         return self
@@ -249,52 +307,57 @@ class TraceWriter:
             return []
         records: List[Dict[str, Any]] = []
         try:
-            text = self.path.read_text(encoding="utf-8")
-        except Exception:
+            f = self.path.open("r", encoding="utf-8")
+        except Exception as exc:
+            logger.warning("trace read failed on %s: %s", self.path, exc)
             return []
-        for line in text.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                rec = json.loads(line)
-            except Exception:
-                continue
-            if resolve_offloads:
-                if "sidecar" in rec:
-                    sp = self._safe_sidecar_path(self.dir_path, rec["sidecar"])
-                    if sp is not None and sp.exists():
-                        try:
-                            raw = sp.read_text(encoding="utf-8")
+        with f:
+            for lineno, line in enumerate(f, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except Exception as exc:
+                    logger.warning("trace json decode failed at line %d: %s", lineno, exc)
+                    continue
+                if resolve_offloads:
+                    if "sidecar" in rec:
+                        sp = self._safe_sidecar_path(self.dir_path, rec["sidecar"])
+                        if sp is not None and sp.exists():
                             try:
-                                original = json.loads(raw)
-                                # 若侧车内是原始对象的 json，则直接替换
-                                if isinstance(original, dict):
-                                    rec = original
-                                else:
+                                raw = sp.read_text(encoding="utf-8")
+                                try:
+                                    original = json.loads(raw)
+                                    # 若侧车内是原始对象的 json，则直接替换
+                                    if isinstance(original, dict):
+                                        rec = original
+                                    else:
+                                        rec["sidecar_content"] = raw
+                                except Exception:
                                     rec["sidecar_content"] = raw
                             except Exception:
-                                rec["sidecar_content"] = raw
-                        except Exception:
-                            pass
-                elif "result_path" in rec:
-                    sp = self._safe_sidecar_path(self.dir_path, rec["result_path"])
-                    if sp is not None and sp.exists():
-                        try:
-                            content = sp.read_text(encoding="utf-8")
-                            # 仅当 rec 未含 content 时回灌，避免覆盖已有的 preview 逻辑
-                            if "content" not in rec:
-                                rec["content"] = content
-                        except Exception:
-                            pass
-            records.append(rec)
+                                pass
+                    elif "result_path" in rec:
+                        sp = self._safe_sidecar_path(self.dir_path, rec["result_path"])
+                        if sp is not None and sp.exists():
+                            try:
+                                content = sp.read_text(encoding="utf-8")
+                                # 仅当 rec 未含 content 时回灌，避免覆盖已有的 preview 逻辑
+                                if "content" not in rec:
+                                    rec["content"] = content
+                            except Exception:
+                                pass
+                records.append(rec)
         return records
 
     def _write_sidecar_durable(self, path: Path, value: str) -> None:
         """原子持久写入侧车：tmp 全量写入 → fsync → hardlink 发布 → fsync 目录."""
         with self._lock:
-            tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            tmp = path.with_name(
+                f".{path.name}.{os.getpid()}.{threading.get_ident()}.{os.urandom(4).hex()}.tmp"
+            )
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             try:
                 payload = value.encode("utf-8")
                 written = 0
@@ -304,8 +367,11 @@ class TraceWriter:
                     os.fsync(fd)
                 except OSError as exc:
                     self._warn_fsync_failure(exc, tmp)
-            except BaseException:
-                os.close(fd)
+            except Exception:
+                try:
+                    os.close(fd)
+                except Exception:
+                    pass
                 try:
                     os.unlink(tmp)
                 except OSError:
@@ -362,18 +428,32 @@ class TraceWriter:
             os.close(dir_fd)
 
     def _warn_fsync_failure(self, exc: OSError, target: Path) -> None:
-        if self._fsync_warned:
+        now = time.monotonic()
+        last = getattr(self, "_last_fsync_warning", 0)
+        # 限流但不永久静默：5秒内重复仅 debug，超时后再次 warning
+        if self._fsync_warned and (now - last) < 5:
+            logger.debug("trace fsync throttled on %s: %s", target, exc)
             return
-        self._fsync_warned = True
         logger.warning(
             "trace fsync failed on %s (%s); trace durability degraded to flush-only",
             target,
             exc,
         )
+        self._fsync_warned = True
+        self._last_fsync_warning = now
 
     @staticmethod
     def _safe_sidecar_path(base: Path, rel_path: str) -> Path | None:
         """校验侧车路径在 base 内，防目录穿越；越界返回 None."""
+        if os.path.isabs(rel_path) or ".." in Path(rel_path).parts:
+            return None
+        if "\n" in rel_path or "\x00" in rel_path or ":" in rel_path:
+            # 拒绝含冒号/换行等非法字符，防止 Windows 盘符或注入
+            # 但允许正常文件名中的下划线等
+            if rel_path.count(":") > 0 and os.name == "nt":
+                return None
+            if "\n" in rel_path or "\x00" in rel_path:
+                return None
         root = base.resolve()
         candidate = (base / rel_path).resolve()
         try:

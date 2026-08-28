@@ -10,6 +10,9 @@
 
 from __future__ import annotations
 
+import logging
+
+logger = logging.getLogger(__name__)
 
 # 段模板：保持简洁明确，便于测试与审计校验
 
@@ -57,6 +60,35 @@ Operational Notes:
 - RetryPolicy with exponential backoff for transient LLM errors; max_iterations guards loops.
 """
 
+_MAX_UNTRUSTED_LEN = 20000
+
+
+def _sanitize_untrusted(text: str, field: str = "block") -> str:
+    """Escape markdown headers and fence terminators, enforce length limit."""
+    if not isinstance(text, str):
+        raise ValueError(f"{field} must be str, got {type(text).__name__}")
+    if len(text) > _MAX_UNTRUSTED_LEN:
+        logger.warning("prompt %s truncated to %d (was %d)", field, _MAX_UNTRUSTED_LEN, len(text))
+        text = text[:_MAX_UNTRUSTED_LEN] + "\n[TRUNCATED: exceeds max length]"
+    # Escape fence terminator to prevent breakout
+    text = text.replace("```", "`\\``")
+    # Escape leading markdown headers line by line
+    lines = text.splitlines()
+    escaped: list[str] = []
+    for line in lines:
+        stripped = line.lstrip()
+        if stripped.startswith("#"):
+            idx = line.find("#")
+            escaped.append(line[:idx] + "\\" + line[idx:])
+        else:
+            escaped.append(line)
+    return "\n".join(escaped)
+
+
+def _fenced_block(content: str, label: str = "text") -> str:
+    """Wrap sanitized content in a fenced block for isolation."""
+    return f"```{label}\n{content}\n```"
+
 
 def build_system_prompt(
     skill_count: int = 5,
@@ -67,42 +99,71 @@ def build_system_prompt(
     extra_rules: str = "",
 ) -> str:
     """组装含 Grounding 三级校验的 System Prompt，未提供证据时使用占位块."""
+    # --- validate skill_count explicitly before int() ---
+    if isinstance(skill_count, bool):
+        raise ValueError("skill_count must be int, got bool")
+    try:
+        skill_count_int = int(skill_count)  # type: ignore[arg-type]
+    except (ValueError, TypeError) as exc:
+        raise ValueError(f"skill_count must be int, got {skill_count!r}") from exc
+    if skill_count_int < 0 or skill_count_int > 10000:
+        raise ValueError(f"skill_count out of range: {skill_count_int}")
+
+    # --- validate types for untrusted blocks ---
+    for name, val in [
+        ("grounding_block", grounding_block),
+        ("skills_digest", skills_digest),
+        ("extra_rules", extra_rules),
+    ]:
+        if val is not None and not isinstance(val, str):
+            raise ValueError(f"{name} must be str, got {type(val).__name__}")
+
     block = grounding_block
     if not block and ledger is not None:
         try:
             block = ledger.render_block()  # type: ignore[union-attr]
-        except Exception:
+        except (AttributeError, ValueError, TypeError, RuntimeError) as exc:
+            logger.exception("ledger.render_block failed: %s", exc)
+            block = ""
+        except Exception as exc:  # narrow fallback but still log
+            logger.exception("unexpected ledger.render_block failure: %s", exc)
             block = ""
     if not block:
         block = "(no grounding evidence yet — any price quote must be blocked)"
 
     if not isinstance(block, str):
-        block = str(block)
+        raise ValueError(f"grounding_block must be str, got {type(block).__name__}")
 
-    tool_skill = TOOL_SKILL_TEMPLATE.format(skill_count=int(skill_count))
-    if skills_digest:
-        tool_skill += f"\nSkills digest:\n{skills_digest}\n"
+    # Sanitize untrusted inputs and wrap in fenced blocks for isolation
+    safe_block = _sanitize_untrusted(block, "grounding_block")
+    safe_digest = _sanitize_untrusted(skills_digest, "skills_digest") if skills_digest else ""
+    safe_extra = _sanitize_untrusted(extra_rules, "extra_rules") if extra_rules else ""
 
-    grounding_section = GROUNDING_TEMPLATE.format(grounding_block=block)
+    fenced_grounding = _fenced_block(safe_block, "grounding")
+    tool_skill = TOOL_SKILL_TEMPLATE.format(skill_count=skill_count_int)
+    if safe_digest:
+        tool_skill += f"\nSkills digest:\n{_fenced_block(safe_digest, 'skills')}\n"
 
-    parts = [
+    grounding_section = GROUNDING_TEMPLATE.format(grounding_block=fenced_grounding)
+
+    parts: list[str] = [
         HEADER,
         OUTPUT_PRINCIPLES,
         tool_skill,
         grounding_section,
     ]
-    if extra_rules:
-        parts.append(f"## Extra Rules\n{extra_rules}\n")
+    if safe_extra:
+        parts.append(f"## Extra Rules\n{_fenced_block(safe_extra, 'extra')}\n")
     parts.append(HARD_RULE)
     parts.append(FOOTER)
 
     prompt = "\n".join(parts)
 
-    # 防御性：确保关键不变量必出现，便于审计
-    if block and block not in prompt:
-        prompt += f"\n{block}\n"
-    if "HARD RULE" not in prompt:
-        prompt += "\n" + HARD_RULE
+    # Deterministic invariants: assert instead of fragile substring duplication
+    assert "HARD RULE" in prompt, "HARD_RULE invariant broken"
+    assert HEADER in prompt, "HEADER missing"
+    # grounding fenced block must be present
+    assert fenced_grounding in prompt, "grounding block missing"
 
     return prompt
 
