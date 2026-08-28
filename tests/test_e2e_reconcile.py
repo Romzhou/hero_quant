@@ -12,6 +12,56 @@ def test_reconcile_zero_diff():
     """Shadow positions vs broker CSV 0差额 should pass."""
     from hero_quant.governance.reconcile import reconcile, load_positions_csv, aggregate_shadow
 
+
+def test_reconcile_qty_validation_raises(tmp_path):
+    """P2: missing validation - invalid qty should raise ValueError with log, not silent."""
+    from hero_quant.governance.reconcile import _normalize_qty, load_positions_csv
+    import pytest, csv
+    from pathlib import Path
+    with pytest.raises(ValueError):
+        _normalize_qty(None)
+    with pytest.raises(ValueError):
+        _normalize_qty("")
+    with pytest.raises(ValueError):
+        _normalize_qty("   ")
+    with pytest.raises(ValueError):
+        _normalize_qty("not_a_number")
+    # CSV with invalid qty should propagate error
+    p = Path(tmp_path) / "bad.csv"
+    with p.open("w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["symbol", "qty"])
+        w.writerow(["600519.SH", "bad_qty"])
+    with pytest.raises(ValueError):
+        load_positions_csv(p)
+
+
+def test_reconcile_tolerance_validation():
+    """P2: tolerance must be non-negative, otherwise ValueError."""
+    from hero_quant.governance.reconcile import reconcile
+    import pytest
+    with pytest.raises(ValueError):
+        reconcile({"A": 1}, {"A": 1}, tolerance=-1)
+    with pytest.raises(ValueError):
+        reconcile({"A": 1}, {"A": 1}, tolerance="bad")  # type: ignore
+
+
+def test_aggregate_shadow_deterministic(tmp_path):
+    """P2: non-deterministic ordering - reconcile sorted keys deterministically."""
+    from hero_quant.governance.reconcile import reconcile
+    s1 = {"B": 100, "A": 50}
+    b1 = {"A": 50, "B": 100}
+    r1 = reconcile(s1, b1)
+    r2 = reconcile({"A": 50, "B": 100}, {"B": 100, "A": 50})
+    assert r1.diffs == r2.diffs
+    assert r1.zero_diff == r2.zero_diff
+    assert r1.total_diff == r2.total_diff
+
+
+def test_reconcile_zero_diff():
+    """Shadow positions vs broker CSV 0差额 should pass."""
+    from hero_quant.governance.reconcile import reconcile, load_positions_csv, aggregate_shadow
+
     # shadow journal with trades
     from hero_quant.shadow import ShadowJournal
 

@@ -176,7 +176,8 @@ def aggregate_shadow(
                         continue
                     try:
                         e = json.loads(line)
-                    except (json.JSONDecodeError, ValueError):
+                    except (json.JSONDecodeError, ValueError) as exc:
+                        logger.debug("aggregate_shadow skip malformed json line %r: %s", line[:200], exc)
                         continue
                     rec = e.get("record", {}) if isinstance(e, dict) else {}
                     if rec.get("action") == "shadow_record":
@@ -211,6 +212,18 @@ def reconcile(
     tolerance: float = 1e-6,
 ) -> ReconcileResult:
     """逐 symbol 比对影子与券商持仓，容差内视为零差额，total_diff 为绝对差之和。"""
+    # P2: missing validation - tolerance must be non-negative float
+    try:
+        tolerance = float(tolerance)
+    except (ValueError, TypeError) as e:
+        logger.warning("reconcile invalid tolerance %r: %s", tolerance, e)
+        raise ValueError(f"tolerance must be numeric, got {tolerance!r}") from e
+    if tolerance < 0:
+        logger.warning("reconcile tolerance negative %r", tolerance)
+        raise ValueError(f"tolerance must be >=0, got {tolerance}")
+    if not isinstance(shadow, dict) or not isinstance(broker, dict):
+        logger.warning("reconcile shadow/broker must be dict, got %r / %r", type(shadow), type(broker))
+        raise TypeError("shadow and broker must be dict")
     all_syms = set(shadow.keys()) | set(broker.keys())
     diffs: List[Dict[str, Any]] = []
     total = 0.0

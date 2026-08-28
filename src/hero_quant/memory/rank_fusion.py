@@ -68,11 +68,16 @@ def rank_fusion(bm25_cands, vec_cands, k: int = 60) -> List[Tuple[str, float]]:
         List[(key, hybrid_score)] sorted descending by hybrid_score, tie-breaker lexical.
         Empty if both inputs empty.
     """
+    import logging
+    logger = logging.getLogger("hero_quant.memory.rank_fusion")
+    orig_k = k
     try:
         k = int(k)
     except (ValueError, TypeError):  # narrow: only conversion errors
+        logger.warning("rank_fusion invalid k %r, defaulting to 60", orig_k)
         k = 60
     if k <= 0:
+        logger.warning("rank_fusion k must be >0, got %r, defaulting to 60", orig_k)
         k = 60
 
     # 先 _dedup_max 每 key 最高分 再 RRF
@@ -82,13 +87,11 @@ def rank_fusion(bm25_cands, vec_cands, k: int = 60) -> List[Tuple[str, float]]:
     if not bm25_pairs and not vec_pairs:
         return []
 
-    # Sort each list by score descending to derive rank (stable)
-    # If scores equal, preserve original order.
+    # Sort each list by score descending to derive rank (deterministic)
+    # If scores equal, lexical tie-breaker for determinism (not insertion order).
     def _sorted_by_score(pairs: List[Tuple[str, float]]) -> List[Tuple[str, float]]:
-        # enumerate to keep stable ties
-        indexed = list(enumerate(pairs))
-        indexed.sort(key=lambda x: (-x[1][1], x[0]))
-        return [p for _, p in indexed]
+        # deterministic: sort by (-score, key) lexical
+        return sorted(pairs, key=lambda kv: (-kv[1], kv[0]))
 
     bm25_sorted = _sorted_by_score(bm25_pairs) if bm25_pairs else []
     vec_sorted = _sorted_by_score(vec_pairs) if vec_pairs else []

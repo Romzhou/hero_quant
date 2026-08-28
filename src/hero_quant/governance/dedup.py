@@ -155,7 +155,7 @@ class DedupStore:
         # 单进程回退存储：无外部 DB 时仍可保证幂等语义
         self._mem: dict[str, dict[str, Any]] = {}
         self._mem_ts: dict[str, float] = {}
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
 
         # 探测后端类型：显式 dsn > 路径前缀 > 环境变量，决定 PG / SQLite / 纯内存三分支
         raw = str(db_path) if isinstance(db_path, Path) else str(db_path) if db_path is not None else ""
@@ -348,6 +348,20 @@ class DedupStore:
             if rec is None:
                 return None
             return dict(rec)
+
+    def _mem_evict_if_needed(self) -> None:
+        """P2: unbounded growth - cap _mem to 10000 entries, evict oldest by timestamp. Caller must hold _lock."""
+        try:
+            if len(self._mem) > 10000:
+                # sort by ts ascending, keep newest 10000
+                sorted_keys = sorted(self._mem_ts.items(), key=lambda kv: kv[1])
+                to_evict = len(self._mem) - 10000
+                for k, _ in sorted_keys[:to_evict]:
+                    self._mem.pop(k, None)
+                    self._mem_ts.pop(k, None)
+                logger.debug("dedup _mem capped, evicted %d", to_evict)
+        except Exception as e:
+            logger.debug("dedup eviction failed: %s", e)
 
     # PG 辅助（同步）：插入占位或查询/更新，None 表示回退到 SQLite/内存
     def _pg_insert_pending_sync(self, key: str, tool: str) -> bool | None:
@@ -578,6 +592,16 @@ class DedupStore:
     # 公共 API：幂等状态机
     def insert_pending(self, key: str, tool: str) -> bool:
         """尝试写入 PENDING 占位，成功返回 True，已存在返回 False，供重试方决定是否执行。"""
+        # P2: missing validation - fail-visible for empty key/tool
+        if not isinstance(key, str) or not key.strip():
+            logger.warning("insert_pending rejected empty key %r", key)
+            raise ValueError("key must be non-empty str")
+        if not isinstance(tool, str) or not tool.strip():
+            logger.warning("insert_pending rejected empty tool %r", tool)
+            raise ValueError("tool must be non-empty str")
+        if ":" not in key:
+            logger.warning("insert_pending key should contain ':' for tenant isolation, got %r", key)
+            # not raising, just warning for observability
         _start = time.monotonic()
         _status = "success"
         try:
@@ -590,12 +614,14 @@ class DedupStore:
                         if pg_res:
                             self._mem[key] = {"key": key, "tool": tool, "status": "PENDING", "result": None, "updated_at": now}
                             self._mem_ts[key] = now
+                            self._mem_evict_if_needed()
                         else:
                             if key not in self._mem:
                                 pg_rec = self._pg_get_sync(key)
                                 if pg_rec:
                                     self._mem[key] = pg_rec
                                     self._mem_ts[key] = now
+                                    self._mem_evict_if_needed()
                     return bool(pg_res)
                 logger.warning("dedup pg insert_pending fallback to sqlite/mem for key=%s", key)
                 _dedup_observe("pg_fallback", time.monotonic(), status="error")
@@ -624,6 +650,7 @@ class DedupStore:
                         with self._lock:
                             self._mem[key] = {"key": key, "tool": tool, "status": row[0], "result": None, "updated_at": now}
                             self._mem_ts[key] = now
+                            self._mem_evict_if_needed()
                         return False
                     try:
                         cur2 = con.execute(
@@ -639,6 +666,7 @@ class DedupStore:
                             with self._lock:
                                 self._mem[key] = {"key": key, "tool": tool, "status": "PENDING", "result": None, "updated_at": now}
                                 self._mem_ts[key] = now
+                                self._mem_evict_if_needed()
                             return True
                         else:
                             return False
@@ -664,6 +692,7 @@ class DedupStore:
                     return False
                 self._mem[key] = {"key": key, "tool": tool, "status": "PENDING", "result": None, "updated_at": now}
                 self._mem_ts[key] = now
+                self._mem_evict_if_needed()
                 return True
         except Exception:
             _status = "error"
@@ -705,6 +734,7 @@ class DedupStore:
                 rec = self._mem.get(key, {})
                 self._mem[key] = {"key": key, "tool": rec.get("tool"), "status": "SUCCESS", "result": result, "updated_at": now}
                 self._mem_ts[key] = now
+                self._mem_evict_if_needed()
         except Exception:
             _status = "error"
             raise
@@ -743,6 +773,7 @@ class DedupStore:
                 rec = self._mem.get(key, {})
                 self._mem[key] = {"key": key, "tool": rec.get("tool"), "status": "FAILED", "error": str(error), "updated_at": now}
                 self._mem_ts[key] = now
+                self._mem_evict_if_needed()
         except Exception:
             _status = "error"
             raise
@@ -751,6 +782,9 @@ class DedupStore:
 
     def get(self, key: str) -> dict[str, Any] | None:
         """查询幂等记录，TTL 过期或不存在返回 None；PG→SQLite→内存依次回退。"""
+        if not isinstance(key, str) or not key.strip():
+            logger.warning("get rejected empty key %r", key)
+            raise ValueError("key must be non-empty str")
         _start = time.monotonic()
         _status = "success"
         try:
@@ -761,6 +795,7 @@ class DedupStore:
                     with self._lock:
                         self._mem[key] = pg_rec
                         self._mem_ts[key] = time.time()
+                        self._mem_evict_if_needed()
                     if pg_rec.get("result") is not None and isinstance(pg_rec["result"], str):
                         try:
                             pg_rec["result"] = json.loads(pg_rec["result"])
@@ -802,6 +837,7 @@ class DedupStore:
                         with self._lock:
                             self._mem[key] = rec
                             self._mem_ts[key] = rec.get("updated_at", time.time())
+                            self._mem_evict_if_needed()
                         return rec
                 finally:
                     con.close()

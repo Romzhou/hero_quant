@@ -577,6 +577,44 @@ class MemoryStore:
         except Exception:
             pass
 
+    def close(self) -> None:
+        """Idempotent close - release sqlite handle, safe for Windows tmp_path cleanup."""
+        try:
+            with self._lock:
+                # clear caches to free memory (bounded growth)
+                try:
+                    self._retrieval_cache.clear()
+                    self._vector_cache.clear()
+                except Exception:
+                    pass
+                # close sqlite connection if open
+                conn = getattr(self, "_conn", None)
+                if conn is not None:
+                    try:
+                        real = getattr(conn, "_real", conn)
+                        try:
+                            real.commit()
+                        except Exception:
+                            pass
+                        real.close()
+                    except Exception as e:
+                        logger.debug("MemoryStore close failed: %s", e)
+                    finally:
+                        # mark as closed to make idempotent
+                        self._conn = None  # type: ignore
+        except Exception as e:
+            logger.debug("MemoryStore close outer failed: %s", e)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            self.close()
+        except Exception:
+            pass
+        return False
+
     @property
     def vector_backend(self) -> str:
         """返回当前向量后端：``pgvector`` 或 ``local``。"""
@@ -827,12 +865,26 @@ class MemoryStore:
 
     def write(self, key: str, content: str, memory_type: str | None = None) -> None:
         """写入一条记忆：经去重、落盘、建索引并同步向量侧车。"""
+        # P2: missing validation - fail-visible for empty key/content
+        if not isinstance(key, str) or not key.strip():
+            logger.warning("MemoryStore.write rejected empty key %r", key)
+            raise ValueError("key must be non-empty str")
+        if not isinstance(content, str) or not content.strip():
+            logger.warning("MemoryStore.write rejected empty content for key %r", key)
+            raise ValueError("content must be non-empty str")
         now = time.time()
         ns_key = self._ns_key(key)
         # 30 秒滑动窗口去重：跨 key、大小写/空白归一
         with self._lock:
             # 定时清理过期哈希，避免内存膨胀
             self._recent_hashes = {h: ts for h, ts in self._recent_hashes.items() if now - ts < 30}
+            # P2: unbounded growth - cap _recent_hashes to 2048 entries (LRU by timestamp)
+            if len(self._recent_hashes) > 2048:
+                # evict oldest by timestamp
+                sorted_items = sorted(self._recent_hashes.items(), key=lambda kv: kv[1])
+                # keep newest 2048
+                self._recent_hashes = dict(sorted_items[-2048:])
+                logger.debug("recent_hashes capped to 2048, evicted %d", len(sorted_items) - 2048)
             # 内容归一哈希为去重核心
             content_hash = hashlib.sha256(content.lower().strip().encode()).hexdigest()[:12]
             # 同时校验 name:content 组合哈希，覆盖同内容不同键的重复
@@ -841,6 +893,10 @@ class MemoryStore:
                 return
             self._recent_hashes[content_hash] = now
             self._recent_hashes[full_hash] = now
+            # re-check cap after insert
+            if len(self._recent_hashes) > 2048:
+                sorted_items = sorted(self._recent_hashes.items(), key=lambda kv: kv[1])
+                self._recent_hashes = dict(sorted_items[-2048:])
 
         # 原子落盘：tmp 写入 -> fsync -> os.replace，权限 0600，兼容 flock
         # 层次路由：memory_type 命中 CATEGORIES 时分目录，其余回落到 base
@@ -1013,6 +1069,14 @@ class MemoryStore:
             else:
                 # 已有元数据保持不变，避免覆盖外部更新的访问计数
                 pass
+            # P2: unbounded growth - cap _meta to 4096 entries, evict oldest by last_accessed
+            if len(self._meta) > 4096:
+                sorted_meta = sorted(self._meta.items(), key=lambda kv: kv[1].get("last_accessed", 0))
+                # keep newest 4096
+                keep = dict(sorted_meta[-4096:])
+                self._meta.clear()
+                self._meta.update(keep)
+                logger.debug("meta capped to 4096, evicted %d", len(sorted_meta) - 4096)
         # 写入后失效检索缓存，保证新笔记立即可召回
         try:
             self.clear_retrieval_cache()

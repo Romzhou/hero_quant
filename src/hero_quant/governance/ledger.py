@@ -497,12 +497,29 @@ class Ledger:
     def append(self, record: dict, tenant: str = "default", price: float | None = None):
         """追加一条记录：先加锁并全链校验，再计算 tenant_seq/prev_hash/record_hash 并 fsync 落盘。"""
         import time as _t
+        import copy
+
+        # P2: missing validation - fail-visible for empty/invalid record/tenant
+        if not isinstance(record, dict):
+            logger.warning("ledger append rejected non-dict record %r", type(record))
+            raise TypeError("record must be dict")
+        if not isinstance(tenant, str) or not tenant.strip():
+            logger.warning("ledger append rejected empty tenant %r", tenant)
+            raise ValueError("tenant must be non-empty str")
+        if price is not None:
+            try:
+                price = float(price)
+            except (ValueError, TypeError) as e:
+                logger.warning("ledger append invalid price %r: %s", price, e)
+                raise ValueError(f"price must be numeric, got {price!r}") from e
 
         _append_start = _t.monotonic()
         _status = "success"
         try:
             if isinstance(record, dict):
                 sink = RESULT_SINK if record.get("type") == "tool_result" else ARGUMENTS_SINK
+                # P2: shallow copy leak - deepcopy before redact to avoid mutating caller dict
+                record = copy.deepcopy(record)
                 record = redact_payload(record, sink=sink)
         except Exception as _exc:
             logger.warning("silent handled: governance: ledger fsync/lock best-effort, durability degraded but not silent", exc_info=_exc)  # intentional: governance: ledger fsync/lock best-effort, durability degraded but not silent
@@ -605,7 +622,21 @@ class Ledger:
             pass  # intentional governance: ledger fsync/lock best-effort, durability degraded but not silent
         if created:
             _fsync_dir(self.path.parent)
-        return obj
+        # P2: unbounded growth - best-effort auto-rotate when exceeding threshold
+        try:
+            if self.path.exists() and self.path.stat().st_size >= DEFAULT_ROTATE_BYTES:
+                logger.warning("ledger size exceeds %d, auto-rotating", DEFAULT_ROTATE_BYTES)
+                try:
+                    rotate_if_needed(self.path)
+                except LedgerCorruptionError:
+                    logger.warning("ledger auto-rotate refused due to corruption")
+                except Exception as e:
+                    logger.debug("ledger auto-rotate failed: %s", e)
+        except Exception as e:
+            logger.debug("ledger auto-rotate check failed: %s", e)
+        # P2: shallow copy leak - return deep copy
+        import copy
+        return copy.deepcopy(obj)
 
     def verify(self, tenant: str | None = None) -> bool:
         """校验链完整性；指定 tenant 时仅校验该租户子链。"""
@@ -651,8 +682,15 @@ class Ledger:
 
     def query(self, tenant: str):
         """按租户隔离查询，返回该 tenant 的全部条目。"""
+        import copy
+        # P2: missing validation + shallow copy leak
+        if not isinstance(tenant, str) or not tenant.strip():
+            logger.warning("ledger query rejected empty tenant %r", tenant)
+            raise ValueError("tenant must be non-empty str")
         entries = self._read_all()
-        return [e for e in entries if e.get("tenant", "default") == tenant]
+        filtered = [e for e in entries if e.get("tenant", "default") == tenant]
+        # deep copy to prevent caller mutation leaking state
+        return copy.deepcopy(filtered)
 
     def query_by_tenant(self, tenant: str):
         """query 的别名，保持对旧调用的兼容。"""
