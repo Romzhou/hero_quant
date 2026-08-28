@@ -17,8 +17,30 @@ import logging
 import os
 import pathlib
 import json
+import asyncio
+import threading
+import tempfile
+import itertools
+
+from fastapi import BackgroundTasks, HTTPException
 
 from hero_quant.api.security import SSE_TICKET_TTL_SECONDS, consume_ticket, issue_ticket
+
+# 结构化日志：JSON 输出 + contextvars 透传，便于与 OTel 关联（需在 metrics import 前定义 logger）
+structlog.configure(
+    processors=[
+        structlog.contextvars.merge_contextvars,
+        structlog.processors.add_log_level,
+        structlog.processors.TimeStamper(fmt="iso"),
+        structlog.processors.JSONRenderer(),
+    ],
+    wrapper_class=structlog.make_filtering_bound_logger(logging.NOTSET),
+    context_class=dict,
+    logger_factory=structlog.PrintLoggerFactory(),
+    cache_logger_on_first_use=True,
+)
+
+logger = structlog.get_logger("api")
 
 # 预注册 metrics 加固指标（wall-time、ledger、去重等），失败不影响主流程
 try:
@@ -58,22 +80,6 @@ def _host_without_port(host: str) -> str:
 def _is_allowed_loopback_host(host: str) -> bool:
     """判断 Host 是否在回环白名单内（用于 DNS rebinding 防护）。"""
     return _host_without_port(host) in _DEFAULT_LOOPBACK_HOSTS
-
-# 结构化日志：JSON 输出 + contextvars 透传，便于与 OTel 关联
-structlog.configure(
-    processors=[
-        structlog.contextvars.merge_contextvars,
-        structlog.processors.add_log_level,
-        structlog.processors.TimeStamper(fmt="iso"),
-        structlog.processors.JSONRenderer(),
-    ],
-    wrapper_class=structlog.make_filtering_bound_logger(logging.NOTSET),
-    context_class=dict,
-    logger_factory=structlog.PrintLoggerFactory(),
-    cache_logger_on_first_use=True,
-)
-
-logger = structlog.get_logger("api")
 
 # --- 8-module wiring helpers (best-effort, logged, non-blocking) ---
 def _get_checkpoint_saver():
@@ -300,7 +306,11 @@ async def _security_headers_and_host_check(request: Request, call_next):
 @app.get("/live")
 def live():
     """存活探针：返回 ok 并递增请求计数。"""
-    REQUEST_COUNTER.labels(endpoint="/live").inc()
+    if REQUEST_COUNTER is not None:
+        try:
+            REQUEST_COUNTER.labels(endpoint="/live").inc()
+        except Exception as _e:
+            logger.debug("metrics.counter_failed", error=str(_e))
     return {"status": "ok"}
 
 
@@ -379,11 +389,7 @@ def _check_cohere() -> bool:
         from hero_quant.config.settings import Settings
 
         s = Settings()
-        key = getattr(s, "cohere_api_key", "") or os.environ.get("COHERE_API_KEY", "") or ""
-        if not key or not str(key).strip():
-            # Cohere optional; missing key not considered degraded for Task9 but probe returns True to avoid false degraded
-            return True
-        # if key present, consider healthy (avoid external call in readiness)
+        _ = getattr(s, "cohere_api_key", "") or os.environ.get("COHERE_API_KEY", "") or ""
         return True
     except Exception:
         return True
@@ -392,7 +398,12 @@ def _check_cohere() -> bool:
 @app.get("/ready")
 def ready():
     """就绪探针：聚合 degraded — probe PG (checkpoint), Cohere health, 返回 pg/checkpoint/billing."""
-    REQUEST_COUNTER.labels(endpoint="/ready").inc()
+    if REQUEST_COUNTER is not None:
+        try:
+            REQUEST_COUNTER.labels(endpoint="/ready").inc()
+        except Exception as _e:
+            logger.debug("metrics.counter_failed", error=str(_e))
+    s = None  # 预定义避免 UnboundLocalError
     pg_ok, checkpoint_mode = _check_checkpoint_pg()
     billing_ok, billing_mode = _check_billing_pg()
     cohere_ok = _check_cohere()
@@ -435,9 +446,35 @@ def metrics():
 
 
 @app.get("/v1/query")
-def query(q: str = "", use_graph: bool = False, replay_path: str | None = None, trace_dir: str | None = None, wall_time_budget: float | None = None):
+def query(q: str = "", use_graph: bool = False, replay_path: str | None = None, trace_dir: str | None = None, wall_time_budget: float | None = None, background_tasks: BackgroundTasks = BackgroundTasks([])):  # type: ignore[assignment]
     """同步查询：组装 AgentLoop 并返回 LoopResult 聚合 JSON。"""
-    REQUEST_COUNTER.labels(endpoint="/v1/query").inc()
+    if REQUEST_COUNTER is not None:
+        try:
+            REQUEST_COUNTER.labels(endpoint="/v1/query").inc()
+        except Exception as _e:
+            logger.debug("metrics.counter_failed", error=str(_e))
+    # trace_dir/replay_path 白名单校验：仅允许 tempfile.gettempdir() 内
+    _tmp_base = pathlib.Path(tempfile.gettempdir()).resolve()
+    if trace_dir is not None:
+        try:
+            _td = pathlib.Path(trace_dir).resolve()
+            if not _td.is_relative_to(_tmp_base):
+                raise HTTPException(status_code=400, detail="trace_dir must be inside temp dir")
+        except HTTPException:
+            raise
+        except Exception as _e:
+            raise HTTPException(status_code=400, detail=f"invalid trace_dir: {_e}")
+    if replay_path is not None:
+        try:
+            _rp = pathlib.Path(replay_path).resolve()
+            if not _rp.is_relative_to(_tmp_base):
+                raise HTTPException(status_code=400, detail="replay_path must be inside temp dir")
+            if not _rp.is_file():
+                raise HTTPException(status_code=400, detail="replay_path not found")
+        except HTTPException:
+            raise
+        except Exception as _e:
+            raise HTTPException(status_code=400, detail=f"invalid replay_path: {_e}")
     try:
         from hero_quant.config.settings import Settings
         s = Settings()
@@ -503,13 +540,19 @@ def query(q: str = "", use_graph: bool = False, replay_path: str | None = None, 
 
         trace = None
         trace_dir_path = None
+        _tmp_dir_obj = None
         try:
             from hero_quant.agent.trace import TraceWriter
             if trace_dir:
                 trace_dir_path = _pl.Path(trace_dir)
                 trace_dir_path.mkdir(parents=True, exist_ok=True)
             else:
-                trace_dir_path = _pl.Path(tempfile.mkdtemp(prefix="hq_trace_"))
+                _tmp_dir_obj = tempfile.TemporaryDirectory(prefix="hq_trace_")
+                trace_dir_path = _pl.Path(_tmp_dir_obj.name)
+                try:
+                    background_tasks.add_task(_tmp_dir_obj.cleanup)
+                except Exception:
+                    pass  # BackgroundTask 清理失败忽略
             trace = TraceWriter(trace_dir_path / "trace.jsonl")
         except Exception as _e:
             logger.warning("trace.init_failed", error=str(_e))
@@ -602,6 +645,8 @@ def query(q: str = "", use_graph: bool = False, replay_path: str | None = None, 
         if isinstance(res.reason, str) and "approval" in res.reason.lower() or res.reason == "need_approval":
             out["need_approval"] = True
         return out
+    except HTTPException:
+        raise
     except Exception as _e:
         logger.error("query.failed", error=str(_e), query=q)
         return JSONResponse(status_code=500, content={"detail": str(_e), "query": q})
@@ -610,7 +655,11 @@ def query(q: str = "", use_graph: bool = False, replay_path: str | None = None, 
 @app.post("/v1/query/ticket")
 def query_ticket():
     """签发一个短时、单次消费的 SSE 查询票据。"""
-    REQUEST_COUNTER.labels(endpoint="/v1/query/ticket").inc()
+    if REQUEST_COUNTER is not None:
+        try:
+            REQUEST_COUNTER.labels(endpoint="/v1/query/ticket").inc()
+        except Exception as _e:
+            logger.debug("metrics.counter_failed", error=str(_e))
     return {
         "ticket": issue_ticket(ttl=SSE_TICKET_TTL_SECONDS),
         "expires_in": SSE_TICKET_TTL_SECONDS,
@@ -618,15 +667,40 @@ def query_ticket():
 
 
 @app.get("/v1/query/stream")
-def query_stream(q: str = "", ticket: str | None = None, use_graph: bool = False, replay_path: str | None = None, trace_dir: str | None = None, wall_time_budget: float | None = None):
+def query_stream(q: str = "", ticket: str | None = None, use_graph: bool = False, replay_path: str | None = None, trace_dir: str | None = None, wall_time_budget: float | None = None, background_tasks: BackgroundTasks = BackgroundTasks([])):  # type: ignore[assignment]
     """SSE 查询流：真实 AgentLoop 驱动，产出 tool 轨迹 + 流式 delta + [DONE]。"""
-    REQUEST_COUNTER.labels(endpoint="/v1/query/stream").inc()
+    if REQUEST_COUNTER is not None:
+        try:
+            REQUEST_COUNTER.labels(endpoint="/v1/query/stream").inc()
+        except Exception as _e:
+            logger.debug("metrics.counter_failed", error=str(_e))
+    # 路径白名单校验
+    _tmp_base_s = pathlib.Path(tempfile.gettempdir()).resolve()
+    if trace_dir is not None:
+        try:
+            _td_s = pathlib.Path(trace_dir).resolve()
+            if not _td_s.is_relative_to(_tmp_base_s):
+                raise HTTPException(status_code=400, detail="trace_dir must be inside temp dir")
+        except HTTPException:
+            raise
+        except Exception as _e:
+            raise HTTPException(status_code=400, detail=f"invalid trace_dir: {_e}")
+    if replay_path is not None:
+        try:
+            _rp_s = pathlib.Path(replay_path).resolve()
+            if not _rp_s.is_relative_to(_tmp_base_s):
+                raise HTTPException(status_code=400, detail="replay_path must be inside temp dir")
+            if not _rp_s.is_file():
+                raise HTTPException(status_code=400, detail="replay_path not found")
+        except HTTPException:
+            raise
+        except Exception as _e:
+            raise HTTPException(status_code=400, detail=f"invalid replay_path: {_e}")
     if not consume_ticket(ticket):
         return JSONResponse(status_code=403, content={"detail": "Invalid or expired SSE ticket"})
 
-    def event_generator():
+    async def event_generator():
         import json as _json
-        import time as _time
         import tempfile
         import pathlib as _pl
         try:
@@ -689,13 +763,19 @@ def query_stream(q: str = "", ticket: str | None = None, use_graph: bool = False
                 llm = _FakeLLM()
             trace = None
             trace_dir_path = None
+            _tmp_stream_dir = None
             try:
                 from hero_quant.agent.trace import TraceWriter
                 if trace_dir:
                     trace_dir_path = _pl.Path(trace_dir)
                     trace_dir_path.mkdir(parents=True, exist_ok=True)
                 else:
-                    trace_dir_path = _pl.Path(tempfile.mkdtemp(prefix="hq_trace_"))
+                    _tmp_stream_dir = tempfile.TemporaryDirectory(prefix="hq_trace_")
+                    trace_dir_path = _pl.Path(_tmp_stream_dir.name)
+                    try:
+                        background_tasks.add_task(_tmp_stream_dir.cleanup)
+                    except Exception:
+                        pass
                 trace = TraceWriter(trace_dir_path / "trace.jsonl")
             except Exception as _e:
                 logger.warning("trace.init_failed", error=str(_e))
@@ -817,7 +897,7 @@ def query_stream(q: str = "", ticket: str | None = None, use_graph: bool = False
                         continue
                     yield f"data: {_json.dumps(payload, ensure_ascii=False)}\n\n"
                     emitted += 1
-                    _time.sleep(0.02)
+                    await asyncio.sleep(0.02)
                 except Exception as _e:
                     logger.warning("tool.emit_failed", error=str(_e))
                     continue
@@ -838,7 +918,7 @@ def query_stream(q: str = "", ticket: str | None = None, use_graph: bool = False
                 for ft in fallback_tools:
                     payload = {"type": "tool", "tool": ft["tool"], "status": "success", "preview": ft["preview"], "latencyMs": ft["latencyMs"]}
                     yield f"data: {_json.dumps(payload, ensure_ascii=False)}\n\n"
-                    _time.sleep(0.04)
+                    await asyncio.sleep(0.04)
             text = res.text or ""
             if not text:
                 text = f"【回测完成】600519.SH 近一月等权 Sharpe 1.62 grounding_verified {res.grounding_verified}\n查询: {q}\n"
@@ -863,7 +943,7 @@ def query_stream(q: str = "", ticket: str | None = None, use_graph: bool = False
                 if not c:
                     continue
                 yield f"data: {_json.dumps({'delta': c}, ensure_ascii=False)}\n\n"
-                _time.sleep(0.04)
+                await asyncio.sleep(0.04)
             # interaction wiring: emit need_approval if loop requested approval (best-effort, logged)
             try:
                 if isinstance(res.reason, str) and ("need_approval" in res.reason.lower() or "approval" in res.reason.lower()):
@@ -895,71 +975,76 @@ def query_stream(q: str = "", ticket: str | None = None, use_graph: bool = False
 
 # 研究页回测产物：以 BacktestEngine 合成生成，保证 metrics/sharpe/date/tearsheet 齐全
 _backtest_cache = {}
+_backtest_cache_lock = threading.Lock()
 
 def _get_backtest_bundle():
     """获取回测产物（metrics、持仓、tearsheet、CSV），带缓存；失败返回静态兜底。"""
     global _backtest_cache
     if _backtest_cache:
         return _backtest_cache
-    try:
-        import pandas as pd
-        import numpy as np
-        from hero_quant.backtest.engine import BacktestEngine
-
-        # 确定性合成行情（20 日，类 600519.SH 走势）
-        dates = pd.date_range("2026-07-20", periods=20, freq="D")
-        # 确定性爬升叠加小幅正弦波动，无随机性
-        base = 1680.0
-        close_vals = [base + i * 1.8 + (3.0 if i % 5 == 0 else -1.2 if i % 7 == 0 else 0.6 * np.sin(i)) for i in range(20)]
-        prices = pd.DataFrame({"close": close_vals}, index=dates)
-        prices.index.name = "date"
-        eng = BacktestEngine(initial_capital=1.0)
-        res = eng.run(prices, weights=[0.5, 0.5])
-        metrics_data = res.get("metrics", {})
-        # 补齐关键指标缺省值
-        if "sharpe" not in metrics_data:
-            metrics_data["sharpe"] = 1.62
-        if "annual_return" not in metrics_data:
-            metrics_data["annual_return"] = 0.184
-        positions = res.get("positions")
-        # 生成带 date 表头的 CSV 文本
-        csv_text = ""
+    with _backtest_cache_lock:
+        if _backtest_cache:
+            return _backtest_cache
         try:
-            if positions is not None and hasattr(positions, "to_csv"):
-                import io
-                buf = io.StringIO()
-                # 保证 index_label 为 date，便于前端/测试解析
-                positions.to_csv(buf, index=True, index_label="date")
-                csv_text = buf.getvalue()
-            else:
+            import pandas as pd
+            import numpy as np
+            from hero_quant.backtest.engine import BacktestEngine
+
+            # 确定性合成行情（20 日，类 600519.SH 走势）
+            dates = pd.date_range("2026-07-20", periods=20, freq="D")
+            # 确定性爬升叠加小幅正弦波动，无随机性
+            base = 1680.0
+            close_vals = [base + i * 1.8 + (3.0 if i % 5 == 0 else -1.2 if i % 7 == 0 else 0.6 * np.sin(i)) for i in range(20)]
+            prices = pd.DataFrame({"close": close_vals}, index=dates)
+            prices.index.name = "date"
+            eng = BacktestEngine(initial_capital=1.0)
+            res = eng.run(prices, weights=[0.5, 0.5])
+            metrics_data = res.get("metrics", {})
+            # 补齐关键指标缺省值
+            if "sharpe" not in metrics_data:
+                metrics_data["sharpe"] = 1.62
+            if "annual_return" not in metrics_data:
+                metrics_data["annual_return"] = 0.184
+            positions = res.get("positions")
+            # 生成带 date 表头的 CSV 文本
+            csv_text = ""
+            try:
+                if positions is not None and hasattr(positions, "to_csv"):
+                    import io
+                    buf = io.StringIO()
+                    # 保证 index_label 为 date，便于前端/测试解析
+                    positions.to_csv(buf, index=True, index_label="date")
+                    csv_text = buf.getvalue()
+                else:
+                    csv_text = "date,symbol,weight,close\n2026-08-12,600519.SH,0.5,1680.2\n"
+            except Exception:
                 csv_text = "date,symbol,weight,close\n2026-08-12,600519.SH,0.5,1680.2\n"
-        except Exception:
-            csv_text = "date,symbol,weight,close\n2026-08-12,600519.SH,0.5,1680.2\n"
-        tearsheet = res.get("tearsheet", "")
-        if not tearsheet or "Tearsheet" not in tearsheet:
-            tearsheet = """<!doctype html><html><head><meta charset="utf-8"><title>Tearsheet</title></head><body><h1>Tearsheet — Production Core</h1><p>Sharpe 1.62 | Annual 18.4%</p><table><tr><th>Month</th><th>Return</th></tr><tr><td>2026-08</td><td>+0.82%</td></tr></table></body></html>"""
-        _backtest_cache = {"metrics": metrics_data, "positions": positions, "csv": csv_text, "tearsheet": tearsheet}
-        return _backtest_cache
-    except Exception as _e:
-        logger.warning("backtest.bundle_failed_fallback", error=str(_e))  # intentional fallback to static
-        # 静态兜底，保证接口始终可用
-        _backtest_cache = {
-            "metrics": {"sharpe": 1.62, "annual_return": 0.184, "max_drawdown": -0.032, "turnover": 0.42, "volatility": 0.18, "cumulative_return": 0.06},
-            "positions": None,
-            "csv": "date,symbol,weight,close\n2026-08-12,600519.SH,0.5,1680.2\n2026-08-13,600519.SH,0.5,1692.5\n",
-            "tearsheet": """<!doctype html><html><head><meta charset="utf-8"><title>Tearsheet</title></head><body><h1>Tearsheet — Production Core</h1><p>Sharpe 1.62 | Annual 18.4%</p></body></html>""",
-        }
-        return _backtest_cache
+            tearsheet = res.get("tearsheet", "")
+            if not tearsheet or "Tearsheet" not in tearsheet:
+                tearsheet = """<!doctype html><html><head><meta charset="utf-8"><title>Tearsheet</title></head><body><h1>Tearsheet — Production Core</h1><p>Sharpe 1.62 | Annual 18.4%</p><table><tr><th>Month</th><th>Return</th></tr><tr><td>2026-08</td><td>+0.82%</td></tr></table></body></html>"""
+            _backtest_cache = {"metrics": metrics_data, "positions": positions, "csv": csv_text, "tearsheet": tearsheet}
+            return _backtest_cache
+        except Exception as _e:
+            logger.warning("backtest.bundle_failed_fallback", error=str(_e))  # intentional fallback to static
+            # 静态兜底，保证接口始终可用
+            _backtest_cache = {
+                "metrics": {"sharpe": 1.62, "annual_return": 0.184, "max_drawdown": -0.032, "turnover": 0.42, "volatility": 0.18, "cumulative_return": 0.06},
+                "positions": None,
+                "csv": "date,symbol,weight,close\n2026-08-12,600519.SH,0.5,1680.2\n2026-08-13,600519.SH,0.5,1692.5\n",
+                "tearsheet": """<!doctype html><html><head><meta charset="utf-8"><title>Tearsheet</title></head><body><h1>Tearsheet — Production Core</h1><p>Sharpe 1.62 | Annual 18.4%</p></body></html>""",
+            }
+            return _backtest_cache
 
 
 @app.get("/v1/backtest/metrics.json")
 def backtest_metrics():
     """返回回测核心指标 JSON。"""
-    try:
-        REQUEST_COUNTER.labels(endpoint="/v1/backtest/metrics.json").inc()
-    except Exception as _e:
-        logger.debug("metrics.counter_failed", error=str(_e))  # intentional offline-safe
-        pass  # intentional offline-safe
+    if REQUEST_COUNTER is not None:
+        try:
+            REQUEST_COUNTER.labels(endpoint="/v1/backtest/metrics.json").inc()
+        except Exception as _e:
+            logger.debug("metrics.counter_failed", error=str(_e))  # intentional offline-safe
+            pass  # intentional offline-safe
     bundle = _get_backtest_bundle()
     return JSONResponse(content=bundle["metrics"])
 
@@ -967,11 +1052,12 @@ def backtest_metrics():
 @app.get("/v1/backtest/positions.csv")
 def backtest_positions():
     """返回持仓 CSV，表头包含 date 列。"""
-    try:
-        REQUEST_COUNTER.labels(endpoint="/v1/backtest/positions.csv").inc()
-    except Exception as _e:
-        logger.debug("metrics.counter_failed", error=str(_e))  # intentional offline-safe
-        pass  # intentional offline-safe
+    if REQUEST_COUNTER is not None:
+        try:
+            REQUEST_COUNTER.labels(endpoint="/v1/backtest/positions.csv").inc()
+        except Exception as _e:
+            logger.debug("metrics.counter_failed", error=str(_e))  # intentional offline-safe
+            pass  # intentional offline-safe
     bundle = _get_backtest_bundle()
     csv_text = bundle.get("csv", "date,symbol,weight,close\n2026-08-12,600519.SH,0.5,1680.2\n")
     return PlainTextResponse(content=csv_text, media_type="text/csv", headers={"Content-Disposition": "inline; filename=positions.csv"})
@@ -994,11 +1080,14 @@ def backtest_tearsheet():
 @app.get("/v1/trace/events")
 def trace_events(request: Request, offset: int = 0):
     """按 offset 返回追踪事件；Accept 为 text/event-stream 时以 SSE 流式返回。"""
-    try:
-        REQUEST_COUNTER.labels(endpoint="/v1/trace/events").inc()
-    except Exception as _e:
-        logger.debug("metrics.counter_failed", error=str(_e))  # intentional offline-safe
-        pass  # intentional offline-safe
+    if offset < 0:
+        raise HTTPException(status_code=400, detail="offset must be >=0")
+    if REQUEST_COUNTER is not None:
+        try:
+            REQUEST_COUNTER.labels(endpoint="/v1/trace/events").inc()
+        except Exception as _e:
+            logger.debug("metrics.counter_failed", error=str(_e))  # intentional offline-safe
+            pass  # intentional offline-safe
     accept = request.headers.get("accept", "")
     # 优先尝试读取真实 trace.jsonl，否则返回合成心跳
     # 搜索候选：环境变量、当前目录、仓库根、/tmp
@@ -1018,10 +1107,9 @@ def trace_events(request: Request, offset: int = 0):
         for p in search_paths:
             try:
                 if p.is_file():
-                    txt = p.read_text(encoding="utf-8", errors="ignore")
-                    lines = [line.strip() for line in txt.splitlines() if line.strip()]
-                    # 按 offset 切片
-                    sliced = lines[offset: offset + 50]
+                    # 流式 islice 读取，避免全量加载 OOM
+                    with p.open("r", encoding="utf-8", errors="ignore") as _f:
+                        sliced = list(itertools.islice((_l.strip() for _l in _f if _l.strip()), offset, offset + 50))
                     for line in sliced:
                         try:
                             j = json.loads(line)
@@ -1132,9 +1220,11 @@ if _dist_path is not None:
         if full_path.startswith("v1/"):
             return JSONResponse(status_code=404, content={"detail": "Not Found"})
 
-        # 若为真实静态资源则直接返回文件（如 js/css/svg）
-        candidate = _dist_path / full_path
+        # 若为真实静态资源则直接返回文件（如 js/css/svg）— 需 resolve+is_relative_to 防穿越
+        candidate = (_dist_path / full_path).resolve()
         try:
+            if not candidate.is_relative_to(_dist_path.resolve()):
+                return JSONResponse(status_code=404, content={"detail": "Not Found"})
             if candidate.is_file():
                 # 由 FileResponse 推断媒体类型
                 return FileResponse(str(candidate))
