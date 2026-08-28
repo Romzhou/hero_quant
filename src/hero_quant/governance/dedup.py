@@ -9,12 +9,16 @@ from __future__ import annotations
 
 import inspect
 import json
+import logging
 import os
 import re
 import sqlite3
+import threading
 import time
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 # 可观测性探针（离线安全，无硬依赖）：记录 dedup 操作耗时与计数，失败时静默降级
@@ -151,6 +155,7 @@ class DedupStore:
         # 单进程回退存储：无外部 DB 时仍可保证幂等语义
         self._mem: dict[str, dict[str, Any]] = {}
         self._mem_ts: dict[str, float] = {}
+        self._lock = threading.Lock()
 
         # 探测后端类型：显式 dsn > 路径前缀 > 环境变量，决定 PG / SQLite / 纯内存三分支
         raw = str(db_path) if isinstance(db_path, Path) else str(db_path) if db_path is not None else ""
@@ -329,28 +334,29 @@ class DedupStore:
         return (time.time() - ts) > self.ttl_seconds
 
     def _mem_cleanup(self, key: str) -> None:
-        if self._mem_is_expired(key):
-            self._mem.pop(key, None)
-            self._mem_ts.pop(key, None)
+        with self._lock:
+            if self._mem_is_expired(key):
+                self._mem.pop(key, None)
+                self._mem_ts.pop(key, None)
 
     def _mem_get(self, key: str) -> dict[str, Any] | None:
-        self._mem_cleanup(key)
-        rec = self._mem.get(key)
-        if rec is None:
-            return None
-        # deep copy to avoid mutation
-        return dict(rec)
+        with self._lock:
+            if self._mem_is_expired(key):
+                self._mem.pop(key, None)
+                self._mem_ts.pop(key, None)
+            rec = self._mem.get(key)
+            if rec is None:
+                return None
+            return dict(rec)
 
     # PG 辅助（同步）：插入占位或查询/更新，None 表示回退到 SQLite/内存
     def _pg_insert_pending_sync(self, key: str, tool: str) -> bool | None:
-        """PG 原子插入 PENDING（ON CONFLICT DO NOTHING），成功返回是否插入，否则回退。"""
+        """PG 原子插入 PENDING，先 DELETE 过期再 INSERT，成功返回是否插入，否则回退。"""
         if not self._is_pg or self.pool is None or _is_async_pool(self.pool):
             return None
         try:
-            # cleanup expired first: delete where updated_at < now() - ttl
-            if self.ttl_seconds > 0:
-                # we skip ttl delete for now to keep SQL simple; expiry handled in SELECT
-                pass
+            sql_del = "DELETE FROM dedup WHERE key=%s AND updated_at < now() - interval '%s seconds'"
+            sql_del2 = "DELETE FROM tool_call_dedup WHERE idempotency_key=%s AND updated_at < now() - interval '%s seconds'"
             sql = """
                 INSERT INTO dedup (key, tool, status, updated_at)
                 VALUES (%s, %s, 'PENDING', now())
@@ -364,15 +370,32 @@ class DedupStore:
             inserted = False
             if hasattr(self.pool, "connection"):
                 with self.pool.connection() as conn:  # type: ignore
+                    # TTL cleanup: delete expired rows before insert
+                    if self.ttl_seconds > 0:
+                        try:
+                            try:
+                                conn.execute(sql_del, (key, str(int(self.ttl_seconds))))  # type: ignore
+                            except Exception:
+                                with conn.cursor() as _c:  # type: ignore
+                                    _c.execute(sql_del, (key, str(int(self.ttl_seconds))))
+                        except Exception as e:
+                            logger.warning("dedup pg delete expired failed: %s", e, exc_info=True)
+                            _dedup_observe("pg_delete_expired", time.monotonic(), status="error")
+                        try:
+                            try:
+                                conn.execute(sql_del2, (key, str(int(self.ttl_seconds))))  # type: ignore
+                            except Exception:
+                                with conn.cursor() as _c2:  # type: ignore
+                                    _c2.execute(sql_del2, (key, str(int(self.ttl_seconds))))
+                        except Exception:
+                            pass
                     try:
                         cur = conn.execute(sql, (key, tool))  # type: ignore
-                        # rowcount 1 if inserted
                         inserted = getattr(cur, "rowcount", 0) == 1
                     except Exception:
                         with conn.cursor() as cur2:  # type: ignore
                             cur2.execute(sql, (key, tool))
                             inserted = getattr(cur2, "rowcount", 0) == 1
-                    # also try alias table for compat (ignore errors)
                     try:
                         conn.execute(sql2, (key, tool))  # type: ignore
                     except Exception:
@@ -388,6 +411,17 @@ class DedupStore:
             elif hasattr(self.pool, "getconn"):
                 conn = self.pool.getconn()  # type: ignore
                 try:
+                    if self.ttl_seconds > 0:
+                        try:
+                            with conn.cursor() as _c:
+                                _c.execute(sql_del, (key, str(int(self.ttl_seconds))))
+                        except Exception as e:
+                            logger.warning("dedup pg delete expired failed: %s", e, exc_info=True)
+                        try:
+                            with conn.cursor() as _c2:
+                                _c2.execute(sql_del2, (key, str(int(self.ttl_seconds))))
+                        except Exception:
+                            pass
                     with conn.cursor() as cur:
                         cur.execute(sql, (key, tool))
                         inserted = getattr(cur, "rowcount", 0) == 1
@@ -404,7 +438,9 @@ class DedupStore:
             else:
                 return None
             return bool(inserted)
-        except Exception:
+        except Exception as e:
+            logger.warning("dedup pg insert_pending failed, fallback: %s", e, exc_info=True)
+            _dedup_observe("pg_insert_pending", time.monotonic(), status="error")
             return None
 
     def _pg_get_sync(self, key: str) -> dict[str, Any] | None:
@@ -473,7 +509,9 @@ class DedupStore:
                     except Exception:
                         pass
             return None
-        except Exception:
+        except Exception as e:
+            logger.warning("dedup pg get failed, fallback: %s", e, exc_info=True)
+            _dedup_observe("pg_get", time.monotonic(), status="error")
             return None
 
     def _pg_mark_sync(self, key: str, status: str, result: Any | None = None, error: str | None = None) -> bool:
@@ -532,7 +570,9 @@ class DedupStore:
                     except Exception:
                         pass
             return True
-        except Exception:
+        except Exception as e:
+            logger.warning("dedup pg mark failed, fallback: %s", e, exc_info=True)
+            _dedup_observe("pg_mark", time.monotonic(), status="error")
             return False
 
     # 公共 API：幂等状态机
@@ -546,25 +586,29 @@ class DedupStore:
             if self._is_pg:
                 pg_res = self._pg_insert_pending_sync(key, tool)
                 if pg_res is not None:
-                    # keep mem in sync for fallback reads
-                    if pg_res:
-                        self._mem[key] = {"key": key, "tool": tool, "status": "PENDING", "result": None, "updated_at": now}
-                        self._mem_ts[key] = now
-                    else:
-                        # existing: ensure mem reflects PG state if not yet
-                        if key not in self._mem:
-                            pg_rec = self._pg_get_sync(key)
-                            if pg_rec:
-                                self._mem[key] = pg_rec
-                                self._mem_ts[key] = now
+                    with self._lock:
+                        if pg_res:
+                            self._mem[key] = {"key": key, "tool": tool, "status": "PENDING", "result": None, "updated_at": now}
+                            self._mem_ts[key] = now
+                        else:
+                            if key not in self._mem:
+                                pg_rec = self._pg_get_sync(key)
+                                if pg_rec:
+                                    self._mem[key] = pg_rec
+                                    self._mem_ts[key] = now
                     return bool(pg_res)
-                # PG unavailable -> fallback to mem/SQLite below
+                logger.warning("dedup pg insert_pending fallback to sqlite/mem for key=%s", key)
+                _dedup_observe("pg_fallback", time.monotonic(), status="error")
 
-            # SQLite path
+            # SQLite path — BEGIN IMMEDIATE for atomic DELETE+SELECT+INSERT, rowcount decides winner
             if self.db_path is not None:
                 con = self._connect()
                 try:
-                    # TTL-aware: if expired, allow re-insert by deleting expired row first
+                    try:
+                        con.execute("BEGIN IMMEDIATE")
+                    except Exception:
+                        pass
+                    # TTL-aware: delete expired row first within same txn
                     if self.ttl_seconds > 0:
                         try:
                             con.execute("DELETE FROM tool_call_dedup WHERE idempotency_key=? AND updated_at < ?", (key, now - self.ttl_seconds))
@@ -573,29 +617,54 @@ class DedupStore:
                     cur = con.execute("SELECT status FROM tool_call_dedup WHERE idempotency_key=?", (key,))
                     row = cur.fetchone()
                     if row is not None:
-                        # also update mem for consistency
-                        self._mem[key] = {"key": key, "tool": tool, "status": row[0], "result": None, "updated_at": now}
-                        self._mem_ts[key] = now
+                        try:
+                            con.execute("ROLLBACK")
+                        except Exception:
+                            pass
+                        with self._lock:
+                            self._mem[key] = {"key": key, "tool": tool, "status": row[0], "result": None, "updated_at": now}
+                            self._mem_ts[key] = now
                         return False
                     try:
-                        con.execute(
+                        cur2 = con.execute(
                             "INSERT INTO tool_call_dedup (idempotency_key, status, tool, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
                             (key, "PENDING", tool, now, now),
                         )
-                        self._mem[key] = {"key": key, "tool": tool, "status": "PENDING", "result": None, "updated_at": now}
-                        self._mem_ts[key] = now
-                        return True
+                        inserted = getattr(cur2, "rowcount", 1) == 1
+                        try:
+                            con.execute("COMMIT")
+                        except Exception:
+                            pass
+                        if inserted:
+                            with self._lock:
+                                self._mem[key] = {"key": key, "tool": tool, "status": "PENDING", "result": None, "updated_at": now}
+                                self._mem_ts[key] = now
+                            return True
+                        else:
+                            return False
                     except sqlite3.IntegrityError:
+                        try:
+                            con.execute("ROLLBACK")
+                        except Exception:
+                            pass
                         return False
                 finally:
-                    con.close()
-            # pure memory dict fallback (single-process)
-            self._mem_cleanup(key)
-            if key in self._mem:
-                return False
-            self._mem[key] = {"key": key, "tool": tool, "status": "PENDING", "result": None, "updated_at": now}
-            self._mem_ts[key] = now
-            return True
+                    try:
+                        con.close()
+                    except Exception:
+                        pass
+            # pure memory dict fallback (single-process) with lock
+            with self._lock:
+                # inline expiry check with lock
+                ts = self._mem_ts.get(key)
+                if ts is not None and self.ttl_seconds > 0 and (time.time() - ts) > self.ttl_seconds:
+                    self._mem.pop(key, None)
+                    self._mem_ts.pop(key, None)
+                if key in self._mem:
+                    return False
+                self._mem[key] = {"key": key, "tool": tool, "status": "PENDING", "result": None, "updated_at": now}
+                self._mem_ts[key] = now
+                return True
         except Exception:
             _status = "error"
             raise
@@ -612,29 +681,30 @@ class DedupStore:
             # 优先 PG，失败回退本地
             if self._is_pg:
                 if self._pg_mark_sync(key, "SUCCESS", result=result, error=None):
-                    self._mem[key] = {"key": key, "tool": self._mem.get(key, {}).get("tool"), "status": "SUCCESS", "result": result, "updated_at": now}
-                    self._mem_ts[key] = now
-                    # also try sqlite alias if exists? not needed for PG
+                    with self._lock:
+                        self._mem[key] = {"key": key, "tool": self._mem.get(key, {}).get("tool"), "status": "SUCCESS", "result": result, "updated_at": now}
+                        self._mem_ts[key] = now
                     return
-                # fallback to mem/sqlite on PG failure
+                logger.warning("dedup pg mark_success fallback to sqlite/mem for key=%s", key)
+                _dedup_observe("pg_fallback", time.monotonic(), status="error")
             if self.db_path is not None:
                 con = self._connect()
                 try:
-                    con.execute(
+                    cur = con.execute(
                         "UPDATE tool_call_dedup SET status=?, result=?, updated_at=? WHERE idempotency_key=?",
                         ("SUCCESS", result_json, now, key),
                     )
-                    if con.total_changes == 0:
+                    if getattr(cur, "rowcount", 0) == 0:
                         con.execute(
                             "INSERT OR IGNORE INTO tool_call_dedup (idempotency_key, status, result, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
                             (key, "SUCCESS", result_json, now, now),
                         )
                 finally:
                     con.close()
-            # mem sync
-            rec = self._mem.get(key, {})
-            self._mem[key] = {"key": key, "tool": rec.get("tool"), "status": "SUCCESS", "result": result, "updated_at": now}
-            self._mem_ts[key] = now
+            with self._lock:
+                rec = self._mem.get(key, {})
+                self._mem[key] = {"key": key, "tool": rec.get("tool"), "status": "SUCCESS", "result": result, "updated_at": now}
+                self._mem_ts[key] = now
         except Exception:
             _status = "error"
             raise
@@ -649,26 +719,30 @@ class DedupStore:
             now = time.time()
             if self._is_pg:
                 if self._pg_mark_sync(key, "FAILED", result=None, error=error):
-                    self._mem[key] = {"key": key, "tool": self._mem.get(key, {}).get("tool"), "status": "FAILED", "error": str(error), "updated_at": now}
-                    self._mem_ts[key] = now
+                    with self._lock:
+                        self._mem[key] = {"key": key, "tool": self._mem.get(key, {}).get("tool"), "status": "FAILED", "error": str(error), "updated_at": now}
+                        self._mem_ts[key] = now
                     return
+                logger.warning("dedup pg mark_failed fallback to sqlite/mem for key=%s", key)
+                _dedup_observe("pg_fallback", time.monotonic(), status="error")
             if self.db_path is not None:
                 con = self._connect()
                 try:
-                    con.execute(
+                    cur = con.execute(
                         "UPDATE tool_call_dedup SET status=?, error=?, updated_at=? WHERE idempotency_key=?",
                         ("FAILED", str(error), now, key),
                     )
-                    if con.total_changes == 0:
+                    if getattr(cur, "rowcount", 0) == 0:
                         con.execute(
                             "INSERT OR IGNORE INTO tool_call_dedup (idempotency_key, status, error, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
                             (key, "FAILED", str(error), now, now),
                         )
                 finally:
                     con.close()
-            rec = self._mem.get(key, {})
-            self._mem[key] = {"key": key, "tool": rec.get("tool"), "status": "FAILED", "error": str(error), "updated_at": now}
-            self._mem_ts[key] = now
+            with self._lock:
+                rec = self._mem.get(key, {})
+                self._mem[key] = {"key": key, "tool": rec.get("tool"), "status": "FAILED", "error": str(error), "updated_at": now}
+                self._mem_ts[key] = now
         except Exception:
             _status = "error"
             raise
@@ -684,10 +758,9 @@ class DedupStore:
             if self._is_pg:
                 pg_rec = self._pg_get_sync(key)
                 if pg_rec is not None:
-                    # keep mem warm
-                    self._mem[key] = pg_rec
-                    self._mem_ts[key] = time.time()
-                    # normalize result JSON
+                    with self._lock:
+                        self._mem[key] = pg_rec
+                        self._mem_ts[key] = time.time()
                     if pg_rec.get("result") is not None and isinstance(pg_rec["result"], str):
                         try:
                             pg_rec["result"] = json.loads(pg_rec["result"])
@@ -715,8 +788,9 @@ class DedupStore:
                                         con.execute("DELETE FROM tool_call_dedup WHERE idempotency_key=?", (key,))
                                     except Exception:
                                         pass
-                                    self._mem.pop(key, None)
-                                    self._mem_ts.pop(key, None)
+                                    with self._lock:
+                                        self._mem.pop(key, None)
+                                        self._mem_ts.pop(key, None)
                                     return None
                             except Exception:
                                 pass
@@ -725,9 +799,9 @@ class DedupStore:
                                 rec["result"] = json.loads(rec["result"])
                             except Exception:
                                 pass
-                        # sync mem
-                        self._mem[key] = rec
-                        self._mem_ts[key] = rec.get("updated_at", time.time())
+                        with self._lock:
+                            self._mem[key] = rec
+                            self._mem_ts[key] = rec.get("updated_at", time.time())
                         return rec
                 finally:
                     con.close()
@@ -750,12 +824,11 @@ class DedupStore:
         _start = time.monotonic()
         _status = "success"
         try:
-            deadline = time.time() + timeout
-            while time.time() < deadline:
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
                 rec = self.get(key)
                 if rec is not None and rec.get("status") in ("SUCCESS", "FAILED"):
                     return rec
-                # PG branch additional WAIT using SELECT FOR UPDATE? Polling is fallback
                 time.sleep(0.05)
             return self.get(key)
         except Exception:
