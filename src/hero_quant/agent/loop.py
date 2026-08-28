@@ -177,8 +177,8 @@ class AgentLoop:
                     is_inside = True
                 except Exception:
                     is_inside = False
-            if not is_inside:
-                # 兼容测试：允许 tempfile 临时目录下的回放文件
+            if not is_inside and _allow_root is None:
+                # 兼容测试：仅默认 replays 时允许 tempfile 临时目录下的回放文件；显式 allow_root 时严格只认该目录
                 try:
                     import tempfile
 
