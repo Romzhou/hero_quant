@@ -64,6 +64,12 @@ def _audit(event: str, **fields):
         pass
 
 
+def requires_approval(policy: str) -> bool:
+    """模块级 helper：判断策略是否需要人审（仅 ask 需审批）。"""
+    p = policy.strip().lower() if isinstance(policy, str) else str(policy).lower()
+    return p == ApprovalPolicy.ASK
+
+
 @dataclass
 class ApprovalService:
     """审批服务：ask 需人审、never 直接拒绝，保障高危操作 fail-closed。"""
@@ -75,17 +81,32 @@ class ApprovalService:
         if self.mode not in ("ask", "never", "auto"):
             self.mode = "ask"
 
-    def request_sync(self, tool: str, reason: str | None = None, **kwargs: Any) -> str:
-        """同步审批：never 模式直接 rejected 短路，其余走 ask 流程并落审计。"""
+    def requires_approval(self, tool: str | None = None) -> bool:  # noqa: ARG002
+        """实例 helper：当前模式是否需要人审（ask→True，其余 False）。"""
+        return self.mode == ApprovalPolicy.ASK
+
+    def request_sync(self, tool: str, reason: str | None = None, **kwargs: Any) -> Any:
+        """同步审批：never 短路 rejected，ask 返回 pending 阻塞，auto 直接 approved。"""
         _audit("asked", tool=tool, reason=reason, mode=self.mode)
         if self.mode == ApprovalPolicy.NEVER:
             _audit("decided", tool=tool, outcome="rejected", reason=reason)
             return "rejected"
-        # ask 路径最小实现：实际应阻塞等待人审，此处先返回 approved 以保障 e2e 流转
+        if self.mode == ApprovalPolicy.ASK:
+            # P2 blocking: 返回 pending/need_approval 由调用方处理阻塞与超时（300s）
+            _audit("asked_pending", tool=tool, reason=reason, timeout=300)
+            return {
+                "status": "pending",
+                "need_approval": True,
+                "timeout": 300,
+                "tool": tool,
+                "reason": reason,
+                "mode": self.mode,
+            }
+        # auto 直通
         _audit("decided", tool=tool, outcome="approved", reason=reason)
         return "approved"
 
-    async def request(self, tool: str, reason: str | None = None, **kwargs: Any) -> str:
+    async def request(self, tool: str, reason: str | None = None, **kwargs: Any) -> Any:
         """异步审批入口，当前委托同步实现。"""
         return self.request_sync(tool=tool, reason=reason, **kwargs)
 

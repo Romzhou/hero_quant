@@ -28,6 +28,25 @@ try:
 except Exception:  # prometheus_client not available
     CIRCUIT_STATE_GAUGE = None  # type: ignore
 
+# 数据源熔断告警计数（Resilience P3.12）— 按 source 维度
+try:
+    from prometheus_client import Counter as _Counter
+
+    try:
+        data_source_circuit_open_total = _Counter(
+            "data_source_circuit_open_total",
+            "Data source circuit breaker opened count",
+            ["source"],
+        )
+    except ValueError:
+        from prometheus_client import REGISTRY as _REG  # type: ignore
+
+        data_source_circuit_open_total = _REG._names_to_collectors[  # type: ignore[attr-defined]
+            "data_source_circuit_open_total"
+        ]
+except Exception:  # prometheus_client not available
+    data_source_circuit_open_total = None  # type: ignore
+
 # 兼容历史导入名
 CIRCUIT_GAUGE = CIRCUIT_STATE_GAUGE
 
@@ -128,6 +147,13 @@ class CircuitBreaker:
         self._opened_at = now if now is not None else time.time()
         self._half_open_calls = 0
         self._sync_gauge()
+        # 熔断告警计数（按 source=unknown 兜底，调用方可覆盖 label）
+        try:
+            if data_source_circuit_open_total is not None:
+                data_source_circuit_open_total.labels(source="unknown").inc()
+        except Exception as _exc:
+            logger.debug("silent handled: offline-safe: circuit counter inc", exc_info=_exc)  # intentional: offline-safe
+            pass  # intentional offline-safe
 
     def record_failure(self, duration: float | None = None):
         """记录一次失败（可选携带耗时以判定慢调用）。"""

@@ -137,6 +137,14 @@ npm --prefix frontend run test:run
 - [ ] Checkpoint 真 PG 落盘（已默认 PG `postgresql://postgres:postgres@localhost:5432/hero_quant`，PG 不可达时回退 `memory://`）
 - [x] `requirements-lock.txt` 真 hash 全量（已 `uv pip compile --generate-hashes` 非占位）
 
+## 合规与免责
+
+> **非投资建议**：本项目仅供研究与教育参考，输出不构成任何投资建议（详见 `docs/COMPLIANCE.md`）。
+
+- **投资免责**：LLM 存在幻觉与时效局限，回测收益不预示未来表现；交易决策由用户自担风险。
+- **数据许可**：行情以 `tencent/yahoo` 为主，`tushare/akshare/yfinance/ccxt` 需自备许可并遵守其条款；全链路 `provenance{source,unit}` 可追溯（A股 `board_lots`/美股 `shares`）。
+- **风险揭示**：证券投资涉及市场、流动性与系统风险，可能导致本金损失；单机部署、网络/模型抖动可能导致延迟不一致，请结合 `/metrics` 与日志巡检。
+
 ## 致谢
 
 - [HKUDS/Vibe-Trading](https://github.com/HKUDS/Vibe-Trading) 的 8 大模式与 8 月正确性修复清单
