@@ -16,32 +16,135 @@ type RiskSummary = {
   reject_rate?: number
 }
 
+// --- constants extracted (no visual change) ---
+const API_RISK_SUMMARY = "/v1/risk/summary"
+const ROUTES = { RESEARCH: "/research" } as const
+const FALLBACK = {
+  EXPOSURE: "62%",
+  SINGLE_LIMIT: "20%",
+  CIRCUIT_THRESHOLD: "80%",
+  CIRCUIT_LABEL: "50%",
+} as const
+
+function isFiniteNumber(v: unknown): v is number {
+  return typeof v === "number" && Number.isFinite(v)
+}
+
+function sanitizeRiskSummary(raw: unknown): RiskSummary | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null
+  const r = raw as Record<string, unknown>
+  const out: RiskSummary = {}
+  if (isFiniteNumber(r.exposure)) out.exposure = r.exposure
+  if (isFiniteNumber(r.single_limit)) out.single_limit = r.single_limit
+  if (isFiniteNumber(r.circuit_threshold)) out.circuit_threshold = r.circuit_threshold
+  if (isFiniteNumber(r.turnover)) out.turnover = r.turnover
+  if (isFiniteNumber(r.reject_rate)) out.reject_rate = r.reject_rate
+  if (typeof r.cross_source === "string") out.cross_source = r.cross_source
+  if (typeof r.pit === "string") out.pit = r.pit
+  if (typeof r.circuit === "string") out.circuit = r.circuit
+  return out
+}
+
 export default function Risk() {
   const [summary, setSummary] = useState<RiskSummary | null>(null)
   const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
+  const [reloadKey, setReloadKey] = useState(0)
 
   useEffect(() => {
     let aborted = false
     async function load() {
+      setLoading(true)
+      setError(null)
       try {
-        const r = await fetch("/v1/risk/summary", { cache: "no-store" })
+        const r = await fetch(API_RISK_SUMMARY, { cache: "no-store" })
         if (!r.ok) throw new Error(String(r.status))
         const j = await r.json()
-        if (!aborted && j && typeof j === "object") setSummary(j)
-      } catch {
-        // keep null -> fallback static
+        if (aborted) return
+        const sanitized = sanitizeRiskSummary(j)
+        // sanitized may be empty object when all fields invalid -> still a valid response, render "--"
+        // only null means completely unparseable (array/null) -> treat as error shape but keep fallback via null
+        if (sanitized === null) {
+          // keep null to trigger degraded badge? but payload was object-like failure: treat as empty?
+          // if json was null/array we keep null; UI will show placeholders but badge degraded only if error
+          // To keep honesty, if sanitized null and response was object, show empty placeholder object not degraded
+          setSummary(null)
+        } else {
+          setSummary(sanitized)
+        }
+      } catch (e) {
+        if (!aborted) {
+          setError(e instanceof Error ? e.message : String(e))
+          setSummary(null)
+        }
       } finally {
         if (!aborted) setLoading(false)
       }
     }
     load()
-    return () => { aborted = true }
-  }, [])
+    return () => {
+      aborted = true
+    }
+  }, [reloadKey])
 
   const turnover = summary?.turnover
   const crossSource = summary?.cross_source
   const pit = summary?.pit
   const circuit = summary?.circuit
+
+  const isDegraded = !loading && (error !== null || summary === null)
+  const badge = (() => {
+    if (loading) return { text: "加载中…", cls: "border-white/10 bg-white/5 text-slate-300" }
+    if (isDegraded) return { text: "数据异常 · --", cls: "border-amber-500/30 bg-amber-500/10 text-amber-200" }
+    if (circuit) return { text: `风控正常 · ${circuit}`, cls: "border-emerald-400/20 bg-emerald-400/10 text-emerald-300" }
+    return { text: "风控正常 · CLOSED", cls: "border-emerald-400/20 bg-emerald-400/10 text-emerald-300" }
+  })()
+
+  // guarded display values — invalid fields render "--" not NaN%, fetch failure keeps placeholder
+  const exposureDisplay = loading
+    ? "…"
+    : summary === null
+      ? FALLBACK.EXPOSURE
+      : isFiniteNumber(summary.exposure)
+        ? `${(summary.exposure * 100).toFixed(0)}%`
+        : "--"
+
+  const singleLimitDisplay = loading
+    ? "…"
+    : summary === null
+      ? FALLBACK.SINGLE_LIMIT
+      : isFiniteNumber(summary.single_limit)
+        ? `${(summary.single_limit * 100).toFixed(0)}%`
+        : "--"
+
+  const circuitDisplay = loading ? "…" : typeof circuit === "string" && circuit.length > 0 ? String(circuit) : "未触发"
+
+  const circuitThresholdSub = (() => {
+    if (loading) return "阈值 …"
+    if (summary === null) return `阈值 ${FALLBACK.CIRCUIT_THRESHOLD}`
+    if (isFiniteNumber(summary.circuit_threshold)) return `阈值 ${(summary.circuit_threshold * 100).toFixed(0)}%`
+    return "阈值 --"
+  })()
+
+  const turnoverDisplay = loading
+    ? "…"
+    : summary === null
+      ? "0.42"
+      : isFiniteNumber(turnover)
+        ? String(turnover)
+        : "--"
+
+  const turnoverSub = crossSource ? `cross_source ${crossSource}` : "PIT/证据链"
+
+  // For the lower sections, use guarded helpers to avoid NaN%
+  const pitText = loading ? "…" : typeof pit === "string" && pit.length > 0 ? String(pit) : "w ≤ p 否则 ValidationError"
+  const crossSourceText = loading ? "…" : typeof crossSource === "string" && crossSource.length > 0 ? String(crossSource) : "首bar偏差>1% 阻断"
+  const circuitDualText = loading ? "…" : typeof circuit === "string" && circuit.length > 0 ? String(circuit) : FALLBACK.CIRCUIT_LABEL
+  const groundingText = (() => {
+    if (isFiniteNumber(turnover)) return `turnover ${turnover}`
+    if (summary !== null && turnover !== undefined) return "turnover --"
+    return "证据链未命中阻断"
+  })()
 
   return (
     <div className="mx-auto max-w-7xl px-6 py-6">
@@ -50,21 +153,45 @@ export default function Risk() {
           <h1 className="font-display text-xl font-semibold text-mist">Risk · 风控</h1>
           <p className="mt-1 text-sm text-slate-400">敞口 · 熔断 · 归因 · 证据链 · ShadowAccount</p>
         </div>
-        <span className="rounded-full border border-emerald-400/20 bg-emerald-400/10 px-3 py-1 text-xs font-medium text-emerald-300">
-          {loading ? "加载中…" : circuit ? `风控正常 · ${circuit}` : "风控正常 · CLOSED"}
+        <span
+          className={`inline-flex items-center gap-1.5 rounded-full border px-3 py-1 text-xs font-medium ${badge.cls}`}
+        >
+          {isDegraded && <span className="h-1.5 w-1.5 rounded-full bg-amber-400 animate-pulse" aria-hidden />}
+          {badge.text}
         </span>
       </div>
 
+      {error && !loading && (
+        <div
+          role="alert"
+          className="mt-4 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-3"
+        >
+          <div className="flex items-center gap-2 text-sm text-amber-200">
+            <span className="h-2 w-2 rounded-full bg-amber-400 animate-pulse" aria-hidden />
+            风控数据获取失败，当前显示为占位数据
+          </div>
+          <button
+            type="button"
+            onClick={() => setReloadKey((k) => k + 1)}
+            className="rounded-full border border-amber-500/30 bg-amber-500/20 px-3 py-1 text-xs font-medium text-amber-100 hover:bg-amber-500/30"
+          >
+            重试
+          </button>
+        </div>
+      )}
+
       <div className="mt-6 grid grid-cols-2 gap-3 md:grid-cols-4">
         {[
-          { k: "总敞口", v: loading ? "…" : summary?.exposure != null ? `${(summary.exposure * 100).toFixed(0)}%` : "62%", sub: "杠杆 1.2x" },
-          { k: "单票上限", v: loading ? "…" : summary?.single_limit != null ? `${(summary.single_limit * 100).toFixed(0)}%` : "20%", sub: "600519 18%" },
-          { k: "日内熔断", v: loading ? "…" : circuit ? String(circuit) : "未触发", sub: summary?.circuit_threshold != null ? `阈值 ${(summary.circuit_threshold * 100).toFixed(0)}%` : "阈值 80%" },
-          { k: "换手率", v: loading ? "…" : turnover != null ? String(turnover) : "0.42", sub: crossSource ? `cross_source ${crossSource}` : "PIT/证据链" },
+          { k: "总敞口", v: loading ? "…" : exposureDisplay, sub: "杠杆 1.2x" },
+          { k: "单票上限", v: loading ? "…" : singleLimitDisplay, sub: "600519 18%" },
+          { k: "日内熔断", v: circuitDisplay, sub: circuitThresholdSub },
+          { k: "换手率", v: turnoverDisplay, sub: turnoverSub },
         ].map((c) => (
           <div key={c.k} className="rounded-2xl border border-white/10 bg-white/[0.04] p-4 backdrop-blur">
             <div className="text-[11px] tracking-[0.14em] text-slate-400">{c.k}</div>
-            <div className="mt-1 font-display text-xl font-semibold text-mist">{loading ? <span className="inline-block h-5 w-16 animate-pulse rounded bg-white/10" /> : c.v}</div>
+            <div className="mt-1 font-display text-xl font-semibold text-mist">
+              {loading ? <span className="inline-block h-5 w-16 animate-pulse rounded bg-white/10" /> : c.v}
+            </div>
             <div className="font-mono text-[11px] text-slate-500">{c.sub}</div>
           </div>
         ))}
@@ -76,19 +203,19 @@ export default function Risk() {
           <div className="mt-3 space-y-2 text-xs">
             <div className="flex justify-between rounded-xl bg-ink-900/60 border border-white/5 px-3 py-2">
               <span className="text-slate-400">PIT 校验</span>
-              <span className="text-emerald-300">{loading ? "…" : pit ? String(pit) : "w ≤ p 否则 ValidationError"}</span>
+              <span className="text-emerald-300">{pitText}</span>
             </div>
             <div className="flex justify-between rounded-xl bg-ink-900/60 border border-white/5 px-3 py-2">
               <span className="text-slate-400">cross_source 1%</span>
-              <span className="text-emerald-300">{loading ? "…" : crossSource ? String(crossSource) : "首bar偏差>1% 阻断"}</span>
+              <span className="text-emerald-300">{crossSourceText}</span>
             </div>
             <div className="flex justify-between rounded-xl bg-amber-500/10 border border-amber-500/20 px-3 py-2">
               <span className="text-amber-300">熔断双桶</span>
-              <span className="font-mono text-amber-100">Circuit {loading ? "…" : circuit ? String(circuit) : "50%"} / OTel 80%</span>
+              <span className="font-mono text-amber-100">Circuit {circuitDualText} / OTel 80%</span>
             </div>
             <div className="flex justify-between rounded-xl bg-ink-900/60 border border-white/5 px-3 py-2">
               <span className="text-slate-400">Grounding</span>
-              <span className="text-mist">{turnover != null ? `turnover ${turnover}` : "证据链未命中阻断"}</span>
+              <span className="text-mist">{groundingText}</span>
             </div>
           </div>
         </div>
@@ -96,7 +223,9 @@ export default function Risk() {
         <div className="rounded-2xl border border-white/10 bg-white/[0.04] p-4">
           <div className="flex items-center justify-between">
             <h2 className="text-sm font-semibold text-mist">归因 · 5类 coverage&gt;0</h2>
-            <a href="/research" className="rounded-full bg-white/5 px-2.5 py-1 text-[11px] text-slate-300 hover:bg-white/10">查看研究 → tearsheet</a>
+            <a href={ROUTES.RESEARCH} className="rounded-full bg-white/5 px-2.5 py-1 text-[11px] text-slate-300 hover:bg-white/10">
+              查看研究 → tearsheet
+            </a>
           </div>
           <div className="mt-3 grid grid-cols-3 gap-2 text-xs">
             {[
@@ -119,12 +248,14 @@ export default function Risk() {
       <div className="mt-4 rounded-2xl border border-amber-400/20 bg-amber-400/10 p-4">
         <div className="flex items-center justify-between">
           <div className="text-xs font-semibold tracking-widest text-amber-300">审计 · 可追溯</div>
-          <a href="/research" className="rounded-full bg-white px-2.5 py-1 text-xs font-semibold text-amber-700 hover:bg-white/90">打开研究页 ↗</a>
+          <a href={ROUTES.RESEARCH} className="rounded-full bg-white px-2.5 py-1 text-xs font-semibold text-amber-700 hover:bg-white/90">
+            打开研究页 ↗
+          </a>
         </div>
-        <p className="mt-2 text-sm leading-6 text-amber-100/90">
-          每笔风控决策均可回溯验证，超阈值自动进入备用路径并记录全链路。
+        <p className="mt-2 text-sm leading-6 text-amber-100/90">每笔风控决策均可回溯验证，超阈值自动进入备用路径并记录全链路。</p>
+        <p className="mt-1 font-mono text-xs text-amber-200/60">
+          ledger.verify() · trace.jsonl{isFiniteNumber(turnover) ? ` · turnover ${turnover}` : ""}
         </p>
-        <p className="mt-1 font-mono text-xs text-amber-200/60">ledger.verify() · trace.jsonl{turnover != null ? ` · turnover ${turnover}` : ""}</p>
       </div>
     </div>
   )
