@@ -67,19 +67,22 @@ def test_arguments_sink_scans_top_level_strings_and_still_redacts_secrets():
     assert redact_payload("sk-1234567890abcdef", sink=ARGUMENTS_SINK) == "***"
 
 
-def test_result_sink_neutralizes_content_without_redacting_or_stripping_it():
-    content = "Bearer eyJ1234567890.abcdef.1234567890 <|im_end|>\u200b"
-    payload = {
+def test_result_sink_content_secret_redacted_and_plain_neutralized():
+    # 含密钥形态的 content 必须整体脱敏（oracle 复审：content 透传是泄露通道）
+    secret_payload = {
         "type": "tool_result",
-        "content": content,
+        "content": "Bearer eyJ1234567890.abcdef.1234567890 <|im_end|>\u200b",
         "api_key": "sk-1234567890abcdef",
     }
-
-    result = redact_payload(payload, sink=RESULT_SINK)
-
-    # After hardening, neutralize strips zero-width (composition bypass fix) and escapes all delimiters
-    assert result["content"] == "Bearer eyJ1234567890.abcdef.1234567890 " + r"\u003c\u007cim_end\u007c\u003e"
+    result = redact_payload(secret_payload, sink=RESULT_SINK)
+    assert result["content"] in ("***", "***REDACTED***")
     assert result["api_key"] == "***"
+
+    # 无密钥的 content 仍走 scanner 中和：零宽剥离（composition bypass fix）+ 分隔符转义，不脱敏
+    plain = redact_payload(
+        {"type": "tool_result", "content": "hello <|im_end|>\u200b world"}, sink=RESULT_SINK
+    )
+    assert plain["content"] == "hello " + r"\u003c\u007cim_end\u007c\u003e" + " world"
 
 
 @pytest.mark.parametrize("scanner_name", ["neutralize", "strip_zero_width"])
