@@ -15,6 +15,54 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Module-level lazy cache for Settings().data_mode — instantiate ONCE, unified across provenance blocks
+_settings_mode_cache: str | None = None
+
+
+def _get_data_mode() -> str:
+    """Lazy cache for Settings().data_mode; on failure defaults to SAFE 'synthetic' (fail-closed).
+
+    Fail-closed rationale: synthetic data must not masquerade as live when Settings unavailable;
+    unit interpretation would be wrong (board_lots vs shares). Checked against tests/test_data_registry.py
+    and tests/test_trait_contract.py — no contract expects 'live' on Settings failure.
+    """
+    global _settings_mode_cache
+    if _settings_mode_cache is not None:
+        return _settings_mode_cache
+    try:
+        from hero_quant.config.settings import Settings
+
+        m = Settings().data_mode
+        _settings_mode_cache = str(m).strip().lower() if isinstance(m, str) else "live"
+    except Exception as e:
+        logger.warning("settings load failed for provenance: %s", e, exc_info=e)
+        _settings_mode_cache = "synthetic"  # fail-closed SAFE default
+    return _settings_mode_cache
+
+
+def _resolve_provenance(loader, result=None, prov=None) -> str:
+    """Single helper used by all 3 provenance blocks; instantiate Settings ONCE via cache.
+
+    Unifies class+source+name substring logic: any contains 'synthetic' or data_mode=='synthetic' => synthetic.
+    Otherwise infer via _infer_loader_source logic (class name mapping).
+    """
+    mode = _get_data_mode()
+    lname = loader.__class__.__name__.lower()
+    lsrc = str(getattr(loader, "source", "")).lower()
+    lnm = str(getattr(loader, "name", "")).lower()
+    is_synthetic = mode == "synthetic" or "synthetic" in lname or "synthetic" in lsrc or "synthetic" in lnm
+    if is_synthetic:
+        return "synthetic"
+    # unified infer: mirrors MarketDataRegistry._infer_loader_source
+    if "tencent" in lname:
+        return "tencent"
+    elif "yahoo" in lname:
+        return "yahoo"
+    elif "akshare" in lname:
+        return "akshare"
+    else:
+        return getattr(loader, "source", getattr(loader, "name", lname))
+
 
 class CrossSourceError(ValueError):
     """跨源收盘价偏差超 1% 时抛出，阻断不一致数据流入下游。"""
@@ -246,51 +294,16 @@ class MarketDataRegistry:
             if isinstance(result, tuple) and len(result) == 2:
                 bars, prov = result
                 if prov is None:
-                    # 合成不得冒充真实源：按 loader 与 data_mode 诚实标注（仅经 Settings 门控，不直读环境）
-                    try:
-                        from hero_quant.config.settings import Settings as _Settings
-                        _mode = _Settings().data_mode
-                    except Exception as _e:
-                        logger.warning("settings load failed for provenance fallback: %s", _e, exc_info=_e)
-                        _mode = "live"
-                    _mode = str(_mode).strip().lower() if isinstance(_mode, str) else "live"
-                    _lname = loader.__class__.__name__.lower()
-                    _lsrc = str(getattr(loader, "source", "")).lower()
-                    _lnm = str(getattr(loader, "name", "")).lower()
-                    is_synthetic = _mode == "synthetic" or "synthetic" in _lname or "synthetic" in _lsrc or "synthetic" in _lnm
-                    prov = Provenance(source="synthetic" if is_synthetic else self._infer_loader_source(loader), unit=getattr(loader, "unit", "shares"), symbol=symbol)
+                    prov = Provenance(source=_resolve_provenance(loader, result, prov), unit=getattr(loader, "unit", "shares"), symbol=symbol)
             else:
                 bars = result
                 unit = getattr(loader, "unit", "shares")
-                source = self._infer_loader_source(loader)
-                # synthetic 模式或 synthetic-like loader 必须标 synthetic
-                try:
-                    from hero_quant.config.settings import Settings as _Settings2
-                    _mode2 = _Settings2().data_mode
-                except Exception as _e2:
-                    logger.warning("settings load failed for provenance: %s", _e2, exc_info=_e2)
-                    _mode2 = "live"
-                _mode2 = str(_mode2).strip().lower() if isinstance(_mode2, str) else "live"
-                _lname2 = loader.__class__.__name__.lower()
-                if _mode2 == "synthetic" or "synthetic" in _lname2:
-                    source = "synthetic"
+                source = _resolve_provenance(loader, result, None)
                 prov = Provenance(source=source, unit=unit, symbol=symbol)
             if self._bars_empty(bars):
                 continue
             if not getattr(prov, "source", None):
-                # 诚实标注：synthetic 显式 synthetic，其余推断真实源
-                try:
-                    from hero_quant.config.settings import Settings as _Settings3
-                    _mode3 = _Settings3().data_mode
-                except Exception as _e3:
-                    logger.warning("settings load failed for provenance empty source: %s", _e3, exc_info=_e3)
-                    _mode3 = "live"
-                _mode3 = str(_mode3).strip().lower() if isinstance(_mode3, str) else "live"
-                _lname3 = loader.__class__.__name__.lower()
-                if _mode3 == "synthetic" or "synthetic" in _lname3:
-                    prov.source = "synthetic"
-                else:
-                    prov.source = self._infer_loader_source(loader)
+                prov.source = _resolve_provenance(loader, result, prov)
             if not getattr(prov, "unit", None):
                 prov.unit = getattr(loader, "unit", "shares")
             # 记录审计日志：用于追踪每次成功取数的来源与单位

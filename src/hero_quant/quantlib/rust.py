@@ -71,6 +71,19 @@ def _to_list(series) -> list[float]:
     return s.tolist()
 
 
+def _prepare_data(series) -> list[float] | None:
+    """Centralized NaN detection: if any NaN present, return None to signal fallback.
+
+    Uses pd.isna for robust NaN/None detection (covers float('nan'), np.nan, None).
+    Only clean floats are returned for Rust Vec<f64>; corrupt 0.0 coercion is removed.
+    """
+    data = _to_list(series)
+    # pd.isna handles NaN/None/NaT robustly; math.isnan would fail on non-float
+    if any(pd.isna(x) for x in data):
+        return None
+    return [float(x) for x in data]
+
+
 def sma(series, window: int = 20, *args, **kwargs) -> pd.Series:
     """SMA：优先 Rust，失败回落 Python；语义与 indicators.sma 一致。"""
     # 兼容别名
@@ -80,12 +93,14 @@ def sma(series, window: int = 20, *args, **kwargs) -> pd.Series:
         window = kwargs["period"]
     if "span" in kwargs:
         window = kwargs["span"]
-    # 尝试 Rust 路径
+    # 尝试 Rust 路径 — NaN 输入直接走 Python 回落，避免 0.0 污染
     if _use_rust():
+        _prep = _prepare_data(series)
+        if _prep is None:
+            return _py_sma(series, window, *args, **kwargs)
         try:
-            data = _to_list(series)
-            # Rust 期望 Vec<f64> 与窗口大小
-            raw = _RUST_MOD.sma([float(x) if x == x else 0.0 for x in data], int(window))
+            # Rust 期望 Vec<f64> 与窗口大小（已确保无 NaN）
+            raw = _RUST_MOD.sma(_prep, int(window))
             # Vec<Option<f64>> 转 Series，None 映射为 NaN
             vals = [v if v is not None else float("nan") for v in raw]
             # 保留原始索引以保持可替换性
@@ -112,9 +127,11 @@ def ema(series, span: int = 20, *args, **kwargs) -> pd.Series:
     if "period" in kwargs:
         span = kwargs["period"]
     if _use_rust():
+        _prep = _prepare_data(series)
+        if _prep is None:
+            return _py_ema(series, span, *args, **kwargs)
         try:
-            data = _to_list(series)
-            raw = _RUST_MOD.ema([float(x) if x == x else 0.0 for x in data], int(span))  # NaN 已在 _to_list 归一
+            raw = _RUST_MOD.ema(_prep, int(span))
             if isinstance(series, pd.Series):
                 idx = series.index
             elif isinstance(series, pd.DataFrame):
@@ -136,9 +153,11 @@ def rsi(series, period: int = 14, *args, **kwargs) -> pd.Series:
     if "span" in kwargs:
         period = kwargs["span"]
     if _use_rust():
+        _prep = _prepare_data(series)
+        if _prep is None:
+            return _py_rsi(series, period, *args, **kwargs)
         try:
-            data = _to_list(series)
-            raw = _RUST_MOD.rsi([float(x) if x == x else 0.0 for x in data], int(period))
+            raw = _RUST_MOD.rsi(_prep, int(period))
             if isinstance(series, pd.Series):
                 idx = series.index
             elif isinstance(series, pd.DataFrame):
@@ -154,10 +173,12 @@ def rsi(series, period: int = 14, *args, **kwargs) -> pd.Series:
 def bollinger(series, window: int = 20, num_std: float = 2.0, *args, **kwargs):
     """布林带：优先 Rust（无别名时），失败回落 Python。"""
     if _use_rust() and "n" not in kwargs and "k" not in kwargs:
+        _prep = _prepare_data(series)
+        if _prep is None:
+            return _py_bollinger(series, window, num_std, *args, **kwargs)
         try:
-            data = _to_list(series)
             mid_raw, up_raw, low_raw = _RUST_MOD.bollinger(
-                [float(x) if x == x else 0.0 for x in data], int(window), float(num_std)
+                _prep, int(window), float(num_std)
             )
             vals_mid = [v if v is not None else float("nan") for v in mid_raw]
             vals_up = [v if v is not None else float("nan") for v in up_raw]
@@ -177,10 +198,12 @@ def bollinger(series, window: int = 20, num_std: float = 2.0, *args, **kwargs):
 def macd(series, fast: int = 12, slow: int = 26, signal: int = 9, *args, **kwargs):
     """MACD：优先 Rust，失败回落 Python。"""
     if _use_rust():
+        _prep = _prepare_data(series)
+        if _prep is None:
+            return _py_macd(series, fast, slow, signal, *args, **kwargs)
         try:
-            data = _to_list(series)
             a, b, c = _RUST_MOD.macd(
-                [float(x) if x == x else 0.0 for x in data], int(fast), int(slow), int(signal)
+                _prep, int(fast), int(slow), int(signal)
             )
             if isinstance(series, pd.Series):
                 idx = series.index
