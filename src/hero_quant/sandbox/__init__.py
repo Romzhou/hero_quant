@@ -31,41 +31,47 @@ try:
     )
 
     # 保持便捷导出的统一身份：包级 SandboxViolation 即 ast_guard 的同一类型
+    assert _RunnerSandboxViolation is SandboxViolation  # type: ignore[attr-defined]
     SandboxViolation = _RunnerSandboxViolation  # type: ignore
     check_source = _runner_check_source  # type: ignore
-except Exception:  # pragma: no cover — runner 缺失时不影响基础沙箱功能
+except (ImportError, ModuleNotFoundError):  # pragma: no cover — runner 缺失时不影响基础沙箱功能
+    from .base import SandboxUnavailableError  # type: ignore[import-not-found] # noqa: F401
+
     LAUNCHER_BIN = "landlock-run"  # type: ignore
     LAUNCHER_FAILURE_EXIT = 125  # type: ignore
-
-    class SandboxUnavailableError(RuntimeError):  # type: ignore
-        pass
 
     def launcher_path(*a, **kw):  # type: ignore
         return "landlock-run"
 
     def grant_args(*a, **kw):  # type: ignore
-        return []
+        raise SandboxUnavailableError("sandbox unavailable: runner not installed")
 
     def probe(*a, **kw):  # type: ignore
-        return "unusable"
+        raise SandboxUnavailableError("sandbox unavailable: runner not installed")
 
     def probe_raw(*a, **kw):  # type: ignore
-        return (125, "", "landlock-run: unusable\n")
+        raise SandboxUnavailableError("sandbox unavailable: runner not installed")
 
     def validate_probe_args(*a, **kw):  # type: ignore
-        return 125
+        raise SandboxUnavailableError("sandbox unavailable: runner not installed")
 
     # AST 守卫保持 fail-closed：委托 canonical ast_guard，保持异常身份不 fork
     # SandboxViolation / check_source 已在顶层从 ast_guard 导入，此处不再重定义
 
     class LandlockSandbox(BaseSandbox):  # type: ignore
+        def execute(self, *a, **kw):  # type: ignore
+            raise SandboxUnavailableError("sandbox unavailable: runner not installed")
+
+        def confine(self, argv, policy=None):  # type: ignore
+            raise SandboxUnavailableError("sandbox unavailable: runner not installed")
+
         def execute_python(self, source, *a, **kw):  # type: ignore
             check_source(source)
-            raise SandboxUnavailableError("runner unavailable")
+            raise SandboxUnavailableError("sandbox unavailable: runner not installed")
 
     def execute_python(source, *a, **kw):  # type: ignore
         check_source(source)
-        raise SandboxUnavailableError("runner unavailable")
+        raise SandboxUnavailableError("sandbox unavailable: runner not installed")
 
 
 __all__ = [
