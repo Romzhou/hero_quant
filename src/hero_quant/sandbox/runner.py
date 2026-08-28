@@ -14,6 +14,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -69,7 +70,7 @@ def launcher_path(
         repo_root = Path(__file__).resolve().parents[3]
         candidate = repo_root / "node_modules" / f"@deepseek-ai/node-addon-landlock-run-{sys.platform}-{os.uname().machine if hasattr(os, 'uname') else 'x64'}" / "bin" / LAUNCHER_BIN
         return str(candidate)
-    except Exception:
+    except (IndexError, OSError):
         pass
     # 最后回退为裸二进制名，依赖 PATH 解析；缺失时探针将返回 unusable
     return LAUNCHER_BIN
@@ -107,9 +108,7 @@ def validate_probe_args(argv: List[str]) -> int:
                 return LAUNCHER_FAILURE_EXIT
             nxt = args[i + 1]
             if not nxt or nxt.startswith("-"):
-                # 路径不应被误判为标志；仅当下一个 token 是已知标志时拒绝
-                if nxt in ("--ro", "--rw", "--probe", "--"):
-                    return LAUNCHER_FAILURE_EXIT
+                return LAUNCHER_FAILURE_EXIT
             i += 2
         elif token == "--":
             has_seen_sep = True
@@ -241,10 +240,13 @@ class LandlockSandbox(BaseSandbox):
         self._policy: Dict = dict(policy) if isinstance(policy, dict) else {}
         self._launcher: str = launcher or launcher_path()
         self._cached_verdict: str | None = None
+        self._verdict_lock = threading.Lock()
 
     def _verdict(self) -> str:
         if self._cached_verdict is None:
-            self._cached_verdict = probe(launcher=self._launcher)
+            with self._verdict_lock:
+                if self._cached_verdict is None:
+                    self._cached_verdict = probe(launcher=self._launcher)
         return self._cached_verdict
 
     @property
@@ -280,22 +282,34 @@ class LandlockSandbox(BaseSandbox):
             # 此处捕获后返回 no-op，交由 execute 的 fail-closed 分支按 require_enforcement 决定是否执行
             try:
                 return super().confine(argv, merged)
+            except SandboxUnavailableError:
+                return list(argv)
             except Exception as e:
-                # 捕获基类 bwrap 不可用的 fail-closed 异常，转为 no-op 以便 permissive 模式仍可运行
+                # 窄化：仅基类的 SandboxUnavailableError 转 no-op，其余原样抛出
                 try:
                     from .base import SandboxUnavailableError as _BaseUE  # type: ignore
 
                     if isinstance(e, _BaseUE):
                         return list(argv)
-                except Exception:
+                except (ImportError, OSError):
                     pass
                 raise
 
         # 构造授权：根目录只读，工作区与 /tmp 可写
         ws = merged.get("workspaceRoot") or merged.get("workspace_root") or merged.get("canonicalPath") or "/tmp"
+        # symlink 拒绝：工作区本身若为符号链接则直接 fail-closed，防止 TOCTOU 逃逸
+        try:
+            if Path(ws).is_symlink():
+                raise SandboxUnavailableError(
+                    f"{_FATAL_PREFIX}workspaceRoot symlink rejected: {ws} (exit {LAUNCHER_FAILURE_EXIT})"
+                )
+        except OSError as e:
+            raise SandboxUnavailableError(
+                f"{_FATAL_PREFIX}workspaceRoot unavailable: {ws} (exit {LAUNCHER_FAILURE_EXIT})"
+            ) from e
         try:
             ws_canonical = str(Path(ws).resolve())
-        except Exception:
+        except (OSError, RuntimeError, ValueError):
             ws_canonical = str(ws)
         grants = {
             "readOnly": ["/"],
@@ -312,14 +326,18 @@ class LandlockSandbox(BaseSandbox):
     ) -> Tuple[str, str, int]:
         """以 fail-closed 语义执行命令；强隔离缺失时抛异常而非执行。"""
         if isinstance(cmd, str):
-            # shell 字符串需 shell 展开，无法做 argv 级隔离；仍需 fail-closed 判定
             mode = self._policy.get("mode") if isinstance(self._policy, dict) else None
-            if require_enforcement and mode == "workspace-write" and self._verdict() == "unusable":
+            if mode == "workspace-write":
                 raise SandboxUnavailableError(
-                    f"{_FATAL_PREFIX}{_NOT_ENFORCED_MSG} (exit {LAUNCHER_FAILURE_EXIT}); "
-                    f"workspace-write requires Landlock but probe is unusable; command not run"
+                    f"{_FATAL_PREFIX}str cmd not allowed in workspace-write; use List[str] (exit {LAUNCHER_FAILURE_EXIT})"
                 )
-            result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+            # 非 workspace-write 避免 shell=True 注入，改用 sh -c 显式 shell；Windows 无 sh 时回退
+            try:
+                result = subprocess.run(
+                    ["sh", "-c", cmd], shell=False, capture_output=True, text=True, timeout=timeout
+                )
+            except FileNotFoundError:
+                result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
             return result.stdout, result.stderr, result.returncode
 
         # list argv 路径
@@ -401,26 +419,29 @@ def dispatch_tool(tool_spec: Any, args: dict | None = None, policy: dict | None 
     # 非 python：尝试通过沙箱隔离执行；工具本身可能是任意 callable，回退为直接调用
     try:
         from .base import SandboxUnavailableError as _BaseSandboxError  # type: ignore
-    except Exception:
+    except (ImportError, OSError):
         _BaseSandboxError = SandboxUnavailableError  # type: ignore
     try:
         # 若 tool_spec 有可调用 func，则尝试隔离包裹其命令形式
         sandbox = LandlockSandbox(policy=pol)
+        require_enforcement = pol.get("require_enforcement", pol.get("mode") == "workspace-write")
         # 若 args 含 argv/cmd 则走子进程，否则直接调用 func
         cmd = args.get("cmd") or args.get("argv") or args.get("command")
         if isinstance(cmd, (list, tuple)):
-            out, err, code = sandbox.execute(list(cmd), require_enforcement=False)  # type: ignore[arg-type]
+            out, err, code = sandbox.execute(list(cmd), require_enforcement=require_enforcement)  # type: ignore[arg-type]
             if code != 0:
                 return f"tool_error: {err or out} (code {code})"
             return out
         if isinstance(cmd, str) and cmd:
-            out, err, code = sandbox.execute(cmd, require_enforcement=False)  # type: ignore[arg-type]
+            out, err, code = sandbox.execute(cmd, require_enforcement=require_enforcement)  # type: ignore[arg-type]
             if code != 0:
                 return f"tool_error: {err or out} (code {code})"
             return out
-        # 回退直接调用
+        # 回退直接调用 — workspace-write 且探针 unusable 时不得直调，必须 fail-closed
         func = getattr(tool_spec, "func", None)
         if callable(func):
+            if require_enforcement and sandbox._verdict() == "unusable":
+                return f"tool_error: sandbox unavailable: {_FATAL_PREFIX}{_NOT_ENFORCED_MSG} (exit {LAUNCHER_FAILURE_EXIT})"
             return func(**args) if isinstance(args, dict) else func(args)
         return None
     except (SandboxUnavailableError, _BaseSandboxError) as e:  # type: ignore
