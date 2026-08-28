@@ -10,8 +10,11 @@
 
 from __future__ import annotations
 
+import asyncio
+import math
 import os
 import random
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Tuple, Type
@@ -35,9 +38,19 @@ class RetryPolicy:
         """判断是否可重试：未超次数且异常类型匹配."""
         if attempt >= self.max_attempts:
             return False
+        # 校验 retry_on 合法性
         try:
-            return isinstance(exc, self.retry_on)
+            retry_on = self.retry_on
+            if not isinstance(retry_on, tuple):
+                return False
+            for t in retry_on:
+                if not isinstance(t, type):
+                    return False
         except Exception:
+            return False
+        try:
+            return isinstance(exc, retry_on)
+        except TypeError:
             return False
 
     def backoff(self, attempt: int) -> float:
@@ -53,6 +66,14 @@ class RetryPolicy:
         d = self.backoff(attempt)
         try:
             time.sleep(d)
+        except Exception:
+            pass
+
+    async def asleep(self, attempt: int) -> None:
+        """异步退避，保留 sync sleep 供同步路径使用，async 路径 await asyncio.sleep."""
+        d = self.backoff(attempt)
+        try:
+            await asyncio.sleep(d)
         except Exception:
             pass
 
@@ -87,7 +108,7 @@ def error_handler(state: dict[str, Any], error: BaseException) -> Any:
     try:
         return LG(goto=goto, update={"error": str(error)})
     except Exception:
-        return {"goto": goto, "error": str(error)}
+        return {"goto": goto, "update": {"error": str(error)}}
 
 
 @dataclass
@@ -97,6 +118,7 @@ class BudgetBreaker:
     daily_limit: float = 5.0
     window_seconds: int = 86400
     _costs: list[tuple[float, float]] = field(default_factory=list)  # (ts, cost)
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
     # 默认定价（per 1M tokens）
     DEFAULT_PRICE_IN: float = 0.15
@@ -140,32 +162,47 @@ class BudgetBreaker:
     def record_usage(self, usage: dict) -> float:
         """记录 usage 并累计成本，返回本次成本."""
         cost = self.estimate_cost(usage)
-        # 零成本不追加 _costs，避免无界增长
-        if cost is not None:
-            try:
-                if float(cost) <= 0:
-                    return float(cost)
-            except Exception:
-                # 非数值则按原逻辑处理
-                pass
+        # isfinite 校验 NaN/Inf
         try:
-            self.add_cost(cost)
+            cf = float(cost) if cost is not None else 0.0
+            if not math.isfinite(cf):
+                return 0.0
+        except Exception:
+            return 0.0
+        # 零成本不追加 _costs，避免无界增长
+        if cf <= 0:
+            return cf
+        try:
+            self.add_cost(cf)
         except Exception:
             pass
-        return cost
+        return cf
 
-    def _prune(self) -> None:
+    def _prune_locked(self) -> None:
+        """内部 prune，不加锁，调用方需已持有 _lock."""
         now = time.time()
         cutoff = now - self.window_seconds
         self._costs = [(ts, c) for ts, c in self._costs if ts >= cutoff]
 
+    def _prune(self) -> None:
+        with self._lock:
+            self._prune_locked()
+
     def add_cost(self, cost: float) -> None:
-        self._prune()
-        self._costs.append((time.time(), float(cost)))
+        try:
+            c = float(cost) if cost is not None else 0.0
+        except Exception:
+            return
+        if not math.isfinite(c):
+            return
+        with self._lock:
+            self._prune_locked()
+            self._costs.append((time.time(), c))
 
     def total_cost(self) -> float:
-        self._prune()
-        return sum(c for _, c in self._costs)
+        with self._lock:
+            self._prune_locked()
+            return sum(c for _, c in self._costs)
 
     def should_fallback(self, cost: float = 0.0) -> bool:
         """滑动窗口熔断：单次或累计超阈即需降级。cost 默认为 0 便于查询累计状态."""
@@ -173,15 +210,28 @@ class BudgetBreaker:
             c = float(cost) if cost is not None else 0.0
         except Exception:
             c = 0.0
+        if not math.isfinite(c):
+            c = 0.0
         if c > self.daily_limit:
             return True
-        self._prune()
-        if self.total_cost() + c > self.daily_limit:
-            return True
+        with self._lock:
+            self._prune_locked()
+            total = sum(cc for _, cc in self._costs)
+            if total + c > self.daily_limit:
+                return True
         return False
 
     def check_and_add(self, cost: float) -> bool:
-        """累加成本并返回是否需降级."""
-        should = self.should_fallback(cost)
-        self.add_cost(cost)
-        return should
+        """累加成本并返回是否需降级。原子 check_and_add."""
+        try:
+            c = float(cost) if cost is not None else 0.0
+        except Exception as e:
+            raise ValueError(f"invalid cost: {cost}") from e
+        if not math.isfinite(c):
+            raise ValueError(f"non-finite cost: {cost}")
+        with self._lock:
+            self._prune_locked()
+            total = sum(cc for _, cc in self._costs)
+            should = c > self.daily_limit or (total + c > self.daily_limit)
+            self._costs.append((time.time(), c))
+            return should

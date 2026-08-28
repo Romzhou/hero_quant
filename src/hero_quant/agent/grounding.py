@@ -17,7 +17,9 @@ class GroundingError(Exception):
 
 
 def _normalize_price_value(raw: Any) -> float:
-    """归一价格字符串：去除千分位逗号、货币符号、空格后转 float."""
+    """归一价格字符串：去除千分位逗号、货币符号、空格后转 float，完整校验."""
+    if isinstance(raw, bool):
+        raise ValueError(f"invalid price value: {raw!r}")
     if isinstance(raw, (int, float)):
         return float(raw)
     s = str(raw).strip()
@@ -26,11 +28,10 @@ def _normalize_price_value(raw: Any) -> float:
     s = s.replace(",", "").replace(" ", "")
     # 移除尾随 %（若调用方误传百分比，保持数值）
     if s.endswith("%"):
-        s = s[:-1]
-    # 处理手/股等后缀（若包含，取数字部分）
-    m = re.search(r"[-+]?[0-9]*\.?[0-9]+", s)
-    if m:
-        s = m.group(0)
+        s = s[:-1].strip()
+    # 完整校验：去币符逗号%后必须全数字，否则 ValueError
+    if not s or not re.fullmatch(r"[-+]?[0-9]*\.?[0-9]+", s):
+        raise ValueError(f"invalid price value: {raw!r}")
     return float(s)
 
 
@@ -42,13 +43,17 @@ class GroundingLedger:
 
     def ingest(self, symbol: str, bars: list[dict]):
         """摄入行情 bars，聚合 closes/low/high 作为证据."""
-        closes = set()
-        lows = []
-        highs = []
+        closes: set[float] = set()
+        lows: list[float] = []
+        highs: list[float] = []
         for bar in bars:
             close = bar.get("close")
             if close is not None:
-                closes.add(float(close))
+                try:
+                    norm_close = _normalize_price_value(close)
+                except Exception as e:
+                    raise GroundingError(f"invalid close value {close!r}: {e}") from e
+                closes.add(norm_close)
             low = bar.get("low", close)
             high = bar.get("high", close)
             if low is None:
@@ -56,16 +61,24 @@ class GroundingLedger:
             if high is None:
                 high = close
             if low is not None:
-                lows.append(float(low))
+                try:
+                    norm_low = _normalize_price_value(low)
+                except Exception as e:
+                    raise GroundingError(f"invalid low value {low!r}: {e}") from e
+                lows.append(norm_low)
             if high is not None:
-                highs.append(float(high))
-        min_low = min(lows) if lows else (min(closes) if closes else 0)
-        max_high = max(highs) if highs else (max(closes) if closes else 0)
+                try:
+                    norm_high = _normalize_price_value(high)
+                except Exception as e:
+                    raise GroundingError(f"invalid high value {high!r}: {e}") from e
+                highs.append(norm_high)
+        min_low = min(lows) if lows else None
+        max_high = max(highs) if highs else None
         self._evidence[symbol] = {
             "closes": closes,
             "low": min_low,
             "high": max_high,
-            "bars": list(bars),
+            "bars": [dict(b) for b in bars],
         }
 
     def assert_price(self, symbol: str, price: float, authorized: Optional[Any] = None):
@@ -76,40 +89,37 @@ class GroundingLedger:
         """
         # 批冻结检查
         if authorized is not None:
-            try:
-                # authorized 可能是 frozenset/set/list 或 None
-                if isinstance(authorized, (set, frozenset, list, tuple)):
-                    if symbol not in authorized:
-                        raise GroundingError(f"not in evidence: frozen identity {symbol} not in authorized snapshot {authorized}")
-                elif isinstance(authorized, dict):
-                    if symbol not in authorized:
-                        raise GroundingError(f"not in evidence: frozen identity {symbol} not in authorized snapshot")
-            except GroundingError:
-                raise
-            except Exception:
-                pass
+            if isinstance(authorized, (set, frozenset, list, tuple)):
+                if symbol not in authorized:
+                    raise GroundingError(
+                        f"not in evidence: frozen identity {symbol} not in authorized snapshot {authorized}"
+                    )
+            elif isinstance(authorized, dict):
+                if symbol not in authorized:
+                    raise GroundingError(f"not in evidence: frozen identity {symbol} not in authorized snapshot")
+            else:
+                raise TypeError(
+                    f"authorized must be set, frozenset, list, tuple, dict or None, got {type(authorized).__name__}"
+                )
         if symbol not in self._evidence:
             raise GroundingError(f"not in evidence: unknown symbol {symbol}")
         ev = self._evidence[symbol]
+        if ev["low"] is None or ev["high"] is None:
+            raise GroundingError(f"not in evidence: empty evidence for {symbol}")
         # 归一 price（支持 "1,500", "$1,500" 等）
         try:
             norm_price = _normalize_price_value(price)
-        except Exception:
-            # 回退直接 float
-            norm_price = float(price)  # type: ignore
-        if norm_price in ev["closes"]:
-            return
-        # 也检查归一后 closes 是否匹配（处理 int vs float）
-        try:
-            # ev closes 已是 float，尝试归一后比较容差？
-            for c in ev["closes"]:
-                if abs(float(c) - norm_price) < 1e-9:
-                    return
-        except Exception:
-            pass
+        except Exception as e:
+            raise GroundingError(f"invalid price value {price!r}: {e}") from e
+        # 容差循环替代精确 == in closes
+        for c in ev["closes"]:
+            if abs(float(c) - norm_price) < 1e-9:
+                return
         if ev["low"] <= norm_price <= ev["high"]:
             return
-        raise GroundingError(f"not in evidence: price {price} (normalized {norm_price}) for {symbol} not in [{ev['low']}, {ev['high']}] closes={ev['closes']}")
+        raise GroundingError(
+            f"not in evidence: price {price} (normalized {norm_price}) for {symbol} not in [{ev['low']}, {ev['high']}] closes={ev['closes']}"
+        )
 
     def render_block(self) -> str:
         """渲染 Ground Truth 证据块，供 System Prompt 注入（L3）."""
