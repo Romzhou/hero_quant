@@ -12,29 +12,34 @@ import re
 import warnings
 from pathlib import Path
 
-# 匹配 ${VAR}、$VAR、ref:xxx / credential:xxx / env:xxx 三类引用
-REF_PATTERN = re.compile(r"^(?:\$\{([^}]+)\}|\$(?P<var2>[A-Za-z_][A-Za-z0-9_]*)$|(?:ref|credential|env):(?P<ref>.+))")
+# 匹配 ${VAR}、$VAR、ref:xxx / credential:xxx / env:xxx 三类引用 — 每分支均 $ 锚定，防前缀截断
+REF_PATTERN = re.compile(r"^(?:\$\{(?P<braced>[^}]+)\}$|\$(?P<var2>[A-Za-z_][A-Za-z0-9_]*)$|(?:(?P<kind>ref|credential|env):(?P<ref>.+))$)")
 
 # 兜底匹配：字符串内嵌的任意 ${...}
 _GENERIC_REF = re.compile(r"\$\{([^}]+)\}")
 
 
-def _check_0600(path: Path) -> None:
-    """检查文件权限是否为 0600，非 0600 时告警（防多用户可读导致泄露）。"""
+def _check_0600(path: Path, *, strict: bool = False) -> None:
+    """检查文件权限是否为 0600，非 0600 时告警（防多用户可读导致泄露）。
+
+    strict=False 保持历史 warn-only 兼容；strict=True 时抛 PermissionError 强制隔离。
+    仅捕获 OSError/FileNotFoundError，不吞噬其它异常，避免隐藏 Windows ACL 等错误。
+    """
     try:
         st = os.stat(path)
         mode = st.st_mode & 0o777
         if mode != 0o600:
-            warnings.warn(
-                f"credential file {path} permissions {oct(mode)} not 0600",
-                UserWarning,
-                stacklevel=3,
-            )
+            msg = f"credential file {path} permissions {oct(mode)} not 0600"
+            if strict:
+                raise PermissionError(msg)
+            warnings.warn(msg, UserWarning, stacklevel=3)
     except FileNotFoundError:
-        pass
-    except Exception:
-        # Windows 或缺失时 stat 可能失败，不阻塞解析流程
-        pass
+        return
+    except OSError as e:
+        if strict:
+            raise ValueError(f"cannot stat credential file {path}: {e}") from e
+        warnings.warn(f"cannot stat {path}: {e}", UserWarning, stacklevel=3)
+        return
 
 
 def _read_credential_file(path: Path) -> str:
@@ -56,36 +61,40 @@ def resolve(ref: str) -> str:
     if not ref:
         return ref
 
-    # 匹配整串为 ${VAR} 或 ref:xxx 的情况
-    m = REF_PATTERN.match(ref)
+    # 匹配整串为 ${VAR} 或 ref:xxx 的情况 — 用 fullmatch 防前缀截断
+    m = REF_PATTERN.fullmatch(ref)
     if m:
-        var = m.group(1) or m.group("var2") or m.group("ref")
+        # 兼容 braced 命名与旧未命名分组
+        var = m.group("braced") or m.group(1) or m.group("var2") or m.group("ref")
+        kind = m.groupdict().get("kind")
         if var:
             var = var.strip()
-            # 支持 ${VAR:-default} 语法
+            # 支持 ${VAR:-default} 语义：unset 或空字符串均回落到 default（与 shell :- 一致）
             if ":-" in var:
                 key, default = var.split(":-", 1)
                 val = _resolve_env_key(key.strip())
-                if val is None:
+                if not val:  # None or "" -> fallback
                     return default
                 return val
             val = _resolve_env_key(var)
-            if val is not None:
-                # 环境变量存在时直接返回其值，不再做文件二次解析
+            if val is not None and val != "":
+                # 环境变量存在且非空时直接返回，不再做文件二次解析
                 return val
-            # 环境变量缺失时尝试按文件路径读取
+            # 处理 env: 前缀：显式要求仅读环境，不回落文件，fail-loud
+            if kind == "env":
+                raise ValueError(f"credential ref not found (shadow fail-loud): {ref}")
+            # 对 ref:/credential:/${} / $VAR 允许文件回落，但不展开 env vars 防注入
             p = Path(var)
+            # 仅用字面路径，不做 expandvars/expanduser，避免 $HOME 注入任意文件读取
+            cand = p
+            exists = False
             try:
-                p_exp = Path(os.path.expandvars(os.path.expanduser(var)))
-            except Exception:
-                p_exp = p
-            for cand in (p, p_exp):
-                try:
-                    if cand.exists() and cand.is_file():
-                        return _read_credential_file(cand)
-                except Exception:
-                    continue
-            # 未找到则 fail-loud，防静默使用空值
+                exists = cand.exists() and cand.is_file()
+            except OSError:
+                exists = False
+            if exists:
+                return _read_credential_file(cand)  # 让读取错误透出，不吞 PermissionError/UnicodeError
+            # 未找到则 fail-loud
             raise ValueError(f"credential ref not found (shadow fail-loud): {ref}")
 
     # 字符串内嵌多个 ${VAR} 的替换（每次调用重新解析）
@@ -95,21 +104,23 @@ def resolve(ref: str) -> str:
             if ":-" in key:
                 k, default = key.split(":-", 1)
                 v = _resolve_env_key(k.strip())
-                return v if v is not None else default
+                return v if v is not None and v != "" else default
             v = _resolve_env_key(key)
-            if v is None:
+            if v is None or v == "":
                 raise ValueError(f"credential ref not found: {key}")
             return v
 
         return _GENERIC_REF.sub(_repl, ref)
 
-    # 无模式的纯值：若指向已存在文件则按凭据文件读取（支持热重载）
+    # 无模式的纯值：若指向已存在文件则按凭据文件读取（支持热重载）— 仅捕获 OSError，不吞读取错误
+    p_plain = Path(ref)
+    exists_plain = False
     try:
-        p_plain = Path(ref)
-        if p_plain.exists() and p_plain.is_file():
-            return _read_credential_file(p_plain)
-    except Exception:
-        pass
+        exists_plain = p_plain.exists() and p_plain.is_file()
+    except OSError:
+        exists_plain = False
+    if exists_plain:
+        return _read_credential_file(p_plain)
 
     return ref
 

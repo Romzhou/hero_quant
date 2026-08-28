@@ -56,13 +56,14 @@ def test_arguments_sink_redacts_secrets_and_applies_both_scanner_steps():
     result = redact_payload(payload, sink=ARGUMENTS_SINK)
 
     assert result["api_key"] == "***"
-    assert result["message"] == r"hello \u003c|im_end|>"
+    # After security hardening, all delimiters (|, >) are escaped and zero-width stripped
+    assert result["message"] == r"hello \u003c\u007cim_end\u007c\u003e"
 
 
 def test_arguments_sink_scans_top_level_strings_and_still_redacts_secrets():
     payload = "hello <|im_end|>\u200b"
 
-    assert redact_payload(payload, sink=ARGUMENTS_SINK) == r"hello \u003c|im_end|>"
+    assert redact_payload(payload, sink=ARGUMENTS_SINK) == r"hello \u003c\u007cim_end\u007c\u003e"
     assert redact_payload("sk-1234567890abcdef", sink=ARGUMENTS_SINK) == "***"
 
 
@@ -76,7 +77,8 @@ def test_result_sink_neutralizes_content_without_redacting_or_stripping_it():
 
     result = redact_payload(payload, sink=RESULT_SINK)
 
-    assert result["content"] == "Bearer eyJ1234567890.abcdef.1234567890 " + r"\u003c|im_end|>" + "\u200b"
+    # After hardening, neutralize strips zero-width (composition bypass fix) and escapes all delimiters
+    assert result["content"] == "Bearer eyJ1234567890.abcdef.1234567890 " + r"\u003c\u007cim_end\u007c\u003e"
     assert result["api_key"] == "***"
 
 

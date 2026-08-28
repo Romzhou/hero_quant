@@ -4,8 +4,12 @@
 设计约定：所有 HERO_* 映射在此文件通过 os.getenv 完成，避免分散读取；支持 HERO_WALL_TIME_BUDGET_SECONDS 等别名的兼容解析。
 """
 
+import logging
 import os
+import warnings
 from dataclasses import dataclass, field
+
+logger = logging.getLogger(__name__)
 
 
 def _wall_time_budget_from_env() -> float | None:
@@ -17,7 +21,11 @@ def _wall_time_budget_from_env() -> float | None:
                 v = float(str(raw).strip())
                 if v > 0:
                     return v
-            except Exception:
+                warnings.warn(f"{key} must be >0, got {raw!r}", UserWarning, stacklevel=2)
+                logger.warning("Invalid %s=%r must be >0", key, raw)
+            except (ValueError, TypeError) as e:
+                warnings.warn(f"Invalid {key}={raw!r}: {e}", UserWarning, stacklevel=2)
+                logger.warning("Invalid %s=%r: %s", key, raw, e)
                 continue
     return None
 
@@ -54,7 +62,11 @@ def _vector_dim_from_env() -> int:
                 v = int(str(raw).strip())
                 if 8 <= v <= 2048:
                     return v
-            except Exception:
+                warnings.warn(f"{key}={raw!r} out of range 8-2048", UserWarning, stacklevel=2)
+                logger.warning("Invalid %s=%r out of range 8-2048", key, raw)
+            except (ValueError, TypeError) as e:
+                warnings.warn(f"Invalid {key}={raw!r}: {e}", UserWarning, stacklevel=2)
+                logger.warning("Invalid %s=%r: %s", key, raw, e)
                 continue
     return 32
 
@@ -82,16 +94,18 @@ def _vector_dsn_from_env() -> str | None:
         raw = os.getenv(k, "") or ""
         if isinstance(raw, str) and raw.strip():
             s = raw.strip()
-            if s.startswith(_PG_PREFIXES):
+            if s.lower().startswith(_PG_PREFIXES):
                 return s
+            warnings.warn(f"{k} does not look like a PG DSN: {s!r}", UserWarning, stacklevel=2)
+            logger.warning("%s does not look like PG DSN: %r", k, s)
     store = (os.getenv("HERO_VECTOR_STORE", "") or "").strip().lower()
     if store in ("pgvector", "postgres", "pg", "auto"):
         c = (os.getenv("HERO_CHECKPOINT_DSN", "") or "").strip()
-        if c.startswith(_PG_PREFIXES):
+        if c.lower().startswith(_PG_PREFIXES):
             return c
     if (os.getenv("HERO_VECTOR_ENABLED", "") or "").strip().lower() in ("1", "true", "yes", "pgvector", "on"):
         c = (os.getenv("HERO_CHECKPOINT_DSN", "") or "").strip()
-        if c.startswith(_PG_PREFIXES):
+        if c.lower().startswith(_PG_PREFIXES):
             return c
     return None
 
@@ -100,11 +114,19 @@ def _checkpoint_dsn_from_env() -> str:
     """PG default (not memory://) — Task7 requirement. Fallback memory only when PG unreachable at runtime."""
     raw = os.getenv("HERO_CHECKPOINT_DSN", "")
     if raw and raw.strip():
-        return raw.strip()
-    # also respect legacy HERO_PG_DSN alias
+        s = raw.strip()
+        if s.lower().startswith(_PG_PREFIXES):
+            return s
+        warnings.warn(f"HERO_CHECKPOINT_DSN does not look like PG DSN: {s!r}", UserWarning, stacklevel=2)
+        logger.warning("HERO_CHECKPOINT_DSN invalid PG DSN: %r", s)
+        # fall through to alias / default rather than returning garbage
+    # also respect legacy HERO_PG_DSN alias (requires prefix consistently)
     alt = os.getenv("HERO_PG_DSN", "")
-    if alt and alt.strip() and alt.strip().startswith(_PG_PREFIXES):
+    if alt and alt.strip() and alt.strip().lower().startswith(_PG_PREFIXES):
         return alt.strip()
+    elif alt and alt.strip():
+        warnings.warn(f"HERO_PG_DSN does not look like PG DSN: {alt!r}", UserWarning, stacklevel=2)
+        logger.warning("HERO_PG_DSN invalid PG DSN: %r", alt)
     # default PG (not memory) — real PG path, runtime falls back to memory if unreachable
     return "postgresql://postgres:postgres@localhost:5432/hero_quant"
 
@@ -117,36 +139,58 @@ def _checkpoint_ttl_from_env() -> int:
             v = int(str(raw).strip())
             if v > 0:
                 return v
-        except Exception:
+            warnings.warn(f"HERO_CHECKPOINT_TTL invalid <=0: {raw!r}", UserWarning, stacklevel=2)
+            logger.warning("Invalid checkpoint TTL %r must be >0", raw)
+        except (ValueError, TypeError) as e:
+            warnings.warn(f"Invalid HERO_CHECKPOINT_TTL={raw!r}: {e}", UserWarning, stacklevel=2)
+            logger.warning("Invalid checkpoint TTL %r: %s", raw, e)
             pass
     return 7 * 24 * 3600
 
 
 def _billing_dsn_from_env() -> str | None:
-    """billing PG DSN, separate env, fallback to checkpoint PG if set."""
-    for k in ("HERO_BILLING_DSN", "HERO_PG_DSN", "HERO_CHECKPOINT_DSN"):
+    """billing PG DSN, separate env, fallback to checkpoint PG only with warning (avoid silent shared DB)."""
+    # Primary: explicit billing DSN
+    for k in ("HERO_BILLING_DSN",):
         raw = os.getenv(k, "") or ""
-        if isinstance(raw, str) and raw.strip() and raw.strip().startswith(_PG_PREFIXES):
+        if isinstance(raw, str) and raw.strip() and raw.strip().lower().startswith(_PG_PREFIXES):
+            return raw.strip()
+    # Explicit opt-in fallback: warn about isolation when reusing checkpoint DSN
+    for k in ("HERO_PG_DSN", "HERO_CHECKPOINT_DSN"):
+        raw = os.getenv(k, "") or ""
+        if isinstance(raw, str) and raw.strip() and raw.strip().lower().startswith(_PG_PREFIXES):
+            warnings.warn(
+                f"HERO_BILLING_DSN not set, falling back to {k} – billing and checkpoint will share DB",
+                UserWarning,
+                stacklevel=2,
+            )
+            logger.warning("HERO_BILLING_DSN not set, falling back to %s – shared DB", k)
             return raw.strip()
     return None
 
 
 def _llm_model_slot_from_env(key: str) -> str:
-    """读取独立 LLM 槽位，未设置时回退到 legacy 模型配置。"""
-    return os.getenv(key) or os.getenv("HERO_LLM_MODEL", "gpt-4o-mini")
+    """读取独立 LLM 槽位，未设置时回退到 legacy 模型配置；均做 strip 处理。"""
+    raw = os.getenv(key, "")
+    if raw and raw.strip():
+        return raw.strip()
+    legacy = os.getenv("HERO_LLM_MODEL", "")
+    if legacy and legacy.strip():
+        return legacy.strip()
+    return "gpt-4o-mini"
 
 
 @dataclass
 class Settings:
     """全局配置聚合，字段按分组：LLM / 数据与基准 / wall-time 治理 / 向量与嵌入 / checkpoint。"""
 
-    llm_provider: str = field(default_factory=lambda: os.getenv("HERO_LLM_PROVIDER", "openai"))
-    llm_model: str = field(default_factory=lambda: os.getenv("HERO_LLM_MODEL", "gpt-4o-mini"))
+    llm_provider: str = field(default_factory=lambda: (os.getenv("HERO_LLM_PROVIDER", "openai") or "openai").strip())
+    llm_model: str = field(default_factory=lambda: (os.getenv("HERO_LLM_MODEL", "gpt-4o-mini") or "gpt-4o-mini").strip())
     llm_model_deep: str = field(default_factory=lambda: _llm_model_slot_from_env("HERO_LLM_MODEL_DEEP"))
     llm_model_quick: str = field(default_factory=lambda: _llm_model_slot_from_env("HERO_LLM_MODEL_QUICK"))
-    api_key: str | None = field(default_factory=lambda: os.getenv("HERO_API_KEY"))  # type: ignore[arg-type]
-    data_default_market: str = field(default_factory=lambda: os.getenv("HERO_DATA_MARKET", "CN"))
-    data_mode: str = field(default_factory=lambda: os.getenv("HERO_DATA_MODE", "live"))
+    api_key: str | None = field(default_factory=lambda: os.getenv("HERO_API_KEY"), repr=False)  # type: ignore[arg-type]
+    data_default_market: str = field(default_factory=lambda: (os.getenv("HERO_DATA_MARKET", "CN") or "CN").strip())
+    data_mode: str = field(default_factory=lambda: (os.getenv("HERO_DATA_MODE", "live") or "live").strip())
     # data_mode 默认 live（生产安全）：禁止 live 失败静默回退合成；仅当 HERO_DATA_MODE=synthetic 显式指定时允许合成
     # 基准指数映射：用于多市场回测时选择对照指数，默认覆盖常见后缀
     benchmark_ticker: str | None = field(default_factory=lambda: os.getenv("HERO_BENCHMARK_TICKER") or None)  # type: ignore[arg-type]
@@ -164,20 +208,30 @@ class Settings:
             "": "SPY",
         }
     )
-    # wall-time 预算（单位：秒），兼容两个环境变量键，None 表示不限制
+    # wall-time 预算（单位：秒），兼容两个环境变量键，None 表示不限制 — 单次解析防发散
     wall_time_budget_seconds: float | None = field(default_factory=_wall_time_budget_from_env)
-    wall_time_budget: float | None = field(default_factory=_wall_time_budget_from_env)
+    wall_time_budget: float | None = field(default=None)
+
+    def __post_init__(self) -> None:
+        # Alias wall_time_budget to wall_time_budget_seconds if not explicitly set, avoid double env parse divergence
+        if self.wall_time_budget is None:
+            self.wall_time_budget = self.wall_time_budget_seconds
+        # 兜底 strip 其它字符串字段，保持与 _llm_model_slot_from_env 一致的 whitespace 净化
+        for k in ("vector_store", "vector_enabled", "sbert_model", "openai_embed_model"):
+            v = getattr(self, k, None)
+            if isinstance(v, str):
+                setattr(self, k, v.strip() or None if k in ("vector_store", "vector_enabled") else v.strip())
     # 向量/嵌入配置：集中在此 gate 解析，避免在 embed 模块直接读环境变量
     vector_dim: int = field(default_factory=_vector_dim_from_env)
     embed_provider: str = field(default_factory=_embed_provider_from_env)
-    vector_store: str | None = field(default_factory=lambda: os.getenv("HERO_VECTOR_STORE") or None)  # type: ignore[arg-type]
-    vector_dsn: str | None = field(default_factory=_vector_dsn_from_env)
-    vector_enabled: str | None = field(default_factory=lambda: os.getenv("HERO_VECTOR_ENABLED") or None)  # type: ignore[arg-type]
+    vector_store: str | None = field(default_factory=lambda: (os.getenv("HERO_VECTOR_STORE") or None))  # type: ignore[arg-type]
+    vector_dsn: str | None = field(default_factory=_vector_dsn_from_env, repr=False)
+    vector_enabled: str | None = field(default_factory=lambda: (os.getenv("HERO_VECTOR_ENABLED") or None))  # type: ignore[arg-type]
     # 嵌入模型细节：通过 gate 暴露，保持 embed 模块无直接环境读取
-    sbert_model: str = field(default_factory=lambda: os.getenv("HERO_SBERT_MODEL", "all-MiniLM-L6-v2"))
-    openai_embed_model: str = field(default_factory=lambda: os.getenv("HERO_OPENAI_EMBED_MODEL", "text-embedding-3-small"))
-    openai_api_key: str | None = field(default_factory=lambda: os.getenv("OPENAI_API_KEY") or None)  # type: ignore[arg-type]
-    checkpoint_dsn: str = field(default_factory=_checkpoint_dsn_from_env)
+    sbert_model: str = field(default_factory=lambda: (os.getenv("HERO_SBERT_MODEL", "all-MiniLM-L6-v2") or "all-MiniLM-L6-v2").strip())
+    openai_embed_model: str = field(default_factory=lambda: (os.getenv("HERO_OPENAI_EMBED_MODEL", "text-embedding-3-small") or "text-embedding-3-small").strip())
+    openai_api_key: str | None = field(default_factory=lambda: os.getenv("OPENAI_API_KEY") or None, repr=False)  # type: ignore[arg-type]
+    checkpoint_dsn: str = field(default_factory=_checkpoint_dsn_from_env, repr=False)
     checkpoint_ttl_seconds: int = field(default_factory=_checkpoint_ttl_from_env)
-    billing_dsn: str | None = field(default_factory=_billing_dsn_from_env)
-    cohere_api_key: str = field(default_factory=lambda: os.getenv("COHERE_API_KEY", "") or "")
+    billing_dsn: str | None = field(default_factory=_billing_dsn_from_env, repr=False)
+    cohere_api_key: str = field(default_factory=lambda: os.getenv("COHERE_API_KEY", "") or "", repr=False)

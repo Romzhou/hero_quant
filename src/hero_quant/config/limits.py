@@ -71,12 +71,12 @@ def truncate_tool_result(result: Any, limit: int | None = None) -> str:
             logger.debug("truncate json dumps failed: %s", e, exc_info=True)
             try:
                 s = str(result)
-            except Exception as e2:
+            except (TypeError, ValueError, OverflowError) as e2:
                 logger.warning("truncate str() failed: %s", e2, exc_info=True)
                 s = ""
-        except Exception as e:
-            logger.warning("truncate unexpected error: %s", e, exc_info=True)
-            s = str(result)
+            except Exception as e2:
+                logger.warning("truncate unexpected str() error: %s", e2, exc_info=True)
+                s = ""
     if len(s) <= lim:
         return s
     total = len(s)
@@ -104,20 +104,31 @@ def truncate_tool_result(result: Any, limit: int | None = None) -> str:
 def fit_records(records: list[Any], limit: int | None = None, per_record_limit: int | None = None) -> list[str]:
     """分页打包：在总字符预算内尽可能容纳多条记录，单条可独立限长。"""
     lim = limit if limit is not None else TOOL_RESULT_LIMIT
+    # validate lim
+    try:
+        lim = int(lim)
+    except (ValueError, TypeError):
+        lim = TOOL_RESULT_LIMIT
+    if lim <= 0:
+        lim = TOOL_RESULT_LIMIT
     out: list[str] = []
     total = 0
+    # minimal marker length to judge if remaining budget can hold truncated entry
+    _min_marker_len = len("\n...[TRUNCATED shown=0/total=0]")
     for r in records:
         s = truncate_tool_result(r, limit=per_record_limit if per_record_limit is not None else lim)
-        # 单条已超总预算时进一步截断，避免整体溢出
+        # 单条已超总预算时进一步截断，避免整体溢出 — 直接按剩余预算截断原始记录，避免二次标记叠加
         if total + len(s) > lim and out:
             remaining = lim - total
-            if remaining > 100:
-                s = truncate_tool_result(s, limit=remaining)
-            else:
+            if remaining <= 0:
+                break
+            # 截断原始记录而非已带标记的 s，避免双标记与错误 total
+            s = truncate_tool_result(r, limit=remaining)
+            if total + len(s) > lim:
                 break
         if total + len(s) > lim and not out:
-            # 首条即超限：直接返回截断后的单条，保证至少有结果
-            out.append(truncate_tool_result(s, limit=lim))
+            # 首条即超限：直接返回按总预算截断的原始记录，保证至少有结果
+            out.append(truncate_tool_result(r, limit=lim))
             break
         out.append(s)
         total += len(s)
