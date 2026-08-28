@@ -10,6 +10,7 @@ from __future__ import annotations
 import inspect
 import json
 import os
+import re
 import sqlite3
 import time
 from pathlib import Path
@@ -45,6 +46,7 @@ _PG_PREFIXES = ("postgresql://", "postgres://", "postgresql+psycopg://")
 DDL_DEDUP_PG = """
 CREATE TABLE IF NOT EXISTS dedup (
   key TEXT PRIMARY KEY,
+  tenant TEXT,
   tool TEXT,
   status TEXT,
   result JSONB,
@@ -52,6 +54,7 @@ CREATE TABLE IF NOT EXISTS dedup (
 );
 CREATE INDEX IF NOT EXISTS idx_dedup_status ON dedup (status);
 CREATE INDEX IF NOT EXISTS idx_dedup_updated_at ON dedup (updated_at);
+CREATE INDEX IF NOT EXISTS idx_dedup_tenant ON dedup (tenant);
 """
 
 DDL_TOOL_CALL_PG = """
@@ -68,23 +71,27 @@ CREATE INDEX IF NOT EXISTS idx_tool_status ON tool_call_dedup(status);
 """
 
 # RLS 策略 DDL（DB 层二次防护）：应用层已按 tenant 前缀过滤，库层再以 current_setting 强制隔离
-# 键前缀即 tenant，split_part 取首段比对，防止跨租户穿透
+# 键前缀即 tenant，split_part 取首段比对，防止跨租户穿透；deny-by-default 需 SET LOCAL app.current_tenant
 DDL_RLS_PG = """
 ALTER TABLE dedup ENABLE ROW LEVEL SECURITY;
-CREATE POLICY tenant_isolation ON dedup USING (tenant = current_setting('app.current_tenant', true) OR current_setting('app.current_tenant', true) = '');
-CREATE POLICY tenant_isolation_insert ON dedup FOR INSERT WITH CHECK (tenant = current_setting('app.current_tenant', true) OR current_setting('app.current_tenant', true) = '');
+DO $$ BEGIN
+  CREATE POLICY tenant_isolation ON dedup USING (tenant = current_setting('app.current_tenant', true));
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+DO $$ BEGIN
+  CREATE POLICY tenant_isolation_insert ON dedup FOR INSERT WITH CHECK (tenant = current_setting('app.current_tenant', true));
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
 
 ALTER TABLE tool_call_dedup ENABLE ROW LEVEL SECURITY;
-CREATE POLICY tenant_isolation ON tool_call_dedup USING (
-  split_part(idempotency_key, ':', 1) = current_setting('app.current_tenant', true)
-  OR current_setting('app.current_tenant', true) = ''
-  OR current_setting('app.current_tenant', true) IS NULL
-);
-CREATE POLICY tenant_isolation_insert ON tool_call_dedup FOR INSERT WITH CHECK (
-  split_part(idempotency_key, ':', 1) = current_setting('app.current_tenant', true)
-  OR current_setting('app.current_tenant', true) = ''
-  OR current_setting('app.current_tenant', true) IS NULL
-);
+DO $$ BEGIN
+  CREATE POLICY tenant_isolation ON tool_call_dedup USING (split_part(idempotency_key, ':', 1) = current_setting('app.current_tenant', true));
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+DO $$ BEGIN
+  CREATE POLICY tenant_isolation_insert ON tool_call_dedup FOR INSERT WITH CHECK (split_part(idempotency_key, ':', 1) = current_setting('app.current_tenant', true));
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
 """
 
 DDL_RLS_DEDUP = DDL_RLS_PG
@@ -119,9 +126,16 @@ def _is_async_pool(pool: Any) -> bool:
         return False
 
 
+_KEY_PART_RE = re.compile(r"^[^:]+$")
+
+
 def derive_key(tenant: str, workflow_id: str, step_id: str, tool: str, business_id: str) -> str:
     """在编排层派生幂等键，格式固定为 tenant:workflow:step:tool:businessId 以保证跨租户隔离与可追溯。"""
     parts = [tenant, workflow_id, step_id, tool, business_id]
+    for p in parts:
+        s = str(p)
+        if not s or not _KEY_PART_RE.match(s):
+            raise ValueError(f"derive_key part must match ^[^:]+$: got {s!r}")
     return ":".join(str(p) for p in parts)
 
 
@@ -198,6 +212,14 @@ class DedupStore:
                     except Exception:
                         with conn.cursor() as cur:  # type: ignore
                             cur.execute(DDL_DEDUP_PG)
+                    try:
+                        conn.execute(DDL_TOOL_CALL_PG)  # type: ignore
+                    except Exception:
+                        try:
+                            with conn.cursor() as cur:  # type: ignore
+                                cur.execute(DDL_TOOL_CALL_PG)
+                        except Exception:
+                            pass
                     # DB-level RLS true policy
                     try:
                         conn.execute(DDL_RLS_PG)  # type: ignore
@@ -216,6 +238,10 @@ class DedupStore:
                 try:
                     with conn.cursor() as cur:
                         cur.execute(DDL_DEDUP_PG)
+                        try:
+                            cur.execute(DDL_TOOL_CALL_PG)
+                        except Exception:
+                            pass
                         try:
                             cur.execute(DDL_RLS_PG)
                         except Exception:
@@ -241,11 +267,27 @@ class DedupStore:
             try:
                 async with self.pool.connection() as conn:  # type: ignore
                     await conn.execute(DDL_DEDUP_PG)  # type: ignore
+                    try:
+                        await conn.execute(DDL_TOOL_CALL_PG)  # type: ignore
+                    except Exception:
+                        pass
+                    try:
+                        await conn.execute(DDL_RLS_PG)  # type: ignore
+                    except Exception:
+                        pass
             except Exception:
                 try:
                     async with self.pool.connection() as conn:  # type: ignore
                         async with conn.cursor() as cur:  # type: ignore
                             await cur.execute(DDL_DEDUP_PG)
+                            try:
+                                await cur.execute(DDL_TOOL_CALL_PG)
+                            except Exception:
+                                pass
+                            try:
+                                await cur.execute(DDL_RLS_PG)
+                            except Exception:
+                                pass
                 except Exception:
                     pass
 
