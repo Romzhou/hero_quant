@@ -3,7 +3,8 @@
  * - 职责：渲染回测核心产出——指标卡、净值曲线（累积收益 vs 沪深300 + 回撤阴影）、月度收益热力、回撤 TopN、positions.csv 预览与 tearsheet.html 嵌入
  * - 数据流：优先使用父组件传入的 props（metrics/drawdowns/heatmapDataset/csvPreview），缺省则发请求拉取
  *   /v1/backtest/metrics.json、positions.csv、tearsheet.html；失败静默回退 mock，保持 synthetic 保真
- * - 图表：ECharts（line/heatmap/bar），cumulative 默认从 positions.csv 解析 close 序列驱动，失败回退静态 mock
+ * - 图表：ECharts（line/heatmap/bar），cumulative 从 positions.csv 解析 close 序列驱动，解析失败诚实空状态不回退 mock（可靠性修复）
+ * - 安全：tearsheet iframe 使用直接 src + 空 sandbox，不使用 srcDoc/allow-same-origin（防 XSS）；无新增依赖 DOMPurify
  */
 import { useEffect, useMemo, useState } from "react"
 import ReactECharts from "echarts-for-react"
@@ -17,6 +18,19 @@ const MOCK_POSITIONS = `date,symbol,weight,close
 2026-08-14,600519.SH,0.5,1671.0
 2026-08-15,600519.SH,0.5,1701.3`
 
+const DEFAULT_METRICS: Metrics = { sharpe: 1.62, annual_return: 0.184, max_drawdown: -0.032, turnover: 0.42 }
+const DEFAULT_DRAWDOWNS: Drawdown[] = [
+  { start: "2026-08-13", end: "2026-08-14", depth: -1.27, duration: 2 },
+  { start: "2026-08-16", end: "2026-08-17", depth: -0.98, duration: 1 },
+  { start: "2026-08-10", end: "2026-08-12", depth: -0.62, duration: 3 },
+]
+
+const API_METRICS = "/v1/backtest/metrics.json"
+const API_POSITIONS = "/v1/backtest/positions.csv"
+const API_TEARSHEET = "/v1/backtest/tearsheet.html"
+const MAX_CSV_CHARS = 4000
+const MAX_HTML_CHARS = 8000
+
 export type ResearchProps = {
   heatmapDataset?: [number, number, number][]
   heatmapWeeks?: string[]
@@ -26,29 +40,72 @@ export type ResearchProps = {
   csvPreview?: string
 }
 
-function parseCumulative(csv: string): { dates: string[]; values: number[] } | null {
+// 手写鲁棒 CSV 行解析：处理引号包裹、转义双引号、逗号在引号内不分割（无新依赖）
+export function parseCsvLine(line: string): string[] {
+  const out: string[] = []
+  let cur = ""
+  let inQuotes = false
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i]
+    if (ch === '"') {
+      if (inQuotes && line[i + 1] === '"') { cur += '"'; i++ }
+      else inQuotes = !inQuotes
+    } else if (ch === ',' && !inQuotes) {
+      out.push(cur.trim())
+      cur = ""
+    } else {
+      cur += ch
+    }
+  }
+  out.push(cur.trim())
+  // 去掉首尾包裹引号残留（parse 阶段已跳过外层引号，但保留内部）
+  return out.map(s => {
+    if (s.length >= 2 && s.startsWith('"') && s.endsWith('"')) return s.slice(1, -1).trim()
+    return s
+  })
+}
+
+export function formatDateForDisplay(raw: string): string {
+  const t = (raw || "").trim()
+  // 仅对标准 YYYY-MM-DD（含时间后缀）做 MM-DD 展示，其他格式原样保留避免 slice(5) 产生垃圾
+  if (/^\d{4}-\d{2}-\d{2}/.test(t)) return t.slice(5, 10)
+  return t
+}
+
+export function truncateOnLineBoundary(txt: string, max: number): string {
+  if (txt.length <= max) return txt
+  const sliced = txt.slice(0, max)
+  const lastNewline = sliced.lastIndexOf("\n")
+  // 若在后半段找到换行则截到行边界，否则保留 max 避免过度截断
+  if (lastNewline > max * 0.5) return sliced.slice(0, lastNewline + 1)
+  return sliced
+}
+
+export function parseCumulative(csv: string): { dates: string[]; values: number[] } | null {
   try {
     const lines = csv.trim().split(/\r?\n/).filter(l => l.trim())
     if (lines.length < 2) return null
-    const headers = lines[0].split(",").map(h => h.trim().toLowerCase())
+    const headers = parseCsvLine(lines[0]).map(h => h.toLowerCase())
     const dateIdx = headers.indexOf("date")
     const closeIdx = headers.indexOf("close")
     if (closeIdx === -1) return null
     const rows: { date: string; close: number }[] = []
     for (let i = 1; i < lines.length; i++) {
-      const cols = lines[i].split(",")
+      const cols = parseCsvLine(lines[i])
+      // 列不足时跳过而非错位解析
+      if (cols.length <= closeIdx) continue
       const c = parseFloat(cols[closeIdx])
       if (isNaN(c) || c <= 0) continue
-      let d = dateIdx !== -1 ? cols[dateIdx]?.trim() : `D${i}`
-      // 仅保留 MM-DD 显示
-      if (d && d.includes("-")) d = d.slice(5)
-      rows.push({ date: d || `D${i}`, close: c })
+      let d = dateIdx !== -1 ? (cols[dateIdx]?.trim() ?? "") : `D${i}`
+      if (!d) d = `D${i}`
+      // 保留完整日期用于解析，仅展示时格式化
+      const display = d.startsWith("D") ? d : formatDateForDisplay(d)
+      rows.push({ date: display, close: c })
     }
     if (rows.length < 2) return null
     const base = rows[0].close
     const values = rows.map(r => +(r.close / base).toFixed(4))
     const dates = rows.map(r => r.date)
-    // 限制 30 点以内避免拥挤
     if (dates.length > 30) {
       return { dates: dates.slice(-30), values: values.slice(-30) }
     }
@@ -58,79 +115,124 @@ function parseCumulative(csv: string): { dates: string[]; values: number[] } | n
   }
 }
 
+// 供测试直接验证热力推导不造假（不补零）
+export function deriveHeatmapForTest(metrics: Metrics): [number, number, number][] | null {
+  const raw: unknown = (metrics as unknown as Record<string, unknown>)?.monthly_returns ?? (metrics as unknown as Record<string, unknown>)?.monthly ?? null
+  if (raw == null) return null
+  try {
+    if (Array.isArray(raw) && raw.length > 0) {
+      const first = (raw as unknown[])[0]
+      if (Array.isArray(first) && first.length === 3) return raw as [number, number, number][]
+      if (typeof first === "number") {
+        const arr = raw as number[]
+        return arr.map((v, idx) => [idx % 5, Math.floor(idx / 5) % 7, +(Number(v) * 100).toFixed(2)] as [number, number, number])
+      }
+    }
+    if (typeof raw === "object" && !Array.isArray(raw)) {
+      const entries = Object.entries(raw as Record<string, unknown>)
+      if (entries.length) return entries.map(([, v], idx) => [idx % 5, Math.floor(idx / 5) % 7, +(Number(v) * 100)] as [number, number, number])
+    }
+  } catch {}
+  return null
+}
+
+function getTearsheetBadge(tearsheetLoaded: boolean, isSynthetic: boolean): { label: string; className: string } {
+  if (!tearsheetLoaded) return { label: "占位预览（未找到则展示占位）", className: "border-white/10 bg-white/5 text-slate-500" }
+  if (isSynthetic) return { label: "演示合成", className: "border-amber-400/20 bg-amber-400/10 text-amber-300" }
+  return { label: "真实回测", className: "border-emerald-400/20 bg-emerald-400/10 text-emerald-300" }
+}
+
+function formatDrawdownDate(s: string): string {
+  const t = (s || "").trim()
+  if (/^\d{4}-\d{2}-\d{2}/.test(t)) return t.slice(5, 10)
+  return t
+}
+
 export default function Research(props: ResearchProps) {
-  const [metrics, setMetrics] = useState<Metrics>(props.metrics ?? { sharpe: 1.62, annual_return: 0.184, max_drawdown: -0.032, turnover: 0.42 })
-  const [drawdowns] = useState<Drawdown[]>(props.drawdowns ?? [
-    { start: "2026-08-13", end: "2026-08-14", depth: -1.27, duration: 2 },
-    { start: "2026-08-16", end: "2026-08-17", depth: -0.98, duration: 1 },
-    { start: "2026-08-10", end: "2026-08-12", depth: -0.62, duration: 3 },
-  ])
+  const [metrics, setMetrics] = useState<Metrics>(props.metrics ?? DEFAULT_METRICS)
+  const [drawdowns, setDrawdowns] = useState<Drawdown[]>(props.drawdowns ?? DEFAULT_DRAWDOWNS)
   const [csvPreview, setCsvPreview] = useState<string>(props.csvPreview ?? MOCK_POSITIONS)
   const [csvIsMock, setCsvIsMock] = useState<boolean>(!props.csvPreview)
   const [csvLoading, setCsvLoading] = useState<boolean>(!props.csvPreview)
   const [metricsLoading, setMetricsLoading] = useState<boolean>(!props.metrics)
   const [tearsheetLoaded, setTearsheetLoaded] = useState(false)
-  const [tearsheetHtml, setTearsheetHtml] = useState<string | null>(null)
   const [tearsheetIsSynthetic, setTearsheetIsSynthetic] = useState<boolean>(true)
 
+  // 单一真实源：props 变更时同步到 state（修复 props-to-state 脱节，drawdowns 补回 setter）
+  useEffect(() => { if (props.metrics) setMetrics(props.metrics) }, [props.metrics])
+  useEffect(() => { if (props.drawdowns) setDrawdowns(props.drawdowns) }, [props.drawdowns])
   useEffect(() => {
+    if (props.csvPreview !== undefined) {
+      setCsvPreview(props.csvPreview)
+      setCsvIsMock(false)
+      setCsvLoading(false)
+    }
+  }, [props.csvPreview])
+
+  const hasMetricsProp = !!props.metrics
+  const hasCsvProp = !!props.csvPreview
+
+  useEffect(() => {
+    const controller = new AbortController()
+    const { signal } = controller
     let aborted = false
-    async function fetchArtifact(path: string, setter: (v: string) => void, onReal: () => void) {
+
+    async function fetchArtifact(path: string, setter: (v: string) => void, onReal: () => void, maxChars: number) {
       setCsvLoading(true)
       try {
-        const r = await fetch(path, { cache: "no-store" })
+        const r = await fetch(path, { cache: "no-store", signal } as RequestInit)
         if (!r.ok) throw new Error(String(r.status))
         const txt = await r.text()
-        if (!aborted && txt) { setter(txt.slice(0, 4000)); onReal() }
+        if (!aborted && !signal.aborted && txt) { setter(truncateOnLineBoundary(txt, maxChars)); onReal() }
       } catch {
-        // keep mock
+        // keep mock, honest fallback handled via parsed === null
       } finally {
-        if (!aborted) setCsvLoading(false)
+        if (!aborted && !signal.aborted) setCsvLoading(false)
       }
     }
     async function fetchMetrics() {
-      if (props.metrics) { setMetricsLoading(false); return }
+      if (hasMetricsProp) { setMetricsLoading(false); return }
       setMetricsLoading(true)
       try {
-        const r = await fetch("/v1/backtest/metrics.json", { cache: "no-store" })
+        const r = await fetch(API_METRICS, { cache: "no-store", signal } as RequestInit)
         if (r.ok) {
           const j = await r.json()
-          if (!aborted) setMetrics(j)
+          if (!aborted && !signal.aborted) setMetrics(j)
         }
-      } catch {} finally { if (!aborted) setMetricsLoading(false) }
+      } catch {} finally { if (!aborted && !signal.aborted) setMetricsLoading(false) }
     }
-    if (!props.csvPreview) fetchArtifact("/v1/backtest/positions.csv", setCsvPreview, () => setCsvIsMock(false))
+    if (!hasCsvProp) fetchArtifact(API_POSITIONS, setCsvPreview, () => setCsvIsMock(false), MAX_CSV_CHARS)
     else setCsvLoading(false)
     fetchMetrics()
-    fetch("/v1/backtest/tearsheet.html", { cache: "no-store" })
+    // tearsheet 仅用于徽标判定，iframe 使用直接 src 不注入 srcDoc（防 XSS，无需 DOMPurify）
+    fetch(API_TEARSHEET, { cache: "no-store", signal } as RequestInit)
       .then(r => r.ok ? r.text() : Promise.reject())
       .then(html => {
-        if (!aborted) {
-          const sliced = html.slice(0, 8000)
-          // 启发式：含 synthetic / 占位字样则视为合成
+        if (!aborted && !signal.aborted) {
+          const sliced = truncateOnLineBoundary(html, MAX_HTML_CHARS)
           const isSynthetic = /synthetic|placeholder|占位|演示合成/i.test(sliced) || sliced.length < 300
-          setTearsheetHtml(sliced); setTearsheetLoaded(true); setTearsheetIsSynthetic(isSynthetic)
+          setTearsheetLoaded(true); setTearsheetIsSynthetic(isSynthetic)
         }
       })
-      .catch(() => { if (!aborted) setTearsheetLoaded(false) })
-    return () => { aborted = true }
-  }, [props.metrics, props.csvPreview])
+      .catch(() => { if (!aborted && !signal.aborted) setTearsheetLoaded(false) })
+    return () => { aborted = true; controller.abort() }
+  }, [hasMetricsProp, hasCsvProp])
 
   const parsed = useMemo(() => parseCumulative(csvPreview), [csvPreview])
+  const hasParsed = !!parsed
 
   const cumulativeOption = useMemo(() => {
-    const xData = parsed?.dates ?? ["08-12","08-13","08-14","08-15","08-16","08-19","08-20"]
-    const cumValues = parsed?.values ?? [1.0, 1.01, 0.995, 1.02, 1.04, 1.03, 1.06]
-    // 沪深300 对照：确定性系数，保证可测与无随机化
-    const bench = cumValues.map(v => +(v * 0.985).toFixed(4))
-    // 回撤阴影：cum - rollingMax 粗略
-    let max = cumValues[0]
-    const dd = cumValues.map(v => { max = Math.max(max, v); return +(v - max).toFixed(4) })
+    // 诚实空状态：解析失败不回退 mock 静态数据 [1.0,1.01...]，改用空序列由外层占位提示
+    const xData = hasParsed ? parsed!.dates : []
+    const cumValues = hasParsed ? parsed!.values : []
+    const bench = hasParsed ? cumValues.map(v => +(v * 0.985).toFixed(4)) : []
+    let max = cumValues[0] ?? 1
+    const dd = hasParsed ? cumValues.map(v => { max = Math.max(max, v); return +(v - max).toFixed(4) }) : []
     return {
       backgroundColor: "transparent",
       textStyle: { color: "#94A3B8" },
       grid: { left: 40, right: 16, top: 16, bottom: 28 },
-      tooltip: { trigger: "axis" as const, backgroundColor: "#121722", borderColor: "rgba(255,255,255,0.1)", textStyle: { color: "#E6EAF2" }, valueFormatter: (v: number) => v.toFixed(3) },
+      tooltip: { trigger: "axis" as const, backgroundColor: "#121722", borderColor: "rgba(255,255,255,0.1)", textStyle: { color: "#E6EAF2" }, valueFormatter: (v: number) => Number(v).toFixed(3) },
       xAxis: {
         type: "category" as const,
         data: xData,
@@ -141,7 +243,7 @@ export default function Research(props: ResearchProps) {
         type: "value" as const,
         axisLine: { show: false },
         splitLine: { lineStyle: { color: "rgba(255,255,255,0.06)" } },
-        axisLabel: { color: "#64748B", formatter: (v: number) => v.toFixed(2) }
+        axisLabel: { color: "#64748B", formatter: (v: number) => Number(v).toFixed(2) }
       },
       series: [
         {
@@ -173,27 +275,21 @@ export default function Research(props: ResearchProps) {
       ],
       legend: { bottom: 0, textStyle: { color: "#CBD5E1", fontSize: 11 }, data: ["累积收益","沪深300"] }
     }
-  }, [parsed])
+  }, [parsed, hasParsed])
 
-  // Wave5: heatmap derives from metrics.monthly / monthly_returns real, props takes priority
   const metricsMonthlyRaw: unknown = (metrics as unknown as Record<string, unknown>)?.monthly_returns ?? (metrics as unknown as Record<string, unknown>)?.monthly ?? null
   const derivedHeatmap: [number, number, number][] | null = useMemo(() => {
     if (metricsMonthlyRaw == null) return null
     try {
       if (Array.isArray(metricsMonthlyRaw) && metricsMonthlyRaw.length > 0) {
         const first = (metricsMonthlyRaw as unknown[])[0]
-        // Already heatmap triplets
         if (Array.isArray(first) && first.length === 3) return metricsMonthlyRaw as [number, number, number][]
-        // Numeric monthly returns array -> map to heatmap grid
         if (typeof first === "number") {
           const arr = metricsMonthlyRaw as number[]
           const pts: [number, number, number][] = arr.map((v, idx) => [idx % 5, Math.floor(idx / 5) % 7, +(Number(v) * 100).toFixed(2)] as [number, number, number])
-          // ensure at least 10 cells for visual
-          while (pts.length < 10) pts.push([pts.length % 5, Math.floor(pts.length / 5) % 7, 0])
           return pts
         }
       }
-      // Object mapping month->return
       if (typeof metricsMonthlyRaw === "object" && !Array.isArray(metricsMonthlyRaw)) {
         const entries = Object.entries(metricsMonthlyRaw as Record<string, unknown>)
         if (entries.length) return entries.map(([, v], idx) => [idx % 5, Math.floor(idx / 5) % 7, +(Number(v) * 100)] as [number, number, number])
@@ -202,7 +298,7 @@ export default function Research(props: ResearchProps) {
     return null
   }, [metricsMonthlyRaw])
 
-  const hasHeatmap = !!( (props.heatmapDataset && props.heatmapDataset.length > 0) || (derivedHeatmap && derivedHeatmap.length > 0) || metricsMonthlyRaw)
+  const hasHeatmap = !!((props.heatmapDataset && props.heatmapDataset.length > 0) || (derivedHeatmap && derivedHeatmap.length > 0))
   const heatmapOption = useMemo(() => {
     const days = props.heatmapDays ?? ["周一","周二","周三","周四","周五","周六","周日"]
     const weeks = props.heatmapWeeks ?? ["W1","W2","W3","W4","W5"]
@@ -212,8 +308,18 @@ export default function Research(props: ResearchProps) {
     } else if (derivedHeatmap && derivedHeatmap.length > 0) {
       data = derivedHeatmap
     } else {
-      // metrics.monthly / monthly_returns 已经通过 derivedHeatmap 消费，此分支保留空以触发"暂无数据"占位，满足真算驱动
       data = []
+    }
+    // 动态 visualMap 范围：基于真实数据极值，避免固定 -1..1.2 截断；无数据时保留默认
+    let vMin = -1, vMax = 1.2
+    if (data.length > 0) {
+      const vals = data.map(d => d[2])
+      const dMin = Math.min(...vals)
+      const dMax = Math.max(...vals)
+      // 加 10% padding 且至少覆盖数据
+      vMin = Math.floor(Math.min(dMin, -0.5) * 1.1 * 10) / 10
+      vMax = Math.ceil(Math.max(dMax, 0.5) * 1.1 * 10) / 10
+      if (vMin === vMax) { vMin -= 1; vMax += 1 }
     }
     return {
       backgroundColor: "transparent",
@@ -225,7 +331,7 @@ export default function Research(props: ResearchProps) {
       xAxis: { type: "category" as const, data: weeks, splitArea: { show: true, areaStyle: { color: ["rgba(255,255,255,0.02)","transparent"] } }, axisLabel: { color: "#64748B", fontSize: 10 }, axisTick: { show: false }, axisLine: { show: false } },
       yAxis: { type: "category" as const, data: days, splitArea: { show: true }, axisLabel: { color: "#94A3B8", fontSize: 10 }, axisTick: { show: false }, axisLine: { show: false } },
       visualMap: {
-        min: -1, max: 1.2, calculable: false, orient: "horizontal" as const, left: "center", bottom: 0,
+        min: vMin, max: vMax, calculable: false, orient: "horizontal" as const, left: "center", bottom: 0,
         textStyle: { color: "#64748B", fontSize: 10 },
         inRange: { color: ["#1e293b","#f59e0b","#fde68a"] },
         show: true, itemWidth: 12, itemHeight: 60
@@ -244,13 +350,13 @@ export default function Research(props: ResearchProps) {
     } },
     xAxis: {
       type: "category" as const,
-      data: drawdowns.map(d => `${d.start.slice(5)}→${d.end.slice(5)}`),
+      data: drawdowns.map(d => `${formatDrawdownDate(d.start)}→${formatDrawdownDate(d.end)}`),
       axisLabel: { color: "#64748B", fontSize: 10, interval: 0 },
       axisLine: { lineStyle: { color: "rgba(255,255,255,0.08)" } }
     },
     yAxis: {
       type: "value" as const,
-      axisLabel: { color: "#64748B", formatter: (v: number) => v.toFixed(1)+"%" },
+      axisLabel: { color: "#64748B", formatter: (v: number) => Number(v).toFixed(1)+"%" },
       splitLine: { lineStyle: { color: "rgba(255,255,255,0.06)" } }
     },
     series: [{
@@ -260,6 +366,8 @@ export default function Research(props: ResearchProps) {
       label: { show: true, position: "top" as const, color: "#CBD5E1", formatter: "{c}%" , fontSize: 11 }
     }]
   }), [drawdowns])
+
+  const tearsheetBadge = getTearsheetBadge(tearsheetLoaded, tearsheetIsSynthetic)
 
   return (
     <div className="mx-auto max-w-7xl px-6 py-6">
@@ -271,7 +379,7 @@ export default function Research(props: ResearchProps) {
         <div className="flex flex-wrap gap-2">
           <span className="rounded-full border border-emerald-400/15 bg-emerald-400/10 px-3 py-1 text-xs font-medium text-emerald-300">PIT 已校验</span>
           <span className="rounded-full border border-white/10 bg-white/5 px-3 py-1 text-xs text-slate-300">数据单位 · 板手/股</span>
-          <a href="/v1/backtest/tearsheet.html" target="_blank" rel="noreferrer" className="rounded-full bg-amber-500 px-3.5 py-1 text-xs font-semibold text-ink-900 hover:bg-amber-400 transition">打开 tearsheet.html ↗</a>
+          <a href={API_TEARSHEET} target="_blank" rel="noopener noreferrer" className="rounded-full bg-amber-500 px-3.5 py-1 text-xs font-semibold text-ink-900 hover:bg-amber-400 transition">打开 tearsheet.html ↗</a>
         </div>
       </div>
 
@@ -297,9 +405,15 @@ export default function Research(props: ResearchProps) {
         <div className="lg:col-span-3 rounded-2xl border border-white/10 bg-ink-800/60 p-4 backdrop-blur">
           <div className="flex items-center justify-between">
             <h2 className="text-sm font-semibold text-mist">净值曲线</h2>
-            <span className={"rounded-full border px-2.5 py-1 text-[11px] " + (parsed ? "border-emerald-400/20 bg-emerald-400/10 text-emerald-300" : "border-white/10 bg-white/5 text-slate-400")}>{parsed ? "真 positions.csv 驱动 · 含累积净值" : "演示数据 · 等待真实 positions.csv"}</span>
+            <span className={"rounded-full border px-2.5 py-1 text-[11px] " + (hasParsed ? "border-emerald-400/20 bg-emerald-400/10 text-emerald-300" : "border-amber-400/20 bg-amber-400/10 text-amber-300")}>{hasParsed ? "真 positions.csv 驱动 · 含累积净值" : "暂无有效数据 · 请检查文件"}</span>
           </div>
-          {csvLoading ? (
+          {/* 诚实空状态：解析失败不展示伪造 mock 曲线 */}
+          {!hasParsed && !csvLoading ? (
+            <div className="mt-4 flex h-[300px] flex-col items-center justify-center rounded-xl border border-dashed border-white/10 bg-ink-900/50 px-6 text-center">
+              <p className="text-sm font-medium text-slate-300">暂无有效回测数据</p>
+              <p className="mt-1 max-w-md text-xs leading-5 text-slate-500">解析失败或数据不足 · 请检查 positions.csv 格式（需包含 date,close 且至少 2 行有效数据，引号包裹字段已支持）</p>
+            </div>
+          ) : csvLoading ? (
             <div className="mt-4 h-[300px] animate-pulse rounded-xl bg-white/5" />
           ) : (
             <ReactECharts option={cumulativeOption} style={{ height: 300 }} opts={{ renderer: "canvas" }} />
@@ -351,8 +465,8 @@ export default function Research(props: ResearchProps) {
             <div className="flex items-center justify-between">
               <h3 className="text-sm font-semibold text-mist">positions.csv 预览</h3>
               <div className="flex gap-2">
-                <a href="/v1/backtest/positions.csv" download className="rounded-lg border border-white/10 bg-white/5 px-2.5 py-1 text-xs text-mist hover:bg-white/10">下载 CSV</a>
-                <a href="/v1/backtest/metrics.json" target="_blank" rel="noreferrer" className="rounded-lg border border-amber-500/20 bg-amber-500/10 px-2.5 py-1 text-xs text-amber-300">metrics.json</a>
+                <a href={API_POSITIONS} download className="rounded-lg border border-white/10 bg-white/5 px-2.5 py-1 text-xs text-mist hover:bg-white/10">下载 CSV</a>
+                <a href={API_METRICS} target="_blank" rel="noopener noreferrer" className="rounded-lg border border-amber-500/20 bg-amber-500/10 px-2.5 py-1 text-xs text-amber-300">metrics.json</a>
               </div>
             </div>
             {csvLoading ? (
@@ -366,10 +480,10 @@ export default function Research(props: ResearchProps) {
           <div className="rounded-2xl border border-white/10 bg-white/[0.04] p-4">
             <div className="flex items-center justify-between">
               <h3 className="text-sm font-semibold text-mist">tearsheet.html 嵌入</h3>
-              <span className={"rounded-full px-2.5 py-1 text-[11px] border " + (tearsheetLoaded ? (tearsheetIsSynthetic ? "border-amber-400/20 bg-amber-400/10 text-amber-300" : "border-emerald-400/20 bg-emerald-400/10 text-emerald-300") : "border-white/10 bg-white/5 text-slate-500")}>{tearsheetLoaded ? (tearsheetIsSynthetic ? "演示合成" : "真实回测") : "占位预览（未找到则展示占位）"}</span>
+              <span className={"rounded-full px-2.5 py-1 text-[11px] border " + tearsheetBadge.className}>{tearsheetBadge.label}</span>
             </div>
-            {tearsheetHtml ? (
-              <iframe title="tearsheet" srcDoc={tearsheetHtml} className="mt-3 h-48 w-full rounded-xl border border-white/10 bg-white" sandbox="allow-same-origin" />
+            {tearsheetLoaded ? (
+              <iframe title="tearsheet" src={API_TEARSHEET} className="mt-3 h-48 w-full rounded-xl border border-white/10 bg-white" sandbox="" />
             ) : (
               <div className="mt-3 rounded-xl border border-dashed border-white/10 bg-ink-900/50 p-6 text-center text-sm text-slate-400">
                 <div className="mx-auto h-10 w-10 rounded-xl bg-gradient-to-br from-amber-400 to-amber-600 grid place-items-center text-ink-900 font-bold">HT</div>
