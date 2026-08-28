@@ -37,12 +37,15 @@ def max_drawdown(equity: pd.Series) -> float:
     # 兼容单列 DataFrame 传入
     if isinstance(equity, pd.DataFrame):
         s = equity.iloc[:, 0]
+    s = pd.to_numeric(s, errors="coerce")
     cummax = s.cummax()  # 滚动峰值
-    # 避免除零：cummax 为 0 处回撤归零（已在后续 NaN 处理）
+    # 避免除零：cummax 为 0 处回撤归零（inf 替换为 NaN 后填 0）
+    cummax = cummax.replace(0, np.nan)
     dd = s / cummax - 1.0
+    dd = dd.replace([np.inf, -np.inf], np.nan).fillna(0.0)
     # 最深回撤（最小值即最负）
-    mdd = float(dd.min())
-    if np.isnan(mdd):
+    mdd = float(dd.min()) if not dd.empty else 0.0
+    if np.isnan(mdd) or np.isinf(mdd):
         return 0.0
     return mdd
 
@@ -107,8 +110,13 @@ def turnover(positions: pd.DataFrame | pd.Series | None = None, weights=None) ->
 
 
 def compute_metrics(equity_series: pd.Series | pd.DataFrame, costs: float = 0.0, positions=None, weights=None) -> dict:
-    """汇总常规回测指标：sharpe/annual_return/max_drawdown/turnover/volatility/cumulative_return。"""
+    """汇总常规回测指标：sharpe/annual_return/max_drawdown/turnover/volatility/cumulative_return。
+
+    costs: 若非零则按 costs 对权益做净收益调整（net returns = gross - costs），
+           避免 unused 参数误导；若 equity 已是净权益则 costs 接近 0，影响可忽略。
+    """
     import logging
+    import math
 
     logger = logging.getLogger(__name__)
     # 归一化为 Series
@@ -127,7 +135,7 @@ def compute_metrics(equity_series: pd.Series | pd.DataFrame, costs: float = 0.0,
     try:
         s = pd.to_numeric(s, errors="coerce").dropna()
     except (ValueError, TypeError, AttributeError) as e:
-        logger.warning("equity to_numeric failed: %s", e)
+        logger.warning("equity to_numeric failed: %s", e, exc_info=True)
         s = pd.Series(dtype=float)
     if s.empty:
         return {
@@ -138,6 +146,26 @@ def compute_metrics(equity_series: pd.Series | pd.DataFrame, costs: float = 0.0,
             "volatility": 0.0,
             "cumulative_return": 0.0,
         }
+
+    # Wire costs: net returns = gross - costs (per-bar drag)
+    try:
+        costs_f = float(costs) if costs is not None else 0.0
+    except (ValueError, TypeError):
+        costs_f = 0.0
+    if costs_f and np.isfinite(costs_f) and not math.isclose(costs_f, 0.0, abs_tol=1e-12) and len(s) >= 2:
+        try:
+            gross_ret = s.pct_change().fillna(0.0).replace([np.inf, -np.inf], 0.0)
+            net_ret = gross_ret - costs_f
+            # 首期不扣费（建仓已计入 turnover 的场景下首期已处理，此处首期保留 gross）
+            # 为保持幂等：若 s 已是净权益，再扣一次会低估；仅当 costs 显著且调用方显式传入时执行
+            # 使用 cumprod 重建净权益曲线
+            net_equity = (1 + net_ret).cumprod() * float(s.iloc[0])
+            net_equity.index = s.index
+            net_equity = pd.to_numeric(net_equity, errors="coerce").dropna()
+            if not net_equity.empty and np.isfinite(net_equity.iloc[-1]):
+                s = net_equity
+        except (ValueError, TypeError, AttributeError) as e:
+            logger.warning("compute_metrics costs wiring failed: %s", e, exc_info=True)
 
     sr = sharpe_ratio(s)
     ar = annual_return(s)

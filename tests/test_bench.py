@@ -46,3 +46,46 @@ def test_run_batch_regional():
         # single-date shorthand also works
         metrics2 = run_batch(["600519.SS", "0700.HK"], dates=["2024-01-01"], output_dir=tmp)
         assert metrics2["600519.SS"]["benchmark"] == "000001.SS"
+
+
+def test_synthetic_prices_deterministic_seed():
+    """Task13-11: bench synthetic seed must be deterministic via hashlib.sha256, not hash()."""
+    from hero_quant.backtest.bench import _synthetic_prices
+    import pandas as pd
+    idx = pd.date_range("2024-01-01", periods=5)
+    df1 = _synthetic_prices(idx, "AAPL")
+    df2 = _synthetic_prices(idx, "AAPL")
+    assert df1["close"].equals(df2["close"]), "same ticker must give identical synthetic prices"
+    df3 = _synthetic_prices(idx, "MSFT")
+    assert not df1["close"].equals(df3["close"])
+
+
+def test_run_batch_engine_exception_logged(caplog):
+    """Task13-12a: bench run_batch must log engine exceptions with exc_info, not silently swallow."""
+    from hero_quant.backtest.bench import run_batch
+    import tempfile
+    import logging
+    from unittest.mock import patch
+    from hero_quant.backtest import bench as bench_mod
+    # Force engine.run to raise
+    with patch.object(bench_mod.BacktestEngine, "run", side_effect=RuntimeError("engine boom")):
+        caplog.set_level(logging.WARNING)
+        with tempfile.TemporaryDirectory() as tmp:
+            res = run_batch(["AAPL"], dates=["2024-01-01"], output_dir=tmp)
+            # Should still produce fallback metrics
+            assert "AAPL" in res
+            assert res["AAPL"]["sharpe"] == 0.0
+            # Should have logged warning with exc_info
+            assert any("engine run failed" in rec.message for rec in caplog.records)
+
+
+def test_run_batch_io_failure_surfaces(tmp_path):
+    """Task13-12b: bench IO failures for metrics.json/tearsheet must surface (raise), not silent pass."""
+    from hero_quant.backtest.bench import run_batch
+    import pathlib
+    import pytest
+    # Use a file as output_dir to force failure (bench should raise)
+    file_path = tmp_path / "blockfile"
+    file_path.write_text("block")
+    with pytest.raises(Exception):
+        run_batch(["AAPL"], dates=["2024-01-01"], output_dir=file_path)

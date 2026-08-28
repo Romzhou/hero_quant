@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import pathlib
 from dataclasses import dataclass
 
@@ -87,9 +88,12 @@ class Signal:
                     return np.ones(n_assets, dtype=float) / n_assets
                 # 熊市/死叉：返回 0 权重表示空仓观望（不触发等权回落，由调用方识别）
                 return np.zeros(n_assets, dtype=float)
-            except (ValueError, TypeError, AttributeError, KeyError, IndexError) as e:
-                logger.warning("sma_crossover signal generation failed: %s", e)
+            except (ValueError, TypeError, KeyError, IndexError) as e:
+                logger.warning("sma_crossover signal generation failed: %s", e, exc_info=True)
                 return np.ones(n_assets, dtype=float) / n_assets
+            except AttributeError as e:
+                logger.warning("sma_crossover signal generation failed: %s", e, exc_info=True)
+                raise
 
         # 未知方法回落等权
         logger.warning("unknown signal method %r, fallback to equal_weight", self.method)
@@ -118,7 +122,7 @@ def generate_signal(
             if arr.size > 0:
                 return arr
         except (ValueError, TypeError) as e:
-            logger.warning("static weights conversion failed: %s", e)
+            logger.warning("static weights conversion failed: %s", e, exc_info=True)
     sig = Signal(method=method, window_short=kwargs.get("window_short", 5), window_long=kwargs.get("window_long", 20))
     return sig.generate(prices, n_assets=n_assets)
 
@@ -130,7 +134,7 @@ def _static_signal(weights) -> np.ndarray:
         arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
         return arr
     except (ValueError, TypeError) as e:
-        logger.warning("_static_signal conversion failed: %s", e)
+        logger.warning("_static_signal conversion failed: %s", e, exc_info=True)
         return np.array([1.0], dtype=float)
 
 
@@ -152,48 +156,106 @@ class BacktestEngine:
         self.historical_base_price: float | None = None
 
     # ------------------------------------------------------------------ helpers
-    def _align(self, prices: pd.DataFrame, idx: int) -> float:
-        """将 idx 处信号对齐至下一交易日的可执行价格（避免同 Bar 未来信息）。有 open 用次日 open，否则用次日 close；末 Bar 回落至当 Bar。"""
+    def _align(self, prices: pd.DataFrame, idx: int) -> pd.Series | float:
+        """将 idx 处信号对齐至下一交易日的可执行价格（避免同 Bar 未来信息）。有 open 用次日 open，否则用次日 close；末 Bar 回落至当 Bar。
+
+        多资产时返回 per-asset Series（每列一资产），单资产返回 float。
+        解析失败时抛异常（fail-closed），绝不注入 0.0 零价。
+        """
         if not isinstance(prices, pd.DataFrame) or prices.empty:
             raise ValueError("prices empty for _align")
         n = len(prices)
         if idx < 0:
             idx = 0  # 边界保护：负索引归零，避免越界
+        # 判定多资产（复用 _price_matrix 的候选列逻辑）
+        non_price_cols = {"open", "high", "low", "volume", "currency", "ccy"}
+        candidate_cols: list[str] = []
+        for c in prices.columns:
+            if c.lower() in non_price_cols:
+                continue
+            try:
+                col_vals = pd.to_numeric(prices[c], errors="coerce")
+                if col_vals.notna().any():
+                    candidate_cols.append(c)
+            except (ValueError, TypeError):
+                continue
+        is_multi = len(candidate_cols) > 1
+
+        def _parse_scalar(val) -> float:
+            parsed = pd.to_numeric(val, errors="coerce")
+            try:
+                f = float(parsed)
+            except (ValueError, TypeError) as e:
+                raise ValueError(f"aligned price parse failed for {val!r} -> {parsed!r}") from e
+            if not np.isfinite(f) or f <= 0 or math.isclose(f, 0.0, abs_tol=1e-12):
+                raise ValueError(f"aligned price non-positive/non-finite: {f!r}")
+            return f
+
         if idx + 1 < n:
             nxt = prices.iloc[idx + 1]
+            if is_multi:
+                result: dict[str, float] = {}
+                for col in candidate_cols:
+                    raw = nxt.get(col, np.nan)
+                    try:
+                        result[col] = _parse_scalar(raw)
+                    except ValueError as e:
+                        logger.warning("_align multi parse failed for %s: %s", col, e, exc_info=True)
+                        raise
+                return pd.Series(result, dtype=float)
             if "open" in prices.columns and pd.notna(nxt.get("open", np.nan)):
                 try:
-                    return float(pd.to_numeric(nxt["open"], errors="coerce"))
-                except (ValueError, TypeError, AttributeError) as e:
-                    logger.warning("_align open parse failed: %s", e)
+                    return _parse_scalar(nxt["open"])
+                except ValueError as e:
+                    logger.warning("_align open parse failed: %s", e, exc_info=True)
+                    raise
             if "close" in prices.columns:
                 try:
-                    return float(pd.to_numeric(nxt["close"], errors="coerce"))
-                except (ValueError, TypeError, AttributeError) as e:
-                    logger.warning("_align close parse failed: %s", e)
+                    return _parse_scalar(nxt["close"])
+                except ValueError as e:
+                    logger.warning("_align close parse failed: %s", e, exc_info=True)
+                    raise
             # 回落：行首个有效数值（兼容无 close/open 的宽表）
             try:
-                return float(pd.to_numeric(nxt, errors="coerce").dropna().iloc[0])
+                numeric = pd.to_numeric(nxt, errors="coerce").dropna()
+                if numeric.empty:
+                    raise ValueError("no valid numeric in next bar")
+                return _parse_scalar(numeric.iloc[0])
             except (ValueError, TypeError, IndexError, AttributeError) as e:
-                logger.warning("_align fallback parse failed: %s", e)
-                return 0.0
+                logger.warning("_align fallback parse failed: %s", e, exc_info=True)
+                raise ValueError(f"_align fallback failed: {e}") from e
         # 末 Bar 无次日，回落至当 Bar 的 close/open
         cur = prices.iloc[idx if idx < n else n - 1]
+        if is_multi:
+            result: dict[str, float] = {}
+            for col in candidate_cols:
+                raw = cur.get(col, np.nan)
+                try:
+                    result[col] = _parse_scalar(raw)
+                except ValueError as e:
+                    logger.warning("_align cur multi parse failed for %s: %s", col, e, exc_info=True)
+                    raise
+            return pd.Series(result, dtype=float)
         if "close" in prices.columns and pd.notna(cur.get("close", np.nan)):
             try:
-                return float(pd.to_numeric(cur["close"], errors="coerce"))
-            except (ValueError, TypeError, AttributeError) as e:
-                logger.warning("_align cur close parse failed: %s", e)
+                return _parse_scalar(cur["close"])
+            except ValueError as e:
+                logger.warning("_align cur close parse failed: %s", e, exc_info=True)
+                raise
         if "open" in prices.columns and pd.notna(cur.get("open", np.nan)):
             try:
-                return float(pd.to_numeric(cur["open"], errors="coerce"))
-            except (ValueError, TypeError, AttributeError) as e:
-                logger.warning("_align cur open parse failed: %s", e)
+                return _parse_scalar(cur["open"])
+            except ValueError as e:
+                logger.warning("_align cur open parse failed: %s", e, exc_info=True)
+                raise
         try:
-            return float(pd.to_numeric(cur, errors="coerce").dropna().iloc[0]) if len(cur.dropna()) else 0.0
+            numeric = pd.to_numeric(cur, errors="coerce").dropna()
+            if numeric.empty:
+                raise ValueError("no valid numeric in cur bar")
+            return _parse_scalar(numeric.iloc[0])
         except (ValueError, TypeError, IndexError, AttributeError) as e:
-            logger.warning("_align final fallback failed: %s", e)
-            return 0.0
+            logger.warning("_align final fallback failed: %s", e, exc_info=True)
+            raise ValueError(f"_align final fallback failed: {e}") from e
 
     def _execute_bars(
         self,
@@ -208,7 +270,7 @@ class BacktestEngine:
             try:
                 arr = np.asarray(target_positions, dtype=float)
             except (ValueError, TypeError) as e:
-                logger.warning("_execute_bars array conversion failed: %s", e)
+                logger.warning("_execute_bars array conversion failed: %s", e, exc_info=True)
                 arr = np.array([0.0], dtype=float)
             s = pd.Series(arr)
 
@@ -216,7 +278,7 @@ class BacktestEngine:
         try:
             avail = float(available_capital)
         except (ValueError, TypeError) as e:
-            logger.warning("_execute_bars available_capital parse failed: %s", e)
+            logger.warning("_execute_bars available_capital parse failed: %s", e, exc_info=True)
             avail = self.initial_capital  # 非法输入回落至初始资金
         if not np.isfinite(avail) or avail <= 0:
             avail = self.initial_capital if self.initial_capital > 0 else 1.0  # 边界：资金非正/非有限时重置
@@ -243,7 +305,7 @@ class BacktestEngine:
                 price = float(getattr(tick, "price", 0))
                 symbol = str(getattr(tick, "symbol", ""))
         except (ValueError, TypeError, AttributeError) as e:
-            logger.warning("on_tick tick parse failed: %s", e)
+            logger.warning("on_tick tick parse failed: %s", e, exc_info=True)
             price = 0.0
             symbol = ""
         # 惰性初始化增量因子（窗口 20 为经验值，平衡平滑与灵敏度）
@@ -262,7 +324,7 @@ class BacktestEngine:
             else:
                 val = price  # 无增量因子时直接回落为价格本身
         except (ValueError, TypeError, AttributeError) as e:
-            logger.warning("tick factor update failed: %s", e)
+            logger.warning("tick factor update failed: %s", e, exc_info=True)
             val = price
         latency_ms = (time.perf_counter() - t0) * 1000
         if latency_ms >= 200:
@@ -288,13 +350,36 @@ class BacktestEngine:
         except ValidationError:
             raise
         except (ValueError, TypeError, KeyError, IndexError, AttributeError) as e:
-            logger.warning("on_bar _align failed: %s", e)
+            logger.warning("on_bar _align failed: %s", e, exc_info=True)
             # 窄异常回落至当 Bar 收盘，避免吞没上游 ValidationError
+            # 保留多资产结构：若价格矩阵多资产则回落为 per-asset Series
             try:
-                aligned_price = float(bar.get("close", bar.iloc[0]))
+                # 尝试判定多资产以保持结构一致
+                non_price = {"open", "high", "low", "volume", "currency", "ccy"}
+                cand = [c for c in prices.columns if c.lower() not in non_price]
+                # 过滤有效价格列
+                cand = [c for c in cand if pd.to_numeric(prices[c], errors="coerce").notna().any()]
+                is_multi_fallback = len(cand) > 1
+                if is_multi_fallback:
+                    fallback_dict = {}
+                    for c in cand:
+                        raw = bar.get(c, np.nan)
+                        v = float(pd.to_numeric(raw, errors="coerce"))
+                        if not np.isfinite(v) or v <= 0:
+                            raise ValueError(f"fallback price non-positive for {c}: {v!r}")
+                        fallback_dict[c] = v
+                    aligned_price = pd.Series(fallback_dict, dtype=float)
+                else:
+                    aligned_price = float(bar.get("close", bar.iloc[0]))
+                    if not np.isfinite(aligned_price) or aligned_price <= 0:
+                        raise ValueError(f"fallback price invalid: {aligned_price!r}")
+                    aligned_price = float(pd.to_numeric(aligned_price, errors="coerce"))
             except (ValueError, TypeError, KeyError, IndexError, AttributeError) as e2:
-                logger.warning("on_bar fallback price failed: %s", e2)
-                aligned_price = float(self.historical_base_price) if self.historical_base_price else 0.0
+                logger.warning("on_bar fallback price failed: %s", e2, exc_info=True)
+                if self.historical_base_price is not None and np.isfinite(self.historical_base_price) and self.historical_base_price > 0:
+                    aligned_price = float(self.historical_base_price)
+                else:
+                    raise ValidationError(f"aligned price unavailable at idx {idx}: {e2}") from e2
 
         return {"bar": bar, "idx": idx, "aligned_price": aligned_price, "equity_prev": equity_prev}
 
@@ -333,7 +418,7 @@ class BacktestEngine:
                 if mat.shape[1] >= 1:
                     return mat.iloc[:, [0]], False
             except (ValueError, TypeError, AttributeError) as e:
-                logger.warning("price matrix fallback failed: %s", e)
+                logger.warning("price matrix fallback failed: %s", e, exc_info=True)
             # 最后回落单列零
             return pd.DataFrame({"close": [100.0] * len(prices)}, index=prices.index), False
 
@@ -358,6 +443,8 @@ class BacktestEngine:
         price_date: str | pd.Timestamp | None = None,
         signal: str | Signal | None = None,
         signal_method: str | None = None,
+        enforce_pit: bool = True,
+        skip_pit: bool = False,
     ) -> dict:
         """执行回测主流程：校验→PIT 检查→信号生成→收益与换手计费→事件循环生成权益/持仓并产出 tearsheet。
 
@@ -399,12 +486,24 @@ class BacktestEngine:
             except (TypeError, AttributeError) as e:
                 raise ValueError(f"invalid prices['close']: {e}") from e
 
-        # PIT 守卫：仅当显式传入日期时校验，要求 weights_on ≤ price_date
-        if weights_on is not None or price_date is not None:
+        # PIT 守卫：默认 ON（enforce_pit=True），显式 opt-out 需 skip_pit=True 或 enforce_pit=False
+        # 兼容 kwargs 中的 skip_pit / bypass_pit 别名
+        _skip_pit_flag = bool(skip_pit) or (not bool(enforce_pit))
+        # 额外兼容调用方经 **kwargs 传入的 bypass 标记（若存在）
+        # 注意：run 签名已显式包含 skip_pit/enforce_pit，额外 kwargs 中的同名键已在上层 pop 忽略，此处不再处理
+        if _skip_pit_flag:
+            logger.info("PIT guard bypassed via skip_pit/enforce_pit flag")
+        else:
+            # 默认强制校验：若未显式提供 price_date 则取首个交易日；若未提供 weights_on 则视为等于 price_date（无未来数据）
             pd_date = price_date
             if pd_date is None and isinstance(prices.index, pd.DatetimeIndex) and len(prices.index) > 0:
                 pd_date = prices.index[0]  # 未显式给 price_date 时取首个交易日
-            validate(prices, weights_on=weights_on, price_date=pd_date)
+            eff_weights_on = weights_on
+            if eff_weights_on is None:
+                eff_weights_on = pd_date  # 默认无未来数据，满足 weights_on <= price_date
+            # 只要 enforce_pit 为 True 就执行校验（默认路径）
+            # 即使 weights_on 与 price_date 均推断为同日，也会走 validate以触发价格/币种检查
+            validate(prices, weights_on=eff_weights_on, price_date=pd_date)
 
         # 信号生成：若 weights 未给出但 signal/signal_method 给出，则生成权重
         # 保持向后兼容：weights 显式传入优先
@@ -431,29 +530,51 @@ class BacktestEngine:
                     w_sig = generate_signal(prices, method=signal_method, n_assets=n_hint)
                     weights = w_sig
             except (ValueError, TypeError, AttributeError, KeyError) as e:
-                logger.warning("signal generation failed, fallback to equal_weight: %s", e)
+                logger.warning("signal generation failed, fallback to equal_weight: %s", e, exc_info=True)
                 weights = None
 
-        # 归一化权重向量：空/全零/含 NaN/Inf 均回落至等权，避免零杠杆
+        # 归一化权重向量：显式 bear 0 权重应保留，不静默覆盖；仅对非法输入回落
         if weights is None:
             w = np.array([1.0], dtype=float)
         else:
             try:
                 w = np.asarray(weights, dtype=float)
             except (ValueError, TypeError) as e:
-                logger.warning("weights conversion failed: %s", e)
+                logger.warning("weights conversion failed: %s", e, exc_info=True)
                 w = np.array([1.0], dtype=float)
             if w.size == 0:
+                logger.warning("weights empty, fallback to equal_weight 1.0", exc_info=True)
                 w = np.array([1.0], dtype=float)
             w = np.nan_to_num(w, nan=0.0, posinf=0.0, neginf=0.0)
-            if w.size == 0 or np.all(w == 0):
+            if w.size == 0:
+                logger.warning("weights size 0 after nan_to_num, fallback to 1.0", exc_info=True)
                 w = np.array([1.0], dtype=float)
+            # 若全零：视为 bear 信号空仓，不静默覆盖为等权；仅记录日志
+            if np.all(np.isclose(w, 0.0, atol=1e-12)):
+                logger.info("bear signal detected: zero weights preserved (leverage 0), not overriding to equal_weight")
+                # 保留零权重，杠杆与总权重按 isclose 处理
         leverage = float(np.sum(w))
-        if leverage == 0 or not np.isfinite(leverage):
-            leverage = 1.0  # 零/非有限杠杆回落，避免除零
-        total_weight = float(np.sum(np.abs(w))) if np.sum(np.abs(w)) != 0 else leverage
-        if total_weight == 0 or not np.isfinite(total_weight):
+        if math.isclose(leverage, 0.0, abs_tol=1e-12) or not np.isfinite(leverage):
+            if not math.isclose(leverage, 0.0, abs_tol=1e-12):
+                logger.warning("leverage non-finite %r clamped to 1.0", leverage, exc_info=True)
+                leverage = 1.0
+            else:
+                logger.info("leverage ~0 (bear/flat) -> keep 0 for ret calc, use total_weight 1 for position scaling")
+                # 保持 leverage 0 以使收益为 0；total_weight 单独处理（保持 0 值）
+        # total_weight 使用 isclose 判断
+        try:
+            sum_abs = float(np.sum(np.abs(w)))
+        except (ValueError, TypeError):
+            sum_abs = 0.0
+        if math.isclose(sum_abs, 0.0, abs_tol=1e-12):
+            total_weight = float(leverage) if not math.isclose(float(leverage), 0.0, abs_tol=1e-12) and np.isfinite(leverage) and leverage != 0 else 1.0
+            logger.info("total_weight ~0 clamped to %r", total_weight)
+        else:
+            total_weight = sum_abs
+        if not np.isfinite(total_weight) or math.isclose(total_weight, 0.0, abs_tol=1e-12):
+            logger.warning("total_weight non-finite/zero %r clamped to 1.0", total_weight, exc_info=True)
             total_weight = 1.0
+        # 确保 bear 场景 total_weight=1, leverage=0 不被后续覆盖
 
         # 解析价格矩阵与单/多资产分支
         price_matrix, is_multi = self._price_matrix(prices)
@@ -462,7 +583,7 @@ class BacktestEngine:
             first_col = price_matrix.iloc[:, 0]
             self.historical_base_price = float(first_col.iloc[0]) if len(first_col) > 0 else None
         except (ValueError, TypeError, IndexError, AttributeError) as e:
-            logger.warning("historical_base_price set failed: %s", e)
+            logger.warning("historical_base_price set failed: %s", e, exc_info=True)
             self.historical_base_price = None
 
         # 计算组合日收益：区分单/多资产
@@ -478,13 +599,13 @@ class BacktestEngine:
                     try:
                         daily_ret = daily_ret + rets.iloc[:, i].astype(float) * wi
                     except (ValueError, TypeError, IndexError) as e:
-                        logger.warning("multi-asset ret accumulation failed at %d: %s", i, e)
+                        logger.warning("multi-asset ret accumulation failed at %d: %s", i, e, exc_info=True)
                         continue
                 # 若权重多于资产列，忽略多余权重；若资产多于权重，剩余资产权重视为 0
                 daily_ret = pd.to_numeric(daily_ret, errors="coerce").fillna(0.0)
                 daily_ret = daily_ret.replace([np.inf, -np.inf], 0.0).fillna(0.0)
             except (ValueError, TypeError, AttributeError) as e:
-                logger.warning("multi-asset daily_ret computation failed: %s", e)
+                logger.warning("multi-asset daily_ret computation failed: %s", e, exc_info=True)
                 daily_ret = price_matrix.iloc[:, 0].pct_change().fillna(0.0).replace([np.inf, -np.inf], 0.0).fillna(0.0)
                 if leverage != 1.0:
                     daily_ret = daily_ret * leverage
@@ -494,7 +615,7 @@ class BacktestEngine:
                 close = price_matrix.iloc[:, 0].astype(float)
                 close = pd.to_numeric(close, errors="coerce").astype(float)
             except (ValueError, TypeError, AttributeError) as e:
-                logger.warning("single-asset close parse failed: %s", e)
+                logger.warning("single-asset close parse failed: %s", e, exc_info=True)
                 close = pd.Series([100.0] * len(prices), index=prices.index, dtype=float)
             daily_ret = close.pct_change().fillna(0.0)
             daily_ret = daily_ret.replace([np.inf, -np.inf], 0.0).fillna(0.0)
@@ -534,7 +655,7 @@ class BacktestEngine:
                 try:
                     _init_turnover = float(pos_proxy.iloc[0].abs().sum())
                 except (ValueError, TypeError, AttributeError) as e:
-                    logger.warning("init turnover fallback: %s", e)
+                    logger.warning("init turnover fallback: %s", e, exc_info=True)
                     _init_turnover = 0.0
                 turnover_series = pos_proxy.diff().abs().sum(axis=1).fillna(_init_turnover)
                 equity_safe = gross_equity.replace(0, np.nan).fillna(self.initial_capital)  # 避免除零
@@ -546,12 +667,12 @@ class BacktestEngine:
                 net_ret = daily_ret - cost_drag
                 net_ret = net_ret.replace([np.inf, -np.inf], 0.0).fillna(0.0)
             except (ValueError, TypeError, AttributeError, KeyError, IndexError) as e:
-                logger.warning("turnover cost computation failed: %s", e)
+                logger.warning("turnover cost computation failed: %s", e, exc_info=True)
                 try:
                     net_ret = daily_ret.copy()
                     net_ret.iloc[1:] = net_ret.iloc[1:] - costs_f  # 兜底：简化为固定费率
                 except (ValueError, TypeError, AttributeError, IndexError) as e2:
-                    logger.warning("cost fallback failed: %s", e2)
+                    logger.warning("cost fallback failed: %s", e2, exc_info=True)
                     net_ret = daily_ret.copy()
 
         # --- 事件驱动主循环：逐 Bar 调用 on_bar 并执行资金预检缩放 ---
@@ -559,7 +680,6 @@ class BacktestEngine:
         cum = 1.0
         # 逐 Bar 累积原始目标持仓，交由 _execute_bars 做等比缩放
         raw_positions_rows: list[pd.Series] = []
-        prev_aligned_price: float | None = None
         # 保留 turnover_rate 供 aligned 成本扣除（若有换手成本）
         _turnover_rate = None
         try:
@@ -568,34 +688,66 @@ class BacktestEngine:
             _turnover_rate = None
         except Exception:
             _turnover_rate = None
+        prev_aligned_price: pd.Series | float | None = None
         for i in range(len(prices)):
             bar = prices.iloc[i]
             # 事件钩子：Bar→Signal→对齐（Wave5：aligned_price 参与 equity 定价）
             bar_result = self.on_bar(bar, i, prices, equity_prev=(equity_vals[-1] if equity_vals else self.initial_capital), w=w, leverage=leverage)
-            _aligned_price = bar_result["aligned_price"]  # 已对齐至次日可执行价；Wave5 起参与权益计算，保留 close 兼容
+            _aligned_price = bar_result["aligned_price"]  # 已对齐至次日可执行价；多资产为 Series
             # 尝试使用 aligned_price 定价：若可得 aligned_ret 则覆盖 close 基 net_ret
             aligned_ret_raw: float | None = None
-            try:
-                ap = float(_aligned_price)
-                if prev_aligned_price is not None and np.isfinite(ap) and np.isfinite(prev_aligned_price) and prev_aligned_price != 0:
-                    aligned_ret_raw = ap / prev_aligned_price - 1
-                    if not np.isfinite(aligned_ret_raw):
-                        aligned_ret_raw = None
-            except (ValueError, TypeError):
-                aligned_ret_raw = None
+            # Multi-asset aligned: per-asset weighted return
+            if isinstance(_aligned_price, pd.Series):
+                try:
+                    if prev_aligned_price is not None and isinstance(prev_aligned_price, pd.Series):
+                        # compute per-asset returns weighted by w
+                        price_cols = list(price_matrix.columns)
+                        n_use = min(len(w), len(price_cols))
+                        weighted_ret = 0.0
+                        valid = False
+                        for ci in range(n_use):
+                            col = price_cols[ci]
+                            try:
+                                ap = float(_aligned_price.get(col, np.nan))
+                                prev = float(prev_aligned_price.get(col, np.nan))
+                                if np.isfinite(ap) and np.isfinite(prev) and not math.isclose(prev, 0.0, abs_tol=1e-12):
+                                    r = ap / prev - 1
+                                    if np.isfinite(r):
+                                        weighted_ret += float(w[ci]) * r
+                                        valid = True
+                            except (ValueError, TypeError, KeyError):
+                                continue
+                        if valid:
+                            aligned_ret_raw = float(weighted_ret)
+                except (ValueError, TypeError, AttributeError) as e:
+                    logger.warning("multi aligned_ret compute failed at %d: %s", i, e, exc_info=True)
+                    aligned_ret_raw = None
+            else:
+                try:
+                    ap = float(_aligned_price)  # type: ignore[arg-type]
+                    if prev_aligned_price is not None and not isinstance(prev_aligned_price, pd.Series) and np.isfinite(ap) and np.isfinite(float(prev_aligned_price)) and not math.isclose(float(prev_aligned_price), 0.0, abs_tol=1e-12):
+                        aligned_ret_raw = ap / float(prev_aligned_price) - 1  # type: ignore[arg-type]
+                        if not np.isfinite(aligned_ret_raw):
+                            aligned_ret_raw = None
+                except (ValueError, TypeError):
+                    aligned_ret_raw = None
             # 迭代计算权益：优先 aligned_ret（已按杠杆缩放），否则回落 close 基 net_ret
             try:
                 ret_i = float(net_ret.iloc[i])
             except (ValueError, TypeError, KeyError, IndexError, AttributeError) as e:
-                logger.warning("net_ret parse failed at %d: %s", i, e)
+                logger.warning("net_ret parse failed at %d: %s", i, e, exc_info=True)
                 ret_i = 0.0
             if not np.isfinite(ret_i):
                 ret_i = 0.0  # 非有限收益置零，避免权益发散
             # 若本 Bar 有有效 aligned_ret，则以 aligned 定价覆盖（保留成本扣除逻辑）
             if aligned_ret_raw is not None:
                 try:
-                    if not is_multi and leverage is not None and np.isfinite(leverage) and leverage != 0:
-                        aligned_scaled = float(aligned_ret_raw * leverage)
+                    # 单资产时按杠杆缩放（包括 bear 0），多资产已按权重加权故不再乘 leverage
+                    if not is_multi:
+                        if leverage is not None and np.isfinite(leverage):
+                            aligned_scaled = float(aligned_ret_raw) * float(leverage)
+                        else:
+                            aligned_scaled = float(aligned_ret_raw)
                     else:
                         aligned_scaled = float(aligned_ret_raw)
                     if _turnover_rate is not None and costs_f:
@@ -607,21 +759,50 @@ class BacktestEngine:
                             pass
                     if np.isfinite(aligned_scaled):
                         ret_i = aligned_scaled
-                except (ValueError, TypeError):
+                except (ValueError, TypeError) as e:
+                    logger.warning("aligned_scaled computation failed: %s", e, exc_info=True)
                     pass
             # 更新 prev_aligned 供下次计算（首 Bar 初始化基准）
             try:
-                ap_cur = float(_aligned_price)
-                if np.isfinite(ap_cur) and ap_cur != 0:
-                    prev_aligned_price = ap_cur
-                elif prev_aligned_price is None:
-                    try:
-                        # 回落以 close 兜底，避免首 Bar 无基准
-                        fallback = float(prices.iloc[i].get("close", ap_cur)) if isinstance(prices.iloc[i], pd.Series) else float(ap_cur)
-                        if np.isfinite(fallback) and fallback != 0:
-                            prev_aligned_price = fallback
-                    except (ValueError, TypeError, KeyError, IndexError, AttributeError):
+                if isinstance(_aligned_price, pd.Series):
+                    # 校验 Series 均为正有限，否则保留 prev
+                    valid_series = True
+                    for v in _aligned_price.values:
+                        try:
+                            fv = float(v)
+                            if not np.isfinite(fv) or fv <= 0 or math.isclose(fv, 0.0, abs_tol=1e-12):
+                                valid_series = False
+                                break
+                        except (ValueError, TypeError):
+                            valid_series = False
+                            break
+                    if valid_series:
+                        prev_aligned_price = _aligned_price.copy()
+                    elif prev_aligned_price is None:
+                        # 首 Bar 无基准，尝试用 price_matrix 当前行兜底
+                        try:
+                            fallback_dict = {}
+                            for col in price_matrix.columns:
+                                raw = prices.iloc[i].get(col, np.nan)
+                                fv = float(pd.to_numeric(raw, errors="coerce"))
+                                if np.isfinite(fv) and fv > 0:
+                                    fallback_dict[col] = fv
+                            if fallback_dict:
+                                prev_aligned_price = pd.Series(fallback_dict, dtype=float)
+                        except (ValueError, TypeError, KeyError, IndexError, AttributeError):
+                            prev_aligned_price = _aligned_price
+                else:
+                    ap_cur = float(_aligned_price)  # type: ignore[arg-type]
+                    if np.isfinite(ap_cur) and ap_cur != 0 and not math.isclose(ap_cur, 0.0, abs_tol=1e-12):
                         prev_aligned_price = ap_cur
+                    elif prev_aligned_price is None:
+                        try:
+                            # 回落以 close 兜底，避免首 Bar 无基准
+                            fallback = float(prices.iloc[i].get("close", ap_cur)) if isinstance(prices.iloc[i], pd.Series) else float(ap_cur)
+                            if np.isfinite(fallback) and fallback != 0 and not math.isclose(fallback, 0.0, abs_tol=1e-12):
+                                prev_aligned_price = fallback
+                        except (ValueError, TypeError, KeyError, IndexError, AttributeError):
+                            prev_aligned_price = ap_cur
             except (ValueError, TypeError):
                 pass
             cum = cum * (1 + ret_i)
@@ -657,7 +838,7 @@ class BacktestEngine:
         try:
             base_close = price_matrix.iloc[:, 0].astype(float)
         except (ValueError, TypeError, AttributeError, IndexError) as e:
-            logger.warning("base_close fallback: %s", e)
+            logger.warning("base_close fallback: %s", e, exc_info=True)
             base_close = pd.Series([self.initial_capital] * len(prices), index=prices.index, dtype=float)
 
         equity = pd.Series(equity_vals, index=prices.index, name="equity", dtype=float)
@@ -666,7 +847,7 @@ class BacktestEngine:
             try:
                 equity = base_close / base_close.iloc[0] * self.initial_capital
             except (ValueError, TypeError, ZeroDivisionError, AttributeError) as e:
-                logger.warning("equity fallback failed: %s", e)
+                logger.warning("equity fallback failed: %s", e, exc_info=True)
                 equity = pd.Series([self.initial_capital] * len(prices), index=prices.index, dtype=float)
             equity.name = "equity"
             equity.index = prices.index
@@ -699,7 +880,7 @@ class BacktestEngine:
                     else:
                         positions = pd.DataFrame({"position": equity * float(w[0]) / total_weight}, index=prices.index)
         except (ValueError, TypeError, AttributeError, KeyError, IndexError) as e:
-            logger.warning("positions construction failed: %s", e)
+            logger.warning("positions construction failed: %s", e, exc_info=True)
             positions = pd.DataFrame({"position": equity}, index=prices.index)
 
         # 成交：持仓差分即交易量
@@ -707,7 +888,7 @@ class BacktestEngine:
             fills = positions.diff().fillna(positions.iloc[0])
             fills.index = prices.index
         except (ValueError, TypeError, AttributeError) as e:
-            logger.warning("fills construction failed: %s", e)
+            logger.warning("fills construction failed: %s", e, exc_info=True)
             fills = pd.DataFrame(index=prices.index)
 
         # 指标计算
@@ -722,23 +903,28 @@ class BacktestEngine:
             try:
                 out.mkdir(parents=True, exist_ok=True)
             except (OSError, ValueError) as e:
-                logger.warning("output_dir mkdir failed: %s", e)
+                logger.warning("output_dir mkdir failed: %s", e, exc_info=True)
+                raise
             try:
                 positions.to_csv(out / "positions.csv")
             except (OSError, IOError, ValueError, AttributeError) as e:
-                logger.warning("positions.csv write failed: %s", e)
+                logger.warning("positions.csv write failed: %s", e, exc_info=True)
+                raise
             try:
                 fills.to_csv(out / "fills.csv")
             except (OSError, IOError, ValueError, AttributeError) as e:
-                logger.warning("fills.csv write failed: %s", e)
+                logger.warning("fills.csv write failed: %s", e, exc_info=True)
+                raise
             try:
                 (out / "metrics.json").write_text(json.dumps(metrics, indent=2, ensure_ascii=False), encoding="utf-8")
             except (OSError, IOError, ValueError, TypeError) as e:
-                logger.warning("metrics.json write failed: %s", e)
+                logger.warning("metrics.json write failed: %s", e, exc_info=True)
+                raise
             try:
                 (out / "tearsheet.html").write_text(tearsheet_html, encoding="utf-8")
             except (OSError, IOError, ValueError, TypeError) as e:
-                logger.warning("tearsheet.html write failed: %s", e)
+                logger.warning("tearsheet.html write failed: %s", e, exc_info=True)
+                raise
 
         result: dict = {
             "equity": equity,
@@ -763,13 +949,13 @@ class BacktestEngine:
             else:
                 month_table = "<tr><td>2026-08</td><td>+0.00%</td></tr>"
         except (ValueError, TypeError, AttributeError) as e:
-            logger.warning("tearsheet monthly table failed: %s", e)
+            logger.warning("tearsheet monthly table failed: %s", e, exc_info=True)
             month_table = "<tr><td>2026-08</td><td>+0.00%</td></tr>"
 
         try:
             episodes_html = self._drawdown_episodes_html(equity)
         except (ValueError, TypeError, AttributeError) as e:
-            logger.warning("drawdown episodes html failed: %s", e)
+            logger.warning("drawdown episodes html failed: %s", e, exc_info=True)
             episodes_html = "<p>Drawdown episodes unavailable</p>"
 
         sharpe = metrics.get("sharpe", 0)

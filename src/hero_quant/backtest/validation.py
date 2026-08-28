@@ -53,10 +53,22 @@ def validate(
         currency = args[2]
 
     # 1. PIT 校验：weights_on ≤ price_date 为正逻辑
+    # Normalize TZ-aware vs naive to UTC-naive consistently before comparison
+    def _norm_ts(v):
+        ts = pd.Timestamp(v)
+        # If tz-aware, convert to UTC then drop tz
+        if ts.tz is not None:
+            try:
+                ts = ts.tz_convert("UTC").tz_localize(None)
+            except Exception:
+                # Fallback: localize naive handling
+                ts = ts.tz_localize(None) if ts.tz is None else ts
+        return ts
+
     if weights_on is not None and price_date is not None:
         try:
-            ts_w = pd.Timestamp(weights_on)
-            ts_p = pd.Timestamp(price_date)
+            ts_w = _norm_ts(weights_on)
+            ts_p = _norm_ts(price_date)
         except (ValueError, TypeError, pd.errors.OutOfBoundsDatetime) as e:
             raise ValidationError(f"invalid date format: {e}") from e
         # 使用未来数据直接拒绝：仅当 ts_w > ts_p 时违规
@@ -65,17 +77,27 @@ def validate(
                 f"PIT violation: weights_on {ts_w.date()} > price_date {ts_p.date()} uses future data"
             )
 
-    # 2. 非正价格拒绝：close ≤ 0 视为脏数据
+    # 2. 非正价格拒绝：close ≤ 0 视为脏数据；同时 fail-closed on NaN/non-numeric
     if isinstance(prices, pd.DataFrame) and "close" in prices.columns:
         try:
-            # 数值化后检查，避免字符串误判
+            # 数值化后检查，避免字符串误判；NaN/null 视为脏数据直接拒绝
             close = pd.to_numeric(prices["close"], errors="coerce")
-            if (close <= 0).any():
+            # fail-closed: any NaN (including coercion-introduced) 或非正均拒绝
+            if close.isna().any() or (close <= 0).any():
+                # 更精确提示：区分 NaN 与非正
+                if close.isna().any():
+                    # 检测是否由非数值 coercion 产生
+                    mask = prices["close"].notna() & close.isna()
+                    bad_idx = mask[mask].index.tolist()[:5]
+                    raise ValidationError(
+                        f"non-numeric/NaN price detected in prices['close'] at {bad_idx} (fail-closed)"
+                    )
                 raise ValidationError("non-positive price detected in prices['close']")
         except ValidationError:
             raise
         except (ValueError, TypeError, AttributeError) as e:
-            logger.warning("price validation conversion failed: %s", e)
+            logger.warning("price validation conversion failed: %s", e, exc_info=True)
+            raise ValidationError(f"price validation failed: {e}") from e
 
     # 3. 混币种聚合拒绝
     if isinstance(prices, pd.DataFrame) and "currency" in prices.columns:
@@ -93,7 +115,8 @@ def validate(
         except ValidationError:
             raise
         except (ValueError, TypeError, AttributeError, KeyError) as e:
-            logger.warning("currency validation failed: %s", e)
+            logger.warning("currency validation failed: %s", e, exc_info=True)
+            raise ValidationError(f"currency validation failed: {e}") from e
 
     # 4. 字符串日期已在 PIT 步骤经 pd.Timestamp 解析
 

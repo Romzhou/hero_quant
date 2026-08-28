@@ -7,14 +7,18 @@
 
 from __future__ import annotations
 
+import hashlib
 import html
 import json
+import logging
 import pathlib
 
 import numpy as np
 import pandas as pd
 
 from hero_quant.backtest.engine import BacktestEngine
+
+logger = logging.getLogger(__name__)
 
 
 def _build_tearsheet_html(results: dict, disclosure_text: str) -> str:
@@ -203,7 +207,8 @@ def _normalize_index(dates: list[str] | None) -> pd.DatetimeIndex:
 def _synthetic_prices(index: pd.DatetimeIndex, ticker: str) -> pd.DataFrame:
     """按 ticker 生成确定性合成价格（趋势+噪声），用于批量对比与无数据源时的演示。"""
     n = len(index)
-    seed = abs(hash(str(ticker))) % (2**32)  # 哈希种子保证同 ticker 可复现
+    # Deterministic seed via sha256 (avoid hash() randomization under PYTHONHASHSEED)
+    seed = int(hashlib.sha256(str(ticker).encode()).hexdigest()[:8], 16)  # 32-bit seed
     rng = np.random.default_rng(seed)
     noise = rng.normal(0, 0.5, size=n)
     trend = np.arange(n) * 0.3  # 线性趋势，避免长期水平导致指标退化
@@ -262,11 +267,13 @@ def run_batch(
         engine = BacktestEngine()
         try:
             res = engine.run(prices)
-        except Exception:
+        except Exception as e:
+            logger.warning("engine run failed for %s: %s", t, e, exc_info=True)
             res = {"metrics": {"sharpe": 0.0, "cumulative_return": 0.0, "annual_return": 0.0, "max_drawdown": 0.0, "turnover": 0.0, "volatility": 0.0}}
         try:
             bench_res = engine.run(bench_prices)
-        except Exception:
+        except Exception as e:
+            logger.warning("engine bench run failed for %s (%s): %s", t, bench, e, exc_info=True)
             bench_res = {"metrics": {"cumulative_return": 0.0}}
 
         strat_metrics = dict(res.get("metrics", {}))
@@ -318,21 +325,24 @@ def run_batch(
             out.parent.mkdir(parents=True, exist_ok=True)
             try:
                 out.write_text(json.dumps(results, indent=2, ensure_ascii=False), encoding="utf-8")
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("metrics.json write failed (%s): %s", out, e, exc_info=True)
+                raise
         else:
             out.mkdir(parents=True, exist_ok=True)
             p = out / "metrics.json"
             try:
                 p.write_text(json.dumps(results, indent=2, ensure_ascii=False), encoding="utf-8")
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("metrics.json write failed (%s): %s", p, e, exc_info=True)
+                raise
             # 生成最小 tearsheet.html
             try:
                 html_text = _build_tearsheet_html(results, disclosure_text)
                 (out / "tearsheet.html").write_text(html_text, encoding="utf-8")
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("tearsheet.html write failed (%s): %s", out / "tearsheet.html", e, exc_info=True)
+                raise
 
     return results
 
