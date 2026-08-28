@@ -20,7 +20,15 @@ def _extract_pairs(cands) -> List[Tuple[str, float]]:
     for item in cands:
         try:
             if isinstance(item, dict):
-                key = item.get("key") or item.get("id") or item.get("doc_id") or ""
+                # explicit None/"" check - avoid collapsing to ""
+                key = item.get("key")
+                if key is None or (isinstance(key, str) and key == ""):
+                    key = item.get("id")
+                if key is None or (isinstance(key, str) and key == ""):
+                    key = item.get("doc_id")
+                if key is None or (isinstance(key, str) and key == ""):
+                    # 全缺 continue 不落 ""
+                    continue
                 # score may be under score, relevance_score, _score
                 sc = item.get("score")
                 if sc is None:
@@ -28,13 +36,24 @@ def _extract_pairs(cands) -> List[Tuple[str, float]]:
                 out.append((str(key), float(sc) if sc is not None else 0.0))
             elif isinstance(item, (list, tuple)) and len(item) >= 2:
                 k, s = item[0], item[1]
+                if k is None or (isinstance(k, str) and k == ""):
+                    continue
                 out.append((str(k), float(s) if s is not None else 0.0))
             else:
                 # unsupported shape skip
                 continue
-        except Exception:
+        except (ValueError, TypeError):  # narrow: only conversion/type errors
             continue
     return out
+
+
+def _dedup_max(pairs: List[Tuple[str, float]]) -> List[Tuple[str, float]]:
+    """Deduplicate by key keeping max score per key."""
+    best: Dict[str, float] = {}
+    for k, s in pairs:
+        if k not in best or s > best[k]:
+            best[k] = s
+    return list(best.items())
 
 
 def rank_fusion(bm25_cands, vec_cands, k: int = 60) -> List[Tuple[str, float]]:
@@ -51,13 +70,14 @@ def rank_fusion(bm25_cands, vec_cands, k: int = 60) -> List[Tuple[str, float]]:
     """
     try:
         k = int(k)
-    except Exception:
+    except (ValueError, TypeError):  # narrow: only conversion errors
         k = 60
     if k <= 0:
         k = 60
 
-    bm25_pairs = _extract_pairs(bm25_cands)
-    vec_pairs = _extract_pairs(vec_cands)
+    # 先 _dedup_max 每 key 最高分 再 RRF
+    bm25_pairs = _dedup_max(_extract_pairs(bm25_cands))
+    vec_pairs = _dedup_max(_extract_pairs(vec_cands))
 
     if not bm25_pairs and not vec_pairs:
         return []
@@ -80,15 +100,8 @@ def rank_fusion(bm25_cands, vec_cands, k: int = 60) -> List[Tuple[str, float]]:
     for rank, (key, _sc) in enumerate(vec_sorted, start=1):
         rrf[key] = rrf.get(key, 0.0) + 1.0 / (k + rank)
 
-    # cosine map
-    cos_map: Dict[str, float] = {}
-    for key, sc in vec_pairs:
-        # keep max if duplicate keys
-        if key in cos_map:
-            if float(sc) > cos_map[key]:
-                cos_map[key] = float(sc)
-        else:
-            cos_map[key] = float(sc)
+    # cosine map 用 dedup 结果
+    cos_map: Dict[str, float] = dict(vec_pairs)
 
     # normalize RRF to [0,1] by max
     max_rrf = max(rrf.values()) if rrf else 0.0

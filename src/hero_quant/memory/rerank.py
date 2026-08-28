@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import logging
-import os
+import threading
 from typing import List, Tuple
 
 logger = logging.getLogger("hero_quant.memory.rerank")
@@ -52,6 +53,7 @@ except Exception:
 
 # simple integer mirror for tests that cannot read prometheus internals
 _fallback_count: int = 0
+_fallback_lock = threading.Lock()
 
 
 def get_fallback_count() -> int:
@@ -62,7 +64,8 @@ def get_fallback_count() -> int:
             try:
                 return int(v.get()) if hasattr(v, "get") else int(v)
             except Exception:
-                return int(_fallback_count)
+                with _fallback_lock:
+                    return int(_fallback_count)
         # check prometheus value
         if hasattr(rerank_fallback_total, "_metrics"):
             # sum all labeled values
@@ -77,12 +80,14 @@ def get_fallback_count() -> int:
                 pass
     except Exception:
         pass
-    return int(_fallback_count)
+    with _fallback_lock:
+        return int(_fallback_count)
 
 
 def _inc_fallback() -> None:
     global _fallback_count
-    _fallback_count += 1
+    with _fallback_lock:
+        _fallback_count += 1
     try:
         rerank_fallback_total.inc()  # type: ignore
     except Exception:
@@ -102,9 +107,14 @@ class CohereReranker:
                 self.api_key = (_Settings().cohere_api_key or "").strip()
             except Exception:
                 self.api_key = ""
-        self.timeout = int(timeout) if timeout else 5
-        if self.timeout <= 0:
-            self.timeout = 5
+        # timeout 校验(0/负/非数→ValueError)
+        try:
+            t = int(timeout)  # type: ignore[arg-type]
+        except (ValueError, TypeError) as e:  # narrow: only conversion errors
+            raise ValueError(f"invalid timeout: {timeout!r}") from e
+        if t <= 0:
+            raise ValueError(f"timeout must be >=1, got {t}")
+        self.timeout = t
         self.model = model
 
     def rerank(self, query: str, candidates: List[Tuple[str, float]] | List[dict], top_k: int | None = None) -> List[Tuple[str, float]]:
@@ -125,7 +135,7 @@ class CohereReranker:
                     sc = item.get("score", item.get("relevance_score", item.get("_score", 0.0)))
                     try:
                         sc_f = float(sc) if sc is not None else 0.0
-                    except Exception:
+                    except (ValueError, TypeError):  # narrow: only conversion errors
                         sc_f = 0.0
                     text = item.get("content") or item.get("text") or key
                     normalized.append((key, sc_f, str(text)))
@@ -133,12 +143,12 @@ class CohereReranker:
                     key = str(item[0])
                     try:
                         sc_f = float(item[1]) if item[1] is not None else 0.0
-                    except Exception:
+                    except (ValueError, TypeError):  # narrow: only conversion errors
                         sc_f = 0.0
                     # if 3 elements, third is text
                     text = str(item[2]) if len(item) >= 3 else key
                     normalized.append((key, sc_f, text))
-            except Exception:
+            except (ValueError, TypeError):  # narrow: only conversion/type errors
                 continue
 
         if not normalized:
@@ -153,11 +163,25 @@ class CohereReranker:
 
         # Build payload
         docs = [{"text": t} for _, _, t in normalized]
+        # top_n 校验 int(top_k)>=1 且 clamp 到 len(docs)+log
+        if top_k is not None:
+            try:
+                top_k_int = int(top_k)  # type: ignore[arg-type]
+            except (ValueError, TypeError) as e:  # narrow: only conversion errors
+                raise ValueError(f"invalid top_k: {top_k!r}") from e
+            if top_k_int < 1:
+                raise ValueError(f"top_k must be >=1, got {top_k_int}")
+            if top_k_int > len(docs):
+                logger.warning("top_k %s clamped to %s", top_k_int, len(docs))
+                top_k_int = len(docs)
+            top_n = top_k_int
+        else:
+            top_n = len(docs)
         payload = {
             "model": self.model,
             "query": query or "",
             "documents": docs,
-            "top_n": top_k if top_k is not None else len(docs),
+            "top_n": top_n,
         }
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -181,8 +205,8 @@ class CohereReranker:
             except ImportError:
                 # fallback to urllib
                 import json as _json
-                import urllib.request
                 import urllib.error
+                import urllib.request
 
                 req = urllib.request.Request(
                     "https://api.cohere.ai/v1/rerank",
@@ -211,7 +235,7 @@ class CohereReranker:
                     if 0 <= idx < len(normalized):
                         key = normalized[idx][0]
                         scored.append((key, rel))
-                except Exception:
+                except (ValueError, TypeError):  # narrow: only conversion errors
                     continue
             if not scored:
                 raise RuntimeError("no valid rerank entries")
@@ -219,15 +243,35 @@ class CohereReranker:
             # Return as ranked by relevance desc (already)
             scored.sort(key=lambda x: (-x[1], x[0]))
             return scored
-        except Exception as exc:
-            logger.warning("cohere rerank fallback", extra={"error": str(exc)})
+        except (json.JSONDecodeError, RuntimeError) as exc:  # narrow: json / runtime
+            logger.warning("cohere rerank fallback", extra={"error": str(exc)}, exc_info=True)
             _inc_fallback()
             # fallback: try local rank_fusion semantics not applicable with single list;
             # return original sorted by score
             try:
-                # if we have both bm25/vec semantics, we cannot reconstruct,
-                # fallback to sorting by original score
                 fallback = sorted([(k, s) for k, s, _t in normalized], key=lambda x: (-x[1], x[0]))
                 return fallback
+            except (ValueError, TypeError):  # narrow: only conversion errors
+                return [(k, s) for k, s, _t in normalized]
+        except Exception as exc:  # narrow: httpx.RequestError / Timeout
+            # explicit httpx handling with narrow types
+            try:
+                import httpx  # type: ignore
+
+                if isinstance(exc, (httpx.RequestError, httpx.TimeoutException)):  # httpx.RequestError / Timeout
+                    logger.warning("cohere rerank fallback", extra={"error": str(exc)}, exc_info=True)
+                    _inc_fallback()
+                    try:
+                        fallback = sorted([(k, s) for k, s, _t in normalized], key=lambda x: (-x[1], x[0]))
+                        return fallback
+                    except (ValueError, TypeError):  # narrow
+                        return [(k, s) for k, s, _t in normalized]
             except Exception:
+                pass
+            logger.warning("cohere rerank fallback", extra={"error": str(exc)}, exc_info=True)
+            _inc_fallback()
+            try:
+                fallback = sorted([(k, s) for k, s, _t in normalized], key=lambda x: (-x[1], x[0]))
+                return fallback
+            except (ValueError, TypeError):  # narrow
                 return [(k, s) for k, s, _t in normalized]
