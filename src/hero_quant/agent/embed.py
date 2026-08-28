@@ -11,14 +11,20 @@ from __future__ import annotations
 
 import functools
 import hashlib
+import logging
 import math
 import re
+import threading
 from typing import Dict, List
+
+logger = logging.getLogger(__name__)
 
 # 默认维度：稠密召回常用 32/64，此处统一 32
 _DEFAULT_DIM = 32
-_OFFLINE_DIM = 32
-_SEMANTIC_DIM = 32
+
+_CACHE_LOCK = threading.RLock()
+_SBERT_LOCK = threading.Lock()
+_SBERT_MODELS: Dict[str, object] = {}
 
 
 def get_vector_dim(default: int | None = None) -> int:
@@ -29,15 +35,15 @@ def get_vector_dim(default: int | None = None) -> int:
         v = int(Settings().vector_dim)
         if 8 <= v <= 2048:
             return v
-    except Exception:
-        pass
+    except (ImportError, ValueError, TypeError, AttributeError, OSError) as e:
+        logger.debug("get_vector_dim settings failed: %s", e)
     if default is not None:
         try:
             iv = int(default)
             if 8 <= iv <= 2048:
                 return iv
-        except Exception:
-            pass
+        except (ValueError, TypeError) as e:
+            logger.debug("get_vector_dim default parse failed: %s", e)
     return _DEFAULT_DIM
 
 
@@ -47,18 +53,21 @@ def get_dim() -> int:
 
 def to_pgvector_literal(vec: List[float]) -> str:
     """序列化为 pgvector 文本字面量 '[0.1,0.2,...]'."""
-    try:
-        return "[" + ",".join(f"{float(x):.6f}" for x in vec) + "]"
-    except Exception:
-        return "[" + ",".join(str(x) for x in vec) + "]"
+    return "[" + ",".join(f"{float(x):.6f}" for x in vec) + "]"
 
 
 def from_pgvector_literal(s: str | List[float]) -> List[float]:
     """解析 pgvector 字面量为 list[float]，已是列表则透传."""
     if isinstance(s, list):
-        return [float(x) for x in s]
+        out: List[float] = []
+        for x in s:
+            try:
+                out.append(float(x))
+            except (ValueError, TypeError) as e:
+                raise ValueError(f"invalid numeric value: {x!r}") from e
+        return out
     if not isinstance(s, str):
-        return []
+        raise TypeError(f"from_pgvector_literal expects str or list, got {type(s).__name__}")
     txt = s.strip()
     if txt.startswith("[") and txt.endswith("]"):
         txt = txt[1:-1]
@@ -71,9 +80,10 @@ def from_pgvector_literal(s: str | List[float]) -> List[float]:
             continue
         try:
             out.append(float(part))
-        except Exception:
-            continue
+        except (ValueError, TypeError) as e:
+            raise ValueError(f"invalid numeric value: {part!r}") from e
     return out
+
 
 _PROVIDER_ALIASES = {
     "openai": "openai",
@@ -92,7 +102,7 @@ def _active_provider_name() -> str:
         from hero_quant.config.settings import Settings
 
         raw = Settings().embed_provider
-    except Exception:
+    except (ImportError, ValueError, TypeError, AttributeError, OSError):
         raw = "offline"
     if raw is None:
         raw = "offline"
@@ -122,6 +132,7 @@ def get_active_provider() -> str:
 
 # 离线 hash 嵌入：零依赖、确定性，基于 SHA256 扩展
 
+
 def _embed_offline(text: str, dim: int) -> List[float]:
     if not isinstance(text, str):
         text = str(text)
@@ -133,12 +144,13 @@ def _embed_offline(text: str, dim: int) -> List[float]:
         for b in chunk:
             if len(vals) >= dim:
                 break
-            vals.append(b / 255.0)
+            vals.append(b / 127.5 - 1.0)
         counter += 1
-    return vals[:dim]
+    return _l2_normalize(vals[:dim])
 
 
 # 语义 token-sum 桩：用于 openai/sbert 不可用时的近义相似度保障
+
 
 def _tokenize(text: str) -> List[str]:
     return [t for t in re.split(r"[^a-z0-9]+", text.lower()) if t]
@@ -182,32 +194,44 @@ def _l2_normalize(vec: List[float]) -> List[float]:
     return [x / norm for x in vec]
 
 
+def _get_sbert_model(name: str):
+    """SentenceTransformer 单例缓存，懒加载勿在 import 时初始化."""
+    with _SBERT_LOCK:
+        if name in _SBERT_MODELS:
+            return _SBERT_MODELS[name]
+        from sentence_transformers import SentenceTransformer  # type: ignore
+
+        model = SentenceTransformer(name, device="cpu", local_files_only=True)  # type: ignore
+        _SBERT_MODELS[name] = model
+        return model
+
+
 def _try_sentence_transformers(text: str, dim: int) -> List[float] | None:
     try:
         import importlib.util
 
         if importlib.util.find_spec("sentence_transformers") is None:
             return None
-        from sentence_transformers import SentenceTransformer  # type: ignore
-
         try:
             from hero_quant.config.settings import Settings
 
             model_name = Settings().sbert_model
-        except Exception:
+        except (ImportError, ValueError, TypeError, AttributeError, OSError) as e:
+            logger.debug("sbert settings failed: %s", e)
             model_name = "all-MiniLM-L6-v2"
         try:
-            # 仅使用本地缓存，避免 CI 触发网络下载
-            model = SentenceTransformer(model_name, device="cpu", local_files_only=True)  # type: ignore
+            model = _get_sbert_model(model_name)
             vec = model.encode(text, normalize_embeddings=True).tolist()  # type: ignore
             if len(vec) >= dim:
                 return vec[:dim] if len(vec) != dim else vec
             else:
                 padded = vec + [0.0] * (dim - len(vec))
                 return _l2_normalize(padded)
-        except Exception:
+        except (OSError, ValueError, TypeError, RuntimeError) as e:
+            logger.debug("sbert encode failed: %s", e)
             return None
-    except Exception:
+    except (ImportError, OSError, ValueError, TypeError) as e:
+        logger.debug("sentence_transformers unavailable: %s", e)
         return None
 
 
@@ -218,7 +242,8 @@ def _try_openai(text: str, dim: int) -> List[float] | None:
         _s = Settings()
         api_key = _s.openai_api_key or ""
         model = _s.openai_embed_model
-    except Exception:
+    except (ImportError, ValueError, TypeError, AttributeError, OSError) as e:
+        logger.debug("openai settings failed: %s", e)
         api_key = ""
         model = "text-embedding-3-small"
     if not api_key:
@@ -238,7 +263,8 @@ def _try_openai(text: str, dim: int) -> List[float] | None:
         else:
             v = vec + [0.0] * (dim - len(vec))
         return _l2_normalize(v)
-    except Exception:
+    except (ImportError, OSError, ValueError, TypeError, RuntimeError) as e:
+        logger.debug("openai embed failed: %s", e)
         return None
 
 
@@ -258,7 +284,8 @@ def _embed_uncached(text: str, dim: int | None = None) -> List[float]:
     else:
         try:
             dim = int(dim)
-        except Exception:
+        except (ValueError, TypeError) as e:
+            logger.debug("dim parse failed: %s", e)
             dim = get_vector_dim()
         if dim <= 0:
             dim = get_vector_dim()
@@ -291,25 +318,29 @@ def embed(text: str, dim: int | None = None) -> List[float]:
     else:
         try:
             eff_dim = int(dim)
-        except Exception:
+        except (ValueError, TypeError) as e:
+            logger.debug("embed dim parse failed: %s", e)
             eff_dim = get_vector_dim()
         if eff_dim <= 0 or eff_dim < 8 or eff_dim > 2048:
             eff_dim = get_vector_dim()
     # provider 变化时清空缓存以避免陈旧向量（轻量检查）
     # 缓存键包含 provider 隐式通过文本+dim，但为防 provider 切换污染，检测后清除
-    try:
-        current_provider = _active_provider_name()
-        # 使用函数属性记录上次 provider
-        last = getattr(_embed_cached, "_last_provider", None)
-        if last is not None and last != current_provider:
-            _embed_cached.cache_clear()
-        _embed_cached._last_provider = current_provider  # type: ignore[attr-defined]
-    except Exception:
-        pass
+    with _CACHE_LOCK:
+        try:
+            current_provider = _active_provider_name()
+            # 使用函数属性记录上次 provider
+            last = getattr(_embed_cached, "_last_provider", None)
+            if last is not None and last != current_provider:
+                _embed_cached.cache_clear()
+            _embed_cached._last_provider = current_provider  # type: ignore[attr-defined]
+        except (OSError, ValueError, TypeError, AttributeError, ImportError) as e:
+            logger.debug("provider cache check failed: %s", e)
     return list(_embed_cached(str(text), int(eff_dim)))
 
 
 def cosine_sim(a: List[float], b: List[float]) -> float:
+    if len(a) != len(b):
+        raise ValueError(f"cosine_sim dim mismatch: {len(a)} != {len(b)}")
     dot = sum(x * y for x, y in zip(a, b))
     na = math.sqrt(sum(x * x for x in a))
     nb = math.sqrt(sum(y * y for y in b))
@@ -322,6 +353,9 @@ def centroid(vectors: List[List[float]]) -> List[float]:
     if not vectors:
         return []
     dim = len(vectors[0])
+    for v in vectors:
+        if len(v) != dim:
+            raise ValueError(f"centroid dim mismatch: expected {dim}, got {len(v)}")
     c = [0.0] * dim
     for v in vectors:
         for i, x in enumerate(v):
