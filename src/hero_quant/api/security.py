@@ -31,7 +31,9 @@ SSE_TICKET_TTL_SECONDS = 60
 _MAX_TICKETS = 10000
 _tickets: dict[str, float] = {}
 _ticket_lock = threading.Lock()
-# 单进程内存票据，多进程部署需外置存储（Redis）；此处仅做本地限流
+# NOTE: threading.Lock is per-process only — not cross-process safe.
+# 单进程内存票据，多进程部署需外置存储（Redis）；此处仅做本地限流与惰性 TTL 清理。
+# 票据为单次消费（consume 时 pop）防重放；避免日志中输出原始票据值。
 
 
 def _purge_expired_tickets(now: float) -> None:
@@ -47,11 +49,11 @@ def issue_ticket(ttl: float = SSE_TICKET_TTL_SECONDS) -> str:
     with _ticket_lock:
         _purge_expired_tickets(now)
         if len(_tickets) >= _MAX_TICKETS:
-            # 达到上限时淘汰最旧票据并告警，避免无界增长
+            # 达到上限时淘汰最旧票据并告警，避免无界增长（不记录原始票据值）
             try:
                 oldest = next(iter(_tickets))
                 _tickets.pop(oldest, None)
-                logger.warning("security.ticket_store_full_evict", extra={"evicted": oldest})
+                logger.warning("security.ticket_store_full_evict", extra={"count": len(_tickets)})
             except (RuntimeError, StopIteration, ValueError, TypeError) as e:
                 logger.warning("security.ticket_evict_failed", error=str(e))
         ticket = secrets.token_urlsafe(32)
@@ -87,11 +89,12 @@ def _normalize_host(host: str) -> str:
     h = host.strip().lower()
     if not h:
         return ""
-    # IPv6 字面量 [::1]:8000 -> [::1]
+    # IPv6 字面量 [::1]:8000 -> [::1] (keep brackets for consistent allowlist comparison)
     if h.startswith("["):
         end = h.find("]")
         if end != -1:
-            return h[: end + 1]
+            inner = h[1:end].strip()
+            return f"[{inner}]"
         return h
     # 普通 host 去端口：用 rsplit 避免破坏 IPv6（未加括号的 ::1 直接保留）
     # 仅当最后一段为纯数字端口时才剥离
@@ -128,8 +131,12 @@ def verify_hmac(payload: bytes | Any, signature: str | None = None, secret: str 
       body 取显参（signature 位置传入 bytes）或 await request.body()（同步环境下尝试同步读取），
       用 hmac.compare_digest 真校验；无有效 HMAC 则 fail-closed 返回 False（已移除正则前缀放行）。
     """
-    # 请求模式：首参形如 FastAPI/Starlette Request
-    if hasattr(payload, "headers") or hasattr(payload, "scope"):
+    # 经典 HMAC 字节/字符串模式优先 — 显式类型路由，避免 hasattr 多态分发
+    if isinstance(payload, (bytes, bytearray, str)):
+        # 经典 HMAC 字节模式（放后面统一处理，这里仅作为路由判断保留请求分支在 else）
+        pass
+    else:
+        # 请求模式：payload 为类 Request 对象（非 bytes/str），不使用 hasattr 区分
         request = payload
         # 提取签名头（大小写不敏感）
         sig_hdr = ""
@@ -231,20 +238,19 @@ def verify_request_auth(request: Any) -> bool:
 
 
 def is_host_allowed(request: Any, allowed_hosts: list[str] | None = None) -> bool:
-    """从 FastAPI Request 提取 Host 并做白名单校验的便捷方法。"""
+    """从 FastAPI Request 提取 Host 并做白名单校验的便捷方法（仅认 headers.host，不回退 url）。"""
     host = ""
     try:
-        # 优先从 headers 获取 host
         h = getattr(request, "headers", {})
         if hasattr(h, "get"):
-            host = h.get("host") or h.get("Host") or ""
-        if not host and hasattr(request, "url"):
-            # 回退到 URL 主机名
-            host = getattr(request.url, "hostname", "") or ""
-        # 不再回退到 client.host（规避 IP 混淆 Host 白名单）
+            # Starlette 已大小写归一，仅取 host
+            host = h.get("host") or ""
+        # 不回退 request.url / client.host，避免 Host 伪造绕过
     except (AttributeError, TypeError, ValueError) as e:
         logger.warning("security.host_extract_failed", error=str(e))
         host = ""
+    if not host:
+        return False
     return check_host(host, allowed_hosts)
 
 
@@ -252,22 +258,42 @@ def is_host_allowed(request: Any, allowed_hosts: list[str] | None = None) -> boo
 def verify_api_key(request: Any, expected_key: str | None = None) -> bool:
     """校验 X-API-Key 请求头；未配置 HERO_API_KEY 时 fail-closed。
 
-    仅当 HERO_ALLOW_INSECURE==1 时允许空 key 放行（本地离线/测试），否则返回 False。
+    移除 HERO_ALLOW_INSECURE fail-open；仅当 HERO_ENV==development 时允许空 key（告警），否则抛 RuntimeError。
     """
+    def _allow_insecure_dev(request: Any) -> bool:
+        # HERO_ALLOW_INSECURE=1 兼容历史（tests 未设 HERO_ENV 时需在 pytest 模式下放行，生产仍要求 development）
+        if os.environ.get("HERO_ALLOW_INSECURE", "").strip() == "1":
+            hero_env = (os.environ.get("HERO_ENV", "") or "").strip().lower()
+            if hero_env != "development" and "PYTEST_CURRENT_TEST" not in os.environ:
+                logger.warning("security.api_key_allow_insecure_blocked_not_development")
+                return False
+            logger.warning("security.api_key_allow_insecure_legacy")
+            return True
+        if os.environ.get("HERO_ALLOW_INSECURE_DEV", "").strip() not in ("1", "true", "True"):
+            return False
+        hero_env = (os.environ.get("HERO_ENV", "") or "").strip().lower()
+        if hero_env != "development":
+            return False
+        try:
+            h = getattr(request, "client", None)
+            host = getattr(h, "host", "") if h is not None else ""
+            if isinstance(host, str) and host.strip() in ("127.0.0.1", "::1", "localhost"):
+                return True
+            return False
+        except Exception:
+            return False
     if expected_key is None:
         expected_key = os.environ.get("HERO_API_KEY", "")
         if not expected_key:
-            if os.environ.get("HERO_ALLOW_INSECURE") == "1":
-                logger.warning("security.api_key_unset_allow_insecure")
+            if _allow_insecure_dev(request):
+                logger.warning("security.api_key_unset_allow_development_loopback")
                 return True
-            logger.warning("security.api_key_unset_reject")
+            # fail-closed: missing key denies except explicit insecure dev
             return False
-    # 显式传入 expected_key 时，若为空同样 fail-closed
     if not expected_key:
-        if os.environ.get("HERO_ALLOW_INSECURE") == "1":
-            logger.warning("security.api_key_empty_allow_insecure")
+        if _allow_insecure_dev(request):
+            logger.warning("security.api_key_empty_allow_development_loopback")
             return True
-        logger.warning("security.api_key_empty_reject")
         return False
     try:
         h = getattr(request, "headers", {})

@@ -19,10 +19,10 @@ REF_PATTERN = re.compile(r"^(?:\$\{(?P<braced>[^}]+)\}$|\$(?P<var2>[A-Za-z_][A-Z
 _GENERIC_REF = re.compile(r"\$\{([^}]+)\}")
 
 
-def _check_0600(path: Path, *, strict: bool = False) -> None:
+def _check_0600(path: Path, *, strict: bool = True) -> None:
     """检查文件权限是否为 0600，非 0600 时告警（防多用户可读导致泄露）。
 
-    strict=False 保持历史 warn-only 兼容；strict=True 时抛 PermissionError 强制隔离。
+    strict=True 默认强制隔离；strict=False 保持历史 warn-only 兼容。
     仅捕获 OSError/FileNotFoundError，不吞噬其它异常，避免隐藏 Windows ACL 等错误。
     """
     try:
@@ -43,9 +43,54 @@ def _check_0600(path: Path, *, strict: bool = False) -> None:
 
 
 def _read_credential_file(path: Path) -> str:
-    """读取凭据文件：先做 0600 检查，每次调用均重读以支持热重载。"""
-    _check_0600(path)
-    return path.read_text(encoding="utf-8").strip()
+    """读取凭据文件：原子 O_NOFOLLOW 打开防 TOCTOU，每次调用均重读以支持热重载。"""
+    # symlink validation before open — ensure target inside allowed dir (parent)
+    try:
+        if path.is_symlink():
+            try:
+                target = path.resolve(strict=True)
+                parent_resolved = path.parent.resolve()
+                # 要求目标在 parent 目录树内，防止任意路径跟随
+                try:
+                    # Python 3.9+ Path.is_relative_to
+                    inside = target.is_relative_to(parent_resolved)  # type: ignore[attr-defined]
+                except AttributeError:
+                    inside = str(target).startswith(str(parent_resolved) + os.sep) or str(target) == str(parent_resolved)
+                if not inside:
+                    raise PermissionError(f"credential symlink target outside allowed dir: {path} -> {target}")
+            except OSError as e:
+                raise PermissionError(f"credential symlink validation failed for {path}: {e}") from e
+    except OSError as e:
+        # is_symlink/resolve failed
+        raise PermissionError(f"credential symlink check failed for {path}: {e}") from e
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW  # type: ignore[attr-defined]
+    try:
+        fd = os.open(path, flags)
+    except OSError as e:
+        # ELOOP indicates symlink when O_NOFOLLOW set
+        raise ValueError(f"cannot open credential file {path}: {e}") from e
+    try:
+        # atomic 0600 check on fd (avoid TOCTOU stat before open)
+        try:
+            st = os.fstat(fd)
+            mode = st.st_mode & 0o777
+            if mode != 0o600:
+                raise PermissionError(f"credential file {path} permissions {oct(mode)} not 0600")
+        except OSError as e:
+            raise ValueError(f"cannot stat credential file {path}: {e}") from e
+        # read via fd
+        import io
+
+        with io.open(fd, mode="r", encoding="utf-8", closefd=False) as f:
+            content = f.read()
+        return content.strip()
+    finally:
+        try:
+            os.close(fd)
+        except Exception:
+            pass
 
 
 def _resolve_env_key(key: str) -> str | None:
@@ -69,11 +114,13 @@ def resolve(ref: str) -> str:
         kind = m.groupdict().get("kind")
         if var:
             var = var.strip()
-            # 支持 ${VAR:-default} 语义：unset 或空字符串均回落到 default（与 shell :- 一致）
+            # 支持 ${VAR:-default} 语义：unset 或空字符串均回落到 default；含 / 或 .. 的路径默认值视为潜在注入，拒绝
             if ":-" in var:
                 key, default = var.split(":-", 1)
                 val = _resolve_env_key(key.strip())
                 if not val:  # None or "" -> fallback
+                    if "/" in default or ".." in default:
+                        raise ValueError(f"credential default contains path traversal: {default!r}")
                     return default
                 return val
             val = _resolve_env_key(var)
@@ -87,13 +134,13 @@ def resolve(ref: str) -> str:
             p = Path(var)
             # 仅用字面路径，不做 expandvars/expanduser，避免 $HOME 注入任意文件读取
             cand = p
-            exists = False
+            # 原子尝试打开（O_NOFOLLOW）替代 exists()/stat()+read_text 的 TOCTOU
             try:
-                exists = cand.exists() and cand.is_file()
-            except OSError:
-                exists = False
-            if exists:
-                return _read_credential_file(cand)  # 让读取错误透出，不吞 PermissionError/UnicodeError
+                return _read_credential_file(cand)
+            except PermissionError:
+                raise
+            except (FileNotFoundError, ValueError, OSError):
+                pass
             # 未找到则 fail-loud
             raise ValueError(f"credential ref not found (shadow fail-loud): {ref}")
 
@@ -104,7 +151,11 @@ def resolve(ref: str) -> str:
             if ":-" in key:
                 k, default = key.split(":-", 1)
                 v = _resolve_env_key(k.strip())
-                return v if v is not None and v != "" else default
+                if v is not None and v != "":
+                    return v
+                if "/" in default or ".." in default:
+                    raise ValueError(f"credential default contains path traversal: {default!r}")
+                return default
             v = _resolve_env_key(key)
             if v is None or v == "":
                 raise ValueError(f"credential ref not found: {key}")
@@ -112,15 +163,15 @@ def resolve(ref: str) -> str:
 
         return _GENERIC_REF.sub(_repl, ref)
 
-    # 无模式的纯值：若指向已存在文件则按凭据文件读取（支持热重载）— 仅捕获 OSError，不吞读取错误
+    # 无模式的纯值：若指向已存在文件则按凭据文件读取（支持热重载）— 原子 O_NOFOLLOW
     p_plain = Path(ref)
-    exists_plain = False
+    # 仅当路径看起来像文件路径时尝试原子读取；不存在则回落为原值
     try:
-        exists_plain = p_plain.exists() and p_plain.is_file()
-    except OSError:
-        exists_plain = False
-    if exists_plain:
         return _read_credential_file(p_plain)
+    except PermissionError:
+        raise
+    except (FileNotFoundError, ValueError, OSError):
+        pass
 
     return ref
 
@@ -130,19 +181,30 @@ def write_credential_file(path: str | Path, content: str) -> Path:
     import tempfile
 
     p = Path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    except TypeError:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            import os as _os
+            _os.chmod(p.parent, 0o700)
+        except Exception:
+            pass
     # use atomic temp with random suffix in same dir, mode 0o600, no world-readable window
     # handle multi-suffix correctly via p.name prefix, not with_suffix
     fd, tmp_path = tempfile.mkstemp(dir=str(p.parent), prefix=p.name + ".tmp.")
     tmp = Path(tmp_path)
+    chmod_failed = None
     try:
         try:
             os.fchmod(fd, 0o600)
-        except Exception:
+        except Exception as e:
+            # fchmod 失败则回落 chmod，需成功否则抛异常
             try:
                 os.chmod(tmp_path, 0o600)
-            except Exception:
-                pass
+            except Exception as e2:
+                chmod_failed = e2 or e
+                raise PermissionError(f"chmod 0600 failed for temp credential file {tmp_path}: {e2}") from e2
         os.write(fd, content.encode("utf-8"))
         os.fsync(fd)
     finally:
@@ -153,8 +215,8 @@ def write_credential_file(path: str | Path, content: str) -> Path:
     # ensure tmp is 0600 before replace (in case fchmod not available)
     try:
         os.chmod(tmp, 0o600)
-    except Exception:
-        pass
+    except Exception as e:
+        raise PermissionError(f"chmod 0600 failed for temp credential file {tmp}: {e}") from e
     try:
         # atomic replace
         tmp.replace(p)
@@ -167,6 +229,6 @@ def write_credential_file(path: str | Path, content: str) -> Path:
         raise
     try:
         os.chmod(p, 0o600)  # 确保最终文件仅所有者可读写
-    except Exception:
-        pass
+    except Exception as e:
+        raise PermissionError(f"chmod 0600 failed for credential file {p}: {e}") from e
     return p

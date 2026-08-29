@@ -43,16 +43,58 @@ def effectiveApprovalPolicy(events: list[dict[str, Any]] | None) -> str:
     if not events:
         return ApprovalPolicy.ASK
     for ev in reversed(events):
-        # 兼容多键名（policy / approval_policy / mode 等）
+        if not isinstance(ev, dict):
+            continue
+        # 兼容多键名（policy / approval_policy / mode 等），支持 heterogeneous str|dict
         for k in ("policy", "approval_policy", "effective_policy", "mode"):
-            if k in ev and ev[k] in ("ask", "never", "auto", ApprovalPolicy.ASK, ApprovalPolicy.NEVER, ApprovalPolicy.AUTO):
-                val = ev[k]
-                if isinstance(val, ApprovalPolicy):
-                    return val.value
-                return str(val).lower()
+            if k not in ev:
+                continue
+            val = ev[k]
+            # heterogeneous: val may be str or dict {value/policy/mode}
+            if isinstance(val, dict):
+                # extract inner string policy from dict
+                inner = None
+                for ik in ("policy", "value", "mode", "approval_policy", "effective_policy"):
+                    if ik in val:
+                        inner = val[ik]
+                        break
+                if inner is None:
+                    continue
+                val = inner
+            if isinstance(val, ApprovalPolicy):
+                return val.value
+            if isinstance(val, str):
+                lv = val.strip().lower()
+                if lv in ("ask", "never", "auto"):
+                    return lv
+                continue
+            # fallback: coerce via str
+            try:
+                lv = str(val).strip().lower()
+                if lv in ("ask", "never", "auto"):
+                    return lv
+            except Exception:
+                continue
         # 兼容历史事件类型
         if ev.get("type") in ("approval/asked", "approval/decided") and "policy" in ev:
-            return str(ev["policy"]).lower()
+            pol = ev["policy"]
+            if isinstance(pol, dict):
+                # heterogeneous dict
+                inner = pol.get("policy") or pol.get("value") or pol.get("mode") or ""
+                pol = inner
+            if isinstance(pol, ApprovalPolicy):
+                return pol.value
+            if isinstance(pol, str):
+                lv = pol.strip().lower()
+                if lv in ("ask", "never", "auto"):
+                    return lv
+            else:
+                try:
+                    lv = str(pol).strip().lower()
+                    if lv in ("ask", "never", "auto"):
+                        return lv
+                except Exception:
+                    pass
     return ApprovalPolicy.ASK
 
 
