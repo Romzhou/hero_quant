@@ -39,9 +39,9 @@ def max_drawdown(equity: pd.Series) -> float:
         s = equity.iloc[:, 0]
     s = pd.to_numeric(s, errors="coerce")
     cummax = s.cummax()  # 滚动峰值
-    # 避免除零：cummax 为 0 处回撤归零（inf 替换为 NaN 后填 0）
-    cummax = cummax.replace(0, np.nan)
+    # 避免除零：cummax==0 处回撤定义为 0，不用 inf/NaN 掩盖后续真实回撤
     dd = s / cummax - 1.0
+    dd = dd.where(cummax != 0, 0.0)
     dd = dd.replace([np.inf, -np.inf], np.nan).fillna(0.0)
     # 最深回撤（最小值即最负）
     mdd = float(dd.min()) if not dd.empty else 0.0
@@ -104,7 +104,8 @@ def turnover(positions: pd.DataFrame | pd.Series | None = None, weights=None) ->
     if weights is not None:
         try:
             _w = np.asarray(weights, dtype=float)
-            # 日频再平衡代理，暂视为 0 换手
+            if _w.size > 1:
+                return float(np.abs(np.diff(_w)).sum() / 2)
             return 0.0
         except (ValueError, TypeError) as e:
             logger.warning("turnover weights fallback failed: %s", e)
@@ -159,8 +160,9 @@ def compute_metrics(equity_series: pd.Series | pd.DataFrame, costs: float = 0.0,
         try:
             gross_ret = s.pct_change().fillna(0.0).replace([np.inf, -np.inf], 0.0)
             net_ret = gross_ret - costs_f
-            # 首期不扣费（建仓已计入 turnover 的场景下首期已处理，此处首期保留 gross）
-            # 为保持幂等：若 s 已是净权益，再扣一次会低估；仅当 costs 显著且调用方显式传入时执行
+            # 首期不扣费：首 Bar 的 gross_ret 为 0，不应扣除 costs，避免 double-deduct 建仓费
+            if len(net_ret) > 0:
+                net_ret.iloc[0] = float(gross_ret.iloc[0])
             # 使用 cumprod 重建净权益曲线
             net_equity = (1 + net_ret).cumprod() * float(s.iloc[0])
             net_equity.index = s.index

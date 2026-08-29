@@ -32,22 +32,7 @@ class AKShareLoader:
             s = datetime.strptime(start, "%Y-%m-%d")
             e = datetime.strptime(end, "%Y-%m-%d")
         except Exception as exc:
-            # Only allow deterministic fallback when explicitly gated synthetic mode, with warning
-            try:
-                from hero_quant.config.settings import Settings
-
-                _mode = Settings().data_mode
-            except Exception as se:
-                import os
-
-                _mode = os.environ.get("HERO_DATA_MODE", "live")
-                logger.warning("settings load failed in _synthetic_df: %s", se, exc_info=se)
-            if isinstance(_mode, str) and _mode.strip().lower() == "synthetic":
-                logger.warning("unparseable dates fallback to deterministic range for %s: %s", symbol, exc, exc_info=exc)
-                s = datetime(2026, 8, 1)
-                e = datetime(2026, 8, 19)
-            else:
-                raise DataValidationError(f"invalid date format start={start!r} end={end!r}: {exc}") from exc
+            raise DataValidationError(f"invalid date format start={start!r} end={end!r}: {exc}") from exc
         if e < s:
             e = s
         dates: list[str] = []
@@ -116,26 +101,20 @@ class AKShareLoader:
                 df = df.set_index("date")
             except Exception:
                 pass
-        # 成交量归一至 board_lots：超阈值视为 shares 需 /100；单位 board_lots (1=100 shares)，阈值 100000 用于区分 shares/board_lots；heuristic 为确定性有序处理
+        # 成交量归一：移除 >100000/100 heuristic，禁止静默填补；缺失则 fail-closed
         if "volume" in df.columns:
-            try:
-                vol = pd.to_numeric(df["volume"], errors="coerce").fillna(100.0)
-                # deterministic ordering: ensure stable max calculation (no random)
-                try:
-                    max_vol = float(vol.max())
-                    if max_vol > 100000:
-                        vol = vol / 100.0
-                except Exception as he:
-                    logger.warning("volume heuristic skipped: %s", he, exc_info=he)
-                df["volume"] = vol
-            except Exception as e:
-                logger.warning("volume coercion failed, fallback to 100.0: %s", e, exc_info=e)
-                df["volume"] = 100.0
+            vol = pd.to_numeric(df["volume"], errors="coerce")
+            if vol.isna().any():
+                raise DataValidationError(f"akshare volume contains NaN/non-numeric: {df['volume'].tolist()[:3]}")
+            df["volume"] = vol
         else:
-            df["volume"] = 100.0
-        for c in ("open", "high", "low", "close", "volume"):
+            raise DataValidationError("akshare missing volume column")
+        for c in ("open", "high", "low", "close"):
             if c in df.columns:
-                df[c] = pd.to_numeric(df[c], errors="coerce").fillna(1500.0 if c != "volume" else 100.0)
+                series = pd.to_numeric(df[c], errors="coerce")
+                if series.isna().any():
+                    raise DataValidationError(f"akshare {c} contains NaN/non-numeric: {df[c].tolist()[:3]}")
+                df[c] = series
         cols = ["open", "high", "low", "close", "volume"]
         cols = [c for c in cols if c in df.columns]
         df = df[cols]

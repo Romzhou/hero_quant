@@ -47,21 +47,7 @@ class CCXTLoader:
             s = datetime.strptime(start, "%Y-%m-%d")
             e = datetime.strptime(end, "%Y-%m-%d")
         except Exception as exc:
-            try:
-                from hero_quant.config.settings import Settings
-
-                _mode = Settings().data_mode
-            except Exception as se:
-                import os
-
-                _mode = os.environ.get("HERO_DATA_MODE", "live")
-                logger.warning("settings load failed in _synthetic_df: %s", se, exc_info=se)
-            if isinstance(_mode, str) and _mode.strip().lower() == "synthetic":
-                logger.warning("unparseable dates fallback to deterministic range for %s: %s", symbol, exc, exc_info=exc)
-                s = datetime(2026, 8, 1)
-                e = datetime(2026, 8, 19)
-            else:
-                raise DataValidationError(f"invalid date format start={start!r} end={end!r}: {exc}") from exc
+            raise DataValidationError(f"invalid date format start={start!r} end={end!r}: {exc}") from exc
         if e < s:
             e = s
         dates: list[str] = []
@@ -154,23 +140,53 @@ class CCXTLoader:
             raise DataValidationError(f"invalid date format start={start!r} end={end!r}: {e}") from e
         if e_dt < s_dt:
             e_dt = s_dt
-        since = int(s_dt.timestamp() * 1000)
-        days = (e_dt - s_dt).days + 1
-        # Correct limit math per timeframe; intraday needs minutes-per-day multipliers
+        # fix naive timestamp() to aware UTC
+        from datetime import timezone
+        s_dt_aware = s_dt.replace(tzinfo=timezone.utc)
+        e_dt_aware = e_dt.replace(tzinfo=timezone.utc)
+        since = int(s_dt_aware.timestamp() * 1000)
+        days = (e_dt_aware - s_dt_aware).days + 1
+        # Correct limit math per timeframe; intraday needs minutes-per-day multipliers, do not assume daily
         _intraday_multipliers = {"1m": 1440, "5m": 288, "15m": 96, "30m": 48, "1h": 24}
         if timeframe in _intraday_multipliers:
             requested = days * _intraday_multipliers[timeframe]
             limit = min(1500, max(requested, 5))
             if requested > 1500:
-                logger.warning("ccxt limit truncated: requested %s truncated to %s for %s timeframe=%s days=%s", requested, limit, symbol, timeframe, days)
+                logger.warning("ccxt limit truncated: requested %s truncated to %s for %s timeframe=%s days=%s (pagination required)", requested, limit, symbol, timeframe, days)
         else:
-            requested = days + 5
+            # daily/weekly/monthly: daily count, not intraday
+            if timeframe in ("1d", "1w", "1M"):
+                requested = days + 5
+            else:
+                requested = days + 5
             limit = min(1500, max(requested, 5))
+            if requested > 1500:
+                logger.warning("ccxt pagination needed: requested %s >1500 for %s timeframe=%s; will paginate", requested, symbol, timeframe)
 
         try:
             exchange = ccxt.binance()
-            ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, since=since, limit=limit)
-            if ohlcv is not None and len(ohlcv) < limit and len(ohlcv) < requested:
+            # pagination for 1500 limit
+            ohlcv: list = []
+            fetch_since = since
+            remaining = requested
+            while remaining > 0:
+                chunk_limit = min(1500, remaining)
+                chunk = exchange.fetch_ohlcv(symbol, timeframe=timeframe, since=fetch_since, limit=chunk_limit)
+                if not chunk:
+                    break
+                ohlcv.extend(chunk)
+                if len(chunk) < chunk_limit:
+                    break
+                # advance fetch_since to last candle timestamp + timeframe
+                try:
+                    last_ts = chunk[-1][0]
+                    fetch_since = int(last_ts) + 1
+                except Exception:
+                    break
+                remaining -= len(chunk)
+                if len(ohlcv) >= requested:
+                    break
+            if ohlcv is not None and len(ohlcv) < requested:
                 logger.warning("ccxt history truncated: requested %s returned %s for %s timeframe=%s", requested, len(ohlcv), symbol, timeframe)
             if not ohlcv:
                 raise ValueError("empty ohlcv")

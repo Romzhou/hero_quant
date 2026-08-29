@@ -52,17 +52,21 @@ def validate(
     if currency is None and len(args) >= 3:
         currency = args[2]
 
+    # 0. 空帧必须显式拒绝 — 禁止空 DataFrame 绕过所有校验
+    if not isinstance(prices, pd.DataFrame) or prices.empty:
+        raise ValidationError("prices DataFrame is empty or not a DataFrame (fail-closed)")
+
     # 1. PIT 校验：weights_on ≤ price_date 为正逻辑
-    # Normalize TZ-aware vs naive to UTC-naive consistently before comparison
+    # Normalize TZ-aware vs naive to UTC consistently before comparison
     def _norm_ts(v):
         ts = pd.Timestamp(v)
-        # If tz-aware, convert to UTC then drop tz
-        if ts.tz is not None:
-            try:
-                ts = ts.tz_convert("UTC").tz_localize(None)
-            except Exception:
-                # Fallback: localize naive handling
-                ts = ts.tz_localize(None) if ts.tz is None else ts
+        try:
+            if ts.tz is None:
+                ts = ts.tz_localize("UTC")
+            else:
+                ts = ts.tz_convert("UTC")
+        except (TypeError, ValueError, AttributeError) as e:
+            raise ValidationError(f"invalid timestamp {v!r}: {e}") from e
         return ts
 
     if weights_on is not None and price_date is not None:
@@ -98,6 +102,28 @@ def validate(
         except (ValueError, TypeError, AttributeError) as e:
             logger.warning("price validation conversion failed: %s", e, exc_info=True)
             raise ValidationError(f"price validation failed: {e}") from e
+    else:
+        # multi-asset DataFrame without single "close" column: validate each column as price series
+        if isinstance(prices, pd.DataFrame):
+            for col in prices.columns:
+                # skip non-price metadata columns like currency if present (already handled above)
+                if col == "currency":
+                    continue
+                try:
+                    series = pd.to_numeric(prices[col], errors="coerce")
+                    if series.isna().any() or (series <= 0).any():
+                        if series.isna().any():
+                            mask = prices[col].notna() & series.isna()
+                            bad_idx = mask[mask].index.tolist()[:5]
+                            raise ValidationError(
+                                f"non-numeric/NaN price detected in prices[{col!r}] at {bad_idx} (fail-closed)"
+                            )
+                        raise ValidationError(f"non-positive price detected in prices[{col!r}]")
+                except ValidationError:
+                    raise
+                except (ValueError, TypeError, AttributeError) as e:
+                    logger.warning("price validation conversion failed for column %r: %s", col, e, exc_info=True)
+                    raise ValidationError(f"price validation failed for column {col!r}: {e}") from e
 
     # 3. 混币种聚合拒绝 — 一致 NaN 策略：NaN 视为无效，fail-closed
     if isinstance(prices, pd.DataFrame) and "currency" in prices.columns:

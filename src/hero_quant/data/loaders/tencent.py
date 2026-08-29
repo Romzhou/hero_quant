@@ -6,6 +6,7 @@ live 下限流 1s 后请求腾讯 qfq 接口，live 失败显式抛 RuntimeError
 """
 
 from datetime import datetime, timedelta
+import math
 import time
 import urllib.request
 import urllib.parse
@@ -34,6 +35,8 @@ def _coerce_float(val, default):
 class TencentLoader:
     """腾讯 CN 行情 Loader（board_lots）。"""
 
+    name = "tencent"
+    source = "tencent"
     markets = ["CN"]
     unit = "board_lots"
 
@@ -43,21 +46,7 @@ class TencentLoader:
             s = datetime.strptime(start, "%Y-%m-%d")
             e = datetime.strptime(end, "%Y-%m-%d")
         except Exception as exc:
-            try:
-                from hero_quant.config.settings import Settings
-
-                _mode = Settings().data_mode
-            except Exception as se:
-                import os
-
-                _mode = os.environ.get("HERO_DATA_MODE", "live")
-                logger.warning("settings load failed in _synthetic_bars: %s", se, exc_info=se)
-            if isinstance(_mode, str) and _mode.strip().lower() == "synthetic":
-                logger.warning("unparseable dates fallback to deterministic range for %s: %s", symbol, exc, exc_info=exc)
-                s = datetime(2026, 8, 1)
-                e = datetime(2026, 8, 19)
-            else:
-                raise DataValidationError(f"invalid date format start={start!r} end={end!r}: {exc}") from exc
+            raise DataValidationError(f"invalid date format start={start!r} end={end!r}: {exc}") from exc
         if e < s:
             e = s
         bars = []
@@ -161,23 +150,41 @@ class TencentLoader:
                         bars = []
                         for item in candidate:
                             if isinstance(item, (list, tuple)) and len(item) >= 6:
+                                # validate each field after float conversion (parity with dict path)
+                                _field_vals = {}
+                                for idx_f, field in enumerate(("date", "open", "close", "high", "low", "volume")):
+                                    raw_v = item[idx_f]
+                                    if field == "date":
+                                        _field_vals[field] = str(raw_v)
+                                    else:
+                                        v = float(raw_v)
+                                        if not math.isfinite(v) or (field in ("close", "open", "high", "low") and v <= 0) or (field == "volume" and v < 0):
+                                            raise DataValidationError(f"tencent bar field {field!r} invalid {raw_v!r}: non-finite or out-of-range ({v})")
+                                        _field_vals[field] = v
                                 bars.append({
-                                    "date": str(item[0]),
-                                    "open": _coerce_float(item[1], 1500.0),
-                                    "close": _coerce_float(item[2], 1500.0),
-                                    "high": _coerce_float(item[3], 1510),
-                                    "low": _coerce_float(item[4], 1490),
-                                    "volume": _coerce_float(item[5], 100),
+                                    "date": _field_vals["date"],
+                                    "open": _field_vals["open"],
+                                    "close": _field_vals["close"],
+                                    "high": _field_vals["high"],
+                                    "low": _field_vals["low"],
+                                    "volume": _field_vals["volume"],
                                 })
                             elif isinstance(item, dict):
-                                # already shaped dict - ensure volume handling and required fields
+                                for k in ("open", "close", "high", "low", "volume", "date"):
+                                    if k not in item or item[k] is None or (isinstance(item[k], str) and item[k].strip() == ""):
+                                        raise DataValidationError(f"tencent bar missing required field {k!r}: {item!r}")
+                                    if k != "date":
+                                        try:
+                                            float(item[k])
+                                        except Exception as e:
+                                            raise DataValidationError(f"tencent bar field {k!r} invalid {item[k]!r}: {e}") from e
                                 bars.append({
                                     "date": str(item.get("date", "")),
-                                    "open": _coerce_float(item.get("open", 1500.0), 1500.0),
-                                    "close": _coerce_float(item.get("close", 1500.0), 1500.0),
-                                    "high": _coerce_float(item.get("high", 1510), 1510),
-                                    "low": _coerce_float(item.get("low", 1490), 1490),
-                                    "volume": _coerce_float(item.get("volume", 100), 100),
+                                    "open": float(item.get("open")),
+                                    "close": float(item.get("close")),
+                                    "high": float(item.get("high")),
+                                    "low": float(item.get("low")),
+                                    "volume": float(item.get("volume")),
                                 })
                         if len(bars) > 0:
                             return bars
