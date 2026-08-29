@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 import logging
+import threading as _threading
 
 import math
 import os
@@ -25,9 +26,6 @@ logger = logging.getLogger("hero_quant.mcp.router")
 
 # 预编译 token 切分正则，避免热路径重复编译
 _TOKEN_RE = re.compile(r"[^a-z0-9]+")
-
-# 线程安全：语料与限流/熔断的锁
-import threading as _threading
 
 _CORPUS_LOCK = _threading.Lock()
 _LIMITER_LOCK = _threading.Lock()

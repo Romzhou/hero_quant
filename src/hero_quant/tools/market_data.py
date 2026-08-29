@@ -53,8 +53,6 @@ def _synthetic_fallback(symbol: str, start: str, end: str):
     except Exception as e:
         _logger.debug("public synthetic helper not available: %s", e, exc_info=True)
     # local minimal fallback — standalone, no private loader reach
-    import datetime
-
     try:
         # try to produce two bars with given dates
         return [

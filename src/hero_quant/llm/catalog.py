@@ -74,12 +74,12 @@ MODEL_CATALOG: Mapping[str, ModelInfo] = MappingProxyType(
     }
 )
 
-if DEFAULT_MODEL not in MODEL_CATALOG:
-    raise UnknownModelError(f"DEFAULT_MODEL {DEFAULT_MODEL!r} not in MODEL_CATALOG")
-
-
 class UnknownModelError(ValueError):
     """Raised when strict resolution receives a model absent from the catalog."""
+
+
+if DEFAULT_MODEL not in MODEL_CATALOG:
+    raise UnknownModelError(f"DEFAULT_MODEL {DEFAULT_MODEL!r} not in MODEL_CATALOG")
 
 
 def _model_name(model: str | None) -> str:

@@ -194,16 +194,14 @@ def write_credential_file(path: str | Path, content: str) -> Path:
     # handle multi-suffix correctly via p.name prefix, not with_suffix
     fd, tmp_path = tempfile.mkstemp(dir=str(p.parent), prefix=p.name + ".tmp.")
     tmp = Path(tmp_path)
-    chmod_failed = None
     try:
         try:
             os.fchmod(fd, 0o600)
-        except Exception as e:
+        except Exception:
             # fchmod 失败则回落 chmod，需成功否则抛异常
             try:
                 os.chmod(tmp_path, 0o600)
             except Exception as e2:
-                chmod_failed = e2 or e
                 raise PermissionError(f"chmod 0600 failed for temp credential file {tmp_path}: {e2}") from e2
         os.write(fd, content.encode("utf-8"))
         os.fsync(fd)
