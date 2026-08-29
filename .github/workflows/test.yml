@@ -39,7 +39,7 @@ jobs:
       - name: Frontend typecheck + build + unit tests (blocking)
         run: |
           npm ci --prefix frontend
-          npx tsc --noEmit -p frontend/tsconfig.json
+          npm run typecheck --prefix frontend
           npm run build --prefix frontend
           npm run test:run --prefix frontend
       - name: Install Playwright browsers

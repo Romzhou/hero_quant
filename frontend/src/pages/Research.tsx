@@ -337,8 +337,10 @@ export default function Research(props: ResearchProps) {
       backgroundColor: "transparent",
       tooltip: { position: "top" as const, formatter: (p: unknown) => {
         const param: unknown = Array.isArray(p) ? (p as unknown[])[0] : p
-        const raw = (param as { data?: unknown })?.data ?? (Array.isArray(p) ? (p as unknown[])[0]?.data : undefined)
-        const d = raw as unknown[]
+        const raw = (param as { data?: unknown })?.data
+        const _fallback = Array.isArray(p) ? ((p as unknown[])[0] as { data?: unknown })?.data : undefined
+        const _resolved = (raw ?? _fallback) as unknown
+        const d = _resolved as unknown[]
         if (!Array.isArray(d) || d.length < 3 || typeof d[2] !== "number" || typeof d[0] !== "number" || typeof d[1] !== "number") return ""
         const v = d[2] as number
         const wi = d[0] as number

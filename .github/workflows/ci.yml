@@ -57,7 +57,7 @@ jobs:
           cache-dependency-path: frontend/package-lock.json
       - run: npm ci --prefix frontend
       - name: Typecheck (tsc --noEmit blocking)
-        run: npx tsc --noEmit -p frontend/tsconfig.json
+        run: npm run typecheck --prefix frontend
       - name: Build frontend
         run: npm run build --prefix frontend
       - name: Frontend unit tests
