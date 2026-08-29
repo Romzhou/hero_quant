@@ -307,7 +307,7 @@ def _embed_uncached(text: str, dim: int | None = None) -> List[float]:
 
 
 @functools.lru_cache(maxsize=1024)
-def _embed_cached(text: str, dim: int) -> List[float]:
+def _embed_cached(text: str, dim: int, provider: str = "offline") -> List[float]:
     return _embed_uncached(text, dim)
 
 
@@ -340,7 +340,12 @@ def embed(text: str, dim: int | None = None) -> List[float]:
         except (OSError, ValueError, TypeError, AttributeError, ImportError) as exc:
             logger.warning("provider cache check failed: %s", exc, exc_info=True)
     try:
-        vec = _embed_cached(str(text), int(eff_dim))
+        # provider-aware key，历史 _last_provider 清理保留兼容但不再依赖
+        try:
+            _prov = _active_provider_name()
+        except Exception:
+            _prov = "offline"
+        vec = _embed_cached(str(text), int(eff_dim), _prov)
     except Exception as exc:
         logger.warning("embed cached call failed for %r dim %r: %s", text, eff_dim, exc, exc_info=True)
         vec = _embed_uncached(str(text), int(eff_dim))

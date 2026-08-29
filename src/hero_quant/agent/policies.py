@@ -196,8 +196,8 @@ class BudgetBreaker:
         return cf
 
     def _prune_locked(self) -> None:
-        """内部 prune，不加锁，调用方需已持有 _lock."""
-        now = time.time()
+        """内部 prune，不加锁，调用方需已持有 _lock. 使用 monotonic 避免系统时间回拨影响窗口."""
+        now = time.monotonic()
         cutoff = now - self.window_seconds
         self._costs = [(ts, c) for ts, c in self._costs if ts >= cutoff]
 
@@ -216,7 +216,7 @@ class BudgetBreaker:
             return
         with self._lock:
             self._prune_locked()
-            self._costs.append((time.time(), c))
+            self._costs.append((time.monotonic(), c))
 
     def total_cost(self) -> float:
         with self._lock:
@@ -254,5 +254,5 @@ class BudgetBreaker:
             self._prune_locked()
             total = sum(cc for _, cc in self._costs)
             should = c > self.daily_limit or (total + c > self.daily_limit)
-            self._costs.append((time.time(), c))
+            self._costs.append((time.monotonic(), c))
             return should

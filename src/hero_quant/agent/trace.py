@@ -367,7 +367,10 @@ class TraceWriter:
             tmp = path.with_name(
                 f".{path.name}.{os.getpid()}.{threading.get_ident()}.{os.urandom(4).hex()}.tmp"
             )
-            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            fd = os.open(tmp, flags, 0o600)
             try:
                 payload = value.encode("utf-8")
                 written = 0
@@ -427,7 +430,10 @@ class TraceWriter:
     def _fsync_dir(self, directory: Path) -> None:
         """fsync 目录，使新建/重命名条目落盘."""
         try:
-            dir_fd = os.open(directory, os.O_RDONLY)
+            flags = os.O_RDONLY
+            if hasattr(os, "O_DIRECTORY"):
+                flags |= os.O_DIRECTORY
+            dir_fd = os.open(directory, flags)
         except OSError:
             return
         try:

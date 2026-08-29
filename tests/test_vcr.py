@@ -50,9 +50,12 @@ def test_llm_usage_recorded_in_trace(tmp_path):
     assert llm_usage["output_tokens"] == 12
 
 
-def test_replay_does_not_call_llm(tmp_path):
+def test_replay_does_not_call_llm(tmp_path, monkeypatch):
     from hero_quant.agent.trace import TraceWriter
     from hero_quant.agent.loop import AgentLoop
+
+    # Explicitly allow tmp replay for this VCR-style test (loop fix 4 gates tmp behind HERO_ALLOW_TMP_REPLAY=1)
+    monkeypatch.setenv("HERO_ALLOW_TMP_REPLAY", "1")
 
     # prepare a llm_usage.json that simulates a prior recording
     replay_dir = tmp_path / "replay_src"

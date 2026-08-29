@@ -211,7 +211,22 @@ def extract_claims(text: str) -> List[Dict[str, Any]]:
         claims.append({"type": "currency", "value": val, "raw": raw, "span": (s, e), "symbol": raw[0]})
         _add_span(s, e)
 
-    # 4. 区间/range
+    # 4. 数量（...手/股）— 优先于区间，避免 "100-200股" 误判为 range
+    for m in _QUANTITY_RE.finditer(text):
+        s, e = m.span()
+        if _overlaps(s, e):
+            continue
+        raw = m.group(0)
+        num_str = m.group(1).replace(",", "")
+        try:
+            val = int(float(num_str))
+        except Exception:
+            val = num_str
+        unit = m.group(2)
+        claims.append({"type": "quantity", "value": val, "raw": raw, "span": (s, e), "unit": unit})
+        _add_span(s, e)
+
+    # 5. 区间/range
     for m in _RANGE_RE.finditer(text):
         s, e = m.span()
         if _overlaps(s, e):
@@ -225,21 +240,6 @@ def extract_claims(text: str) -> List[Dict[str, Any]]:
         except Exception:
             val = [g1, g2]
         claims.append({"type": "range", "value": val, "raw": raw, "span": (s, e)})
-        _add_span(s, e)
-
-    # 5. 数量（...手/股）
-    for m in _QUANTITY_RE.finditer(text):
-        s, e = m.span()
-        if _overlaps(s, e):
-            continue
-        raw = m.group(0)
-        num_str = m.group(1).replace(",", "")
-        try:
-            val = int(float(num_str))
-        except Exception:
-            val = num_str
-        unit = m.group(2)
-        claims.append({"type": "quantity", "value": val, "raw": raw, "span": (s, e), "unit": unit})
         _add_span(s, e)
 
     # 6. 负数（未被前面覆盖的）

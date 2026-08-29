@@ -340,6 +340,10 @@ def skills_observed_invalidate(loader: "SkillsLoader", path: str) -> None:
         loader.observed_invalidate(path)
     except Exception as exc:
         logger.warning("observed_invalidate failed for %r: %s", path, exc, exc_info=True)
+    try:
+        _cached_auto_digest.cache_clear()
+    except Exception as exc:
+        logger.debug("cached auto digest clear failed: %s", exc)
 
 
 def build_system_prompt(

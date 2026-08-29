@@ -219,21 +219,24 @@ class AgentLoop:
                 except Exception:
                     is_inside = False
             if not is_inside and _allow_root is None:
-                # 兼容测试：仅默认 replays 时允许 tempfile 临时目录下的回放文件；显式 allow_root 时严格只认该目录
-                try:
-                    import tempfile
+                # 仅当 HERO_ALLOW_TMP_REPLAY=1 时才允许 tmp 回退，避免默认过宽的 /tmp 任意文件读取
+                import os as _replay_os2
 
-                    tmp = Path(tempfile.gettempdir()).resolve()
+                if _replay_os2.environ.get("HERO_ALLOW_TMP_REPLAY") == "1":
                     try:
-                        is_inside = p.is_relative_to(tmp)
-                    except AttributeError:
+                        import tempfile
+
+                        tmp = Path(tempfile.gettempdir()).resolve()
                         try:
-                            p.relative_to(tmp)
-                            is_inside = True
-                        except Exception:
-                            is_inside = False
-                except Exception:
-                    pass
+                            is_inside = p.is_relative_to(tmp)
+                        except AttributeError:
+                            try:
+                                p.relative_to(tmp)
+                                is_inside = True
+                            except Exception:
+                                is_inside = False
+                    except Exception:
+                        pass
             if not is_inside:
                 raise ValueError(f"replay_path outside allowed directory: {p} not in {allow}")
             self._replay_path = p
@@ -278,6 +281,7 @@ class AgentLoop:
             logging.getLogger(__name__).warning("wall_time budget normalize failed for %r: %s", _wt, exc, exc_info=True)
             self.wall_time_budget = None
         self.wall_time_budget_seconds = self.wall_time_budget
+        self._truncated = False
         # 延迟初始化轨迹写入器
         self._trace_writer = None
         self._init_trace_writer()
@@ -697,10 +701,11 @@ class AgentLoop:
                 effective = max(cur_len, ctx_len)
                 if effective >= int(self.token_limit):
                     banner = "TRUNCATED: token_limit exceeded"
-                    if "TRUNCATED" not in buffer:
+                    if not getattr(self, "_truncated", False):
                         # 截断输出并附加截断标识，token_limit转字符数 *4
                         limit = int(self.token_limit)*4
                         buffer = buffer[:limit] + f"\n[{banner}]"
+                        self._truncated = True
                     token_count = estimate_tokens(buffer)
                     reason = "token_limit"
                     terminated = True
@@ -904,8 +909,9 @@ class AgentLoop:
                     # 流中 token 熔断检查 token_limit*4 char
                     if self.token_limit is not None and estimate_tokens(buffer) >= int(self.token_limit):
                         banner = "TRUNCATED: token_limit exceeded"
-                        if "TRUNCATED" not in buffer:
+                        if not getattr(self, "_truncated", False):
                             buffer = buffer[:int(self.token_limit)*4] + f"\n[{banner}]"
+                            self._truncated = True
                         token_count = estimate_tokens(buffer)
                         reason = "token_limit"
                         terminated = True
@@ -1310,8 +1316,9 @@ class AgentLoop:
                         cr = self.context_manager.compact()
                         if getattr(cr, "truncated", False):
                             banner = getattr(cr, "banner", "TRUNCATED: context folded")
-                            if "TRUNCATED" not in buffer:
+                            if not getattr(self, "_truncated", False):
                                 buffer = f"[{banner}]\n" + buffer
+                                self._truncated = True
                             token_count = estimate_tokens(buffer)
                             if trace_writer is not None:
                                 try:
@@ -1394,8 +1401,9 @@ class AgentLoop:
             # 迭代末尾再检 token 上限（工具输出/压缩后可能膨胀） token_limit*4
             if self.token_limit is not None and estimate_tokens(buffer) >= int(self.token_limit):
                 banner = "TRUNCATED: token_limit exceeded"
-                if "TRUNCATED" not in buffer:
+                if not getattr(self, "_truncated", False):
                     buffer = buffer[:int(self.token_limit)*4] + f"\n[{banner}]"
+                    self._truncated = True
                 token_count = estimate_tokens(buffer)
                 reason = "token_limit"
                 terminated = True

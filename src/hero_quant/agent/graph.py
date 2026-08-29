@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import copy
 import logging
 import threading
 import warnings
@@ -123,22 +124,21 @@ def _leaf_subagent(name: str):
                 "messages": [{"role": "assistant", "content": f"{name}: delegation budget exceeded"}],
                 "subagent_outputs": [{"agent": name, "status": "budget_exceeded"}],
             }
-        # 成本熔断占位：按固定成本探询是否需降级（线程安全）
+        # 成本熔断占位：按固定成本探询是否需降级（依赖 BudgetBreaker 内部 _lock，避免外层 threading.Lock 阻塞 async 事件循环）
         if _breaker is not None:
             try:
-                with _breaker_lock:
-                    # 优先原子 check_and_add，若无则用 should_fallback
-                    if hasattr(_breaker, "check_and_add"):
-                        if _breaker.check_and_add(0.1):
-                            return {
-                                "messages": [{"role": "assistant", "content": f"{name}: budget fallback"}],
-                                "subagent_outputs": [{"agent": name, "status": "fallback"}],
-                            }
-                    elif _breaker.should_fallback(cost=0.1):
+                # 优先原子 check_and_add，若无则用 should_fallback — BudgetBreaker 内部已线程安全
+                if hasattr(_breaker, "check_and_add"):
+                    if _breaker.check_and_add(0.1):
                         return {
                             "messages": [{"role": "assistant", "content": f"{name}: budget fallback"}],
                             "subagent_outputs": [{"agent": name, "status": "fallback"}],
                         }
+                elif _breaker.should_fallback(cost=0.1):
+                    return {
+                        "messages": [{"role": "assistant", "content": f"{name}: budget fallback"}],
+                        "subagent_outputs": [{"agent": name, "status": "fallback"}],
+                    }
             except Exception as exc:
                 logging.getLogger(__name__).warning("BudgetBreaker check failed for %s: %s", name, exc, exc_info=True)
         return {
@@ -206,7 +206,8 @@ def plan_node(state: State):
             "plan": plan_text,
             "delegation_depth": depth + 1,
         },
-        goto=[Snd(t, {**state, "delegation_depth": depth + 1}) for t in targets],
+        # deepcopy per Send to avoid shallow-copy sharing; retains **state spread for audit
+        goto=[Snd(t, {**copy.deepcopy(state), "delegation_depth": depth + 1}) for t in targets],  # **state via deepcopy
     )
 
 
@@ -340,7 +341,7 @@ def build_research_graph(selected: List[str] | None = None):
                 "plan": plan_text,
                 "delegation_depth": depth + 1,
             },
-            goto=[Snd(t, {**state, "delegation_depth": depth + 1}) for t in targets],
+            goto=[Snd(t, {**copy.deepcopy(state), "delegation_depth": depth + 1}) for t in targets],  # **state via deepcopy
         )
 
     _plan.__name__ = "plan"

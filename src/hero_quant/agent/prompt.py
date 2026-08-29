@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import html
 import logging
 
 logger = logging.getLogger(__name__)
@@ -72,6 +73,11 @@ def _sanitize_untrusted(text: str, field: str = "block") -> str:
         text = text[:_MAX_UNTRUSTED_LEN] + "\n[TRUNCATED: exceeds max length]"
     # Escape fence terminator to prevent breakout
     text = text.replace("```", "`\\``")
+    # Escape HTML-sensitive chars to prevent injection when prompt rendered in HTML contexts
+    # Preserve existing fence/header escaping above; html.escape covers < > &
+    text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    # Avoid double-escaping the header escape: restore "\#" if html mangled it (it doesn't, but be explicit)
+    # Note: html.escape was avoided via manual replace to keep "\" escapes intact
     # Escape leading markdown headers line by line
     lines = text.splitlines()
     escaped: list[str] = []

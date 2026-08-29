@@ -27,7 +27,7 @@ def _add_messages(left: List[Dict[str, Any]] | Dict[str, Any] | None, right: Lis
         right_list = right
     else:
         right_list = [right]  # type: ignore[list-item]
-    return left_list + right_list
+    return [dict(m) if isinstance(m, dict) else m for m in left_list] + [dict(m) if isinstance(m, dict) else m for m in right_list]
 
 
 def _add_list(left: List[Any] | Any | None, right: List[Any] | Any | None) -> List[Any]:
@@ -44,7 +44,7 @@ def _add_list(left: List[Any] | Any | None, right: List[Any] | Any | None) -> Li
         right_list = right
     else:
         right_list = [right]
-    return left_list + right_list
+    return [dict(m) if isinstance(m, dict) else m for m in left_list] + [dict(m) if isinstance(m, dict) else m for m in right_list]
 
 
 def _keep_last(a: Any, b: Any) -> Any:
