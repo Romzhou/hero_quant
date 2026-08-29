@@ -6,10 +6,23 @@
 
 import logging
 import os
+import re
 import warnings
 from dataclasses import dataclass, field
+from functools import lru_cache
 
 logger = logging.getLogger(__name__)
+
+
+def _redact_dsn(dsn: str) -> str:
+    """Redact password in DSN before logging (replace password with ***)."""
+    if not isinstance(dsn, str) or "://" not in dsn:
+        return "***"
+    try:
+        # keep username, hide password: postgresql://user:pass@host -> postgresql://user:***@host
+        return re.sub(r"://([^:]+):[^@]*@", r"://\1:***@", dsn)
+    except Exception:
+        return "***"
 
 
 def _wall_time_budget_from_env() -> float | None:
@@ -96,8 +109,8 @@ def _vector_dsn_from_env() -> str | None:
             s = raw.strip()
             if s.lower().startswith(_PG_PREFIXES):
                 return s
-            warnings.warn(f"{k} does not look like a PG DSN: {s!r}", UserWarning, stacklevel=2)
-            logger.warning("%s does not look like PG DSN: %r", k, s)
+            warnings.warn(f"{k} does not look like a PG DSN: {_redact_dsn(s)!r}", UserWarning, stacklevel=2)
+            logger.warning("%s does not look like PG DSN: %r", k, _redact_dsn(s))
     store = (os.getenv("HERO_VECTOR_STORE", "") or "").strip().lower()
     if store in ("pgvector", "postgres", "pg", "auto"):
         c = (os.getenv("HERO_CHECKPOINT_DSN", "") or "").strip()
@@ -117,16 +130,16 @@ def _checkpoint_dsn_from_env() -> str:
         s = raw.strip()
         if s.lower().startswith(_PG_PREFIXES):
             return s
-        warnings.warn(f"HERO_CHECKPOINT_DSN does not look like PG DSN: {s!r}", UserWarning, stacklevel=2)
-        logger.warning("HERO_CHECKPOINT_DSN invalid PG DSN: %r", s)
+        warnings.warn(f"HERO_CHECKPOINT_DSN does not look like PG DSN: {_redact_dsn(s)!r}", UserWarning, stacklevel=2)
+        logger.warning("HERO_CHECKPOINT_DSN invalid PG DSN: %r", _redact_dsn(s))
         # fall through to alias / default rather than returning garbage
     # also respect legacy HERO_PG_DSN alias (requires prefix consistently)
     alt = os.getenv("HERO_PG_DSN", "")
     if alt and alt.strip() and alt.strip().lower().startswith(_PG_PREFIXES):
         return alt.strip()
     elif alt and alt.strip():
-        warnings.warn(f"HERO_PG_DSN does not look like PG DSN: {alt!r}", UserWarning, stacklevel=2)
-        logger.warning("HERO_PG_DSN invalid PG DSN: %r", alt)
+        warnings.warn(f"HERO_PG_DSN does not look like PG DSN: {_redact_dsn(alt)!r}", UserWarning, stacklevel=2)
+        logger.warning("HERO_PG_DSN invalid PG DSN: %r", _redact_dsn(alt))
     # default PG (not memory) — real PG path, runtime falls back to memory if unreachable
     return "postgresql://postgres:postgres@localhost:5432/hero_quant"
 
@@ -235,3 +248,9 @@ class Settings:
     checkpoint_ttl_seconds: int = field(default_factory=_checkpoint_ttl_from_env)
     billing_dsn: str | None = field(default_factory=_billing_dsn_from_env, repr=False)
     cohere_api_key: str = field(default_factory=lambda: os.getenv("COHERE_API_KEY", "") or "", repr=False)
+
+
+@lru_cache(maxsize=1)
+def get_settings() -> Settings:
+    """Cached factory to avoid env drift across repeated Settings() constructions."""
+    return Settings()

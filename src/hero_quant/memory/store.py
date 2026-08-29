@@ -97,15 +97,21 @@ def get_vector_dim() -> int:
 
 def _vector_to_literal(vec) -> str:
     """将向量序列化为 pgvector 字面量 ``[0.1,0.2]``，兼顾 vector 类型与 TEXT 回退。"""
+    # finite check first — must raise even if delegate would silently format inf/nan
+    for x in vec:
+        fv = float(x)
+        if not math.isfinite(fv):
+            raise ValueError(f"non-finite vector value {x!r}")
     try:
         from hero_quant.agent.embed import to_pgvector_literal  # type: ignore
 
         return to_pgvector_literal(vec)  # type: ignore
     except Exception:
-        try:
-            return "[" + ",".join(f"{float(x):.6f}" for x in vec) + "]"
-        except Exception:
-            return "[" + ",".join(str(x) for x in vec) + "]"
+        pass
+    vals: list[str] = []
+    for x in vec:
+        vals.append(f"{float(x):.6f}")
+    return "[" + ",".join(vals) + "]"
 
 
 class PgVectorSidecar:
@@ -596,6 +602,10 @@ class MemoryStore:
                             real.commit()
                         except Exception:
                             pass
+                        try:
+                            real.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                        except Exception:
+                            pass
                         real.close()
                     except Exception as e:
                         logger.debug("MemoryStore close failed: %s", e)
@@ -644,18 +654,50 @@ class MemoryStore:
 
     def _safe_filename(self, ns_key: str) -> str:
         """生成文件安全名，规避 Windows 禁用字符与路径穿越。"""
-        # Windows 禁止 ``:`` ``/`` ``\``，统一替换为 ``__``
-        safe = ns_key.replace(":", "__").replace("/", "__").replace("\\", "__")
+        # 使用 ``__NS__`` 作为命名空间分隔，避免与内容中 ``__`` 歧义
+        safe = ns_key.replace(":", "__NS__").replace("/", "__NS__").replace("\\", "__NS__")
         # 阻断 ``..`` 穿越
-        safe = safe.replace("..", "__")
+        safe = safe.replace("..", "__NS__")
         return f"{safe}.md"
 
     def _safe_prefix(self) -> str | None:
         """返回用于文件过滤的安全前缀。"""
         if self.namespace:
             # 与 _safe_filename 保持同构替换
+            return self.namespace.replace(":", "__NS__").replace("/", "__NS__").replace("\\", "__NS__") + "__NS__"
+        return None
+
+    def _safe_prefix_old(self) -> str | None:
+        """旧 ``__`` 前缀，用于向后兼容过滤。"""
+        if self.namespace:
             return self.namespace.replace(":", "__").replace("/", "__").replace("\\", "__") + "__"
         return None
+
+    def _matches_safe_prefix(self, filename: str) -> bool:
+        """兼容新 ``__NS__`` 与旧 ``__`` 前缀的过滤判断；无 namespace 时始终 True。"""
+        if self.namespace is None:
+            return True
+        new_p = self._safe_prefix()
+        old_p = self._safe_prefix_old()
+        return (new_p is not None and filename.startswith(new_p)) or (old_p is not None and filename.startswith(old_p))
+
+    def _parse_safe_stem(self, stem: str) -> str:
+        """将安全文件名 stem 还原为原始 ns_key，兼容旧 ``__`` 分隔。"""
+        if "__NS__" in stem:
+            return stem.replace("__NS__", ":")
+        # 向后兼容旧文件：``__`` 分隔
+        return stem.replace("__", ":")
+
+    def is_safe_filename(self, name: str) -> bool:
+        """校验文件名是否符合安全命名规范（新 ``__NS__`` 或旧 ``__`` 兼容）。"""
+        if not name.endswith(".md"):
+            return False
+        stem = name[:-3]
+        if not stem or "/" in stem or "\\" in stem or ":" in stem:
+            return False
+        if ".." in stem:
+            return False
+        return True
 
     def _init_db(self) -> None:
         """初始化 SQLite：建表、补齐向量列、创建 FTS5 索引。"""
@@ -924,7 +966,9 @@ class MemoryStore:
         # 兼容层次路由的子目录结构，确保父目录存在
         file_path.parent.mkdir(parents=True, exist_ok=True)
         try:
-            with open(tmp_path, "w", encoding="utf-8") as f:
+            _oflag = os.O_WRONLY | os.O_CREAT | os.O_EXCL | (os.O_NOFOLLOW if hasattr(os, "O_NOFOLLOW") else 0)
+            _fd = os.open(tmp_path, _oflag, 0o600)
+            with os.fdopen(_fd, "w", encoding="utf-8") as f:
                 try:
                     import fcntl  # type: ignore
 
@@ -1293,17 +1337,16 @@ class MemoryStore:
             except Exception:
                 files = list(self.base.rglob("*.md"))
                 files = [p for p in files if "archive" not in p.parts]
-            safe_prefix = self._safe_prefix()
             for md_file in files:
                 try:
-                    if safe_prefix is not None and not md_file.name.startswith(safe_prefix):
+                    if not self._matches_safe_prefix(md_file.name):
                         continue
                     txt = md_file.read_text(encoding="utf-8")
-                    # 从文件名反推原始 key，近似还原
-                    derived_key = md_file.stem.replace("__", ":")
+                    # 从文件名反推原始 key，兼容 __NS__ 与旧 __
+                    derived_key = self._parse_safe_stem(md_file.stem)
                     if prefix is not None and not derived_key.startswith(prefix.rstrip(":")):
                         # 二次校验安全前缀，避免命名空间串扰
-                        if safe_prefix and not md_file.name.startswith(safe_prefix):
+                        if not self._matches_safe_prefix(md_file.name):
                             continue
                     note_vec = self._embed_text(txt)
                     sim = self._cosine_sim(qvec, note_vec)
@@ -1387,7 +1430,6 @@ class MemoryStore:
         if not query:
             return []
         prefix = self._ns_prefix()
-        safe_prefix = self._safe_prefix()
         # trigram 对少于三个字符的 query 不可用；trigram 建表失败时所有 query 走此回退。
         if len(query) < 3 or not self._trigram_enabled:
             bigram_result = self._search_bigram_raw(query)
@@ -1452,14 +1494,14 @@ class MemoryStore:
                     candidates = [p for p in candidates if "archive" not in p.parts]
                 for md_file in candidates:
                     try:
-                        if safe_prefix is not None and not md_file.name.startswith(safe_prefix):
+                        if not self._matches_safe_prefix(md_file.name):
                             continue
-                        if prefix is not None and not md_file.stem.replace("__", ":").startswith(prefix.rstrip(":")):
-                            if not md_file.name.startswith(safe_prefix or ""):
+                        if prefix is not None and not self._parse_safe_stem(md_file.stem).startswith(prefix.rstrip(":")):
+                            if not self._matches_safe_prefix(md_file.name):
                                 continue
                         txt = md_file.read_text(encoding="utf-8")
                         if query in txt:
-                            result.append({"key": md_file.stem, "content": txt})
+                            result.append({"key": self._parse_safe_stem(md_file.stem), "content": txt})
                     except Exception:
                         continue
             seen2: dict[str, dict] = {}

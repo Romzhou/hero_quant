@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -190,7 +191,24 @@ class MemoryHierarchy:
         tmp_path = self._index_path.with_suffix(".tmp")
         # use tmp in same dir for atomicity; yaml.safe_dump ensures proper quoting/escaping
         tmp_path.write_text(yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8")
+        try:
+            with open(tmp_path, "rb") as _f:
+                os.fsync(_f.fileno())
+        except OSError as _e:
+            logger.warning("hierarchy index fsync file failed: %s", _e)
         tmp_path.replace(self._index_path)
+        # fsync directory to durably persist rename
+        try:
+            flags = os.O_RDONLY
+            if hasattr(os, "O_DIRECTORY"):
+                flags |= os.O_DIRECTORY
+            _dfd = os.open(self._base_dir, flags)
+            try:
+                os.fsync(_dfd)
+            finally:
+                os.close(_dfd)
+        except OSError as _e:
+            logger.warning("hierarchy index fsync dir failed: %s", _e)
 
     def _parse_index_keywords(self) -> Dict[str, List[str]]:
         """解析索引中的类别关键词，失败则返回空。"""

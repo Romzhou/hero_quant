@@ -7,13 +7,14 @@ Task7: PG default (not memory://), fallback to memory only when PG unreachable, 
 """
 
 from __future__ import annotations
-import hashlib
-import logging
-
+import asyncio
 import copy
+import hashlib
 import inspect
 import json
+import logging
 import os
+import threading
 import time
 from typing import Any, Dict, Optional
 logger = logging.getLogger("hero_quant.checkpoint.postgres")
@@ -41,9 +42,11 @@ CREATE TABLE IF NOT EXISTS checkpoints (
   thread text NOT NULL,
   seq int NOT NULL,
   checkpoint jsonb NOT NULL,
+  run_text TEXT,
   expires_at timestamptz,
   PRIMARY KEY (tenant, thread, seq)
 );
+ALTER TABLE checkpoints ADD COLUMN IF NOT EXISTS run_text TEXT;
 CREATE INDEX IF NOT EXISTS idx_checkpoints_expires_at ON checkpoints (expires_at);
 -- legacy fallback for older code paths using thread_id primary key
 CREATE TABLE IF NOT EXISTS checkpoints_legacy (
@@ -73,6 +76,43 @@ _PG_GLOBAL_TS: Dict[str, float] = {}
 #   to str(seq) with TODO warning.
 _PG_SEQ_BY_RUN: Dict[str, int] = {}
 _PG_RUN_BY_SEQ: Dict[str, str] = {}
+_PG_GLOBAL_LOCK = threading.RLock()
+_PG_ASYNC_LOCK: asyncio.Lock | None = None  # 懒创建，避免导入时绑定旧 loop
+
+def _get_async_lock() -> asyncio.Lock | None:
+    global _PG_ASYNC_LOCK
+    if _PG_ASYNC_LOCK is None:
+        try:
+            _PG_ASYNC_LOCK = asyncio.Lock()
+        except Exception:
+            return None
+    return _PG_ASYNC_LOCK
+
+
+def _pg_store_key(dsn: str, thread_id: str) -> str:
+    """Hashed DSN prefix to avoid leaking password in global key."""
+    try:
+        h = hashlib.sha256(dsn.encode()).hexdigest()[:12]
+    except Exception:
+        h = "default"
+    return f"{h}::{thread_id}"
+
+
+def _pg_store_prefix(dsn: str) -> str:
+    try:
+        h = hashlib.sha256(dsn.encode()).hexdigest()[:12]
+    except Exception:
+        h = "default"
+    return f"{h}::"
+
+
+def _redact_dsn(dsn: str) -> str:
+    """Fallback redactor if hashlib path fails."""
+    try:
+        import re as _re
+        return _re.sub(r"://([^:]+):[^@]*@", r"://\1:***@", dsn)
+    except Exception:
+        return "***"
 
 
 def _is_postgres_dsn(dsn: str) -> bool:
@@ -134,30 +174,31 @@ def _thread_to_keys(thread_id: str) -> tuple[str, str, int]:
         is_numeric = False
         base_seq = int(hashlib.sha256(run.encode()).hexdigest()[:8], 16) % 2147483647
     key_run = f"{tenant}::{wf}::{run}"
-    # fast path: already mapped
-    if key_run in _PG_SEQ_BY_RUN:
-        return tenant, wf, _PG_SEQ_BY_RUN[key_run]
-    seq = base_seq
-    # linear probing within same (tenant, thread) to disambiguate collisions
-    # also handles numeric vs hash collisions uniformly
-    for _ in range(10000):  # bound to avoid infinite loop; 10k distinct runs per thread is ample
-        key_seq = f"{tenant}::{wf}::{seq}"
-        existing_run = _PG_RUN_BY_SEQ.get(key_seq)
-        if existing_run is None or existing_run == run:
-            _PG_SEQ_BY_RUN[key_run] = seq
-            _PG_RUN_BY_SEQ[key_seq] = run
-            return tenant, wf, seq
-        # collision with different run -> probe
-        if is_numeric:
-            seq += 1
-            if seq >= 2147483647:
-                seq %= 2147483647
-        else:
-            seq = (seq + 1) % 2147483647
-    # fallback (unlikely to reach): store and return
-    _PG_SEQ_BY_RUN[key_run] = seq
-    _PG_RUN_BY_SEQ[f"{tenant}::{wf}::{seq}"] = run
-    return tenant, wf, seq
+    with _PG_GLOBAL_LOCK:
+        # fast path: already mapped
+        if key_run in _PG_SEQ_BY_RUN:
+            return tenant, wf, _PG_SEQ_BY_RUN[key_run]
+        seq = base_seq
+        # linear probing within same (tenant, thread) to disambiguate collisions
+        # also handles numeric vs hash collisions uniformly
+        for _ in range(10000):  # bound to avoid infinite loop; 10k distinct runs per thread is ample
+            key_seq = f"{tenant}::{wf}::{seq}"
+            existing_run = _PG_RUN_BY_SEQ.get(key_seq)
+            if existing_run is None or existing_run == run:
+                _PG_SEQ_BY_RUN[key_run] = seq
+                _PG_RUN_BY_SEQ[key_seq] = run
+                return tenant, wf, seq
+            # collision with different run -> probe
+            if is_numeric:
+                seq += 1
+                if seq >= 2147483647:
+                    seq %= 2147483647
+            else:
+                seq = (seq + 1) % 2147483647
+        # fallback (unlikely to reach): store and return
+        _PG_SEQ_BY_RUN[key_run] = seq
+        _PG_RUN_BY_SEQ[f"{tenant}::{wf}::{seq}"] = run
+        return tenant, wf, seq
 
 
 def _is_async_pool(pool: Any) -> bool:
@@ -198,6 +239,11 @@ class AsyncPostgresSaver:
         self._meta: Dict[str, Dict[str, Any]] = {}
         self._timestamps: Dict[str, float] = {}
         self._setup_done = False
+        self._setup_lock = threading.Lock()
+        try:
+            self._asetup_lock = asyncio.Lock()
+        except Exception:
+            self._asetup_lock = None  # type: ignore
 
         self.dsn: str = ""
         self.pool: Optional[Any] = pool
@@ -241,59 +287,91 @@ class AsyncPostgresSaver:
         """同步建表 — 真实 Postgres 时执行 DDL，memory 时 no-op。"""
         if self._setup_done:
             return
-        if self._is_real_pg_pool() and not self._pool_is_async():
-            try:
-                if hasattr(self.pool, "connection"):
-                    with self.pool.connection() as conn:  # type: ignore
+        with self._setup_lock:
+            if self._setup_done:
+                return
+            if self._is_real_pg_pool() and not self._pool_is_async():
+                try:
+                    if hasattr(self.pool, "connection"):
+                        with self.pool.connection() as conn:  # type: ignore
+                            try:
+                                conn.execute(DDL_CHECKPOINTS)  # type: ignore
+                            except Exception:
+                                with conn.cursor() as cur:  # type: ignore
+                                    cur.execute(DDL_CHECKPOINTS)
+                            try:
+                                conn.commit()  # type: ignore
+                            except Exception as _exc:
+                                logger.warning("silent handled: offline-safe: checkpoint pg fallback to memory", exc_info=_exc)
+                                pass
+                    elif hasattr(self.pool, "getconn"):
+                        conn = self.pool.getconn()  # type: ignore
                         try:
-                            conn.execute(DDL_CHECKPOINTS)  # type: ignore
-                        except Exception:
-                            with conn.cursor() as cur:  # type: ignore
+                            with conn.cursor() as cur:
                                 cur.execute(DDL_CHECKPOINTS)
-                        try:
-                            conn.commit()  # type: ignore
-                        except Exception as _exc:
-                            logger.warning("silent handled: offline-safe: checkpoint pg fallback to memory", exc_info=_exc)
-                            pass
-                elif hasattr(self.pool, "getconn"):
-                    conn = self.pool.getconn()  # type: ignore
-                    try:
-                        with conn.cursor() as cur:
-                            cur.execute(DDL_CHECKPOINTS)
-                        conn.commit()
-                    finally:
-                        try:
-                            self.pool.putconn(conn)  # type: ignore
-                        except Exception as _exc:
-                            logger.warning("silent handled: offline-safe: checkpoint pg fallback to memory", exc_info=_exc)
-                            pass
-            except Exception:
-                pass
-        self._setup_done = True
+                            conn.commit()
+                        finally:
+                            try:
+                                self.pool.putconn(conn)  # type: ignore
+                            except Exception as _exc:
+                                logger.warning("silent handled: offline-safe: checkpoint pg fallback to memory", exc_info=_exc)
+                                pass
+                except Exception:
+                    pass
+            self._setup_done = True
 
     async def asetup(self) -> None:
         """异步建表 — 真实 Postgres 时 await pool.open() 并执行 DDL。"""
         if self._setup_done:
             return
-        if self.pool is not None and hasattr(self.pool, "open"):
-            try:
-                await self.pool.open()  # type: ignore
-            except Exception as _exc:
-                logger.warning("silent handled: offline-safe: checkpoint pg fallback to memory", exc_info=_exc)
-                pass
-        if self._is_real_pg_pool() and self._pool_is_async():
-            try:
-                async with self.pool.connection() as conn:  # type: ignore
-                    await conn.execute(DDL_CHECKPOINTS)  # type: ignore
-            except Exception:
+        # use async lock if available, else thread lock
+        lock = getattr(self, "_asetup_lock", None)
+        if lock is not None:
+            async with lock:  # type: ignore
+                if self._setup_done:
+                    return
+                if self.pool is not None and hasattr(self.pool, "open"):
+                    try:
+                        await self.pool.open()  # type: ignore
+                    except Exception as _exc:
+                        logger.warning("silent handled: offline-safe: checkpoint pg fallback to memory", exc_info=_exc)
+                        pass
+                if self._is_real_pg_pool() and self._pool_is_async():
+                    try:
+                        async with self.pool.connection() as conn:  # type: ignore
+                            await conn.execute(DDL_CHECKPOINTS)  # type: ignore
+                    except Exception:
+                        try:
+                            async with self.pool.connection() as conn:  # type: ignore
+                                async with conn.cursor() as cur:  # type: ignore
+                                    await cur.execute(DDL_CHECKPOINTS)
+                        except Exception as _exc:
+                            logger.warning("silent handled: offline-safe: checkpoint pg fallback to memory", exc_info=_exc)
+                            pass
+                self._setup_done = True
+            return
+        with self._setup_lock:
+            if self._setup_done:
+                return
+            if self.pool is not None and hasattr(self.pool, "open"):
                 try:
-                    async with self.pool.connection() as conn:  # type: ignore
-                        async with conn.cursor() as cur:  # type: ignore
-                            await cur.execute(DDL_CHECKPOINTS)
+                    await self.pool.open()  # type: ignore
                 except Exception as _exc:
                     logger.warning("silent handled: offline-safe: checkpoint pg fallback to memory", exc_info=_exc)
                     pass
-        self._setup_done = True
+            if self._is_real_pg_pool() and self._pool_is_async():
+                try:
+                    async with self.pool.connection() as conn:  # type: ignore
+                        await conn.execute(DDL_CHECKPOINTS)  # type: ignore
+                except Exception:
+                    try:
+                        async with self.pool.connection() as conn:  # type: ignore
+                            async with conn.cursor() as cur:  # type: ignore
+                                await cur.execute(DDL_CHECKPOINTS)
+                    except Exception as _exc:
+                        logger.warning("silent handled: offline-safe: checkpoint pg fallback to memory", exc_info=_exc)
+                        pass
+            self._setup_done = True
 
     # ---- internal PG ops ----
     def _pg_put_sync(self, thread_id: str, checkpoint: Dict[str, Any], config: Dict[str, Any]) -> bool:
@@ -311,9 +389,17 @@ class AsyncPostgresSaver:
                 except Exception:
                     ttl_val = 0
                 use_ttl = ttl_val is not None and ttl_val > 0
+                wf, run, _tenant_raw = _validate_thread_id(thread_id)
+                run_text = run
                 if use_ttl:
                     expires_at_expr = "now() + (%s * interval '1 second')"
                     sql_new = f"""
+                        INSERT INTO checkpoints (tenant, thread, seq, checkpoint, run_text, expires_at)
+                        VALUES (%s, %s, %s, %s::jsonb, %s, {expires_at_expr})
+                        ON CONFLICT (tenant, thread, seq) DO UPDATE SET checkpoint=EXCLUDED.checkpoint, run_text=EXCLUDED.run_text, expires_at=EXCLUDED.expires_at
+                    """
+                    # try with run_text, fallback without if column missing
+                    sql_new_no_run = f"""
                         INSERT INTO checkpoints (tenant, thread, seq, checkpoint, expires_at)
                         VALUES (%s, %s, %s, %s::jsonb, {expires_at_expr})
                         ON CONFLICT (tenant, thread, seq) DO UPDATE SET checkpoint=EXCLUDED.checkpoint, expires_at=EXCLUDED.expires_at
@@ -323,11 +409,17 @@ class AsyncPostgresSaver:
                         VALUES (%s, %s::jsonb, %s::jsonb, {expires_at_expr})
                         ON CONFLICT (thread_id) DO UPDATE SET checkpoint=EXCLUDED.checkpoint, config=EXCLUDED.config, expires_at=EXCLUDED.expires_at
                     """
-                    params_new = (tenant, thread, seq, ck_json, ttl_val)
+                    params_new = (tenant, thread, seq, ck_json, run_text, ttl_val)
+                    params_new_no_run = (tenant, thread, seq, ck_json, ttl_val)
                     params_legacy = (thread_id, ck_json, cfg_json, ttl_val)
                 else:
                     expires_at_expr = "NULL"
                     sql_new = f"""
+                        INSERT INTO checkpoints (tenant, thread, seq, checkpoint, run_text, expires_at)
+                        VALUES (%s, %s, %s, %s::jsonb, %s, {expires_at_expr})
+                        ON CONFLICT (tenant, thread, seq) DO UPDATE SET checkpoint=EXCLUDED.checkpoint, run_text=EXCLUDED.run_text, expires_at=EXCLUDED.expires_at
+                    """
+                    sql_new_no_run = f"""
                         INSERT INTO checkpoints (tenant, thread, seq, checkpoint, expires_at)
                         VALUES (%s, %s, %s, %s::jsonb, {expires_at_expr})
                         ON CONFLICT (tenant, thread, seq) DO UPDATE SET checkpoint=EXCLUDED.checkpoint, expires_at=EXCLUDED.expires_at
@@ -337,12 +429,16 @@ class AsyncPostgresSaver:
                         VALUES (%s, %s::jsonb, %s::jsonb, {expires_at_expr})
                         ON CONFLICT (thread_id) DO UPDATE SET checkpoint=EXCLUDED.checkpoint, config=EXCLUDED.config, expires_at=EXCLUDED.expires_at
                     """
-                    params_new = (tenant, thread, seq, ck_json)
+                    params_new = (tenant, thread, seq, ck_json, run_text)
+                    params_new_no_run = (tenant, thread, seq, ck_json)
                     params_legacy = (thread_id, ck_json, cfg_json)
                 if hasattr(self.pool, "connection"):
                     with self.pool.connection() as conn:  # type: ignore
                         try:
-                            conn.execute(sql_new, params_new)  # type: ignore
+                            try:
+                                conn.execute(sql_new, params_new)  # type: ignore
+                            except Exception:
+                                conn.execute(sql_new_no_run, params_new_no_run)  # type: ignore
                             # also maintain legacy for compatibility
                             try:
                                 conn.execute(sql_legacy, params_legacy)  # type: ignore
@@ -352,7 +448,10 @@ class AsyncPostgresSaver:
                             # fallback legacy if new fails (table missing)
                             with conn.cursor() as cur:  # type: ignore
                                 try:
-                                    cur.execute(sql_new, params_new)
+                                    try:
+                                        cur.execute(sql_new, params_new)
+                                    except Exception:
+                                        cur.execute(sql_new_no_run, params_new_no_run)
                                 except Exception:
                                     cur.execute(sql_legacy, params_legacy)
                         try:
@@ -365,7 +464,10 @@ class AsyncPostgresSaver:
                     try:
                         with conn.cursor() as cur:
                             try:
-                                cur.execute(sql_new, params_new)
+                                try:
+                                    cur.execute(sql_new, params_new)
+                                except Exception:
+                                    cur.execute(sql_new_no_run, params_new_no_run)
                             except Exception:
                                 cur.execute(sql_legacy, params_legacy)
                         conn.commit()
@@ -391,6 +493,8 @@ class AsyncPostgresSaver:
             try:
                 tenant, thread, seq = _thread_to_keys(thread_id)
                 ck_json = json.dumps(checkpoint, ensure_ascii=False)
+                wf2, run2, _t2 = _validate_thread_id(thread_id)
+                run_text2 = run2
                 try:
                     ttl_val = int(self.ttl_seconds) if self.ttl_seconds is not None else 0
                 except Exception:
@@ -399,21 +503,36 @@ class AsyncPostgresSaver:
                 if use_ttl:
                     expires_at_expr = "now() + (%s * interval '1 second')"
                     sql_new = f"""
+                        INSERT INTO checkpoints (tenant, thread, seq, checkpoint, run_text, expires_at)
+                        VALUES (%s, %s, %s, %s::jsonb, %s, {expires_at_expr})
+                        ON CONFLICT (tenant, thread, seq) DO UPDATE SET checkpoint=EXCLUDED.checkpoint, run_text=EXCLUDED.run_text, expires_at=EXCLUDED.expires_at
+                    """
+                    params_new = (tenant, thread, seq, ck_json, run_text2, ttl_val)
+                    sql_new_no_run = f"""
                         INSERT INTO checkpoints (tenant, thread, seq, checkpoint, expires_at)
                         VALUES (%s, %s, %s, %s::jsonb, {expires_at_expr})
                         ON CONFLICT (tenant, thread, seq) DO UPDATE SET checkpoint=EXCLUDED.checkpoint, expires_at=EXCLUDED.expires_at
                     """
-                    params_new = (tenant, thread, seq, ck_json, ttl_val)
+                    params_new_no_run = (tenant, thread, seq, ck_json, ttl_val)
                 else:
                     expires_at_expr = "NULL"
                     sql_new = f"""
+                        INSERT INTO checkpoints (tenant, thread, seq, checkpoint, run_text, expires_at)
+                        VALUES (%s, %s, %s, %s::jsonb, %s, {expires_at_expr})
+                        ON CONFLICT (tenant, thread, seq) DO UPDATE SET checkpoint=EXCLUDED.checkpoint, run_text=EXCLUDED.run_text, expires_at=EXCLUDED.expires_at
+                    """
+                    params_new = (tenant, thread, seq, ck_json, run_text2)
+                    sql_new_no_run = f"""
                         INSERT INTO checkpoints (tenant, thread, seq, checkpoint, expires_at)
                         VALUES (%s, %s, %s, %s::jsonb, {expires_at_expr})
                         ON CONFLICT (tenant, thread, seq) DO UPDATE SET checkpoint=EXCLUDED.checkpoint, expires_at=EXCLUDED.expires_at
                     """
-                    params_new = (tenant, thread, seq, ck_json)
+                    params_new_no_run = (tenant, thread, seq, ck_json)
                 async with self.pool.connection() as conn:  # type: ignore
-                    await conn.execute(sql_new, params_new)  # type: ignore
+                    try:
+                        await conn.execute(sql_new, params_new)  # type: ignore
+                    except Exception:
+                        await conn.execute(sql_new_no_run, params_new_no_run)  # type: ignore
                 return True
             except Exception:
                 return False
@@ -536,10 +655,11 @@ class AsyncPostgresSaver:
             except Exception:
                 pass
             # emulated PG global store (ensures restart not lost even without real PG)
-            key = f"{self.dsn}::{thread_id}"
-            _PG_GLOBAL_STORE[key] = copy.deepcopy(checkpoint)
-            _PG_GLOBAL_META[key] = copy.deepcopy(cfg)
-            _PG_GLOBAL_TS[key] = now
+            key = _pg_store_key(self.dsn, thread_id)
+            with _PG_GLOBAL_LOCK:
+                _PG_GLOBAL_STORE[key] = copy.deepcopy(checkpoint)
+                _PG_GLOBAL_META[key] = copy.deepcopy(cfg)
+                _PG_GLOBAL_TS[key] = now
             # also keep instance store for immediate access
             self._store[thread_id] = copy.deepcopy(checkpoint)
             self._meta[thread_id] = cfg
@@ -565,10 +685,18 @@ class AsyncPostgresSaver:
                 _thread_to_keys(thread_id)
             except Exception:
                 pass
-            key = f"{self.dsn}::{thread_id}"
-            _PG_GLOBAL_STORE[key] = copy.deepcopy(checkpoint)
-            _PG_GLOBAL_META[key] = copy.deepcopy(cfg)
-            _PG_GLOBAL_TS[key] = now
+            key = _pg_store_key(self.dsn, thread_id)
+            _alock = _get_async_lock()
+            if _alock is not None:
+                async with _alock:  # type: ignore
+                    _PG_GLOBAL_STORE[key] = copy.deepcopy(checkpoint)
+                    _PG_GLOBAL_META[key] = copy.deepcopy(cfg)
+                    _PG_GLOBAL_TS[key] = now
+            else:
+                with _PG_GLOBAL_LOCK:
+                    _PG_GLOBAL_STORE[key] = copy.deepcopy(checkpoint)
+                    _PG_GLOBAL_META[key] = copy.deepcopy(cfg)
+                    _PG_GLOBAL_TS[key] = now
             self._store[thread_id] = copy.deepcopy(checkpoint)
             self._meta[thread_id] = cfg
             self._timestamps[thread_id] = now
@@ -584,16 +712,17 @@ class AsyncPostgresSaver:
         _validate_thread_id(thread_id)
         if self._is_pg_mode():
             # check emulated global PG store first (with TTL 7d via Settings / ttl_seconds)
-            key = f"{self.dsn}::{thread_id}"
-            ts = _PG_GLOBAL_TS.get(key)
-            if ts is not None and self.ttl_seconds > 0 and time.time() - ts > self.ttl_seconds:
-                _PG_GLOBAL_STORE.pop(key, None)
-                _PG_GLOBAL_META.pop(key, None)
-                _PG_GLOBAL_TS.pop(key, None)
-            else:
-                val = _PG_GLOBAL_STORE.get(key)
-                if val is not None:
-                    return copy.deepcopy(val)
+            key = _pg_store_key(self.dsn, thread_id)
+            with _PG_GLOBAL_LOCK:
+                ts = _PG_GLOBAL_TS.get(key)
+                if ts is not None and self.ttl_seconds > 0 and time.time() - ts > self.ttl_seconds:
+                    _PG_GLOBAL_STORE.pop(key, None)
+                    _PG_GLOBAL_META.pop(key, None)
+                    _PG_GLOBAL_TS.pop(key, None)
+                else:
+                    val = _PG_GLOBAL_STORE.get(key)
+                    if val is not None:
+                        return copy.deepcopy(val)
             # try real PG
             if self._is_real_pg_pool() and not self._pool_is_async():
                 pg_val = self._pg_get_sync(thread_id)
@@ -615,16 +744,30 @@ class AsyncPostgresSaver:
         """异步读取 checkpoint，优先 Postgres，其次内存 TTL。"""
         _validate_thread_id(thread_id)
         if self._is_pg_mode():
-            key = f"{self.dsn}::{thread_id}"
-            ts = _PG_GLOBAL_TS.get(key)
-            if ts is not None and self.ttl_seconds > 0 and time.time() - ts > self.ttl_seconds:
-                _PG_GLOBAL_STORE.pop(key, None)
-                _PG_GLOBAL_META.pop(key, None)
-                _PG_GLOBAL_TS.pop(key, None)
+            key = _pg_store_key(self.dsn, thread_id)
+            _alock = _get_async_lock()
+            if _alock is not None:
+                async with _alock:  # type: ignore
+                    ts = _PG_GLOBAL_TS.get(key)
+                    if ts is not None and self.ttl_seconds > 0 and time.time() - ts > self.ttl_seconds:
+                        _PG_GLOBAL_STORE.pop(key, None)
+                        _PG_GLOBAL_META.pop(key, None)
+                        _PG_GLOBAL_TS.pop(key, None)
+                    else:
+                        val = _PG_GLOBAL_STORE.get(key)
+                        if val is not None:
+                            return copy.deepcopy(val)
             else:
-                val = _PG_GLOBAL_STORE.get(key)
-                if val is not None:
-                    return copy.deepcopy(val)
+                with _PG_GLOBAL_LOCK:
+                    ts = _PG_GLOBAL_TS.get(key)
+                    if ts is not None and self.ttl_seconds > 0 and time.time() - ts > self.ttl_seconds:
+                        _PG_GLOBAL_STORE.pop(key, None)
+                        _PG_GLOBAL_META.pop(key, None)
+                        _PG_GLOBAL_TS.pop(key, None)
+                    else:
+                        val = _PG_GLOBAL_STORE.get(key)
+                        if val is not None:
+                            return copy.deepcopy(val)
             pg_val = await self._pg_get_async(thread_id)
             if pg_val is not None:
                 return copy.deepcopy(pg_val)
@@ -634,15 +777,16 @@ class AsyncPostgresSaver:
         """同时返回 checkpoint 与 config，用于断点续跑恢复上下文。"""
         _validate_thread_id(thread_id)
         if self._is_pg_mode():
-            key = f"{self.dsn}::{thread_id}"
-            ts = _PG_GLOBAL_TS.get(key)
-            if ts is not None and self.ttl_seconds > 0 and time.time() - ts > self.ttl_seconds:
-                pass
-            else:
-                chk = _PG_GLOBAL_STORE.get(key)
-                if chk is not None:
-                    cfg = copy.deepcopy(_PG_GLOBAL_META.get(key, {}))
-                    return copy.deepcopy(chk), cfg
+            key = _pg_store_key(self.dsn, thread_id)
+            with _PG_GLOBAL_LOCK:
+                ts = _PG_GLOBAL_TS.get(key)
+                if ts is not None and self.ttl_seconds > 0 and time.time() - ts > self.ttl_seconds:
+                    pass
+                else:
+                    chk = _PG_GLOBAL_STORE.get(key)
+                    if chk is not None:
+                        cfg = copy.deepcopy(_PG_GLOBAL_META.get(key, {}))
+                        return copy.deepcopy(chk), cfg
             if self._is_real_pg_pool() and not self._pool_is_async():
                 try:
                     tenant, thread, seq = _thread_to_keys(thread_id)
@@ -677,10 +821,11 @@ class AsyncPostgresSaver:
     def delete(self, thread_id: str) -> None:
         """删除指定 thread_id 的 checkpoint（含 PG 侧）。"""
         _validate_thread_id(thread_id)
-        key = f"{self.dsn}::{thread_id}"
-        _PG_GLOBAL_STORE.pop(key, None)
-        _PG_GLOBAL_META.pop(key, None)
-        _PG_GLOBAL_TS.pop(key, None)
+        key = _pg_store_key(self.dsn, thread_id)
+        with _PG_GLOBAL_LOCK:
+            _PG_GLOBAL_STORE.pop(key, None)
+            _PG_GLOBAL_META.pop(key, None)
+            _PG_GLOBAL_TS.pop(key, None)
         self._store.pop(thread_id, None)
         self._meta.pop(thread_id, None)
         self._timestamps.pop(thread_id, None)
@@ -713,17 +858,18 @@ class AsyncPostgresSaver:
             # collect from global store
             now = time.time()
             alive = []
-            prefix = f"{self.dsn}::"
-            for k, ts in list(_PG_GLOBAL_TS.items()):
-                if not k.startswith(prefix):
-                    continue
-                tid = k[len(prefix):]
-                if self.ttl_seconds > 0 and now - ts > self.ttl_seconds:
-                    _PG_GLOBAL_STORE.pop(k, None)
-                    _PG_GLOBAL_META.pop(k, None)
-                    _PG_GLOBAL_TS.pop(k, None)
-                else:
-                    alive.append(tid)
+            prefix = _pg_store_prefix(self.dsn)
+            with _PG_GLOBAL_LOCK:
+                for k, ts in list(_PG_GLOBAL_TS.items()):
+                    if not k.startswith(prefix):
+                        continue
+                    tid = k[len(prefix):]
+                    if self.ttl_seconds > 0 and now - ts > self.ttl_seconds:
+                        _PG_GLOBAL_STORE.pop(k, None)
+                        _PG_GLOBAL_META.pop(k, None)
+                        _PG_GLOBAL_TS.pop(k, None)
+                    else:
+                        alive.append(tid)
             if alive:
                 return alive
             if self._is_real_pg_pool() and not self._pool_is_async():
@@ -748,7 +894,8 @@ class AsyncPostgresSaver:
                                 continue
                             tenant_r, thread_r, seq_r = r[0], r[1], r[2]
                             key_seq = f"{tenant_r}::{thread_r}::{seq_r}"
-                            run_str = _PG_RUN_BY_SEQ.get(key_seq)
+                            with _PG_GLOBAL_LOCK:
+                                run_str = _PG_RUN_BY_SEQ.get(key_seq)
                             if run_str is not None:
                                 out.append(f"{thread_r}:{run_str}:{tenant_r}")
                             else:

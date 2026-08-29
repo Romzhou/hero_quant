@@ -150,11 +150,18 @@ class HeartbeatHelper:
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=1.0)
+        self._thread = None
+        self._async_task = None
 
     # 异步变体占位
     async def astart(self, initial_details: Dict[str, Any] | None = None) -> None:
-        """异步启动 — 复用同步线程并可选创建异步循环任务。"""
-        self.start(initial_details)
+        """异步启动 — 仅起异步任务，不复用同步线程（避免双心跳）。"""
+        self._details = dict(initial_details) if initial_details else {}
+        try:
+            heartbeat(self._details)
+        except Exception as _exc:
+            logger.debug("silent handled: offline-safe: temporal sidecar optional", exc_info=_exc)  # intentional: offline-safe: temporal sidecar optional
+            pass  # intentional offline-safe: temporal sidecar optional
         # 异步循环占位（可选）
         try:
             loop = asyncio.get_running_loop()
@@ -174,13 +181,22 @@ class HeartbeatHelper:
 
     async def astop(self) -> None:
         """异步停止 — 取消异步任务并回收线程。"""
+        # save async task before stop() clears it
+        _task = self._async_task
         self.stop()
-        if self._async_task is not None:
+        # restore if stop cleared it but not yet cancelled/awaited
+        task = _task if _task is not None else None
+        if task is not None:
             try:
-                self._async_task.cancel()
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
             except Exception as _exc:
                 logger.debug("silent handled: offline-safe: temporal sidecar optional", exc_info=_exc)  # intentional: offline-safe: temporal sidecar optional
                 pass  # intentional offline-safe: temporal sidecar optional
+            self._async_task = None
 
 
 # 兼容别名 — 历史导入 `HeartbeatTimer` 指向 HeartbeatHelper

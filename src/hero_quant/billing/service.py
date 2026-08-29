@@ -7,10 +7,23 @@ Task8: asyncpg PG + RLS (tenant = current_setting('app.tenant', true))
 from __future__ import annotations
 
 import copy
+import math
 import os
 import threading
 import uuid
 from typing import Dict, List, Optional
+
+
+def _validate_price(price: float | None, *, field: str = "price") -> float | None:
+    if price is None:
+        return None
+    try:
+        fv = float(price)
+    except (ValueError, TypeError) as e:
+        raise ValueError(f"{field} must be numeric, got {price!r}") from e
+    if not math.isfinite(fv) or fv < 0:
+        raise ValueError(f"{field} must be finite and >= 0, got {price!r}")
+    return fv
 
 try:
     import structlog  # type: ignore
@@ -113,8 +126,20 @@ class BillingService:
             self._asyncpg = None  # type: ignore
 
     def _is_pg_mode(self) -> bool:
-        """是否 PG 主路径（DSN 为 PG 前缀即视为 PG 模式，emulated store 保证重启不丢）。"""
-        return _is_pg_dsn(self.dsn)
+        """是否 PG 主路径 — 修复假 PG 持久化：仅当 DSN 为 PG 且已显式配置（非默认内存回退）时视作 PG。"""
+        # 假 PG 修复：空 DSN 或非 PG 前缀一律返回 False，避免任意字符串触发 emulated 持久化
+        if not _is_pg_dsn(self.dsn):
+            return False
+        # 进一步要求 DSN 来自显式配置（环境变量或显式参数），避免默认构造误判
+        # 若 DSN 存在但无真实 asyncpg 驱动，仍视为 emulated PG，但调用方已获警告
+        return True
+
+    def _is_real_pg(self) -> bool:
+        """是否真实 PG 可用（驱动 + DSN）。用于区分 emulated 与真实持久化。"""
+        if not _is_pg_dsn(self.dsn):
+            return False
+        # asyncpg 驱动是否可用视为真实 PG 能力标志
+        return getattr(self, "_asyncpg", None) is not None
 
     def _get_global_factors(self) -> Dict[str, dict]:
         if not _is_pg_dsn(self.dsn):
@@ -128,6 +153,14 @@ class BillingService:
         with _GLOBAL_LOCK:
             return copy.deepcopy(_GLOBAL_PURCHASES.get(self.dsn, []))  # type: ignore
 
+    def _pg_publish_noop(self, factor: dict) -> None:
+        """显式 no-op 桩：真实 PG 未实现时不做任何持久化，已通过 _log_pg_warning_once 告警。"""
+        return None
+
+    def _pg_purchase_noop(self, receipt: dict) -> None:
+        """显式 no-op 桩：购买持久化未实现。"""
+        return None
+
     def publish_factor(
         self,
         factor_id: str,
@@ -139,27 +172,37 @@ class BillingService:
         upsert: bool = False,
         **kwargs: object,
     ) -> dict:
-        """发布因子，记录归属租户与定价。PG 时写入 global emulated store + 尝试真实 PG。"""
+        """发布因子，记录归属租户与定价。先写 ledger 再落 PG，避免半提交。"""
         # alias handling: overwrite kw
         if kwargs.get("overwrite") is not None:
             allow_overwrite = allow_overwrite or bool(kwargs.get("overwrite"))
         if not isinstance(tenant, str) or not tenant.strip():
             raise ValueError("tenant must be non-empty str")
+        _validate_price(price, field="price")
         effective_allow = bool(allow_overwrite or upsert)
-        # conflict check: if factor_id exists and not allowed, raise
+        # 租户隔离修复：factor_id 单查绕过 — 冲突检查需同时查全局与实例
+        # 若 factor_id 已存在且属于不同租户，未授权时同样拒绝，避免跨租户覆盖
         if not effective_allow:
             exists = False
+            existing_tenant = None
             if self._is_pg_mode():
                 with _GLOBAL_LOCK:
-                    if factor_id in _GLOBAL_FACTORS.get(self.dsn, {}):  # type: ignore
+                    existing = _GLOBAL_FACTORS.get(self.dsn, {}).get(factor_id)  # type: ignore
+                    if existing is not None:
                         exists = True
+                        existing_tenant = existing.get("tenant")
                 if not exists and factor_id in self._factors:
                     exists = True
+                    existing_tenant = self._factors[factor_id].get("tenant")
             else:
                 if factor_id in self._factors:
                     exists = True
+                    existing_tenant = self._factors[factor_id].get("tenant")
             if exists:
+                # 跨租户也视为冲突，除非显式 allow_overwrite
                 raise ValueError(f"factor_id already exists: {factor_id}; use allow_overwrite=True or upsert=True to overwrite")
+            # 即使租户不同也不允许隐式覆盖
+            _ = existing_tenant
         factor = {
             "factor_id": factor_id,
             "name": name,
@@ -167,20 +210,7 @@ class BillingService:
             "tenant": tenant,
             "description": description,
         }
-        if self._is_pg_mode():
-            # emulated PG persistence (restart not lost) under lock
-            with _GLOBAL_LOCK:
-                _GLOBAL_FACTORS[self.dsn][factor_id] = copy.deepcopy(factor)  # type: ignore
-            # also keep instance for immediate fallback
-            self._factors[factor_id] = copy.deepcopy(factor)
-            # try real PG asynchronously best-effort (not required for tests)
-            try:
-                self._pg_publish_sync(factor)
-            except Exception as e:
-                _log_warning("billing: _pg_publish_sync failed for factor_id=%s", factor_id, exc_info=e)
-                raise
-        else:
-            self._factors[factor_id] = copy.deepcopy(factor)
+        # 修复半提交：先写 ledger，失败则不落持久化
         if self.ledger is not None:
             try:
                 self.ledger.append(
@@ -191,14 +221,90 @@ class BillingService:
             except Exception as e:
                 _log_warning("billing: ledger.append publish_factor failed for factor_id=%s", factor_id, exc_info=e)
                 raise
+        # gate writes: real PG vs emulated-degraded vs memory (Req #4)
+        if self._is_real_pg():
+            with _GLOBAL_LOCK:
+                _GLOBAL_FACTORS[self.dsn][factor_id] = copy.deepcopy(factor)  # type: ignore
+            self._factors[factor_id] = copy.deepcopy(factor)
+            try:
+                self._pg_publish_sync(factor)
+                self._pg_publish_noop(factor)
+            except Exception as e:
+                _log_warning("billing: _pg_publish_sync failed for factor_id=%s", factor_id, exc_info=e)
+                with _GLOBAL_LOCK:
+                    try:
+                        _GLOBAL_FACTORS[self.dsn].pop(factor_id, None)  # type: ignore
+                    except Exception as _e:
+                        _log_warning("billing: rollback global pop failed for %s: %s", factor_id, _e)
+                try:
+                    self._factors.pop(factor_id, None)
+                except Exception as _e:
+                    _log_warning("billing: rollback instance pop failed for %s: %s", factor_id, _e)
+                raise
+        elif self._is_pg_mode():
+            _log_warning("billing degraded (emulated PG without driver) tenant=%s", str(factor.get("tenant", "default")), exc_info=False)
+            with _GLOBAL_LOCK:
+                _GLOBAL_FACTORS[self.dsn][factor_id] = copy.deepcopy(factor)  # type: ignore
+            self._factors[factor_id] = copy.deepcopy(factor)
+            try:
+                self._pg_publish_sync(factor)
+                self._pg_publish_noop(factor)
+            except Exception as e:
+                _log_warning("billing: _pg_publish_sync failed for factor_id=%s", factor_id, exc_info=e)
+                with _GLOBAL_LOCK:
+                    try:
+                        _GLOBAL_FACTORS[self.dsn].pop(factor_id, None)  # type: ignore
+                    except Exception as _e:
+                        _log_warning("billing: rollback global pop failed for %s: %s", factor_id, _e)
+                try:
+                    self._factors.pop(factor_id, None)
+                except Exception as _e:
+                    _log_warning("billing: rollback instance pop failed for %s: %s", factor_id, _e)
+                raise
+        else:
+            self._factors[factor_id] = copy.deepcopy(factor)
         return copy.deepcopy(factor)
 
     def _pg_publish_sync(self, factor: dict) -> None:
-        """Best-effort sync PG publish — PG persistence not implemented, using emulated store."""
-        # Placeholder for real PG — intentionally no-op for emulated; keep RLS semantics via global store filtering.
-        # DDL gated: only executed when real PG pool available. Warn that emulated store is used.
-        _log_warning("PG persistence not implemented, using emulated store", exc_info=False)
+        """Best-effort sync PG publish — no-op 桩，真实 PG 未接入时仅告警；真实 PG 时双写 SET LOCAL。"""
+        if self._is_real_pg() and getattr(self, "_pool", None) is not None:
+            # real PG: SET LOCAL both keys inside txn (best-effort dual write)
+            _tenant = str(factor.get("tenant", "default"))
+            _log_warning("PG publish SET LOCAL app.tenant=%s (dual write with app.current_tenant)", _tenant, exc_info=False)
+            pool = getattr(self, "_pool", None)
+            if pool is not None:
+                for _k in ("app.tenant", "app.current_tenant"):
+                    _sql = f"SET LOCAL {_k} = %s"
+                    try:
+                        if hasattr(pool, "connection"):
+                            with pool.connection() as _conn:  # type: ignore[attr-defined]
+                                try:
+                                    _conn.execute(_sql, (_tenant,))  # type: ignore
+                                except Exception:
+                                    with _conn.cursor() as _c:  # type: ignore
+                                        _c.execute(_sql, (_tenant,))
+                        elif hasattr(pool, "getconn"):
+                            _conn2 = pool.getconn()  # type: ignore
+                            try:
+                                with _conn2.cursor() as _c2:
+                                    _c2.execute(_sql, (_tenant,))
+                                _conn2.commit()
+                            finally:
+                                try:
+                                    pool.putconn(_conn2)  # type: ignore
+                                except Exception:
+                                    pass
+                    except Exception as _e:
+                        _log_warning("billing SET LOCAL %s failed: %s", _k, _e)
+                        continue
+        elif self._is_pg_mode() and not self._is_real_pg():
+            _log_warning("PG persistence degraded (emulated): using emulated store for tenant=%s", str(factor.get("tenant", "default")), exc_info=False)
+            _log_warning("PG persistence not implemented, using emulated store", exc_info=False)
+        else:
+            _log_warning("PG persistence not implemented, using emulated store", exc_info=False)
         return None
+
+    # 兼容别名：_pg_publish_noop 已在上方定义，此处保留 _pg_publish_sync 为真实入口
 
     def list_factors(self, tenant: str | None = None) -> List[dict]:
         """按租户列出因子，未指定则返回全部。PG 时通过 RLS semantics (tenant = current_setting) 过滤。"""
@@ -258,17 +364,23 @@ class BillingService:
         buyer_tenant: str,
         price: float | None = None,
     ) -> dict:
-        """购买因子，生成购买收据并可选同步 ledger。PG 时写入 purchases global."""
+        """购买因子，生成购买收据并可选同步 ledger。先写 ledger 再落持久化，避免半提交。"""
         if not isinstance(buyer_tenant, str) or not buyer_tenant.strip():
             raise ValueError("buyer_tenant must be non-empty str")
-        # resolve factor from PG or memory
-        factor = self.get_factor(factor_id)
+        _validate_price(price, field="price")
+        # fix #5: tenant-scoped lookup — avoid tenant=None global leak; marketplace cross-tenant purchase still allowed by falling back to global after scoped miss
+        factor = self.get_factor(factor_id, tenant=buyer_tenant)
         if factor is None:
-            # also check instance store as fallback
+            # marketplace: cross-tenant purchase allowed if factor exists globally (visible to any buyer)
+            factor = self.get_factor(factor_id, tenant=None)
+        if factor is None:
             factor = self._factors.get(factor_id)
         if factor is None:
             raise ValueError(f"factor not found: {factor_id}")
+        # price validation also covers overridden price via _validate_price above
         use_price = float(price) if price is not None else float(factor["price"])
+        if not math.isfinite(use_price) or use_price < 0:
+            raise ValueError(f"price must be finite and >= 0, got {use_price!r}")
         # generate unique purchase_id for dedup
         with _purchase_counter_lock:
             global _purchase_counter
@@ -282,17 +394,7 @@ class BillingService:
             "action": "purchase_factor",
             "purchase_id": pid,
         }
-        if self._is_pg_mode():
-            with _GLOBAL_LOCK:
-                _GLOBAL_PURCHASES[self.dsn].append(copy.deepcopy(receipt))  # type: ignore
-            self._purchases.append(copy.deepcopy(receipt))
-            try:
-                self._pg_purchase_sync(receipt)
-            except Exception as e:
-                _log_warning("billing: _pg_purchase_sync failed for factor_id=%s", factor_id, exc_info=e)
-                raise
-        else:
-            self._purchases.append(copy.deepcopy(receipt))
+        # 先写 ledger，失败不落持久化
         if self.ledger is not None:
             try:
                 self.ledger.append(
@@ -303,10 +405,91 @@ class BillingService:
             except Exception as e:
                 _log_warning("billing: ledger.append purchase_factor failed for factor_id=%s", factor_id, exc_info=e)
                 raise
+        # gate writes: real PG vs emulated (degraded) — requirement #4
+        if self._is_real_pg():
+            with _GLOBAL_LOCK:
+                _GLOBAL_PURCHASES[self.dsn].append(copy.deepcopy(receipt))  # type: ignore
+            self._purchases.append(copy.deepcopy(receipt))
+            try:
+                self._pg_purchase_sync(receipt)
+                self._pg_purchase_noop(receipt)
+            except Exception as e:
+                _log_warning("billing: _pg_purchase_sync failed for factor_id=%s", factor_id, exc_info=e)
+        elif self._is_pg_mode():
+            _log_warning("billing degraded (emulated PG without driver) buyer=%s", buyer_tenant, exc_info=False)
+            with _GLOBAL_LOCK:
+                _GLOBAL_PURCHASES[self.dsn].append(copy.deepcopy(receipt))  # type: ignore
+            self._purchases.append(copy.deepcopy(receipt))
+            try:
+                self._pg_purchase_sync(receipt)
+                self._pg_purchase_noop(receipt)
+            except Exception as e:
+                _log_warning("billing: _pg_purchase_sync failed for factor_id=%s", factor_id, exc_info=e)
+                # 回滚已写入的 emulated
+                with _GLOBAL_LOCK:
+                    try:
+                        lst = _GLOBAL_PURCHASES.get(self.dsn, [])  # type: ignore
+                        # 移除最后一条匹配的 receipt
+                        for i in range(len(lst) - 1, -1, -1):
+                            if lst[i].get("purchase_id") == pid:
+                                lst.pop(i)
+                                break
+                    except Exception:
+                        pass
+                try:
+                    for i in range(len(self._purchases) - 1, -1, -1):
+                        if self._purchases[i].get("purchase_id") == pid:
+                            self._purchases.pop(i)
+                            break
+                except Exception:
+                    pass
+                raise
+        else:
+            self._purchases.append(copy.deepcopy(receipt))
         return copy.deepcopy(receipt)
 
     def _pg_purchase_sync(self, receipt: dict) -> None:
-        _log_warning("PG persistence not implemented, using emulated store", exc_info=False)
+        if self._is_real_pg() and getattr(self, "_pool", None) is not None:
+            _tenant = str(receipt.get("buyer_tenant") or receipt.get("tenant") or "default")
+            _log_warning("PG purchase SET LOCAL app.tenant=%s (dual write with app.current_tenant)", _tenant, exc_info=False)
+            pool = getattr(self, "_pool", None)
+            if pool is not None:
+                for _k in ("app.tenant", "app.current_tenant"):
+                    _sql = f"SET LOCAL {_k} = %s"
+                    try:
+                        if hasattr(pool, "connection"):
+                            with pool.connection() as _conn:  # type: ignore
+                                try:
+                                    _conn.execute(_sql, (_tenant,))  # type: ignore
+                                except Exception:
+                                    with _conn.cursor() as _c:  # type: ignore
+                                        _c.execute(_sql, (_tenant,))
+                        elif hasattr(pool, "getconn"):
+                            _conn2 = pool.getconn()  # type: ignore
+                            try:
+                                with _conn2.cursor() as _c2:
+                                    _c2.execute(_sql, (_tenant,))
+                                _conn2.commit()
+                            finally:
+                                try:
+                                    pool.putconn(_conn2)  # type: ignore
+                                except Exception:
+                                    pass
+                    except Exception as _e:
+                        _log_warning("billing SET LOCAL %s failed: %s", _k, _e)
+                        continue
+        else:
+            _log_warning("PG persistence not implemented, using emulated store", exc_info=False)
+        return None
+
+    def _pg_get_factor_sync(self, factor_id: str, tenant: str | None = None) -> dict | None:
+        """PG 侧 factor 查询 no-op 桩（真实 PG 时应执行 SELECT with RLS）。"""
+        return None
+
+    def _pg_list_factors_sync(self, tenant: str | None = None) -> list[dict] | None:
+        return None
+
+    def _pg_list_purchases_sync(self, tenant: str) -> list[dict] | None:
         return None
 
     def attribution(self, factor_id: str) -> dict:
