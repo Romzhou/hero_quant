@@ -22,3 +22,40 @@ forward-*.log
 forward-*.js
 opencode-web*.log
 test-results/
+
+# local scan artifacts & docs drafts (not for commit)
+scan_resume_*.log
+scan_*.log
+all_findings.log
+filtered.log
+finding_*.log
+out_*.log
+tmp_*.txt
+TOOL_RESULT_LIMIT
+ocr_ws.log
+.dsh/
+.zcode/
+nul
+# frontend local tests not yet curated
+frontend/src/__tests__/Live.test.tsx
+frontend/src/__tests__/Settings.test.tsx
+# docs drafts & local run artifacts
+docs/agent-architecture.md
+docs/agentloop-deep-dive.md
+docs/aiohttp_tutorial.md
+docs/fastapi_tutorial.md
+docs/gil_coroutine_await_deep_dive.md
+docs/interview-prep-four-capabilities.md
+docs/interview-question-bank.md
+docs/learning-plan.md
+docs/project-evaluation*.md
+docs/python_*.md
+run_scan*.cmd
+scan_*.txt
+snippet.txt
+test_grouped.log
+tmp_tests_*.log
+*interview_defense_playbook.md
+*resume_v2_defensive.md
+*AI_Agent_*.md
+docs/loop_mindmap.html

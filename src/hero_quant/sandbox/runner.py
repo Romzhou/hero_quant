@@ -320,25 +320,15 @@ class LandlockSandbox(BaseSandbox):
 
     def execute(  # type: ignore[override]
         self,
-        cmd: List[str] | str,
+        cmd: List[str],
         require_enforcement: bool = True,
         timeout: float | None = None,
     ) -> Tuple[str, str, int]:
         """以 fail-closed 语义执行命令；强隔离缺失时抛异常而非执行。"""
-        if isinstance(cmd, str):
-            mode = self._policy.get("mode") if isinstance(self._policy, dict) else None
-            if mode == "workspace-write":
-                raise SandboxUnavailableError(
-                    f"{_FATAL_PREFIX}str cmd not allowed in workspace-write; use List[str] (exit {LAUNCHER_FAILURE_EXIT})"
-                )
-            # 非 workspace-write 避免 shell=True 注入，改用 sh -c 显式 shell；Windows 无 sh 时回退
-            try:
-                result = subprocess.run(
-                    ["sh", "-c", cmd], shell=False, capture_output=True, text=True, timeout=timeout
-                )
-            except FileNotFoundError:
-                result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
-            return result.stdout, result.stderr, result.returncode
+        if isinstance(cmd, str):  # type: ignore[unreachable]
+            raise SandboxViolation("str cmd not allowed; use List[str]")
+        if not isinstance(cmd, (list, tuple)):
+            raise SandboxViolation("cmd must be List[str]; str not allowed")
 
         # list argv 路径
         argv = [str(x) for x in cmd]
@@ -427,25 +417,27 @@ def dispatch_tool(tool_spec: Any, args: dict | None = None, policy: dict | None 
         require_enforcement = pol.get("require_enforcement", pol.get("mode") == "workspace-write")
         # 若 args 含 argv/cmd 则走子进程，否则直接调用 func
         cmd = args.get("cmd") or args.get("argv") or args.get("command")
+        if isinstance(cmd, str):
+            raise SandboxViolation("str cmd not allowed; use List[str]")
         if isinstance(cmd, (list, tuple)):
             out, err, code = sandbox.execute(list(cmd), require_enforcement=require_enforcement)  # type: ignore[arg-type]
             if code != 0:
                 return f"tool_error: {err or out} (code {code})"
             return out
-        if isinstance(cmd, str) and cmd:
-            out, err, code = sandbox.execute(cmd, require_enforcement=require_enforcement)  # type: ignore[arg-type]
-            if code != 0:
-                return f"tool_error: {err or out} (code {code})"
-            return out
-        # 回退直接调用 — workspace-write 且探针 unusable 时不得直调，必须 fail-closed
+        # 回退直接调用 — 默认禁止，直调仅在显式 allow_direct_call 且非 workspace-write 时允许
         func = getattr(tool_spec, "func", None)
         if callable(func):
-            if require_enforcement and sandbox._verdict() == "unusable":
-                return f"tool_error: sandbox unavailable: {_FATAL_PREFIX}{_NOT_ENFORCED_MSG} (exit {LAUNCHER_FAILURE_EXIT})"
+            mode = pol.get("mode") if isinstance(pol, dict) else None
+            allow_direct = bool(pol.get("allow_direct_call")) if isinstance(pol, dict) else False
+            # workspace-write 一律禁止直调；其他模式也需显式白名单
+            if mode == "workspace-write" or not allow_direct:
+                if require_enforcement and sandbox._verdict() == "unusable":
+                    return {"error": f"sandbox unavailable: {_FATAL_PREFIX}{_NOT_ENFORCED_MSG} (exit {LAUNCHER_FAILURE_EXIT})"}
+                return {"error": f"tool_error: direct func call forbidden without allow_direct_call (mode={mode})"}
             return func(**args) if isinstance(args, dict) else func(args)
         return None
     except (SandboxUnavailableError, _BaseSandboxError) as e:  # type: ignore
-        # fail-closed 但对工具层转为可观测的 tool_error
-        return f"tool_error: sandbox unavailable: {e}"
+        # fail-closed 但对工具层转为可观测的结构化 error
+        return {"error": f"sandbox unavailable: {e}"}
     except Exception as e:
-        return f"tool_error: {e}"
+        return {"error": f"tool_error: {e}"}

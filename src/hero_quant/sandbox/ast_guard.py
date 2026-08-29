@@ -167,9 +167,23 @@ def _get_allowed_roots() -> set[str]:
     return set(_STATIC_ALLOWED) | set(_QUANTLIB_EXTRA) | set(_get_dynamic_roots())
 
 
-ALLOWED_ROOTS: set[str] = _get_allowed_roots()
+_STATIC_ROOTS: set[str] = set(_STATIC_ALLOWED) | set(_QUANTLIB_EXTRA)
+# 导入时仅静态可审计集合；动态 roots 首次 via _get_allowed_roots() 懒合并（避免顶层 I/O 副作用）
+# 对外仍暴露 ALLOWED_ROOTS 变量，校验走 _get_allowed_roots() / get_allowed_roots() 懒合并
+ALLOWED_ROOTS: set[str] = set(_STATIC_ROOTS)
+_HAS_DYNAMIC_ATTR = False  # 标记是否已动态合并，避免 __getattr__ 与变量共存冲突
+
+
+def reload_allowed_roots() -> set[str]:
+    """按需将 pyproject 动态 roots 合并进 ALLOWED_ROOTS 并返回拷贝（幂等）。"""
+    global ALLOWED_ROOTS, _HAS_DYNAMIC_ATTR
+    merged = _get_allowed_roots()
+    ALLOWED_ROOTS = set(merged)
+    _HAS_DYNAMIC_ATTR = True
+    return set(ALLOWED_ROOTS)
 
 # 显式黑名单：拦截可导致命令执行/网络外联/底层逃逸的根模块与调用
+# kept only dangerous roots; pathlib/shutil removed — they are in _STATIC_ALLOWED and safe for quant I/O
 BANNED_IMPORT_ROOTS = {
     "socket",
     "subprocess",
@@ -179,19 +193,47 @@ BANNED_IMPORT_ROOTS = {
     "sys",
     "importlib",
     "importlib.util",
+    "importlib.machinery",
+    "importlib.abc",
     "io",
     "builtins",
+    "__builtins__",
+    "posix",
+    "_io",
+    "_socket",
+    "pty",
+    "multiprocessing",
+    "threading",
+    "signal",
 }
 BANNED_CALL_NAMES = {"eval", "exec", "__import__", "compile", "open", "breakpoint"}  # 动态执行与导入劫持
-BANNED_GETATTR_NAMES = {"getattr", "setattr", "hasattr", "vars", "getattribute"}
+BANNED_GETATTR_NAMES = {"getattr", "setattr", "hasattr", "vars", "getattribute", "__getattribute__"}
+# 属性级危险 dunder - 用于 getattr 第二参数及直接属性访问检测
+BANNED_DUNDER_ATTRS = {
+    "__class__",
+    "__bases__",
+    "__subclasses__",
+    "__mro__",
+    "__dict__",
+    "__globals__",
+    "__code__",
+    "__import__",
+    "__builtins__",
+    "__getattribute__",
+    "__subclasscheck__",
+}
 # 属性级黑名单：(base, attr)，防止通过 os.system 等间接执行
 BANNED_ATTRS = {
-    ("os", "system"),  # shell 命令执行
-    ("os", "popen"),  # 管道执行
-    ("os", "execve"),  # 进程替换
-    ("os", "spawnl"),  # 进程派生
+    ("os", "system"),
+    ("os", "popen"),
+    ("os", "execve"),
+    ("os", "execv"),
+    ("os", "execl"),
+    ("os", "spawnl"),
     ("os", "spawnlp"),
-    ("subprocess", "Popen"),  # 子进程创建
+    ("os", "fork"),
+    ("os", "kill"),
+    ("subprocess", "Popen"),
     ("subprocess", "call"),
     ("subprocess", "run"),
     ("subprocess", "check_call"),
@@ -199,11 +241,29 @@ BANNED_ATTRS = {
 }
 
 
+def _is_banned_subscript(node: ast.Subscript) -> bool:
+    """检测 Subscript 索引为危险 dunder 常量字符串（如 obj['__class__']）。"""
+    slc = node.slice
+    if isinstance(slc, ast.Constant) and isinstance(slc.value, str) and slc.value in BANNED_DUNDER_ATTRS:
+        return True
+    return False
+
+
 def _get_root_name(node: ast.AST) -> str | None:
-    """递归剥离 Attribute 直到 Name，返回根名称或 None。"""
+    """递归剥离 Attribute/Call/Subscript 直到 Name，返回根名称或 None（含 dunder 下标透传）。"""
     if isinstance(node, ast.Name):
         return node.id
     if isinstance(node, ast.Attribute):
+        # __getattribute__ 本身即高危，透传为 dunder 信号
+        if node.attr in BANNED_DUNDER_ATTRS:
+            return f"__dunder__{node.attr}"
+        return _get_root_name(node.value)
+    if isinstance(node, ast.Call):
+        return _get_root_name(node.func)
+    if isinstance(node, ast.Subscript):
+        if _is_banned_subscript(node):
+            # 下标为 __class__ 等时视为 dunder 访问，直接拦截
+            return f"__dunder__{node.slice.value}"  # type: ignore[attr-defined]
         return _get_root_name(node.value)
     return None
 
@@ -213,13 +273,23 @@ def _is_banned_attribute(node: ast.Attribute, alias_map: dict[str, str] | None =
 
     支持链式属性（a.b.c）与别名映射：通过 _get_root_name 提取根，
     再经 alias_map 还原到真实根后判定 BANNED_IMPORT_ROOTS。
+    同时拦截危险 dunder 属性 (如 __class__/__bases__) 的直接访问，
+    含 getattr 家族与 __getattribute__。
     """
     alias_map = alias_map or {}
+    attr = node.attr
+    # 危险 dunder 属性无视根，直接拦截；含 __getattribute__
+    if attr in BANNED_DUNDER_ATTRS:
+        return True
+    if attr in BANNED_GETATTR_NAMES:
+        return True
     root = _get_root_name(node)
     if root is None:
         return False
+    # _get_root_name 对 dunder 下标/属性已透传为 __dunder__*，此处一律拦截
+    if isinstance(root, str) and root.startswith("__dunder__"):
+        return True
     effective = alias_map.get(root, root)
-    attr = node.attr
     if (effective, attr) in BANNED_ATTRS:
         return True
     # 受限根的任意属性均视为高危；链式解析后命中 banned root 即拦截
@@ -262,27 +332,57 @@ def check_import_allowlist(code: str) -> bool:
                 asname = alias.asname if alias.asname else alias.name
                 alias_map[asname] = root
 
+    def _is_banned_module(mod: str) -> bool:
+        # 检查完整模块名或根是否命中黑名单（支持 importlib.util 这类点分黑名单）
+        if mod in BANNED_IMPORT_ROOTS:
+            return True
+        root = mod.split(".")[0]
+        if root in BANNED_IMPORT_ROOTS:
+            return True
+        # 前缀匹配：importlib.util 命中 importlib.util.xxx
+        for b in BANNED_IMPORT_ROOTS:
+            if mod == b or mod.startswith(b + "."):
+                return True
+        return False
+
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
-                root = alias.name.split(".")[0]
-                # 黑名单优先于白名单
-                if root in BANNED_IMPORT_ROOTS:
+                full = alias.name
+                root = full.split(".")[0]
+                # 黑名单优先于白名单（完整匹配+前缀）
+                if _is_banned_module(full):
                     return False
-                if root not in ALLOWED_ROOTS:
-                    return False  # 默认拒绝：非白名单一律拦截
+                if root not in _get_allowed_roots():
+                    return False  # 默认拒绝：非白名单一律拦截（懒合并动态 roots）
         elif isinstance(node, ast.ImportFrom):
             if node.module is None:
                 return False  # 相对导入无明确根，视为不安全
-            root = node.module.split(".")[0]
-            if root in BANNED_IMPORT_ROOTS:
+            mod = node.module
+            if _is_banned_module(mod):
                 return False
-            if root not in ALLOWED_ROOTS:
+            root = mod.split(".")[0]
+            if root not in _get_allowed_roots():
                 return False
         elif isinstance(node, ast.Call):
             func = node.func
-            if isinstance(func, ast.Name) and func.id in (BANNED_CALL_NAMES | BANNED_GETATTR_NAMES):
-                return False  # 拦截 eval/exec/__import__/compile/open/breakpoint/getattr 等内置封禁
+            if isinstance(func, ast.Name) and func.id in BANNED_CALL_NAMES:
+                return False  # 拦截 eval/exec/__import__/compile/open/breakpoint 等
+            if isinstance(func, ast.Name) and func.id in BANNED_GETATTR_NAMES:
+                # getattr 家族一律拦截；额外防御：若参数含 dunder 字符串也拦截
+                # 已在上层直接 return False，此处保留参数检查以便未来细粒度放行时仍能拦截 getattr(x,"__class__")
+                has_dunder_arg = False
+                for arg in node.args:
+                    if isinstance(arg, ast.Constant) and isinstance(arg.value, str) and arg.value in BANNED_DUNDER_ATTRS:
+                        has_dunder_arg = True
+                    root = _get_root_name(arg)
+                    if root is not None:
+                        effective = alias_map.get(root, root)
+                        if effective in BANNED_IMPORT_ROOTS:
+                            return False
+                if has_dunder_arg:
+                    return False
+                return False
             # from-import 别名直接调用：`from os import system as s; s(...)`
             if isinstance(func, ast.Name) and func.id in alias_map:
                 effective = alias_map.get(func.id, func.id)
@@ -291,18 +391,16 @@ def check_import_allowlist(code: str) -> bool:
             if isinstance(func, ast.Attribute):
                 if _is_banned_attribute(func, alias_map):
                     return False
-            # getattr/setattr/hasattr/vars/getattribute 间接调用：首参经 alias_map 解析到 banned root
-            if isinstance(func, ast.Name) and func.id in BANNED_GETATTR_NAMES:
-                if node.args:
-                    first = node.args[0]
-                    root = _get_root_name(first)
-                    if root is not None:
-                        effective = alias_map.get(root, root)
-                        if effective in BANNED_IMPORT_ROOTS:
-                            return False
         elif isinstance(node, ast.Attribute):
             # 即使未调用，单纯引用高危属性也应拦截（如 x = os.system）
             if _is_banned_attribute(node, alias_map):
+                return False
+        elif isinstance(node, ast.Subscript):
+            if _is_banned_subscript(node):
+                return False
+            # 链式下标后仍可能挂属性（如 obj["__class__"].__bases__），交由 Attribute 分支捕获
+            root = _get_root_name(node)
+            if isinstance(root, str) and root.startswith("__dunder__"):
                 return False
 
     return True

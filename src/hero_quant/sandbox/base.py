@@ -74,30 +74,27 @@ def is_path_writable(path: str, policy: dict) -> bool:
 
     NOTE: 存在 TOCTOU 窗口——校验与使用之间路径可能被符号链接替换，
     调用方需配合 enforcement 强制重校验或持有隔离上下文。
-    弃用 raw "/tmp" 回退，统一用 commonpath 判定。
+    弃用 raw "/tmp" 回退，统一用 commonpath 判定。失败时 fail-closed 返回 False。
     """
     try:
         cp = str(Path(path).resolve())
-    except Exception:
-        try:
-            cp = os.path.realpath(path)
-        except Exception:
-            cp = path
+    except (OSError, ValueError, RuntimeError):
+        return False
     roots = policy.get("writableRoots") or []
     if not roots:
         ws = policy.get("workspaceRoot") or policy.get("workspace_root") or policy.get("canonicalPath")
         if ws:
             try:
                 roots = [str(Path(ws).resolve())]
-            except Exception:
-                roots = [str(ws)]
+            except (OSError, ValueError, RuntimeError):
+                return False
     for root in roots:
         if root == "/":
             return True
         try:
             r = str(Path(root).resolve())
-        except Exception:
-            r = root
+        except (OSError, ValueError, RuntimeError):
+            continue
         if r == "/":
             return True
         # 使用 commonpath 防 /tmp-evil 前缀欺骗，不再单独回退 raw "/tmp"
@@ -207,21 +204,16 @@ class DockerBackend(BaseSandbox):
         self._policy: dict = dict(policy) if isinstance(policy, dict) else {}
 
     def execute(self, cmd: Union[str, List[str]]) -> Tuple[str, str, int]:
-        """执行命令；有 docker 时走容器，否则回退本地以保持离线可用。"""
+        """执行命令；有 docker 时走容器，否则 fail-closed 抛 SandboxUnavailable。"""
         if isinstance(cmd, str):
             raise ValueError("str cmd not allowed; use List[str]")
         pol = self._policy if self._policy else {}
         wrapped = self.confine(cmd, pol)
-        # 存根模式下若 docker 不存在，避免 ENOENT，回退本地
-        if wrapped and wrapped[0] == "docker" and not _has_docker():
-            fallback = super().confine(cmd, pol)  # 走 bwrap 条件回退
-            result = subprocess.run(fallback, shell=False, capture_output=True, text=True)
-            return result.stdout, result.stderr, result.returncode
+        # 统一以 try/exec 判定可用性，避免 Path.exists -> Popen 的 TOCTOU；缺失时 fail-closed
         try:
             result = subprocess.run(wrapped, shell=False, capture_output=True, text=True)
-        except FileNotFoundError:
-            # 二进制缺失时回退原命令，避免测试环境因缺依赖而失败
-            result = subprocess.run(cmd, shell=False, capture_output=True, text=True)
+        except FileNotFoundError as e:
+            raise SandboxUnavailableError(f"docker/bwrap launcher not found: {e}") from e
         return result.stdout, result.stderr, result.returncode
 
     def confine(self, argv: List[str], policy: dict) -> List[str]:

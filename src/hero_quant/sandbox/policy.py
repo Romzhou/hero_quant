@@ -20,14 +20,12 @@ def _deduplicate_preserve_order(items: list[str]) -> list[str]:
 
 
 def canonical_path(p: str) -> str:
-    """返回路径的真实规范路径（解析符号链接），失败时回退到原路径。"""
+    """返回路径的真实规范路径（解析符号链接），失败即抛 ValueError（不做 realpath 回退）。"""
     try:
-        return str(Path(p).resolve())
-    except (OSError, ValueError, RuntimeError):
-        try:
-            return os.path.realpath(p)
-        except (OSError, ValueError, RuntimeError):
-            return p
+        # strict=True：悬空符号链接视为失败，fail-closed
+        return str(Path(p).resolve(strict=True))
+    except (OSError, ValueError, RuntimeError) as e:
+        raise ValueError(f"path resolve failed for {p!r}: {e}") from e
 
 
 def resolve_policy(mode: str, workspace_root: str | None = None) -> dict:
@@ -51,15 +49,16 @@ def resolve_policy(mode: str, workspace_root: str | None = None) -> dict:
             raise ValueError("workspace_root required for workspace-write mode")
 
     if mode == "workspace-write":
-        tmp_canonical = canonical_path("/tmp") if os.path.exists("/tmp") else "/tmp"
+        # /tmp 解析失败即 fail-closed，不用字面量回退
+        tmp_canonical = canonical_path("/tmp")
         roots = _deduplicate_preserve_order(
-            [r for r in [policy.get("workspaceRoot"), tmp_canonical, "/tmp"] if r]
+            [r for r in [policy.get("workspaceRoot"), tmp_canonical] if r]
         )
         policy["writableRoots"] = roots
         policy["enforcement"] = "full"
     elif mode == "read-only":
-        tmp_canonical = canonical_path("/tmp") if os.path.exists("/tmp") else "/tmp"
-        roots = _deduplicate_preserve_order([r for r in [tmp_canonical, "/tmp"] if r])
+        tmp_canonical = canonical_path("/tmp")
+        roots = _deduplicate_preserve_order([tmp_canonical])
         policy["writableRoots"] = roots
         policy["enforcement"] = "full"
         if "canonicalPath" not in policy:
@@ -86,8 +85,12 @@ def is_path_writable(path: str, policy: dict) -> bool:
     NOTE: This is a TOCTOU-prone check. Caller must not rely on it alone for
     security; open files with O_NOFOLLOW and verify fd path via /proc/self/fd
     or enforce via OS-level sandbox (namespaces).
+    未来路径（如 /tmp/a/b 尚未创建）用非 strict 解析，仅规范化 .. 与大小写，不要求存在。
     """
-    cp = canonical_path(path)
+    try:
+        cp = str(Path(path).resolve())
+    except (OSError, ValueError, RuntimeError):
+        return False
     cp_norm = os.path.normcase(cp)
     for r in policy.get("writableRoots", []):
         if r == "/":
