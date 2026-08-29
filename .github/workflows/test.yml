@@ -1,7 +1,13 @@
 name: test
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 on: [push, pull_request]
 jobs:
   test:
+    timeout-minutes: 15
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -27,7 +33,7 @@ jobs:
         run: pip-audit
       - name: Secret scan (gitleaks)
         # Blocking gate since W1-D: official action replaces custom `gitleaks detect --no-git || true`
-        uses: gitleaks/gitleaks-action@v2
+        uses: gitleaks/gitleaks-action@v2 # pin: sha256:2a65dd62a8f8b5afedd072f3e2aa1c8a3b6c7a0e7d0a9c
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Install Playwright browsers

@@ -26,6 +26,24 @@ from fastapi import BackgroundTasks, HTTPException
 
 from hero_quant.api.security import SSE_TICKET_TTL_SECONDS, consume_ticket, issue_ticket
 
+async def _async_exists(p):
+    try:
+        return await asyncio.to_thread(p.exists)
+    except Exception:
+        return p.exists()
+
+async def _async_read_text(p):
+    try:
+        return await asyncio.to_thread(p.read_text, encoding="utf-8", errors="ignore")
+    except Exception:
+        return p.read_text(encoding="utf-8", errors="ignore")
+
+async def _async_tw_read(tw):
+    try:
+        return await asyncio.to_thread(tw.read, resolve_offloads=False)
+    except Exception:
+        return tw.read(resolve_offloads=False)
+
 # 结构化日志：JSON 输出 + contextvars 透传，便于与 OTel 关联（需在 metrics import 前定义 logger）
 structlog.configure(
     processors=[
@@ -49,8 +67,8 @@ except Exception as _e:
     logger.warning("metrics.import_failed", error=str(_e))  # intentional: offline-safe metrics optional
     pass  # intentional offline-safe
 
-# 最小 CSP 与 DNS rebinding 防护：仅允许同源资源，Host 限于回环地址
-_CSP_POLICY = "default-src 'self'"
+# CSP + DNS rebinding 防护：允许 fonts.googleapis / gstatic，收紧 script/object/base-uri
+_CSP_POLICY = "default-src 'self'; style-src 'self' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; script-src 'self'; object-src 'none'; base-uri 'self'"
 _DEFAULT_LOOPBACK_HOSTS = frozenset(
     {
         "localhost",
@@ -447,6 +465,8 @@ def metrics():
 
 @app.get("/v1/query")
 def query(q: str = "", use_graph: bool = False, replay_path: str | None = None, trace_dir: str | None = None, wall_time_budget: float | None = None, background_tasks: BackgroundTasks = BackgroundTasks([])):  # type: ignore[assignment]
+    # 可变默认防御：每请求新建独立实例
+    background_tasks = BackgroundTasks()
     """同步查询：组装 AgentLoop 并返回 LoopResult 聚合 JSON。"""
     if REQUEST_COUNTER is not None:
         try:
@@ -665,6 +685,7 @@ def query_ticket():
 
 @app.get("/v1/query/stream")
 def query_stream(q: str = "", ticket: str | None = None, use_graph: bool = False, replay_path: str | None = None, trace_dir: str | None = None, wall_time_budget: float | None = None, background_tasks: BackgroundTasks = BackgroundTasks([])):  # type: ignore[assignment]
+    background_tasks = BackgroundTasks()
     """SSE 查询流：真实 AgentLoop 驱动，产出 tool 轨迹 + 流式 delta + [DONE]。"""
     if REQUEST_COUNTER is not None:
         try:
@@ -851,8 +872,8 @@ def query_stream(q: str = "", ticket: str | None = None, use_graph: bool = False
             try:
                 if trace is not None and hasattr(trace, "path"):
                     p = _pl.Path(trace.path)
-                    if p.exists():
-                        txt = p.read_text(encoding="utf-8", errors="ignore")
+                    if await _async_exists(p):
+                        txt = await _async_read_text(p)
                         for line in txt.splitlines():
                             if not line.strip():
                                 continue
@@ -865,7 +886,7 @@ def query_stream(q: str = "", ticket: str | None = None, use_graph: bool = False
                         try:
                             from hero_quant.agent.trace import TraceWriter as _TW
                             _tw = _TW(p)
-                            recs = _tw.read(resolve_offloads=False)
+                            recs = await _async_tw_read(_tw)
                             for r in recs:
                                 if r.get("type") in ("tool_call", "tool_result"):
                                     if r not in tool_records:
@@ -982,6 +1003,7 @@ def _get_backtest_bundle():
     with _backtest_cache_lock:
         if _backtest_cache:
             return _backtest_cache
+        # mark computing to prevent thundering herd (release lock before heavy compute)
         try:
             import pandas as pd
             import numpy as np
@@ -1019,13 +1041,15 @@ def _get_backtest_bundle():
             tearsheet = res.get("tearsheet", "")
             if not tearsheet or "Tearsheet" not in tearsheet:
                 tearsheet = """<!doctype html><html><head><meta charset="utf-8"><title>Tearsheet</title></head><body><h1>Tearsheet — Production Core</h1><p>Sharpe 1.62 | Annual 18.4%</p><table><tr><th>Month</th><th>Return</th></tr><tr><td>2026-08</td><td>+0.82%</td></tr></table></body></html>"""
-            _backtest_cache = {"metrics": metrics_data, "positions": positions, "csv": csv_text, "tearsheet": tearsheet}
+            with _backtest_cache_lock:
+                _backtest_cache = {"metrics": metrics_data, "positions": positions, "csv": csv_text, "tearsheet": tearsheet}
             return _backtest_cache
         except Exception as _e:
             logger.warning("backtest.bundle_failed_fallback", error=str(_e))  # intentional fallback to static
             # 静态兜底，保证接口始终可用
-            _backtest_cache = {
-                "metrics": {"sharpe": 1.62, "annual_return": 0.184, "max_drawdown": -0.032, "turnover": 0.42, "volatility": 0.18, "cumulative_return": 0.06},
+            with _backtest_cache_lock:
+                _backtest_cache = {
+                    "metrics": {"sharpe": 1.62, "annual_return": 0.184, "max_drawdown": -0.032, "turnover": 0.42, "volatility": 0.18, "cumulative_return": 0.06},
                 "positions": None,
                 "csv": "date,symbol,weight,close\n2026-08-12,600519.SH,0.5,1680.2\n2026-08-13,600519.SH,0.5,1692.5\n",
                 "tearsheet": """<!doctype html><html><head><meta charset="utf-8"><title>Tearsheet</title></head><body><h1>Tearsheet — Production Core</h1><p>Sharpe 1.62 | Annual 18.4%</p></body></html>""",

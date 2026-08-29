@@ -1,11 +1,17 @@
 name: CI
 
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 on:
   push:
   pull_request:
 
 jobs:
   hash-lock:
+    timeout-minutes: 15
     name: hash-lock
     runs-on: ubuntu-latest
     steps:
@@ -22,6 +28,7 @@ jobs:
           pip install --dry-run --require-hashes -r requirements-lock.txt
 
   lint:
+    timeout-minutes: 15
     name: lint
     runs-on: ubuntu-latest
     steps:
@@ -38,6 +45,7 @@ jobs:
         run: ruff check src
 
   test:
+    timeout-minutes: 15
     name: test
     runs-on: ubuntu-latest
     steps:
