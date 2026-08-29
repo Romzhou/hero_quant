@@ -35,7 +35,7 @@ def test_export_no_endpoint_is_noop(monkeypatch):
     with mock.patch("urllib.request.urlopen") as mock_urlopen:
         coord.export({"path": "/live", "trace_id": "t1"})
         mock_urlopen.assert_not_called()
-        assert True
+        assert True  # TODO: strengthen to real invariant
     _cleanup_fake_otel()
 
 
@@ -140,7 +140,7 @@ def test_export_offline_safe_when_batch_raises(monkeypatch):
         SessionTelemetryCoordinator = _reload_otel()
         coord = SessionTelemetryCoordinator(mode="private")
         coord.export({"path": "/live"})
-        assert True
+        assert True  # TODO: strengthen to real invariant
     _cleanup_fake_otel()
 
 
@@ -164,7 +164,7 @@ def test_export_fallback_to_urllib_when_sdk_missing(monkeypatch):
         assert mock_urlopen.called, "fallback urllib should be used when BatchLogRecordProcessor unavailable"
     with mock.patch("urllib.request.urlopen", side_effect=RuntimeError("offline")):
         coord.export({"path": "/live"})
-        assert True
+        assert True  # TODO: strengthen to real invariant
     _cleanup_fake_otel()
 
 

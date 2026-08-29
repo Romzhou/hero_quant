@@ -34,6 +34,9 @@ export default function Settings() {
   const [live, setLive] = useState<Check>({ ok: null })
   const [metrics, setMetrics] = useState<Check>({ ok: null })
   const [apiBaseError, setApiBaseError] = useState<string | null>(null)
+  const [draftApiBase, setDraftApiBase] = useState(apiBase)
+
+  useEffect(() => { setDraftApiBase(apiBase) }, [apiBase])
 
   const buildUrl = (path: string) => resolveUrl(apiBase, path)
 
@@ -59,27 +62,26 @@ export default function Settings() {
     return () => { aborted = true; clearInterval(timer) }
   }, [apiBase])
 
+  const [draftApiBase, setDraftApiBase] = useState(apiBase)
+
   const handleApiBaseChange = (raw: string) => {
     const trimmed = raw.trim()
     if (trimmed === "") {
       setApiBaseError(null)
+      setDraftApiBase("")
       setApiBase("")
       return
     }
-    // normalize: strip trailing slash for storage
     const normalized = trimmed.replace(/\/$/, "")
+    setDraftApiBase(trimmed)
     try {
-      // validate URL (must have scheme)
       const u = new URL(normalized)
-      if (!u.protocol.startsWith("http")) throw new Error("invalid protocol")
+      if (u.protocol !== "http:" && u.protocol !== "https:") throw new Error("invalid protocol")
       setApiBaseError(null)
       setApiBase(normalized)
     } catch {
-      // allow typing intermediate state? Show hint but still store raw trimmed? We store normalized only if valid, otherwise show error and don't store invalid
       setApiBaseError("无效 URL，需包含 http(s):// 且格式正确")
-      // still update store with trimmed value? To satisfy trimming test we store normalized only when valid; for invalid we keep input shown but store stays trimmed invalid? For test we need error hint visible.
-      // We store raw trimmed to reflect input, but validation hint guides user
-      setApiBase(trimmed)
+      // 非法输入仅留在 draft，不污染 persisted apiBase，避免 XSS/open-redirect via href
     }
   }
 
@@ -123,7 +125,7 @@ export default function Settings() {
         <div className="rounded-2xl border border-white/10 bg-ink-800/60 p-5 backdrop-blur">
           <label className="text-xs font-semibold tracking-widest text-slate-400">API 基地址</label>
           <input
-            value={apiBase}
+            value={draftApiBase}
             onChange={e => handleApiBaseChange(e.target.value)}
             placeholder="留空则同源代理（/v1）· 可填 https://api.example.com"
             className="mt-2 w-full rounded-xl border border-white/10 bg-ink-900 px-3 py-2.5 text-sm text-mist placeholder:text-slate-500 outline-none focus:border-amber-500/40"

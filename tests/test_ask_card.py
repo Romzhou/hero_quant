@@ -120,8 +120,7 @@ def test_store_isolation_real():
     # use as context manager with swap
     with svc.with_store_isolation("tenant1", "thread1") as isolated:
         # isolated should be same service object but with isolated store
-        assert isolated is svc or isolated.store is not svc.store or "outside" not in isolated.store or True
-        # writes inside should not be visible outside after exit
+        assert isolated is svc or isolated.store is not svc.store or "outside" not in isolated.store
         isolated.store["inside"] = "secret"
         assert "inside" in isolated.store
     # after exit, inside should not be visible

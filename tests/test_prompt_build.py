@@ -9,9 +9,9 @@ def test_prompt_skill_count_boundaries():
     from hero_quant.agent.prompt import build_system_prompt
     import pytest
     p = build_system_prompt(skill_count=0, grounding_block="x")
-    assert "0 skills" in p or "skill" in p.lower()
+    assert "0 skills" in p
     p2 = build_system_prompt(skill_count=5, grounding_block="y")
-    assert "5 skills" in p2 or "skill" in p2.lower()
+    assert "5 skills" in p2
     with pytest.raises(ValueError):
         build_system_prompt(skill_count=-1, grounding_block="x")
     with pytest.raises(ValueError):

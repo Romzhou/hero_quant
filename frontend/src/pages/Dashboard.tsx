@@ -144,11 +144,7 @@ export default function Dashboard() {
             <div key={c.k} style={{ animationDelay: `${i * 80}ms` }} className="group rounded-2xl border border-white/10 bg-white/[0.04] p-4 backdrop-blur transition hover:bg-white/[0.06] hover:border-white/15 hover:shadow-lg hover:-translate-y-0.5 animate-[fadeIn_0.5s_ease_both]">
               <div className="text-[11px] tracking-[0.14em] text-slate-400">{c.k}</div>
               <div className="mt-1 font-display text-xl font-semibold text-mist group-hover:text-white transition">
-                {c.isEquity && !isFiniteNumber(metrics.total_equity) ? (
-                  <span className="inline-block h-5 w-24 animate-pulse rounded bg-white/10" aria-label="skeleton" />
-                ) : (
-                  c.v
-                )}
+                {c.isEquity && !isFiniteNumber(metrics.total_equity) ? "—" : c.v}
               </div>
               <div className="font-mono text-[11px] text-slate-500">{c.sub}</div>
             </div>

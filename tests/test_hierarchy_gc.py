@@ -103,7 +103,7 @@ def test_gc_archive_threshold(tmp_path):
     assert not any("fresh_high" in a["name"] for a in actions_dry)
     # files still there after dry_run
     assert old_file.exists(), "dry_run must not move files"
-    assert (tmp_path / "archive" / old_file.name).exists() is False or True  # archive dir may not exist yet, but old_file must remain
+    assert (tmp_path / "archive" / old_file.name).exists() is False
     # actually ensure archive not created effectively: old file still at original
     # gc.log should be created (vibe does _append_gc_log)
     assert (tmp_path / "gc.log").exists()

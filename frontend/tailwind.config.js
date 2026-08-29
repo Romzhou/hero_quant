@@ -5,7 +5,7 @@ export default {
   content: ["./index.html", "./src/**/*.{js,ts,jsx,tsx}"],
   safelist: [
     // ensure dynamically composed status classes are not purged (e.g. Chat/Live/Monitor 中的 bg-amber-400/15 等由三元静态字面量组成，safelist 仅为保险)
-    "bg-emerald-400/10","bg-amber-400/10","bg-red-400/10","border-emerald-400/20","border-amber-400/20","border-red-400/20","text-emerald-200","text-amber-200","text-red-200"
+    "bg-emerald-400/10","bg-amber-400/10","bg-red-400/10","bg-sky-500/10","bg-sky-500/15","border-emerald-400/20","border-amber-400/20","border-red-400/20","border-sky-500/15","border-sky-500/20","text-emerald-200","text-amber-200","text-red-200","text-sky-300"
   ],
   theme: {
     extend: {

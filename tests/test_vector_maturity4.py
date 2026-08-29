@@ -112,7 +112,7 @@ def test_vector_column_and_cosine_topk_hybrid(tmp_path, monkeypatch):
     cur = ms._conn.cursor()
     cur.execute("PRAGMA table_info(notes)")
     cols = [row[1] for row in cur.fetchall()]
-    assert "vector" in cols or "embedding" in cols or hasattr(ms, "_vector_enabled") or True  # will enforce below
+    assert "vector" in cols or "embedding" in cols or hasattr(ms, "_vector_enabled")
     # stricter: if column named vector exists
     # fallback: check source contains vector handling
     if "vector" not in cols and "embedding" not in cols:
