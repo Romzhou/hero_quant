@@ -179,12 +179,12 @@ class AKShareLoader:
             except Exception as e:
                 raise DataValidationError(f"invalid date format start={start!r} end={end!r}: {e}") from e
             df_ak = None
-            # primary: stock_zh_a_hist
+            # primary: stock_zh_a_hist (retry with different adjust param to handle API variants)
             try:
                 df_ak = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=start_n, end_date=end_n, adjust="qfq")
             except TypeError:
                 try:
-                    df_ak = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=start_n, end_date=end_n, adjust="qfq")
+                    df_ak = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=start_n, end_date=end_n, adjust="")
                 except Exception as e:
                     logger.warning("akshare stock_zh_a_hist failed for %s: %s", symbol, e, exc_info=e)
                     df_ak = None

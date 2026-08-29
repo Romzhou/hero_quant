@@ -30,15 +30,16 @@ export default function Dashboard() {
   const [reloadKey, setReloadKey] = useState(0)
 
   useEffect(() => {
-    let aborted = false
+    const controller = new AbortController()
+    const { signal } = controller
     async function load() {
       setError(null)
       setLoading(true)
       try {
-        const r = await fetch("/v1/backtest/metrics.json", { cache: "no-store" })
+        const r = await fetch("/v1/backtest/metrics.json", { cache: "no-store", signal } as RequestInit)
         if (!r.ok) throw new Error(String(r.status))
         const j = await r.json()
-        if (!aborted && j && typeof j === "object") {
+        if (!signal.aborted && j && typeof j === "object") {
           setMetrics({
             annual_return: isFiniteNumber((j as Record<string, unknown>).annual_return) ? (j as Record<string, unknown>).annual_return as number : FALLBACK.annual_return,
             sharpe: isFiniteNumber((j as Record<string, unknown>).sharpe) ? (j as Record<string, unknown>).sharpe as number : FALLBACK.sharpe,
@@ -48,17 +49,17 @@ export default function Dashboard() {
           })
         }
       } catch (e) {
-        if (!aborted) {
-          const msg = e instanceof Error ? e.message : String(e)
-          console.error("[Dashboard] metrics fetch failed:", msg)
-          setError(msg)
-        }
+        if (signal.aborted) return
+        if (e instanceof DOMException && e.name === "AbortError") return
+        const msg = e instanceof Error ? e.message : String(e)
+        console.error("[Dashboard] metrics fetch failed:", msg)
+        setError(msg)
       } finally {
-        if (!aborted) setLoading(false)
+        if (!signal.aborted) setLoading(false)
       }
     }
     load()
-    return () => { aborted = true }
+    return () => { controller.abort() }
   }, [reloadKey])
 
   const handleDemo = () => {

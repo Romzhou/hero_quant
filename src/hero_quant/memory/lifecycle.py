@@ -104,7 +104,7 @@ class MemoryLifecycle:
         results.sort(key=lambda p: p.name)
         return results
 
-    def _resolve_meta(self, file_path: Path) -> tuple[float, int, float]:
+    def _resolve_meta(self, file_path: Path, _meta_lookup: dict | None = None) -> tuple[float, int, float]:
         """按文件反查 _meta，拿不到则回退到 frontmatter 或默认值。"""
         qs, ac, last = 0.5, 0, time.time()
 
@@ -125,26 +125,40 @@ class MemoryLifecycle:
             except (TypeError, ValueError):
                 pass
 
-        meta_dict = getattr(self._memory, "_meta", None)
-        if isinstance(meta_dict, dict) and meta_dict:
-            # 通过安全文件名精确匹配
+        # P2: 若上层已预计算 safe_filename -> meta 映射则直接 O(1) 命中，避免每文件 O(N) 遍历
+        if _meta_lookup is not None:
             fname = file_path.name
-            # 遍历查找对应键
-            for k, v in meta_dict.items():
-                try:
-                    safe = self._memory._safe_filename(k)  # type: ignore
-                except Exception:
-                    safe = f"{k}.md"
-                if safe == fname:
-                    apply_meta(v)
-                    return qs, ac, last
-            # 精确 stem 匹配（去 fuzzy endswith）
+            if fname in _meta_lookup:
+                apply_meta(_meta_lookup[fname])
+                return qs, ac, last
             stem = file_path.stem
-            for k, v in meta_dict.items():
-                if stem == k:
-                    apply_meta(v)
+            if stem in _meta_lookup:
+                apply_meta(_meta_lookup[stem])
+                return qs, ac, last
+            # 预计算未命中则回退 frontmatter
+        else:
+            meta_dict = getattr(self._memory, "_meta", None)
+            if isinstance(meta_dict, dict) and meta_dict:
+                # 单次构建 safe 映射，避免双重遍历；仍为 O(N) 但仅一次，且上层 run_gc 会复用预计算
+                lookup: dict[str, object] = {}
+                stem_lookup: dict[str, object] = {}
+                for k, v in meta_dict.items():
+                    try:
+                        safe = self._memory._safe_filename(k)  # type: ignore
+                    except Exception:
+                        safe = f"{k}.md"
+                    lookup[safe] = v
+                    stem_lookup[k] = v
+                fname = file_path.name
+                if fname in lookup:
+                    apply_meta(lookup[fname])  # type: ignore[arg-type]
                     return qs, ac, last
-            # 层次文件需处理 namespace 前缀替换，未命中则保留默认值
+                # 精确 stem 匹配（去 fuzzy endswith）
+                stem = file_path.stem
+                if stem in stem_lookup:
+                    apply_meta(stem_lookup[stem])  # type: ignore[arg-type]
+                    return qs, ac, last
+                # 层次文件需处理 namespace 前缀替换，未命中则保留默认值
         # 回退解析 frontmatter 中的质量分
         try:
             text = file_path.read_text(encoding="utf-8")
@@ -180,6 +194,28 @@ class MemoryLifecycle:
         """执行 GC：对重要性 <0.15 且年龄 ≥7 天的条目归档，返回动作列表。"""
         entries = self._scan_entries()
         now = time.time()
+        # P2: 预计算 safe_filename/stem -> meta 映射，避免每文件 O(N) 遍历导致 O(N^2)
+        _meta_lookup: dict[str, object] | None = None
+        _stem_lookup: dict[str, object] | None = None
+        try:
+            _meta_dict = getattr(self._memory, "_meta", None)
+            if isinstance(_meta_dict, dict) and _meta_dict:
+                _meta_lookup = {}
+                _stem_lookup = {}
+                for _k, _v in _meta_dict.items():
+                    try:
+                        _safe = self._memory._safe_filename(_k)  # type: ignore
+                    except Exception:
+                        _safe = f"{_k}.md"
+                    _meta_lookup[_safe] = _v
+                    _stem_lookup[_k] = _v
+                # 合并供 _resolve_meta 一次查询：stem 覆盖同名冲突以 safe 优先
+                _merged = dict(_meta_lookup)
+                for _kk, _vv in _stem_lookup.items():
+                    _merged.setdefault(_kk, _vv)
+                _meta_lookup = _merged
+        except Exception:
+            _meta_lookup = None
         actions: list[dict] = []
         for file_path in entries:
             try:
@@ -190,7 +226,7 @@ class MemoryLifecycle:
             age_days = (now - mtime) / 86400.0
             if age_days < self.MIN_AGE_DAYS:
                 continue
-            qs, ac, last_accessed = self._resolve_meta(file_path)
+            qs, ac, last_accessed = self._resolve_meta(file_path, _meta_lookup=_meta_lookup)
             days_since = (now - last_accessed) / 86400.0
             imp = compute_importance(qs, ac, days_since)
             action = None

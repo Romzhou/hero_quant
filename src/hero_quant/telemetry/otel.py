@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import atexit
 import os
 import threading
 import structlog
@@ -67,33 +68,44 @@ class SessionTelemetryCoordinator:
         return _SHARING_MAP.get(self.mode, "disabled")
 
     def _validate_endpoint(self, endpoint: str) -> bool:
-        """校验 OTLP endpoint 仅允许 http/https 且非私有元数据地址，防 SSRF。"""
+        """校验 OTLP endpoint 仅允许 http/https 且非私有/元数据地址，防 SSRF。"""
         from urllib.parse import urlparse
         import ipaddress
+
+        def _redact(u: str) -> str:
+            try:
+                from hero_quant.config.settings import _redact_dsn as _rd
+
+                return _rd(u)
+            except Exception:
+                return "***"
 
         try:
             parsed = urlparse(endpoint)
         except Exception:
-            logger.warning("invalid OTLP endpoint parse failed", endpoint=endpoint)
+            logger.warning("invalid OTLP endpoint parse failed", endpoint=_redact(endpoint))
             return False
         if parsed.scheme not in ("http", "https") or not parsed.hostname:
-            logger.warning("invalid OTLP endpoint scheme/host", endpoint=endpoint)
+            logger.warning("invalid OTLP endpoint scheme/host", endpoint=_redact(endpoint))
             return False
         host = parsed.hostname or ""
-        # 拒绝元数据/私有 IP 直连（169.254.169.254, localhost 私有段可按需放行，但记录警告）
+        # 明文匿名/元数据主机直接拦截（不依赖 IP 解析）
+        _lower = host.lower()
+        if _lower.endswith("metadata.google.internal") or host in ("169.254.169.254", "metadata.google.internal"):
+            logger.warning("OTLP endpoint blocked metadata host", endpoint=_redact(endpoint))
+            return False
         try:
             ip = ipaddress.ip_address(host)
-            if ip.is_private and host == "169.254.169.254":
-                logger.warning("OTLP endpoint blocked metadata IP", endpoint=endpoint)
+            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
+                logger.warning("OTLP endpoint blocked private/link-local/reserved IP", endpoint=_redact(endpoint))
                 return False
-            if host in ("169.254.169.254",):
-                logger.warning("OTLP endpoint blocked metadata host", endpoint=endpoint)
+            # 169.254.0.0/16 属于 link_local，已被上条覆盖；保留显式阻断以防实现差异
+            if str(ip).startswith("169.254."):
+                logger.warning("OTLP endpoint blocked link-local 169.254/16", endpoint=_redact(endpoint))
                 return False
         except ValueError:
             pass
-        if host in ("localhost", "127.0.0.1", "::1") and parsed.scheme == "http":
-            # 允许本地但记录
-            pass
+        # localhost 仅在显式本地调试时允许，仍放行（mode=disabled 时 export 根本不执行）
         return True
 
     def export(self, payload: dict | None = None) -> None:
@@ -242,3 +254,30 @@ class SessionTelemetryCoordinator:
     def is_enabled(self) -> bool:
         """是否启用遥测（非 disabled 即启用）。"""
         return self.mode != "disabled"
+
+
+def shutdown_otel() -> None:
+    """Flush and shutdown cached OTel provider/processor.
+
+    Safe to call multiple times; intended for atexit and test teardown.
+    """
+    global _OTEL_CACHED_PROVIDER, _OTEL_CACHED_PROCESSOR, _OTEL_CACHED_ENDPOINT
+    with _OTEL_PROVIDER_LOCK:
+        provider = _OTEL_CACHED_PROVIDER
+        processor = _OTEL_CACHED_PROCESSOR
+        _OTEL_CACHED_PROVIDER = None
+        _OTEL_CACHED_PROCESSOR = None
+        _OTEL_CACHED_ENDPOINT = None
+    for obj in (provider, processor):
+        if obj is None:
+            continue
+        try:
+            if hasattr(obj, "shutdown"):
+                obj.shutdown()  # type: ignore[union-attr]
+        except (ValueError, TypeError, AttributeError, OSError, RuntimeError):
+            pass
+        except Exception:
+            logger.debug("shutdown_otel suppressed exception", exc_info=True)
+
+
+atexit.register(shutdown_otel)

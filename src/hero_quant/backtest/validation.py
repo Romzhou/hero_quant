@@ -17,6 +17,10 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
+# Shared with BacktestEngine._price_matrix / _align — non-price metadata columns
+# to skip in multi-asset validation loops. Keep in sync with engine.
+NON_PRICE_COLS: frozenset[str] = frozenset({"open", "high", "low", "volume", "currency", "ccy"})
+
 
 class ValidationError(Exception):
     """输入违反 PIT/价格/币种任一正确性约束时抛出。"""
@@ -55,6 +59,11 @@ def validate(
     # 0. 空帧必须显式拒绝 — 禁止空 DataFrame 绕过所有校验
     if not isinstance(prices, pd.DataFrame) or prices.empty:
         raise ValidationError("prices DataFrame is empty or not a DataFrame (fail-closed)")
+
+    # 0b. Duplicate DatetimeIndex check — duplicated timestamps would corrupt pct_change/ret alignment
+    if isinstance(prices.index, pd.DatetimeIndex) and prices.index.has_duplicates:
+        dup = prices.index[prices.index.duplicated()].unique().tolist()[:5]
+        raise ValidationError(f"duplicated timestamps in prices index at {dup} (fail-closed)")
 
     # 1. PIT 校验：weights_on ≤ price_date 为正逻辑
     # Normalize TZ-aware vs naive to UTC consistently before comparison
@@ -106,8 +115,8 @@ def validate(
         # multi-asset DataFrame without single "close" column: validate each column as price series
         if isinstance(prices, pd.DataFrame):
             for col in prices.columns:
-                # skip non-price metadata columns like currency if present (already handled above)
-                if col == "currency":
+                # skip non-price metadata columns shared with engine NON_PRICE_COLS
+                if col.lower() in NON_PRICE_COLS:
                     continue
                 try:
                     series = pd.to_numeric(prices[col], errors="coerce")

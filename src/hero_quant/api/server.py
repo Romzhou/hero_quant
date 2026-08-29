@@ -340,35 +340,55 @@ def _is_pg_dsn_ready(dsn: str | None) -> bool:
 
 
 def _check_checkpoint_pg() -> tuple[bool, str]:
-    """Probe checkpoint PG; return (pg_bool, mode). PG main path, fallback memory only when unreachable."""
+    """Probe checkpoint PG; only real PG (pool reachable) counts as pg, otherwise memory/degraded."""
     try:
         from hero_quant.config.settings import Settings
         s = Settings()
         dsn = getattr(s, "checkpoint_dsn", None) or os.environ.get("HERO_CHECKPOINT_DSN", "") or ""
-        # check if PG DSN expected
-        is_pg_dsn = _is_pg_dsn_ready(dsn)
-        if not is_pg_dsn:
+        if not _is_pg_dsn_ready(dsn):
             return False, "memory"
-        # try saver probe
         from hero_quant.checkpoint.postgres import get_saver
 
         saver = get_saver(dsn)
-        # _is_pg_mode indicates PG principal path; for emulated PG, saver._is_pg_mode() is True even if real PG unreachable
-        if hasattr(saver, "_is_pg_mode"):
+        # require real PG pool, not emulated
+        is_real = getattr(saver, "_is_real_pg_pool", None)
+        if callable(is_real):
             try:
-                pg_ok = bool(saver._is_pg_mode())
-                # additional liveness: try list_thread_ids (best-effort)
-                if pg_ok and hasattr(saver, "pool") and saver.pool is not None:
-                    # if pool exists but connection fails, consider degraded
-                    try:
-                        # non-blocking probe
-                        if hasattr(saver.pool, "connection"):
-                            pass
-                    except Exception:
-                        pg_ok = False
-                return pg_ok, "pg" if pg_ok else "memory"
+                if not bool(is_real()):
+                    return False, "memory"
             except Exception:
                 return False, "memory"
+        elif hasattr(saver, "_is_pg_mode"):
+            try:
+                if not bool(saver._is_pg_mode()):
+                    return False, "memory"
+            except Exception:
+                return False, "memory"
+        # liveness probe when pool present
+        pool = getattr(saver, "pool", None)
+        if pool is not None:
+            try:
+                if hasattr(pool, "connection"):
+                    import contextlib as _ctx
+                    with _ctx.suppress(Exception):
+                        with pool.connection() as _conn:
+                            with _conn.cursor() as _cur:
+                                _cur.execute("SELECT 1")
+                elif hasattr(pool, "getconn"):
+                    _conn = pool.getconn()
+                    try:
+                        with _conn.cursor() as _cur:
+                            _cur.execute("SELECT 1")
+                    finally:
+                        try:
+                            pool.putconn(_conn)
+                        except Exception:
+                            pass
+            except Exception:
+                return False, "memory"
+        else:
+            # no pool -> emulated only
+            return False, "memory"
         return True, "pg"
     except Exception as _e:
         logger.warning("ready.checkpoint_probe_failed", error=str(_e))
@@ -379,21 +399,26 @@ def _check_billing_pg() -> tuple[bool, str]:
     try:
         from hero_quant.config.settings import Settings
         s = Settings()
-        # billing DSN priority
         dsn = getattr(s, "billing_dsn", None)
         if not dsn:
             dsn = os.environ.get("HERO_BILLING_DSN") or os.environ.get("HERO_PG_DSN") or os.environ.get("HERO_CHECKPOINT_DSN", "")
-        is_pg_dsn = _is_pg_dsn_ready(dsn)
-        if not is_pg_dsn:
+        if not _is_pg_dsn_ready(dsn):
             return False, "memory"
-        # probe billing service
         from hero_quant.billing.service import BillingService
 
         svc = BillingService(dsn=dsn)
-        if hasattr(svc, "_is_pg_mode"):
+        # require real PG driver, emulated does not count as pg
+        is_real = getattr(svc, "_is_real_pg", None)
+        if callable(is_real):
             try:
-                pg_ok = bool(svc._is_pg_mode())
-                return pg_ok, "pg" if pg_ok else "memory"
+                if not bool(is_real()):
+                    return False, "memory"
+            except Exception:
+                return False, "memory"
+        elif hasattr(svc, "_is_pg_mode"):
+            try:
+                if not bool(svc._is_pg_mode()):
+                    return False, "memory"
             except Exception:
                 return False, "memory"
         return True, "pg"

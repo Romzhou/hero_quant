@@ -50,7 +50,8 @@ class MemoryHierarchy:
 
     def _validate_filename(self, filename: str) -> Path:
         """校验 filename 不含路径穿越字符，返回 Path 对象，非法则抛 ValueError。"""
-        if "/" in filename or "\\" in filename or ".." in filename:
+        # P2: 增加 ":" 校验，阻断 Windows ADS（Alternate Data Stream）如 "a:stream" 绕过
+        if "/" in filename or "\\" in filename or ".." in filename or ":" in filename:
             raise ValueError(f"Invalid filename: {filename!r}")
         p = Path(filename)
         if p.is_absolute():
@@ -283,8 +284,10 @@ class MemoryHierarchy:
         scored.sort(key=lambda x: x[0], reverse=True)
         filtered_cats = [cat for score, cat in scored if score > 0]
         if not filtered_cats:
-            logger.debug("no keyword overlap for tokens %s, returning empty scope", query_tokens)
-            return []
+            # P2: 原先直接 return [] 会导致无关键词交集时召回率为 0；
+            # 回落到全量扫描保证召回不丢失，上层可再做重排而非截断。
+            logger.debug("no keyword overlap for tokens %s, falling back to scan_all", query_tokens)
+            return self.scan_all()
         results: List[Path] = []
         seen: Set[Path] = set()
         for cat in filtered_cats:

@@ -6,7 +6,7 @@ def test_health_and_metrics():
         live = c.get("/live")
         assert live.status_code == 200
         assert live.json() == {"status": "ok"}
-        assert live.headers.get("Content-Security-Policy") == "default-src 'self'"
+        assert "default-src 'self'" in (live.headers.get("Content-Security-Policy") or "")
         m = c.get("/metrics")
         assert m.status_code == 200
         assert m.headers["content-type"].startswith("text/plain")

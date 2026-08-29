@@ -41,16 +41,20 @@ export default function Settings() {
   const buildUrl = (path: string) => resolveUrl(apiBase, path)
 
   useEffect(() => {
+    const controller = new AbortController()
+    const { signal } = controller
     let aborted = false
     async function probe(url: string, setter: (c: Check) => void) {
       const t0 = performance.now()
       try {
-        const r = await fetch(url, { cache: "no-store" })
+        const r = await fetch(url, { cache: "no-store", signal } as RequestInit)
         const dt = Math.round(performance.now() - t0)
-        if (!aborted) setter({ ok: r.ok, latency: dt, status: r.status })
-      } catch {
+        if (!aborted && !signal.aborted) setter({ ok: r.ok, latency: dt, status: r.status })
+      } catch (e) {
+        if (signal.aborted) return
+        if (e instanceof DOMException && e.name === "AbortError") return
         const dt = Math.round(performance.now() - t0)
-        if (!aborted) setter({ ok: false, latency: dt })
+        if (!aborted && !signal.aborted) setter({ ok: false, latency: dt })
       }
     }
     const doProbe = () => {
@@ -59,10 +63,8 @@ export default function Settings() {
     }
     doProbe()
     const timer = setInterval(doProbe, 15000)
-    return () => { aborted = true; clearInterval(timer) }
+    return () => { aborted = true; controller.abort(); clearInterval(timer) }
   }, [apiBase])
-
-  const [draftApiBase, setDraftApiBase] = useState(apiBase)
 
   const handleApiBaseChange = (raw: string) => {
     const trimmed = raw.trim()
@@ -116,8 +118,8 @@ export default function Settings() {
         </div>
         <p className="mt-3 text-xs leading-5 text-slate-500">用于演示前快速排错：若显示未连通，请确认后端 <span className="font-mono text-slate-300">uvicorn hero_quant.api.server:app --port 8899</span> 已启动且 Vite proxy 指向 8899。</p>
         <div className="mt-2 flex gap-2">
-          <a href={buildUrl(ENDPOINTS.LIVE)} target="_blank" rel="noreferrer" className="rounded-lg border border-white/10 bg-white/5 px-2.5 py-1 text-xs text-mist hover:bg-white/10">打开 /live ↗</a>
-          <a href={buildUrl(ENDPOINTS.METRICS)} target="_blank" rel="noreferrer" className="rounded-lg border border-amber-500/20 bg-amber-500/10 px-2.5 py-1 text-xs text-amber-300">metrics.json</a>
+          <a href={buildUrl(ENDPOINTS.LIVE)} target="_blank" rel="noopener noreferrer" className="rounded-lg border border-white/10 bg-white/5 px-2.5 py-1 text-xs text-mist hover:bg-white/10">打开 /live ↗</a>
+          <a href={buildUrl(ENDPOINTS.METRICS)} target="_blank" rel="noopener noreferrer" className="rounded-lg border border-amber-500/20 bg-amber-500/10 px-2.5 py-1 text-xs text-amber-300">metrics.json</a>
         </div>
       </div>
 

@@ -78,10 +78,19 @@ def annual_return(equity: pd.Series, periods: int = 252) -> float:
     return float(ann)
 
 
-def turnover(positions: pd.DataFrame | pd.Series | None = None, weights=None) -> float:
+def turnover(
+    positions: pd.DataFrame | pd.Series | None = None,
+    weights: np.ndarray | list[float] | pd.Series | None = None,
+) -> float:
     """换手率估计：有持仓时取日均绝对变动，否则为 0。
 
     多资产场景下，对每行各标的绝对变动求和后取均值，即真实换手。
+
+    weights fallback `/2` — half-turnover semantics:
+        当无 positions 时，用权重差分近似换手。sum(|Δw|) 统计了买卖双边的
+        总变动（买入 amount = 卖出 amount），而换手率按惯例为单边口径，
+        故除以 2 得到单边换手率，避免对同一资金流动双计。例如 w=[0,1,0]
+        时 sum(|Δw|)=2，但单边换手应为 1.0。
     """
     import logging
 
@@ -113,11 +122,20 @@ def turnover(positions: pd.DataFrame | pd.Series | None = None, weights=None) ->
     return 0.0
 
 
-def compute_metrics(equity_series: pd.Series | pd.DataFrame, costs: float = 0.0, positions=None, weights=None) -> dict:
+def compute_metrics(
+    equity_series: pd.Series | pd.DataFrame,
+    costs: float = 0.0,
+    positions: pd.DataFrame | pd.Series | None = None,
+    weights: np.ndarray | list[float] | pd.Series | None = None,
+) -> dict:
     """汇总常规回测指标：sharpe/annual_return/max_drawdown/turnover/volatility/cumulative_return。
 
     costs: 若非零则按 costs 对权益做净收益调整（net returns = gross - costs），
            避免 unused 参数误导；若 equity 已是净权益则 costs 接近 0，影响可忽略。
+           语义为 additive per-bar drag（每 Bar 固定扣除），与 engine 中
+           turnover-scaled 成本（costs * turnover_rate）区分：本函数为轻量
+           指标层面的 additive 估计，不做 multiplicative (1-costs) 复利缩放，
+           也不按换手率缩放；如需换手敏感成本请在 BacktestEngine 层计算。
     """
     import logging
     import math
@@ -151,7 +169,10 @@ def compute_metrics(equity_series: pd.Series | pd.DataFrame, costs: float = 0.0,
             "cumulative_return": 0.0,
         }
 
-    # Wire costs: net returns = gross - costs (per-bar drag)
+    # Wire costs (additive per-bar drag, not multiplicative): net returns = gross - costs
+    # Additive drag subtracts a fixed cost each bar; multiplicative would be (1-costs) scaling.
+    # Contrast with BacktestEngine turnover-scaled costs (costs * turnover_rate) — this
+    # lightweight metrics path is intentionally not turnover-scaled.
     try:
         costs_f = float(costs) if costs is not None else 0.0
     except (ValueError, TypeError):

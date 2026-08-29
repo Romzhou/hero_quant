@@ -64,7 +64,6 @@ def validate_loader(loader: Any) -> None:
     VALID_SOURCES = [
         "tencent", "synthetic", "yahoo", "akshare", "tushare", "em", "sina", "aliyun",
         "binance", "okx", "coinbase", "ccxt", "dukascopy", "tiingo", "polygon", "alpha_vantage",
-        "good",
     ]
     if hasattr(loader, "name"):
         name = getattr(loader, "name")

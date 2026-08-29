@@ -32,8 +32,8 @@ def test_ingest_key_deterministic(tmp_path):
         hexpart = k.split(":")[-1]
         assert len(hexpart) == 16, f"expected 16 hex got {hexpart!r} in {k!r}"
         int(hexpart, 16)
-        # namespace should contain resolved path
-        assert p.resolve().as_posix() in k
+        # namespace should be portable (relative or p.name), not absolute host path
+        assert p.name in k  # P2: key is portable, no absolute host path leak
         # no idx dependency: re-ingest with same content yields same key without idx shift
         assert hashlib.sha256(store1.contents[0].encode()).hexdigest()[:16] in k
 

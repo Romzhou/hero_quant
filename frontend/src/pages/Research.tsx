@@ -115,7 +115,8 @@ export function parseCumulative(csv: string): { dates: string[]; values: number[
       return { dates: dates.slice(-30), values: values.slice(-30) }
     }
     return { dates, values }
-  } catch {
+  } catch (e) {
+    console.debug("[Research] parseCumulative failed:", e)
     return null
   }
 }
@@ -137,7 +138,9 @@ export function deriveHeatmapForTest(metrics: Metrics): [number, number, number]
       const entries = Object.entries(raw as Record<string, unknown>)
       if (entries.length) return entries.map(([, v], idx) => [idx % 5, Math.floor(idx / 5) % 7, +(Number(v) * 100)] as [number, number, number])
     }
-  } catch {}
+  } catch (e) {
+    console.debug("[Research] deriveHeatmapForTest failed:", e)
+  }
   return null
 }
 
@@ -192,7 +195,8 @@ export default function Research(props: ResearchProps) {
         if (!r.ok) throw new Error(String(r.status))
         const txt = await r.text()
         if (isAlive() && txt) { setter(truncateOnLineBoundary(txt, maxChars)); onReal() }
-      } catch {
+      } catch (e) {
+        console.debug("[Research] fetchArtifact failed:", e)
         // keep mock, honest fallback handled via parsed === null
       } finally {
         if (isAlive()) setCsvLoading(false)
@@ -207,7 +211,7 @@ export default function Research(props: ResearchProps) {
           const j = await r.json()
           if (isAlive()) setMetrics(j)
         }
-      } catch {} finally { if (isAlive()) setMetricsLoading(false) }
+      } catch (e) { console.debug("[Research] fetchMetrics failed:", e) } finally { if (isAlive()) setMetricsLoading(false) }
     }
     if (!hasCsvProp) fetchArtifact(API_POSITIONS, setCsvPreview, () => setCsvIsMock(false), MAX_CSV_CHARS)
     else setCsvLoading(false)
@@ -222,7 +226,7 @@ export default function Research(props: ResearchProps) {
           setTearsheetLoaded(true); setTearsheetIsSynthetic(isSynthetic)
         }
       })
-      .catch(() => { if (isAlive()) setTearsheetLoaded(false) })
+      .catch((e) => { console.debug("[Research] tearsheet fetch failed:", e); if (isAlive()) setTearsheetLoaded(false) })
     return () => { aborted = true; controller.abort() }
   }, [hasMetricsProp, hasCsvProp])
 
@@ -302,7 +306,7 @@ export default function Research(props: ResearchProps) {
         const entries = Object.entries(metricsMonthlyRaw as Record<string, unknown>)
         if (entries.length) return entries.map(([, v], idx) => [idx % 5, Math.floor(idx / 5) % 7, +(Number(v) * 100)] as [number, number, number])
       }
-    } catch {}
+    } catch (e) { console.debug("[Research] derivedHeatmap failed:", e) }
     return null
   }, [metricsMonthlyRaw])
 
@@ -500,7 +504,7 @@ export default function Research(props: ResearchProps) {
               <span className={"rounded-full px-2.5 py-1 text-[11px] border " + tearsheetBadge.className}>{tearsheetBadge.label}</span>
             </div>
             {tearsheetLoaded ? (
-              <iframe title="tearsheet" src={API_TEARSHEET} className="mt-3 h-48 w-full rounded-xl border border-white/10 bg-white" sandbox="" />
+              <iframe title="tearsheet" src={API_TEARSHEET} className="mt-3 h-48 w-full rounded-xl border border-white/10 bg-white" sandbox="" referrerPolicy="no-referrer" />
             ) : (
               <div className="mt-3 rounded-xl border border-dashed border-white/10 bg-ink-900/50 p-6 text-center text-sm text-slate-400">
                 <div className="mx-auto h-10 w-10 rounded-xl bg-gradient-to-br from-amber-400 to-amber-600 grid place-items-center text-ink-900 font-bold">HT</div>

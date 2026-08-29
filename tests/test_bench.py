@@ -17,7 +17,7 @@ def test_run_batch_regional():
 
     with tempfile.TemporaryDirectory() as tmp:
         dates = ["2024-01-01", "2024-01-02", "2024-01-03", "2024-01-04", "2024-01-05"]
-        metrics = run_batch(["600519.SS", "0700.HK"], dates=dates, output_dir=tmp)
+        metrics = run_batch(["600519.SS", "0700.HK"], dates=dates, output_dir=tmp, allow_synthetic=True)
 
         # metrics dict per ticker
         assert "600519.SS" in metrics
@@ -44,7 +44,7 @@ def test_run_batch_regional():
         assert data["0700.HK"]["benchmark"] == "^HSI"
 
         # single-date shorthand also works
-        metrics2 = run_batch(["600519.SS", "0700.HK"], dates=["2024-01-01"], output_dir=tmp)
+        metrics2 = run_batch(["600519.SS", "0700.HK"], dates=["2024-01-01"], output_dir=tmp, allow_synthetic=True)
         assert metrics2["600519.SS"]["benchmark"] == "000001.SS"
 
 
@@ -71,7 +71,7 @@ def test_run_batch_engine_exception_logged(caplog):
     with patch.object(bench_mod.BacktestEngine, "run", side_effect=RuntimeError("engine boom")):
         caplog.set_level(logging.WARNING)
         with tempfile.TemporaryDirectory() as tmp:
-            res = run_batch(["AAPL"], dates=["2024-01-01"], output_dir=tmp)
+            res = run_batch(["AAPL"], dates=["2024-01-01"], output_dir=tmp, allow_synthetic=True)
             # Should still produce fallback metrics
             assert "AAPL" in res
             assert res["AAPL"]["sharpe"] == 0.0
@@ -88,7 +88,7 @@ def test_run_batch_io_failure_surfaces(tmp_path):
     file_path = tmp_path / "blockfile"
     file_path.write_text("block")
     with pytest.raises(Exception):
-        run_batch(["AAPL"], dates=["2024-01-01"], output_dir=file_path)
+        run_batch(["AAPL"], dates=["2024-01-01"], output_dir=file_path, allow_synthetic=True)
 
 def test_effective_benchmark_map_narrow_except():
     """P2-7: _effective_benchmark_map must not swallow invalid Settings; should raise."""

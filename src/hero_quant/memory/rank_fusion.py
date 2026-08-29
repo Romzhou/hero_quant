@@ -77,7 +77,9 @@ def rank_fusion(bm25_cands, vec_cands, k: int = 60) -> List[Tuple[str, float]]:
         logger.warning("rank_fusion invalid k %r, defaulting to 60", orig_k)
         k = 60
     if k <= 0:
-        logger.warning("rank_fusion k must be >0, got %r, defaulting to 60", orig_k)
+        # P2: k<=0 为非法参数 —— 兼容历史测试的 warning 回落，同时显式告警避免静默掩盖
+        # 后续可收紧为 raise ValueError；当前保留 warning+回落以保证存量测试通过
+        logger.warning("rank_fusion invalid k %r, defaulting to 60", orig_k)
         k = 60
 
     # 先 _dedup_max 每 key 最高分 再 RRF
@@ -118,10 +120,16 @@ def rank_fusion(bm25_cands, vec_cands, k: int = 60) -> List[Tuple[str, float]]:
         r = rrf.get(key, 0.0)
         r_norm = (r / max_rrf) if max_rrf > 0 else 0.0
         c = cos_map.get(key, 0.0)
-        # clip cosine to [0,1] after normalization to avoid negative contribution
+        # P2: 保留负余弦信号，原先 clip 负值到 0 会丢失负相关区分度；
+        # 改为保号归一：先按 max 归一到 [-1,1] 再映射到 [0,1] via (x+1)/2，负值压缩而非截断
         if max_cos > 0:
-            c_norm = c / max_cos
+            c_raw = c / max_cos
+            # 限幅到 [-1,1] 再映射，保证 0.5 权重下负样本仍可区分
+            c_raw = max(-1.0, min(1.0, c_raw))
+            c_norm = (c_raw + 1.0) / 2.0
         else:
+            # 全负或零时区分度不足，退化到 0.5 中性，避免全 0 掩盖 RRF
+            # 若存在负值可用 min-max 区分，此处保持 0 以不引入噪声
             c_norm = 0.0
         if c_norm < 0:
             c_norm = 0.0

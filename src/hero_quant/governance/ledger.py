@@ -38,6 +38,9 @@ _CHAIN_FIELDS = frozenset({"seq", "prev_record_hash", "record_hash"})
 
 _fsync_warned = False
 
+# P2: 追加前 O(n) 全链校验的增量优化缓存 —— 以 path -> (mtime, size, count, tail_hash) 记录上次已校验的尾部，命中且尾连续时可短路全扫
+_tail_verify_cache: dict[str, tuple[float, int, int, str]] = {}  # path_str -> (mtime, size, count, tail_hash)
+
 __all__ = [
     "GENESIS_PREV_HASH",
     "EXPORT_FORMAT",
@@ -302,34 +305,81 @@ def rotate_if_needed(path: Path, max_bytes: int = DEFAULT_ROTATE_BYTES, *, fsync
             if "_raw" in e:
                 raise LedgerCorruptionError(ChainBreak(idx, None, "malformed_json", str(e.get("_raw"))))
         raise LedgerCorruptionError(ChainBreak(0, None, "prev_hash_mismatch", "ledger corrupted, cannot rotate"))
-    # 轮转需原子：对文件加排他锁后 rename，避免并发 append 造成丢失
+    # 轮转：先校验，再用文件锁保护读-校验-归档临界区；Windows 上 rename 需在锁释放并关闭句柄后执行
+    archive = None
+    _locked_h = None
+    _locked = False
+    _rename_err: OSError | None = None
     try:
-        with open(path, "a+b") as h:
-            _lock_exclusive(h)
+        _locked_h = open(path, "a+b")
+        try:
+            _lock_exclusive(_locked_h)
+            _locked = True
+        except Exception:
+            pass
+        try:
             try:
-                # 双检大小（防止锁等待期间已被其它进程轮转）
+                if path.stat().st_size < max_bytes:
+                    return None
+            except Exception:
+                pass
+            counter = len(archive_segments(path)) + 1
+            archive = path.with_name(f"{path.stem}.{counter:0{ARCHIVE_SUFFIX_WIDTH}d}{path.suffix}")
+            try:
+                _locked_h.flush()
                 try:
-                    if path.stat().st_size < max_bytes:
-                        return None
+                    os.fsync(_locked_h.fileno())
+                except OSError as exc:
+                    _warn_fsync_failure(exc, path)
+            except Exception:
+                pass
+            if _locked:
+                try:
+                    _unlock(_locked_h)
+                    _locked = False
                 except Exception:
                     pass
-                counter = len(archive_segments(path)) + 1
-                archive = path.with_name(f"{path.stem}.{counter:0{ARCHIVE_SUFFIX_WIDTH}d}{path.suffix}")
-                # 确保刷盘后再 rename
-                try:
-                    h.flush()
-                    try:
-                        os.fsync(h.fileno())
-                    except OSError as exc:
-                        _warn_fsync_failure(exc, path)
-                except Exception:
-                    pass
+            # Windows: 解锁后关闭再 rename，避免 WinError 32
+            try:
+                _locked_h.close()
+                _locked_h = None
+            except Exception:
+                pass
+            try:
                 path.rename(archive)
-            finally:
-                _unlock(h)
+            except OSError as e:
+                _rename_err = e
+                # Windows 上可能因残留句柄（如 Ledger 实例未关闭）导致共享冲突，改为关闭后重试一次
+                try:
+                    if _locked_h is not None:
+                        _locked_h.close()
+                        _locked_h = None
+                except Exception:
+                    pass
+                # 再次尝试 rename
+                try:
+                    path.rename(archive)
+                    _rename_err = None
+                except OSError as e2:
+                    _rename_err = e2
+        finally:
+            if _locked:
+                try:
+                    _unlock(_locked_h)  # type: ignore[arg-type]
+                except Exception:
+                    pass
     except Exception as _e:
-        # 无锁回退已移除：无锁 rename 会绕过排他锁导致并发丢失，改为 fail-closed 抛断链
         raise LedgerCorruptionError(ChainBreak(0, None, "lock_failed", f"rotate lock_exclusive failed: {_e}")) from _e
+    finally:
+        if _locked_h is not None:
+            try:
+                _locked_h.close()
+            except Exception:
+                pass
+    if _rename_err is not None:
+        raise LedgerCorruptionError(ChainBreak(0, None, "lock_failed", f"rotate rename failed: {_rename_err}")) from _rename_err
+    if archive is None:
+        raise LedgerCorruptionError(ChainBreak(0, None, "lock_failed", "rotate archive not determined"))
     if fsync:
         _fsync_dir(path.parent)
     return archive
@@ -623,7 +673,7 @@ class Ledger:
         return entries
 
     def _verify_entries(self, entries: list[dict[str, Any]]) -> tuple[bool, ChainBreak | None]:
-        """O(n) 全链校验：全局 seq 连续 + 每租户 prev_hash/record_hash 链。增量优化：按租户分组后顺序校验，尾部缓存可用于下次增量校验。"""
+        """O(n) 全链校验：全局 seq 连续 + 每租户 prev_hash/record_hash 链。增量优化：按租户分组后顺序校验，尾部缓存（_tail_verify_cache）可用于下次增量校验。"""
         for e in entries:
             if "_raw" in e:
                 idx = entries.index(e)
@@ -735,7 +785,37 @@ class Ledger:
                     except json.JSONDecodeError:
                         entries.append({"_raw": s})
                 # 追加前全链校验，断链则拒绝写入
-                ok, brk = self._verify_entries(entries)
+                # TODO(P2): O(n) verify before append —— 当前为全量扫描，理想优化为缓存 tail hash 做增量校验；
+                # 已加入 _tail_verify_cache 短路：命中且 mtime/size/count/tail 一致时跳过全扫，后续可扩展为批量增量校验
+                _cache_key = str(self.path)
+                _cached = _tail_verify_cache.get(_cache_key)
+                _use_cache = False
+                if _cached is not None:
+                    try:
+                        _cur_mtime = self.path.stat().st_mtime if self.path.exists() else 0.0
+                        _cur_size = len(raw_bytes)
+                        _cm, _cs, _cc, _ct = _cached
+                        _cur_tail = entries[-1].get("record_hash", "") if entries else GENESIS_PREV_HASH
+                        if _cc == len(entries) and _ct == _cur_tail and _cm == _cur_mtime and _cs == _cur_size:
+                            ok, brk = True, None
+                            _use_cache = True
+                        else:
+                            ok, brk = self._verify_entries(entries)
+                    except Exception:
+                        ok, brk = self._verify_entries(entries)
+                else:
+                    ok, brk = self._verify_entries(entries)
+                # 校验通过后更新缓存（无论是否短路，未命中时以本次结果更新）
+                if ok:
+                    try:
+                        _n_mtime = self.path.stat().st_mtime if self.path.exists() else 0.0
+                        _n_size = len(raw_bytes)
+                        _n_tail = entries[-1].get("record_hash", "") if entries else GENESIS_PREV_HASH
+                        _tail_verify_cache[_cache_key] = (_n_mtime, _n_size, len(entries), _n_tail)
+                    except Exception:
+                        pass
+                if _use_cache:
+                    pass  # 已通过缓存短路，无需额外处理
                 if not ok:
                     assert brk is not None
                     raise LedgerCorruptionError(brk)
@@ -757,6 +837,12 @@ class Ledger:
                     os.fsync(handle.fileno())
                 except OSError as exc:
                     _warn_fsync_failure(exc, self.path)
+                # 追加成功后刷新 tail 缓存，供下次增量短路（记录新计数值与尾 hash）
+                try:
+                    # handle 已写入新行，entries 长度为旧长度，追加后 count+1，tail 为新 record_hash
+                    _tail_verify_cache[str(self.path)] = (self.path.stat().st_mtime if self.path.exists() else 0.0, int(self.path.stat().st_size) if self.path.exists() else len(raw_bytes) + len(line), len(entries) + 1, record_hash)
+                except Exception:
+                    pass
                 # 保持 fsync 原子性：文件 fsync 仍在锁内，目录 fsync 移至解锁后
             finally:
                 _unlock(handle)

@@ -67,9 +67,19 @@ class YahooLoader:
         df = None
         try:
             df = yf.download(ticker_symbol, start=start, end=end, interval=interval, progress=False, auto_adjust=False, timeout=5)
+        except DataValidationError:
+            raise
         except TypeError:
             # older yfinance without timeout param
-            df = yf.download(ticker_symbol, start=start, end=end, interval=interval, progress=False, auto_adjust=False)
+            try:
+                df = yf.download(ticker_symbol, start=start, end=end, interval=interval, progress=False, auto_adjust=False)
+            except DataValidationError:
+                raise
+            except TypeError:
+                raise
+            except Exception as e:
+                logger.warning("yfinance download failed for %s: %s, trying history", ticker_symbol, e)
+                df = None
         except Exception as e:
             logger.warning("yfinance download failed for %s: %s, trying history", ticker_symbol, e)
             df = None
@@ -78,6 +88,8 @@ class YahooLoader:
             try:
                 ticker = yf.Ticker(ticker_symbol)
                 df = ticker.history(start=start, end=end, interval=interval, auto_adjust=False)
+            except DataValidationError:
+                raise
             except Exception:
                 df = None
 

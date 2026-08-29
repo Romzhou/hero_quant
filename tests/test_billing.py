@@ -182,10 +182,14 @@ def test_billing_pg_noop_explicit_warning():
 def test_billing_attribution_dedup_single_source():
     """Attribution must use single source of truth and dedup by purchase_id; double-attribution not possible."""
     import inspect
-    from hero_quant.billing.service import BillingService, _GLOBAL_PURCHASES, _GLOBAL_FACTORS
+    import hashlib
+    from hero_quant.billing.service import BillingService, _GLOBAL_PURCHASES, _GLOBAL_FACTORS, _dsn_key
     dsn = "postgresql://postgres:postgres@localhost:5432/hero_quant_billing_dedup_test"
+    _dk = _dsn_key(dsn)
     _GLOBAL_FACTORS.pop(dsn, None)
     _GLOBAL_PURCHASES.pop(dsn, None)
+    _GLOBAL_FACTORS.pop(_dk, None)
+    _GLOBAL_PURCHASES.pop(_dk, None)
     svc = BillingService(dsn=dsn)
     svc.publish_factor(factor_id="dedup_f", name="Dedup", price=10.0, tenant="prov")
     receipt = svc.purchase(factor_id="dedup_f", buyer_tenant="buyer_x", price=10.0)
@@ -203,8 +207,9 @@ def test_billing_attribution_dedup_single_source():
     # functional double-insert: insert duplicate receipt with same purchase_id
     if pid is not None:
         dup = receipt.copy()
-        # duplicate in global store
-        _GLOBAL_PURCHASES[dsn].append(dup)
+        # duplicate in global store (hashed key)
+        from hero_quant.billing.service import _dsn_key as _dk2
+        _GLOBAL_PURCHASES[_dk2(dsn)].append(dup)
         # also duplicate in instance
         svc._purchases.append(dup)
         attr2 = svc.attribution("dedup_f")
@@ -215,10 +220,13 @@ def test_billing_attribution_dedup_single_source():
 
 def test_billing_rls_all_read_paths_filter_tenant():
     """ALL factor read paths must filter by tenant: tenant B cannot read tenant A's factor."""
-    from hero_quant.billing.service import BillingService, _GLOBAL_FACTORS, _GLOBAL_PURCHASES
+    from hero_quant.billing.service import BillingService, _GLOBAL_FACTORS, _GLOBAL_PURCHASES, _dsn_key
     dsn = "postgresql://postgres:postgres@localhost:5432/hero_quant_billing_rls_all"
+    _dk = _dsn_key(dsn)
     _GLOBAL_FACTORS.pop(dsn, None)
     _GLOBAL_PURCHASES.pop(dsn, None)
+    _GLOBAL_FACTORS.pop(_dk, None)
+    _GLOBAL_PURCHASES.pop(_dk, None)
     svc = BillingService(dsn=dsn)
     svc.publish_factor(factor_id="rls_f", name="RLS", price=99.0, tenant="tenantA")
     # list_factors isolates
@@ -247,13 +255,16 @@ def test_billing_rls_all_read_paths_filter_tenant():
 
 def test_publish_factor_conflict_without_flag_raises():
     """publish_factor overwrites existing factor_id without validation → must raise unless allow_overwrite/upsert."""
-    from hero_quant.billing.service import BillingService, _GLOBAL_FACTORS, _GLOBAL_PURCHASES
+    from hero_quant.billing.service import BillingService, _GLOBAL_FACTORS, _GLOBAL_PURCHASES, _dsn_key
     import inspect
 
     # PG emulated mode
     dsn = "postgresql://postgres:postgres@localhost:5432/hero_quant_billing_conflict_test"
+    _dk = _dsn_key(dsn)
     _GLOBAL_FACTORS.pop(dsn, None)
+    _GLOBAL_FACTORS.pop(_dk, None)
     _GLOBAL_PURCHASES.pop(dsn, None)
+    _GLOBAL_PURCHASES.pop(_dk, None)
     svc = BillingService(dsn=dsn)
     svc.publish_factor(factor_id="conflict_f", name="F", price=10.0, tenant="prov")
     # republish same id without flag must raise

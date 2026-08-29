@@ -18,21 +18,19 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Module-level lazy cache for Settings().data_mode — instantiate ONCE, unified across provenance blocks
 _settings_mode_cache: str | None = None
 _settings_mode_cache_lock = threading.Lock()
 
 
-def _get_data_mode() -> str:
+def _get_data_mode(*, force_refresh: bool = False) -> str:
     """Lazy cache for Settings().data_mode; on failure defaults to SAFE 'synthetic' (fail-closed).
 
     Fail-closed rationale: synthetic data must not masquerade as live when Settings unavailable;
-    unit interpretation would be wrong (board_lots vs shares). Checked against tests/test_data_registry.py
-    and tests/test_trait_contract.py — no contract expects 'live' on Settings failure.
+    unit interpretation would be wrong (board_lots vs shares).
     """
     global _settings_mode_cache
     with _settings_mode_cache_lock:
-        if _settings_mode_cache is not None:
+        if _settings_mode_cache is not None and not force_refresh:
             return _settings_mode_cache
         try:
             from hero_quant.config.settings import Settings
@@ -43,6 +41,13 @@ def _get_data_mode() -> str:
             logger.warning("settings load failed for provenance: %s", e, exc_info=e)
             _settings_mode_cache = "synthetic"  # fail-closed SAFE default
         return _settings_mode_cache
+
+
+def clear_settings_cache() -> None:
+    """供测试或环境切换时显式失效 data_mode 缓存。"""
+    global _settings_mode_cache
+    with _settings_mode_cache_lock:
+        _settings_mode_cache = None
 
 
 def _resolve_provenance(loader, result=None, prov=None) -> str:
@@ -368,12 +373,18 @@ class MarketDataRegistry:
             other_bars = result[0] if isinstance(result, tuple) and len(result)==2 else result
             if self._bars_empty(other_bars):
                 continue
-            # 避免 synthetic vs synthetic 假通过：若任一方为 synthetic 则跳过比较并记录
+            # synthetic 参与时不再静默跳过：混合 synthetic/live 为 fail-closed，需显式 opt-in 才能放行
             this_is_synthetic = (current_source == "synthetic")
             other_prov = result[1] if isinstance(result, tuple) and len(result) == 2 else None
             other_source = getattr(other_prov, "source", loader_source) if other_prov else loader_source
             if this_is_synthetic or other_source == "synthetic":
-                logger.warning("cross_source skip synthetic comparator for %s: %s vs %s", symbol, current_source, other_source)
+                # synthetic 混比需显式放行：prov 携带 allow_synthetic_comparison 标记时允许
+                _allow_synth = bool(getattr(prov, "allow_synthetic_comparison", False)) if prov is not None and hasattr(prov, "allow_synthetic_comparison") else False
+                if not _allow_synth:
+                    raise CrossSourceError(
+                        f"cross-source synthetic mix rejected for {symbol}: {current_source} vs {other_source} (use synthetic-aware prov to opt-in)"
+                    )
+                logger.warning("cross_source synthetic mix allowed via opt-in for %s: %s vs %s", symbol, current_source, other_source)
                 continue
             try:
                 other_close = self._first_close(other_bars)

@@ -137,15 +137,31 @@ def aggregate_shadow(
                 sym, q = _shadow_qty_from_trade(tr)
                 add(sym, q)
 
-    # 预计算去重标记：journal 与 ledger 是否同源
-    same_ledger = journal is not None and ledger is not None and getattr(journal, "ledger", None) is ledger
+    # 预计算去重标记：journal 与 ledger 是否同源 —— P2: 修复 identity 对比为路径解析对比，避免同内容不同实例误判
+    # 原 `is` 仅当同一对象才命中，持同一文件的不同 Ledger 实例会被双计；改为 Path.resolve 对比
+    same_ledger = False
+    if journal is not None and ledger is not None:
+        try:
+            j_ledger = getattr(journal, "ledger", None)
+            if j_ledger is not None and getattr(j_ledger, "path", None) is not None and getattr(ledger, "path", None) is not None:
+                same_ledger = Path(j_ledger.path).resolve() == Path(ledger.path).resolve()  # type: ignore[union-attr]
+            else:
+                same_ledger = j_ledger is ledger  # 回退：无路径时仍用 identity
+        except (OSError, ValueError, RuntimeError) as exc:
+            logger.warning("same_ledger resolve failed: %s", exc)
+            same_ledger = getattr(journal, "ledger", None) is ledger
+    # P2: same_file 去重与 same_ledger 统一语义，均用 resolve 对比；避免一条分支用 is 分支用 resolve 导致去重口径不一致而双计
     same_file = False
     lp: Path | None = None
     if ledger_path is not None:
         lp = Path(ledger_path)
         if journal is not None and hasattr(journal, "ledger") and getattr(journal.ledger, "path", None) is not None:
             try:
-                same_file = Path(journal.ledger.path).resolve() == lp.resolve()  # type: ignore[union-attr]
+                # P2: 统一用 resolve 比较，若失败则回退到绝对路径字符串比较，不直接置 False 导致漏去重
+                try:
+                    same_file = Path(journal.ledger.path).resolve() == lp.resolve()  # type: ignore[union-attr]
+                except (OSError, ValueError, RuntimeError):
+                    same_file = Path(journal.ledger.path).absolute().as_posix() == lp.absolute().as_posix()  # type: ignore[union-attr]
             except (OSError, ValueError, RuntimeError) as exc:
                 logger.warning("same_file resolve failed: %s", exc)
                 same_file = False
@@ -186,16 +202,17 @@ def aggregate_shadow(
                         # 避免静默丢数据：记录后继续，但上层 daily_reconciliation 会校验 ledger verify
                         continue
                     rec = e.get("record", {}) if isinstance(e, dict) else {}
+                    # P2: 统一去重口径 —— same_file 与 same_ledger 均视为同源，已由 journal 计数则跳过，避免按分支分别 continue 导致一支漏判而双计
+                    if same_file and rec.get("action") == "shadow_record":
+                        continue
+                    if same_file and "symbol" in rec and ("qty" in rec or "quantity" in rec):
+                        continue
                     if rec.get("action") == "shadow_record":
-                        if same_file:
-                            continue
                         trade = rec.get("trade", {})
                         if isinstance(trade, dict):
                             sym, q = _shadow_qty_from_trade(trade)
                             add(sym, q)
                     elif "symbol" in rec and ("qty" in rec or "quantity" in rec):
-                        if same_file:
-                            continue
                         sym, q = _shadow_qty_from_trade(rec)
                         add(sym, q)
                     elif rec:

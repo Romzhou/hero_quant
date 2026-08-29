@@ -104,8 +104,10 @@ class HeartbeatHelper:
     """Activity 心跳辅助 — 每 15s 自动 heartbeat，支持续跑恢复点。"""
 
     def __init__(self, interval: float = HEARTBEAT_INTERVAL_SECONDS) -> None:
-        # 下限 0.5s，避免过密心跳对调度与网络造成压力
-        self.interval = max(0.5, float(interval))
+        # 下限 0.5s，避免过密心跳对调度与网络造成压力；上限 30s 且不超过 heartbeatTimeout*0.8
+        # 保证 heartbeat 必在 Temporal heartbeatTimeout 之前送达，防止 activity 被误判超时
+        _upper = min(30.0, float(DEFAULT_HEARTBEAT_TIMEOUT) * 0.8)
+        self.interval = min(max(0.5, float(interval)), _upper)
         self._details: Optional[Dict[str, Any]] = None
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None

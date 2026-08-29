@@ -135,7 +135,7 @@ def generate_signal(
     return sig.generate(prices, n_assets=n_assets)
 
 
-def _static_signal(weights) -> np.ndarray:
+def _static_signal(weights: list | np.ndarray | None) -> np.ndarray:
     """透传静态权重，兼容旧 '权重向量即信号' 占位。"""
     try:
         arr = np.asarray(weights, dtype=float)
@@ -313,7 +313,7 @@ class BacktestEngine:
         s = s.replace([np.inf, -np.inf], 0.0).fillna(0.0)
         return s
 
-    def on_tick(self, tick: dict | object) -> dict:
+    def on_tick(self, tick: dict | object) -> dict[str, object | float | bool | int]:
         """流式 tick 钩子：增量更新因子并返回时延，用于实时链路的低延迟扩展点。"""
         import time
 
@@ -355,7 +355,8 @@ class BacktestEngine:
             logger.warning("on_tick latency breach %.2fms for %r (threshold 200ms)", latency_ms, symbol, exc_info=False)
             try:
                 self._latency_breach_count = int(getattr(self, "_latency_breach_count", 0)) + 1
-            except Exception:
+            except (ValueError, TypeError, AttributeError) as e:
+                logger.debug("latency breach count increment failed: %s", e)
                 self._latency_breach_count = 1
         return {"factor": val, "value": val, "latency_ms": latency_ms, "latency_breach": latency_breach, "latency_breach_count": int(getattr(self, "_latency_breach_count", 0) if latency_breach else getattr(self, "_latency_breach_count", 0)), "symbol": symbol, "price": price}
 
@@ -367,50 +368,18 @@ class BacktestEngine:
         equity_prev: float | None = None,
         w: np.ndarray | None = None,
         leverage: float | None = None,
-    ) -> dict:
+    ) -> dict[str, object]:
         """处理单根 Bar 的扩展点：返回次日可执行价 aligned_price（经 _align），当前 run 仍以 close 计算权益，未直接挂钩定价以保持 PIT 清晰。
 
         信号：权重向量即信号（通过 Signal.generate 或 _static_signal 产生），执行由外层 run 循环经 _execute_bars 完成。
         """
-        # PIT 校验在 run 层统一处理，此处仅做单 Bar 纯逻辑
+        # PIT 校验在 run 层统一处理，此处仅做单 Bar 纯逻辑 — fail-closed，无静默回退
         try:
             aligned_price = self._align(prices, idx)
         except ValidationError:
             raise
         except (ValueError, TypeError, KeyError, IndexError, AttributeError) as e:
-            logger.warning("on_bar _align failed: %s", e, exc_info=True)
-            # 窄异常回落至当 Bar 收盘，避免吞没上游 ValidationError
-            # 保留多资产结构：若价格矩阵多资产则回落为 per-asset Series
-            try:
-                # 尝试判定多资产以保持结构一致
-                non_price = {"open", "high", "low", "volume", "currency", "ccy"}
-                cand = [c for c in prices.columns if c.lower() not in non_price]
-                # 过滤有效价格列
-                cand = [c for c in cand if pd.to_numeric(prices[c], errors="coerce").notna().any()]
-                is_multi_fallback = len(cand) > 1
-                if is_multi_fallback:
-                    fallback_dict = {}
-                    for c in cand:
-                        raw = bar.get(c, np.nan)
-                        v = float(pd.to_numeric(raw, errors="coerce"))
-                        if not np.isfinite(v) or v <= 0:
-                            raise ValueError(f"fallback price non-positive for {c}: {v!r}")
-                        fallback_dict[c] = v
-                    aligned_price = pd.Series(fallback_dict, dtype=float)
-                else:
-                    raw_price = float(bar.get("close", bar.iloc[0]))
-                    if not np.isfinite(raw_price) or raw_price <= 0:
-                        raise ValueError(f"fallback price invalid: {raw_price!r}")
-                    raw_price = float(pd.to_numeric(raw_price, errors="coerce"))
-                    col_name = cand[0] if len(cand) == 1 else "price"
-                    aligned_price = pd.Series({col_name: raw_price}, dtype=float)
-            except (ValueError, TypeError, KeyError, IndexError, AttributeError) as e2:
-                logger.warning("on_bar fallback price failed: %s", e2, exc_info=True)
-                if self.historical_base_price is not None and np.isfinite(self.historical_base_price) and self.historical_base_price > 0:
-                    col_name = cand[0] if 'cand' in locals() and len(cand) == 1 else "price"
-                    aligned_price = pd.Series({col_name: float(self.historical_base_price)}, dtype=float)
-                else:
-                    raise ValidationError(f"aligned price unavailable at idx {idx}: {e2}") from e2
+            raise ValidationError(f"aligned price unavailable at idx {idx}: {e}") from e
 
         return {"bar": bar, "idx": idx, "aligned_price": aligned_price, "equity_prev": equity_prev}
 
@@ -532,13 +501,9 @@ class BacktestEngine:
         if _skip_pit_flag:
             logger.info("PIT guard bypassed via skip_pit/enforce_pit flag")
         else:
-            # PIT fail-closed: 禁止合成 price_date=index[0]（生产路径）；allow_synthetic=True 时允许 bench 合成
+            # PIT fail-closed: 无 PIT 日期且 allow_synthetic=False 时硬抛，Bench/测试需显式 allow_synthetic=True
             if weights_on is None and price_date is None and not allow_synthetic:
-                # 历史测试路径：内部合成数据窗口小且未声明 fail-closed，降级为告警而非硬抛，生产调用方应显式传 allow_synthetic 或 PIT 日期
-                logger.warning("PIT violation: weights_on and price_date are both None but allow_synthetic=False; auto-degraded to synthetic index[0] for compat (prod should set allow_synthetic=True or provide PIT dates)")
-                pd_date = prices.index[0] if isinstance(prices.index, pd.DatetimeIndex) and len(prices.index) > 0 else None
-                if pd_date is None:
-                    raise PITViolation("PIT violation: price_date is None and allow_synthetic=False; explicit price_date required")
+                raise PITViolation("PIT violation: weights_on and price_date are both None but allow_synthetic=False; explicit price_date or allow_synthetic=True required")
             else:
                 pd_date = price_date
                 if pd_date is None and isinstance(prices.index, pd.DatetimeIndex) and len(prices.index) > 0:
@@ -716,10 +681,18 @@ class BacktestEngine:
                 equity_safe = gross_equity.replace(0, np.nan).fillna(self.initial_capital)  # 避免除零
                 turnover_rate = turnover_series / equity_safe
                 turnover_rate = turnover_rate.replace([np.inf, -np.inf], 0.0).fillna(0.0)
+                # 首日换手：按实际持仓比例计算，空仓为 0 而非硬编码 1.0
                 if len(turnover_rate) > 0:
-                    turnover_rate.iloc[0] = 1.0 if turnover_rate.iloc[0] == 0 else turnover_rate.iloc[0]  # 首日视为建仓
-                cost_drag = turnover_rate * costs_f
-                net_ret = daily_ret - cost_drag
+                    _l1 = float(np.abs(w).sum()) / float(total_weight) if total_weight else 0.0
+                    _expected_first = _l1 * (float(leverage) if leverage and np.isfinite(leverage) else 1.0)
+                    # 仅当有持仓且首日换手为 0 时补齐为预期首日换手，避免空仓扣费
+                    if turnover_rate.iloc[0] == 0 and _expected_first > 0:
+                        try:
+                            turnover_rate.iloc[0] = float(_expected_first)
+                        except (ValueError, TypeError, IndexError):
+                            pass
+                # 周期内收益保持 gross（含杠杆，不含成本），成本仅在主循环逐 Bar 扣除一次，避免双计
+                net_ret = daily_ret
                 net_ret = net_ret.replace([np.inf, -np.inf], 0.0).fillna(0.0)
             except (ValueError, TypeError, AttributeError, KeyError, IndexError) as e:
                 logger.warning("turnover cost computation failed: %s", e, exc_info=True)
@@ -741,7 +714,8 @@ class BacktestEngine:
             _turnover_rate = turnover_rate  # type: ignore[name-defined]
         except NameError:
             _turnover_rate = None
-        except Exception:
+        except (AttributeError, TypeError) as e:
+            logger.debug("_turnover_rate lookup failed: %s", e)
             _turnover_rate = None
         prev_aligned_price: pd.Series | None = None
         for i in range(len(prices)):
@@ -794,18 +768,18 @@ class BacktestEngine:
             except (ValueError, TypeError, AttributeError) as e:
                 logger.warning("aligned_ret compute failed at %d: %s", i, e, exc_info=True)
                 aligned_ret_raw = None
-            # 迭代计算权益：优先 aligned_ret（已按杠杆缩放），否则回落 close 基 net_ret
+            # 迭代计算权益：net_ret 为 gross，成本在此统一扣除一次（aligned 与 close 皆同）
             try:
-                ret_i = float(net_ret.iloc[i])
+                gross_i = float(net_ret.iloc[i])
             except (ValueError, TypeError, KeyError, IndexError, AttributeError) as e:
                 logger.warning("net_ret parse failed at %d: %s", i, e, exc_info=True)
-                ret_i = 0.0
-            if not np.isfinite(ret_i):
-                ret_i = 0.0  # 非有限收益置零，避免权益发散
-            # 若本 Bar 有有效 aligned_ret，则以 aligned 定价覆盖（保留成本扣除逻辑）
+                gross_i = 0.0
+            if not np.isfinite(gross_i):
+                gross_i = 0.0
+            # 若本 Bar 有有效 aligned_ret，则以 aligned 定价覆盖 gross
+            ret_gross = gross_i
             if aligned_ret_raw is not None:
                 try:
-                    # 单资产时按杠杆缩放（包括 bear 0），多资产已按权重加权故不再乘 leverage
                     if not is_multi:
                         if leverage is not None and np.isfinite(leverage):
                             aligned_scaled = float(aligned_ret_raw) * float(leverage)
@@ -813,18 +787,22 @@ class BacktestEngine:
                             aligned_scaled = float(aligned_ret_raw)
                     else:
                         aligned_scaled = float(aligned_ret_raw)
-                    if _turnover_rate is not None and costs_f:
-                        try:
-                            _cost_drag = float(_turnover_rate.iloc[i]) * float(costs_f)  # type: ignore[attr-defined]
-                            if np.isfinite(_cost_drag):
-                                aligned_scaled = aligned_scaled - _cost_drag
-                        except (ValueError, TypeError, KeyError, IndexError, AttributeError):
-                            pass
                     if np.isfinite(aligned_scaled):
-                        ret_i = aligned_scaled
+                        ret_gross = aligned_scaled
                 except (ValueError, TypeError) as e:
                     logger.warning("aligned_scaled computation failed: %s", e, exc_info=True)
                     pass
+            # 成本扣除：仅此处一次，避免 net_ret 已扣 + aligned 再扣的双计
+            ret_i = ret_gross
+            if _turnover_rate is not None and costs_f:
+                try:
+                    _cost_drag = float(_turnover_rate.iloc[i]) * float(costs_f)  # type: ignore[attr-defined]
+                    if np.isfinite(_cost_drag):
+                        ret_i = ret_gross - _cost_drag
+                except (ValueError, TypeError, KeyError, IndexError, AttributeError):
+                    pass
+            if not np.isfinite(ret_i):
+                ret_i = 0.0
             # 更新 prev_aligned 供下次计算（首 Bar 初始化基准）— Series only
             try:
                 valid_series = True

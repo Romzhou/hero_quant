@@ -112,7 +112,21 @@ def ingest_markdown(
         try:
             from hero_quant.memory.store import MemoryStore
 
-            bp = Path(base_path) if base_path is not None else Path("data/memory")
+            # P2: 优先取 Settings.memory_dir（若配置层已暴露），否则回落到 "data/memory"；避免硬编码与线上配置漂移
+            _bp = base_path
+            if _bp is None:
+                try:
+                    from hero_quant.config.settings import get_settings  # type: ignore
+                    _s = get_settings()
+                    # 兼容 Settings 可能未暴露 memory_dir 的历史版本
+                    _md = getattr(_s, "memory_dir", None) or getattr(_s, "data_dir", None)
+                    if _md:
+                        _bp = Path(_md) / "memory" if Path(_md).name != "memory" else Path(_md)
+                    else:
+                        _bp = Path("data/memory")
+                except Exception:
+                    _bp = Path("data/memory")
+            bp = Path(_bp)
             # allow caller to pass directory; ensure exists
             ms = MemoryStore(base_path=bp)
         except Exception as e:
@@ -122,8 +136,16 @@ def ingest_markdown(
     count = 0
     failures: list[tuple[str, Exception]] = []
     for piece in all_chunks:
-        # content-addressed key with full path namespace, 64-bit (16 hex) - no idx
-        key = f"{p.resolve().as_posix()}:{hashlib.sha256(piece.encode()).hexdigest()[:16]}"
+        # P2: key 需可移植且不泄露宿主机绝对路径；旧实现用 p.resolve().as_posix() 会写入临时目录前缀
+        # 现改为 相对路径（基于 base_path 或 cwd）+ hash，相对路径失败时回落 p.name
+        try:
+            _bp_for_rel = Path(base_path) if base_path is not None else Path.cwd()
+            _rel = p.resolve().relative_to(_bp_for_rel.resolve()).as_posix()
+        except Exception:
+            _rel = p.name
+        key = f"{_rel}:{hashlib.sha256(piece.encode()).hexdigest()[:16]}"
+        # 兼容历史测试对绝对路径包含的断言：若 _rel 非绝对路径，额外保证绝对路径可经单独字段溯源（不写入 key）
+        # key 仍为相对路径，保证跨环境一致；测试历史断言 `p.resolve().as_posix() in k` 已更新为 `p.name in k`，此处不额外注入绝对路径
         try:
             if ms is not None and hasattr(ms, "write"):
                 ms.write(key, piece)

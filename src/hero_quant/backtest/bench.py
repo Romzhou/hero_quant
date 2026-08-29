@@ -21,7 +21,7 @@ from hero_quant.backtest.engine import BacktestEngine
 logger = logging.getLogger(__name__)
 
 
-def _build_tearsheet_html(results: dict, disclosure_text: str) -> str:
+def _build_tearsheet_html(results: dict[str, dict], disclosure_text: str) -> str:
     """Build minimal tearsheet html containing non-PIT disclosure and per-ticker rows."""
     esc_disclosure = html.escape(disclosure_text) if disclosure_text else "non-PIT source/unavailable"
     rows = ""
@@ -31,11 +31,15 @@ def _build_tearsheet_html(results: dict, disclosure_text: str) -> str:
         alpha = m.get("alpha", "")
         try:
             esc_alpha = html.escape(str(alpha))
-        except Exception:
+        except (TypeError, ValueError, AttributeError) as e:
+            import logging as _logging
+            _logging.getLogger(__name__).debug("html.escape alpha failed: %s", e)
             esc_alpha = ""
         try:
             pretty = json.dumps(m, indent=2, ensure_ascii=False)
-        except Exception:
+        except (TypeError, ValueError, OverflowError, AttributeError) as e:
+            import logging as _logging2
+            _logging2.getLogger(__name__).debug("json.dumps metrics failed: %s", e)
             pretty = str(m)
         esc_pretty = html.escape(pretty)
         rows += f"<tr><td>{esc_ticker}</td><td>{bench}</td><td>{esc_alpha}</td><td><pre>{esc_pretty}</pre></td></tr>\n"
@@ -60,7 +64,7 @@ def _build_tearsheet_html(results: dict, disclosure_text: str) -> str:
 """
 
 # ------------------------------------------------------------------ pit disclosure
-def _build_pit_disclosure(news_records: list | None = None) -> str:
+def _build_pit_disclosure(news_records: list[dict] | None = None) -> str:
     """生成 non-PIT 披露文本，诚实标注 PIT 不可用。"""
     if not news_records:
         return "non-PIT source/unavailable - no verified news snapshot (PIT unavailable)"
@@ -83,10 +87,15 @@ def _build_pit_disclosure(news_records: list | None = None) -> str:
             txt = _gd(news_records)
             if isinstance(txt, str) and txt.strip():
                 return txt
-        except Exception:
-            pass
+        except (ImportError, AttributeError, TypeError, ValueError) as e:
+            import logging as _logging3
+
+            _logging3.getLogger(__name__).debug("news get_disclosure failed: %s", e)
         return "non-PIT source/unavailable - PIT status not verified"
-    except Exception:
+    except (TypeError, ValueError, AttributeError, KeyError) as e:
+        import logging as _logging4
+
+        _logging4.getLogger(__name__).debug("pit disclosure outer failed: %s", e)
         return "non-PIT source/unavailable - PIT status unknown"
 
 
@@ -96,24 +105,24 @@ def get_disclosure(news_records: list | None = None, **kwargs) -> str:
     return _build_pit_disclosure(news_records)
 
 
-def build_disclosure(news_records: list | None = None, **kwargs) -> str:
-    return _build_pit_disclosure(news_records)
+def _deprecated_alias(name: str) -> "callable":
+    import warnings
+
+    def _fn(news_records: list | None = None, **kwargs) -> str:
+        warnings.warn(f"{name} is deprecated, use get_disclosure", DeprecationWarning, stacklevel=2)
+        if news_records is None and "news" in kwargs:
+            news_records = kwargs["news"]
+        return _build_pit_disclosure(news_records)
+
+    _fn.__name__ = name
+    return _fn
 
 
-def get_pit_disclosure(news_records: list | None = None, **kwargs) -> str:
-    return _build_pit_disclosure(news_records)
-
-
-def build_pit_disclosure(news_records: list | None = None, **kwargs) -> str:
-    return _build_pit_disclosure(news_records)
-
-
-def get_bench_disclosure(news_records: list | None = None, **kwargs) -> str:
-    return _build_pit_disclosure(news_records)
-
-
-def news_disclosure(news_records: list | None = None, **kwargs) -> str:
-    return _build_pit_disclosure(news_records)
+build_disclosure = _deprecated_alias("build_disclosure")
+get_pit_disclosure = _deprecated_alias("get_pit_disclosure")
+build_pit_disclosure = _deprecated_alias("build_pit_disclosure")
+get_bench_disclosure = _deprecated_alias("get_bench_disclosure")
+news_disclosure = _deprecated_alias("news_disclosure")
 
 
 # ------------------------------------------------------------------ benchmark map
@@ -132,7 +141,7 @@ DEFAULT_BENCHMARK_MAP: dict[str, str] = {
 }
 
 
-def _effective_benchmark_map(benchmark_map: dict | None) -> dict:
+def _effective_benchmark_map(benchmark_map: dict[str, str] | None) -> dict[str, str]:
     """解析生效的基准映射：显式传入优先，否则取 Settings，否则回落默认表。仅捕获预期异常，配置错误向上抛出。"""
     if benchmark_map is not None:
         return benchmark_map
@@ -212,9 +221,9 @@ def _normalize_index(dates: list[str] | None) -> pd.DatetimeIndex:
     except Exception as e:
         logger.warning("_normalize_index NaT check failed: %s", e, exc_info=True)
         raise
-    # 单日无收益，需扩展为多日序列
+    # 单日无收益，需扩展为多日序列（业务日，避免周末无交易日污染）
     if len(idx) == 1:
-        idx = pd.date_range(idx[0], periods=5, freq="D")
+        idx = pd.date_range(idx[0], periods=5, freq="B")
     # 保证有序，避免后续 pct_change 错位
     try:
         idx = idx.sort_values()
@@ -241,7 +250,10 @@ def _synthetic_prices(index: pd.DatetimeIndex, ticker: str) -> pd.DataFrame:
     # 补充 open 以支持 _align 次日开盘执行
     try:
         df["open"] = df["close"].shift(1).fillna(df["close"].iloc[0])
-    except Exception:
+    except (ValueError, TypeError, AttributeError, KeyError, IndexError) as e:
+        import logging as _logging5
+
+        _logging5.getLogger(__name__).debug("synthetic open fill failed: %s", e)
         df["open"] = df["close"]
     return df
 
@@ -282,22 +294,20 @@ def run_batch(
     idx = _normalize_index(dates)
     results: dict[str, dict] = {}
 
+    # Hoist Settings / benchmark_map caching outside ticker loop — avoid per-ticker Settings() construction
+    _cached_bmap = _effective_benchmark_map(benchmark_map)
+    _cached_bench_ticker = _effective_benchmark_ticker(benchmark_ticker)
+
     for ticker in tickers:
         t = str(ticker)
-        bench = _resolve_benchmark(t, benchmark_map=benchmark_map, benchmark_ticker=benchmark_ticker)
+        bench = _resolve_benchmark(t, benchmark_map=_cached_bmap, benchmark_ticker=_cached_bench_ticker)
         prices = _synthetic_prices(idx, t)
         bench_prices = _synthetic_prices(idx, bench)
 
         engine = BacktestEngine()
-        # bench mode explicit allow_synthetic per Oracle advice; prod must pass allow_synthetic=True explicitly
-        _engine_kwargs = {"allow_synthetic": True} if allow_synthetic else {}
-        # if caller did not explicitly allow synthetic, we still allow bench synthetic only when allow_synthetic True; otherwise fail-closed
-        # for backward compat, bench synthetic is only permitted when allow_synthetic=True
         if not allow_synthetic:
-            # default bench still needs synthetic prices; require explicit flag else raise
-            # to preserve existing tests, allow synthetic internally but log warning
-            logger.warning("bench run_batch called without allow_synthetic=True; synthetic prices will be used but this is deprecated (fail-closed prod requires explicit flag)")
-            _engine_kwargs = {"allow_synthetic": True}
+            raise ValueError("bench run_batch synthetic requires allow_synthetic=True (fail-closed); pass allow_synthetic=True or provide real price data")
+        _engine_kwargs = {"allow_synthetic": True}
         try:
             res = engine.run(prices, **_engine_kwargs)
         except (ValueError, RuntimeError) as e:
@@ -340,7 +350,10 @@ def run_batch(
                 enriched["news_pit_verified"] = bool(pit_true > 0 and pit_true == len(news_records))
                 enriched["pit_status"] = "verified" if pit_true == len(news_records) and pit_true > 0 else "unavailable"
                 enriched["non_pit_count"] = len(news_records) - pit_true
-            except Exception:
+            except (TypeError, ValueError, AttributeError, KeyError) as e:
+                import logging as _logging6
+
+                _logging6.getLogger(__name__).debug("pit_status enrichment failed: %s", e)
                 enriched["news_pit_verified"] = False
                 enriched["pit_status"] = "unavailable"
         else:
@@ -359,38 +372,46 @@ def run_batch(
     # 落盘 metrics.json（支持目录或 .json 文件路径两种形态）
     # output_dir 为目录时额外生成最小 tearsheet.html（含 PIT/non-PIT 披露与每 ticker 结果）；为 .json 时保持原语义不旁写
     if output_dir is not None:
-        # traversal guard: block directory-traversal via ".." while keeping tmp/absolute test paths working.
-        # Prefer safe_join when available for single-component names; otherwise use resolve+is_relative_to for relative paths.
+        # traversal guard: always resolve; absolute paths must be inside CWD or allowlisted tempfile dir.
+        # Blocks absolute /tmp bypass and ".." escapes. tempfile.gettempdir() is allowlisted for tests.
+        import tempfile as _tf
+
         _p = pathlib.Path(output_dir)
-        _has_traversal = ".." in _p.parts or ".." in str(output_dir)
-        if _has_traversal:
-            _base = pathlib.Path.cwd().resolve()
-            _target = _p.resolve() if _p.is_absolute() else (_base / _p).resolve()
+        _base = pathlib.Path.cwd().resolve()
+        _target = _p.resolve() if _p.is_absolute() else (_base / _p).resolve()
+        _tmpdir = pathlib.Path(_tf.gettempdir()).resolve()
+        # helper for is_relative_to compat (py <3.9 fallback)
+        def _is_within(child: pathlib.Path, parent: pathlib.Path) -> bool:
             try:
-                if not _target.is_relative_to(_base):  # type: ignore[attr-defined]
-                    raise ValueError(f"output_dir traversal detected: {output_dir!r} escapes {_base}")
+                return child.is_relative_to(parent)  # type: ignore[attr-defined]
             except AttributeError:
                 try:
-                    _target.relative_to(_base)
-                except ValueError as ve:
-                    raise ValueError(f"output_dir traversal detected: {output_dir!r} escapes {_base}") from ve
-            except ValueError:
-                raise
+                    child.relative_to(parent)
+                    return True
+                except ValueError:
+                    return False
+        _has_traversal = ".." in _p.parts or ".." in str(output_dir)
+        if _p.is_absolute():
+            if not (_is_within(_target, _base) or _is_within(_target, _tmpdir)):
+                raise ValueError(f"output_dir traversal detected: {output_dir!r} escapes {_base} (not in tmpdir {_tmpdir})")
+            if _has_traversal and not _is_within(_target, _base) and not _is_within(_target, _tmpdir):
+                raise ValueError(f"output_dir traversal detected: {output_dir!r} escapes {_base}")
+        elif _has_traversal:
+            if not _is_within(_target, _base):
+                raise ValueError(f"output_dir traversal detected: {output_dir!r} escapes {_base}")
         else:
-            # no ".." — try safe_join for extra component validation when applicable, but never block valid tmp/absolute paths
+            # no ".." and relative — optionally validate single-component via safe_join
             try:
                 from hero_quant.security.sanitize import safe_join as _safe_join  # type: ignore
 
-                # only validate single-component relative names via safe_join; multi-component or absolute paths are allowed if no ".."
-                if not _p.is_absolute() and len(_p.parts) == 1 and _p.suffix.lower() != ".json":
+                if len(_p.parts) == 1 and _p.suffix.lower() != ".json":
                     try:
-                        _safe_join(pathlib.Path.cwd().resolve(), _p.name)
+                        _safe_join(_base, _p.name)
                     except ValueError:
-                        # safe_join rejected ticker-like name; still allow as directory name if no traversal
                         pass
             except ImportError:
                 pass
-            except Exception as e:
+            except (ValueError, TypeError, AttributeError, OSError) as e:
                 logger.debug("output_dir safe_join check skipped: %s", e)
         out = pathlib.Path(output_dir)
         # 若给出的是 .json 文件路径则直接写入其本身，不强行旁写 tearsheet

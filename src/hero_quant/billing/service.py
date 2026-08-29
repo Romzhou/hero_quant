@@ -7,6 +7,7 @@ Task8: asyncpg PG + RLS (tenant = current_setting('app.tenant', true))
 from __future__ import annotations
 
 import copy
+import hashlib
 import math
 import os
 import threading
@@ -65,10 +66,10 @@ CREATE TABLE IF NOT EXISTS purchases (
 # NOTE: DDL_FACTORS/DDL_PURCHASES are gated — only executed when real PG pool is available.
 # When running in emulated PG mode (no real pool), PG persistence not implemented, using emulated store.
 
-# Global emulated PG stores for fallback when asyncpg not available but DSN is PG (restart not lost)
+# Emulated PG stores — keyed by hashed DSN prefix (avoid clear-text password in dict key)
 _GLOBAL_LOCK = threading.RLock()
-_GLOBAL_FACTORS: Dict[str, Dict[str, dict]] = {}  # dsn -> factor_id -> factor
-_GLOBAL_PURCHASES: Dict[str, List[dict]] = {}  # dsn -> list[purchase]
+_GLOBAL_FACTORS: Dict[str, Dict[str, dict]] = {}  # hashed_dsn -> factor_id -> factor
+_GLOBAL_PURCHASES: Dict[str, List[dict]] = {}  # hashed_dsn -> list[purchase]
 _PG_WARNING_LOGGED = False
 _PG_WARNING_LOCK = threading.Lock()
 _purchase_counter = 0
@@ -77,6 +78,19 @@ _purchase_counter_lock = threading.Lock()
 
 def _is_pg_dsn(dsn: str | None) -> bool:
     return isinstance(dsn, str) and dsn.startswith(_PG_PREFIXES)
+
+
+def _dsn_key(dsn: str | None) -> str:
+    """Hashed DSN key — avoids clear-text password lingering as dict key."""
+    if not isinstance(dsn, str) or not dsn:
+        return "__memory__"
+    # backward compat: if already-hashed key stored as raw DSN, transparently map
+    if dsn in _GLOBAL_FACTORS or dsn in _GLOBAL_PURCHASES:
+        return dsn
+    try:
+        return hashlib.sha256(dsn.encode()).hexdigest()[:12]
+    except Exception:
+        return "__memory__"
 
 
 def _log_pg_warning_once():
@@ -116,10 +130,11 @@ class BillingService:
                 self._asyncpg = asyncpg
             except Exception:
                 self._asyncpg = None  # type: ignore
-            # attempt to init global stores for emulated PG under lock
+            # attempt to init global stores for emulated PG under lock (hashed key)
+            _k = _dsn_key(self.dsn)
             with _GLOBAL_LOCK:
-                _GLOBAL_FACTORS.setdefault(self.dsn, {})  # type: ignore
-                _GLOBAL_PURCHASES.setdefault(self.dsn, [])  # type: ignore
+                _GLOBAL_FACTORS.setdefault(_k, {})  # type: ignore
+                _GLOBAL_PURCHASES.setdefault(_k, [])  # type: ignore
             # minimal fix: log warning that real PG not implemented
             _log_pg_warning_once()
         else:
@@ -145,13 +160,13 @@ class BillingService:
         if not _is_pg_dsn(self.dsn):
             return self._factors
         with _GLOBAL_LOCK:
-            return copy.deepcopy(_GLOBAL_FACTORS.get(self.dsn, {}))  # type: ignore
+            return copy.deepcopy(_GLOBAL_FACTORS.get(_dsn_key(self.dsn), {}))  # type: ignore
 
     def _get_global_purchases(self) -> List[dict]:
         if not _is_pg_dsn(self.dsn):
             return list(self._purchases)
         with _GLOBAL_LOCK:
-            return copy.deepcopy(_GLOBAL_PURCHASES.get(self.dsn, []))  # type: ignore
+            return copy.deepcopy(_GLOBAL_PURCHASES.get(_dsn_key(self.dsn), []))  # type: ignore
 
     def _pg_publish_noop(self, factor: dict) -> None:
         """显式 no-op 桩：真实 PG 未实现时不做任何持久化，已通过 _log_pg_warning_once 告警。"""
@@ -187,7 +202,7 @@ class BillingService:
             existing_tenant = None
             if self._is_pg_mode():
                 with _GLOBAL_LOCK:
-                    existing = _GLOBAL_FACTORS.get(self.dsn, {}).get(factor_id)  # type: ignore
+                    existing = _GLOBAL_FACTORS.get(_dsn_key(self.dsn), {}).get(factor_id)  # type: ignore
                     if existing is not None:
                         exists = True
                         existing_tenant = existing.get("tenant")
@@ -224,7 +239,7 @@ class BillingService:
         # gate writes: real PG vs emulated-degraded vs memory (Req #4)
         if self._is_real_pg():
             with _GLOBAL_LOCK:
-                _GLOBAL_FACTORS[self.dsn][factor_id] = copy.deepcopy(factor)  # type: ignore
+                _GLOBAL_FACTORS[_dsn_key(self.dsn)][factor_id] = copy.deepcopy(factor)  # type: ignore
             self._factors[factor_id] = copy.deepcopy(factor)
             try:
                 self._pg_publish_sync(factor)
@@ -233,7 +248,7 @@ class BillingService:
                 _log_warning("billing: _pg_publish_sync failed for factor_id=%s", factor_id, exc_info=e)
                 with _GLOBAL_LOCK:
                     try:
-                        _GLOBAL_FACTORS[self.dsn].pop(factor_id, None)  # type: ignore
+                        _GLOBAL_FACTORS[_dsn_key(self.dsn)].pop(factor_id, None)  # type: ignore
                     except Exception as _e:
                         _log_warning("billing: rollback global pop failed for %s: %s", factor_id, _e)
                 try:
@@ -244,7 +259,7 @@ class BillingService:
         elif self._is_pg_mode():
             _log_warning("billing degraded (emulated PG without driver) tenant=%s", str(factor.get("tenant", "default")), exc_info=False)
             with _GLOBAL_LOCK:
-                _GLOBAL_FACTORS[self.dsn][factor_id] = copy.deepcopy(factor)  # type: ignore
+                _GLOBAL_FACTORS[_dsn_key(self.dsn)][factor_id] = copy.deepcopy(factor)  # type: ignore
             self._factors[factor_id] = copy.deepcopy(factor)
             try:
                 self._pg_publish_sync(factor)
@@ -253,7 +268,7 @@ class BillingService:
                 _log_warning("billing: _pg_publish_sync failed for factor_id=%s", factor_id, exc_info=e)
                 with _GLOBAL_LOCK:
                     try:
-                        _GLOBAL_FACTORS[self.dsn].pop(factor_id, None)  # type: ignore
+                        _GLOBAL_FACTORS[_dsn_key(self.dsn)].pop(factor_id, None)  # type: ignore
                     except Exception as _e:
                         _log_warning("billing: rollback global pop failed for %s: %s", factor_id, _e)
                 try:
@@ -311,7 +326,7 @@ class BillingService:
         if self._is_pg_mode():
             # emulated RLS: filter by tenant = current_setting('app.tenant') equivalent
             with _GLOBAL_LOCK:
-                store = copy.deepcopy(_GLOBAL_FACTORS.get(self.dsn, {}))  # type: ignore
+                store = copy.deepcopy(_GLOBAL_FACTORS.get(_dsn_key(self.dsn), {}))  # type: ignore
             # merge with instance factors for completeness
             merged: Dict[str, dict] = {}
             merged.update(store)
@@ -336,7 +351,7 @@ class BillingService:
         """按 ID 获取因子，PG 时查 global store. If tenant supplied, enforce RLS filter."""
         if self._is_pg_mode():
             with _GLOBAL_LOCK:
-                val = _GLOBAL_FACTORS.get(self.dsn, {}).get(factor_id)  # type: ignore
+                val = _GLOBAL_FACTORS.get(_dsn_key(self.dsn), {}).get(factor_id)  # type: ignore
                 if val is not None:
                     val = copy.deepcopy(val)
             if val is not None:
@@ -363,8 +378,14 @@ class BillingService:
         factor_id: str,
         buyer_tenant: str,
         price: float | None = None,
+        idempotency_key: str | None = None,
+        **kwargs,
     ) -> dict:
-        """购买因子，生成购买收据并可选同步 ledger。先写 ledger 再落持久化，避免半提交。"""
+        """购买因子，生成购买收据并可选同步 ledger。先写 ledger 再落持久化，避免半提交。
+
+        idempotency_key: 幂等键，若提供则重复调用返回同一收据，不重复计费。
+            未提供时仍生成内部 purchase_id 保证唯一。
+        """
         if not isinstance(buyer_tenant, str) or not buyer_tenant.strip():
             raise ValueError("buyer_tenant must be non-empty str")
         _validate_price(price, field="price")
@@ -381,6 +402,23 @@ class BillingService:
         use_price = float(price) if price is not None else float(factor["price"])
         if not math.isfinite(use_price) or use_price < 0:
             raise ValueError(f"price must be finite and >= 0, got {use_price!r}")
+        # idempotency: accept via explicit arg or kwargs alias
+        if idempotency_key is None:
+            idempotency_key = kwargs.get("idempotency_key") or kwargs.get("idem_key")  # alias
+        if isinstance(idempotency_key, str):
+            idempotency_key = idempotency_key.strip() or None
+        # check existing purchases for same idempotency_key — return prior receipt without duplicate charge
+        if idempotency_key is not None:
+            # search both stores
+            candidates: list[dict] = []
+            if self._is_pg_mode():
+                with _GLOBAL_LOCK:
+                    candidates = list(_GLOBAL_PURCHASES.get(_dsn_key(self.dsn), []) or [])  # type: ignore
+            else:
+                candidates = list(self._purchases)
+            for _prev in candidates:
+                if _prev.get("idempotency_key") == idempotency_key and _prev.get("factor_id") == factor_id and _prev.get("buyer_tenant") == buyer_tenant:
+                    return copy.deepcopy(_prev)
         # generate unique purchase_id for dedup
         with _purchase_counter_lock:
             global _purchase_counter
@@ -393,6 +431,7 @@ class BillingService:
             "price": use_price,
             "action": "purchase_factor",
             "purchase_id": pid,
+            "idempotency_key": idempotency_key,
         }
         # 先写 ledger，失败不落持久化
         if self.ledger is not None:
@@ -408,7 +447,7 @@ class BillingService:
         # gate writes: real PG vs emulated (degraded) — requirement #4
         if self._is_real_pg():
             with _GLOBAL_LOCK:
-                _GLOBAL_PURCHASES[self.dsn].append(copy.deepcopy(receipt))  # type: ignore
+                _GLOBAL_PURCHASES[_dsn_key(self.dsn)].append(copy.deepcopy(receipt))  # type: ignore
             self._purchases.append(copy.deepcopy(receipt))
             try:
                 self._pg_purchase_sync(receipt)
@@ -418,7 +457,7 @@ class BillingService:
         elif self._is_pg_mode():
             _log_warning("billing degraded (emulated PG without driver) buyer=%s", buyer_tenant, exc_info=False)
             with _GLOBAL_LOCK:
-                _GLOBAL_PURCHASES[self.dsn].append(copy.deepcopy(receipt))  # type: ignore
+                _GLOBAL_PURCHASES[_dsn_key(self.dsn)].append(copy.deepcopy(receipt))  # type: ignore
             self._purchases.append(copy.deepcopy(receipt))
             try:
                 self._pg_purchase_sync(receipt)
@@ -428,7 +467,7 @@ class BillingService:
                 # 回滚已写入的 emulated
                 with _GLOBAL_LOCK:
                     try:
-                        lst = _GLOBAL_PURCHASES.get(self.dsn, [])  # type: ignore
+                        lst = _GLOBAL_PURCHASES.get(_dsn_key(self.dsn), [])  # type: ignore
                         # 移除最后一条匹配的 receipt
                         for i in range(len(lst) - 1, -1, -1):
                             if lst[i].get("purchase_id") == pid:
@@ -497,7 +536,7 @@ class BillingService:
         # single source of truth
         if self._is_pg_mode():
             with _GLOBAL_LOCK:
-                store = list(_GLOBAL_PURCHASES.get(self.dsn, []) or [])  # type: ignore
+                store = list(_GLOBAL_PURCHASES.get(_dsn_key(self.dsn), []) or [])  # type: ignore
             relevant = [p for p in store if p.get("factor_id") == factor_id]
         else:
             relevant = [p for p in list(self._purchases) if p.get("factor_id") == factor_id]
@@ -523,7 +562,7 @@ class BillingService:
             raise ValueError("tenant must be non-empty str")
         if self._is_pg_mode():
             with _GLOBAL_LOCK:
-                store = list(_GLOBAL_PURCHASES.get(self.dsn, []) or [])  # type: ignore
+                store = list(_GLOBAL_PURCHASES.get(_dsn_key(self.dsn), []) or [])  # type: ignore
             # RLS simulation: where buyer_tenant = current_setting('app.tenant', true) — canonical field buyer_tenant
             return [copy.deepcopy(p) for p in store if p.get("buyer_tenant") == tenant]
         return [copy.deepcopy(p) for p in self._purchases if p.get("buyer_tenant") == tenant]

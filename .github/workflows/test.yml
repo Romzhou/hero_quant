@@ -36,6 +36,12 @@ jobs:
         uses: gitleaks/gitleaks-action@v2 # pin: sha256:2a65dd62a8f8b5afedd072f3e2aa1c8a3b6c7a0e7d0a9c
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Frontend typecheck + build + unit tests (blocking)
+        run: |
+          npm ci --prefix frontend
+          npx tsc --noEmit -p frontend/tsconfig.json
+          npm run build --prefix frontend
+          npm run test:run --prefix frontend
       - name: Install Playwright browsers
         continue-on-error: true
         run: npx playwright install --with-deps

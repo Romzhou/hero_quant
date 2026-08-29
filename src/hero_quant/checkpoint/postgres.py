@@ -36,6 +36,8 @@ except Exception:
         ConnectionPool = None  # type: ignore
 
 # Task7 DDL — required primary key (tenant, thread, seq), tenant text, thread text, seq int
+# ON CONFLICT (tenant, thread, seq) — upsert semantic: DO UPDATE SET checkpoint/run_text/expires_at
+# (conflict target is the composite PK; see _pg_put_sync/_pg_put_async SQL).
 DDL_CHECKPOINTS = """
 CREATE TABLE IF NOT EXISTS checkpoints (
   tenant text NOT NULL,
@@ -61,9 +63,18 @@ CREATE INDEX IF NOT EXISTS idx_checkpoints_legacy_expires_at ON checkpoints_lega
 _PG_PREFIXES = ("postgresql://", "postgres://", "postgresql+psycopg://")
 
 # Global emulated PG store for in-memory PG mock (restart not lost without real PG)
+# NOTE: unbounded in-memory dict. For production, bound via LRU / TTL eviction or
+# external store: consider maxsize (e.g. 10k entries) with least-recently-used eviction
+# and periodic expiry sweep. Current TTL sweep occurs lazily in get/list_thread_ids;
+# a background janitor could be added for proactive eviction.
+# TODO(warm-start): on startup warm _PG_SEQ_BY_RUN / _PG_RUN_BY_SEQ / _PG_GLOBAL_* from
+# DB (SELECT tenant, thread, seq, run_text FROM checkpoints WHERE expires_at IS NULL
+# OR expires_at > now()) if real PG pool available, so seq<->run mapping survives
+# process restart without relying on in-memory only state.
 _PG_GLOBAL_STORE: Dict[str, Dict[str, Any]] = {}
 _PG_GLOBAL_META: Dict[str, Dict[str, Any]] = {}
 _PG_GLOBAL_TS: Dict[str, float] = {}
+_PG_MAXSIZE = 10000  # LRU bound for emulated store; 0 = unbounded (legacy)
 
 # Persist run-string -> seq mapping for deterministic seq and collision disambiguation.
 # Key: f"{tenant}::{thread}::{run}" -> seq ; reverse: f"{tenant}::{thread}::{seq}" -> run
@@ -104,6 +115,21 @@ def _pg_store_prefix(dsn: str) -> str:
     except Exception:
         h = "default"
     return f"{h}::"
+
+
+def _evict_if_needed() -> None:
+    """LRU eviction for emulated global store when exceeding _PG_MAXSIZE."""
+    if _PG_MAXSIZE <= 0 or len(_PG_GLOBAL_TS) <= _PG_MAXSIZE:
+        return
+    # evict oldest by timestamp
+    try:
+        oldest = sorted(_PG_GLOBAL_TS.items(), key=lambda kv: kv[1])
+        for k, _ in oldest[: len(_PG_GLOBAL_TS) - _PG_MAXSIZE]:
+            _PG_GLOBAL_STORE.pop(k, None)
+            _PG_GLOBAL_META.pop(k, None)
+            _PG_GLOBAL_TS.pop(k, None)
+    except Exception:
+        pass
 
 
 def _redact_dsn(dsn: str) -> str:
@@ -660,6 +686,7 @@ class AsyncPostgresSaver:
                 _PG_GLOBAL_STORE[key] = copy.deepcopy(checkpoint)
                 _PG_GLOBAL_META[key] = copy.deepcopy(cfg)
                 _PG_GLOBAL_TS[key] = now
+                _evict_if_needed()
             # also keep instance store for immediate access
             self._store[thread_id] = copy.deepcopy(checkpoint)
             self._meta[thread_id] = cfg
@@ -692,11 +719,13 @@ class AsyncPostgresSaver:
                     _PG_GLOBAL_STORE[key] = copy.deepcopy(checkpoint)
                     _PG_GLOBAL_META[key] = copy.deepcopy(cfg)
                     _PG_GLOBAL_TS[key] = now
+                    _evict_if_needed()
             else:
                 with _PG_GLOBAL_LOCK:
                     _PG_GLOBAL_STORE[key] = copy.deepcopy(checkpoint)
                     _PG_GLOBAL_META[key] = copy.deepcopy(cfg)
                     _PG_GLOBAL_TS[key] = now
+                    _evict_if_needed()
             self._store[thread_id] = copy.deepcopy(checkpoint)
             self._meta[thread_id] = cfg
             self._timestamps[thread_id] = now
