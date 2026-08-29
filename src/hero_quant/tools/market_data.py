@@ -126,7 +126,7 @@ def get_market_data(
                 is_empty = False
         if is_empty:
             raise ImportError("pip install hero-quant[us] or [ashare] - no loader registered")
-        bars, prov = reg.get_bars(symbol, interval, start, end)
+        bars, prov = reg.get_bars(symbol, start, end, interval=interval)
         provenance = {"source": getattr(prov, "source", "unknown"), "unit": getattr(prov, "unit", "shares")}
         # 透传 provenance 额外字段，便于上游追踪来源细节
         if hasattr(prov, "extra") and prov.extra:
@@ -301,7 +301,7 @@ def get_bars_range(
     reg = _get_shared_registry()
     for sym in symbols or []:
         try:
-            bars, prov = reg.get_bars(sym, interval, start, end)
+            bars, prov = reg.get_bars(sym, start, end, interval=interval)
             provenance = {"source": getattr(prov, "source", "unknown"), "unit": getattr(prov, "unit", "shares")}
             data[sym] = {"bars": bars, "provenance": provenance, "ok": True}
         except Exception as e:

@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 
 # Module-level lazy cache for Settings().data_mode — instantiate ONCE, unified across provenance blocks
 _settings_mode_cache: str | None = None
+_settings_mode_cache_lock = threading.Lock()
 
 
 def _get_data_mode() -> str:
@@ -30,17 +31,18 @@ def _get_data_mode() -> str:
     and tests/test_trait_contract.py — no contract expects 'live' on Settings failure.
     """
     global _settings_mode_cache
-    if _settings_mode_cache is not None:
-        return _settings_mode_cache
-    try:
-        from hero_quant.config.settings import Settings
+    with _settings_mode_cache_lock:
+        if _settings_mode_cache is not None:
+            return _settings_mode_cache
+        try:
+            from hero_quant.config.settings import Settings
 
-        m = Settings().data_mode
-        _settings_mode_cache = str(m).strip().lower() if isinstance(m, str) else "live"
-    except Exception as e:
-        logger.warning("settings load failed for provenance: %s", e, exc_info=e)
-        _settings_mode_cache = "synthetic"  # fail-closed SAFE default
-    return _settings_mode_cache
+            m = Settings().data_mode
+            _settings_mode_cache = str(m).strip().lower() if isinstance(m, str) else "live"
+        except Exception as e:
+            logger.warning("settings load failed for provenance: %s", e, exc_info=e)
+            _settings_mode_cache = "synthetic"  # fail-closed SAFE default
+        return _settings_mode_cache
 
 
 def _resolve_provenance(loader, result=None, prov=None) -> str:

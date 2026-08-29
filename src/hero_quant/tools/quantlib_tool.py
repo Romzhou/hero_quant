@@ -9,6 +9,7 @@ pandas 实现；数据不可用时返回 20 点合成序列兜底。全部工具
 from __future__ import annotations
 
 import logging
+import threading
 from typing import Any, Dict
 
 import pandas as pd
@@ -20,33 +21,35 @@ logger = logging.getLogger(__name__)
 SUPPORTED_INDICATORS = {"sma", "ma", "ema", "rsi", "bollinger", "bb", "boll", "macd", "max_drawdown", "mdd", "drawdown"}
 
 _shared_registry = None
+_shared_registry_lock = threading.Lock()
 
 
 def _get_shared_registry():
     global _shared_registry
-    if _shared_registry is None:
-        from hero_quant.data.registry import MarketDataRegistry
-        from hero_quant.data.loaders.tencent import TencentLoader
+    with _shared_registry_lock:
+        if _shared_registry is None:
+            from hero_quant.data.registry import MarketDataRegistry
+            from hero_quant.data.loaders.tencent import TencentLoader
 
-        reg = MarketDataRegistry()
-        try:
-            reg.register(TencentLoader())
-        except Exception as e:
-            logger.warning("TencentLoader register failed: %s", e, exc_info=True)
-        try:
-            from hero_quant.data.loaders.yahoo import YahooLoader
+            reg = MarketDataRegistry()
+            try:
+                reg.register(TencentLoader())
+            except Exception as e:
+                logger.warning("TencentLoader register failed: %s", e, exc_info=True)
+            try:
+                from hero_quant.data.loaders.yahoo import YahooLoader
 
-            reg.register(YahooLoader())
-        except (ImportError, ModuleNotFoundError) as e:
-            logger.debug("YahooLoader not available: %s", e)
-        except Exception as e:
-            logger.warning("YahooLoader register failed: %s", e, exc_info=True)
-        _shared_registry = reg
-    return _shared_registry
+                reg.register(YahooLoader())
+            except (ImportError, ModuleNotFoundError) as e:
+                logger.debug("YahooLoader not available: %s", e)
+            except Exception as e:
+                logger.warning("YahooLoader register failed: %s", e, exc_info=True)
+            _shared_registry = reg
+        return _shared_registry
 
 
-def _fetch_closes(symbol: str, start: str = "2026-08-01", end: str = "2026-08-03"):
-    """拉取收盘价序列，失败时回退至 20 点合成数据以保证指标可算。"""
+def _fetch_closes(symbol: str, start: str = "2026-08-01", end: str = "2026-08-03", allow_synthetic: bool = False):
+    """拉取收盘价序列，fail-closed：无有效收盘价时抛错，禁止合成 ok:true。"""
     try:
         reg = _get_shared_registry()
         bars, _ = reg.get_bars(symbol, start, end, interval="1d")
@@ -66,11 +69,11 @@ def _fetch_closes(symbol: str, start: str = "2026-08-01", end: str = "2026-08-03
             closes.append(v)
         if closes:
             return closes
-        logger.warning("no valid closes for %s, returning synthetic fallback", symbol)
+        logger.warning("no valid closes for %s", symbol)
     except Exception as e:
         logger.warning("fetch closes failed for %s: %s", symbol, e, exc_info=True)
-    # 无可用行情时提供 20 点等差序列，避免上层指标因空数据失败
-    return [100 + i * 0.5 for i in range(20)]
+        raise RuntimeError(f"no valid closes for {symbol}: {e}") from e
+    raise RuntimeError(f"no valid closes for {symbol} and allow_synthetic={allow_synthetic} (fail-closed)")
 
 
 def _validate_window(window: Any, closes_len: int | None = None) -> int:
@@ -127,10 +130,11 @@ def compute_indicator(
     window: int = 20,
     start: str = "2026-08-01",
     end: str = "2026-08-20",
+    allow_synthetic: bool = False,
 ) -> Dict[str, Any]:
     """计算技术指标（sma/ema/rsi/bollinger/macd/max_drawdown），quantlib 优先、pandas 兜底。"""
     try:
-        closes = _fetch_closes(symbol, start, end)
+        closes = _fetch_closes(symbol, start, end, allow_synthetic=allow_synthetic)
         s = pd.Series(closes, dtype=float)
         ind = (indicator or "sma").lower().strip()
         if ind not in SUPPORTED_INDICATORS:

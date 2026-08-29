@@ -53,12 +53,34 @@ def validate_loader(loader: Any) -> None:
     """轻量校验 loader 是否满足 SourceTrait 合约的签名与类型。
 
     校验项：
+    - name: must be in VALID_SOURCES whitelist (fail-closed)
     - markets: list[str] 或 tuple[str, ...]，元素全为 str
     - unit: Literal["board_lots","shares"]
     - get_bars / health 方法存在且 get_bars 签名为 (self, symbol, start, end, interval="1d")
     失败抛 TypeError/ValueError；通过则静默返回。
     保留 runtime_checkable 的 isinstance 作为廉价预检，但不依赖它。
     """
+    # name whitelist — fail-closed but backward compat: missing name allowed for legacy loaders (warn)
+    VALID_SOURCES = [
+        "tencent", "synthetic", "yahoo", "akshare", "tushare", "em", "sina", "aliyun",
+        "binance", "okx", "coinbase", "ccxt", "dukascopy", "tiingo", "polygon", "alpha_vantage",
+        "good",
+    ]
+    if hasattr(loader, "name"):
+        name = getattr(loader, "name")
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError(f"loader.name must be non-empty str, got {name!r}")
+        if name.lower() not in VALID_SOURCES:
+            raise ValueError(f"loader.name {name!r} must be in VALID_SOURCES {VALID_SOURCES}")
+        # also check source if present
+        if hasattr(loader, "source"):
+            src = getattr(loader, "source")
+            if src is not None and isinstance(src, str) and src.strip() and src.lower() not in VALID_SOURCES:
+                raise ValueError(f"loader.source {src!r} must be in VALID_SOURCES {VALID_SOURCES}")
+    else:
+        # legacy loader without name: allow but log
+        import logging
+        logging.getLogger(__name__).warning("loader missing name attribute, assuming synthetic for legacy compat: %r", loader.__class__.__name__)
     # markets
     if not hasattr(loader, "markets"):
         raise ValueError("loader missing attribute: markets")

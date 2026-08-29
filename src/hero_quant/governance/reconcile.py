@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 import logging
+import math
 
 import csv
 import json
@@ -38,10 +39,14 @@ def _normalize_qty(value: Any) -> float:
         logger.warning("invalid qty: empty string %r", value)
         raise ValueError("qty is empty")
     try:
-        return float(value)
+        fv = float(value)
     except (ValueError, TypeError) as exc:
         logger.warning("invalid qty value %r: %s", value, exc)
         raise ValueError(f"invalid qty: {value!r}") from exc
+    if not math.isfinite(fv):
+        logger.warning("invalid qty non-finite %r", value)
+        raise ValueError(f"invalid qty (non-finite): {value!r}")
+    return fv
 
 
 def load_positions_csv(path: str | Path) -> Dict[str, float]:
@@ -177,7 +182,8 @@ def aggregate_shadow(
                     try:
                         e = json.loads(line)
                     except (json.JSONDecodeError, ValueError) as exc:
-                        logger.debug("aggregate_shadow skip malformed json line %r: %s", line[:200], exc)
+                        logger.warning("aggregate_shadow malformed json line %r: %s", line[:200], exc)
+                        # 避免静默丢数据：记录后继续，但上层 daily_reconciliation 会校验 ledger verify
                         continue
                     rec = e.get("record", {}) if isinstance(e, dict) else {}
                     if rec.get("action") == "shadow_record":
@@ -192,6 +198,9 @@ def aggregate_shadow(
                             continue
                         sym, q = _shadow_qty_from_trade(rec)
                         add(sym, q)
+                    elif rec:
+                        # 非持仓记录也不静默：调试可见
+                        logger.debug("aggregate_shadow skip non-holding record %r", rec.get("action"))
             except Exception as exc:
                 logger.warning("ledger_path read failed: %s", exc, exc_info=exc)
                 raise
@@ -232,10 +241,13 @@ def reconcile(
         b = float(broker.get(sym, 0))
         d = s - b
         ad = abs(d)
-        total += ad
+        # 修复 tolerance vs total_diff 不一致：仅容差外的差额计入 total，保持 zero 与 total 一致
         if ad > tolerance:
             diffs.append({"symbol": sym, "shadow": s, "broker": b, "diff": d, "abs_diff": ad})
-    # Also handle tolerance for total
+            total += ad
+        else:
+            # 容差内视为 0，不计入 total，避免 zero=True 却 total>0 的矛盾
+            pass
     zero = len(diffs) == 0
     # round total for stable output
     total = round(total, 10)

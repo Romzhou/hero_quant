@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 import logging
@@ -100,6 +101,29 @@ END $$;
 
 DDL_RLS_DEDUP = DDL_RLS_PG
 DDL_RLS_TOOL_CALL = DDL_RLS_PG
+
+
+def _pg_set_dual_tenant_sync(conn: Any, tenant: str) -> None:
+    """Unify dual RLS key: SET LOCAL both app.current_tenant (dedup) and app.tenant (billing)."""
+    val = str(tenant).strip()
+    if not val:
+        return
+    for _key in ("app.current_tenant", "app.tenant"):
+        _sql = f"SET LOCAL {_key} = %s"
+        try:
+            try:
+                conn.execute(_sql, (val,))  # type: ignore[attr-defined]
+            except Exception:
+                with conn.cursor() as _c:  # type: ignore[attr-defined]
+                    _c.execute(_sql, (val,))
+        except Exception as _e:
+            logger.debug("dedup SET LOCAL %s failed: %s", _key, _e)
+
+
+def _pg_tenant_from_key(key: str) -> str:
+    if not isinstance(key, str) or not key:
+        return "default"
+    return key.split(":", 1)[0].strip() or "default"
 
 # Optional PG pool
 try:
@@ -369,8 +393,9 @@ class DedupStore:
         if not self._is_pg or self.pool is None or _is_async_pool(self.pool):
             return None
         try:
-            sql_del = "DELETE FROM dedup WHERE key=%s AND updated_at < now() - interval '%s seconds'"
-            sql_del2 = "DELETE FROM tool_call_dedup WHERE idempotency_key=%s AND updated_at < now() - interval '%s seconds'"
+            # 修复 TTL 占位：'%s seconds' 不会替换，改用 %s * INTERVAL '1 second' 参数化
+            sql_del = "DELETE FROM dedup WHERE key=%s AND updated_at < now() - %s * INTERVAL '1 second'"
+            sql_del2 = "DELETE FROM tool_call_dedup WHERE idempotency_key=%s AND updated_at < now() - %s * INTERVAL '1 second'"
             sql = """
                 INSERT INTO dedup (key, tool, status, updated_at)
                 VALUES (%s, %s, 'PENDING', now())
@@ -384,23 +409,25 @@ class DedupStore:
             inserted = False
             if hasattr(self.pool, "connection"):
                 with self.pool.connection() as conn:  # type: ignore
+                    _pg_set_dual_tenant_sync(conn, _pg_tenant_from_key(key))
                     # TTL cleanup: delete expired rows before insert
                     if self.ttl_seconds > 0:
+                        ttl_int = int(self.ttl_seconds)
                         try:
                             try:
-                                conn.execute(sql_del, (key, str(int(self.ttl_seconds))))  # type: ignore
+                                conn.execute(sql_del, (key, ttl_int))  # type: ignore
                             except Exception:
                                 with conn.cursor() as _c:  # type: ignore
-                                    _c.execute(sql_del, (key, str(int(self.ttl_seconds))))
+                                    _c.execute(sql_del, (key, ttl_int))
                         except Exception as e:
                             logger.warning("dedup pg delete expired failed: %s", e, exc_info=True)
                             _dedup_observe("pg_delete_expired", time.monotonic(), status="error")
                         try:
                             try:
-                                conn.execute(sql_del2, (key, str(int(self.ttl_seconds))))  # type: ignore
+                                conn.execute(sql_del2, (key, ttl_int))  # type: ignore
                             except Exception:
                                 with conn.cursor() as _c2:  # type: ignore
-                                    _c2.execute(sql_del2, (key, str(int(self.ttl_seconds))))
+                                    _c2.execute(sql_del2, (key, ttl_int))
                         except Exception:
                             pass
                     try:
@@ -425,15 +452,17 @@ class DedupStore:
             elif hasattr(self.pool, "getconn"):
                 conn = self.pool.getconn()  # type: ignore
                 try:
+                    _pg_set_dual_tenant_sync(conn, _pg_tenant_from_key(key))
                     if self.ttl_seconds > 0:
+                        ttl_int = int(self.ttl_seconds)
                         try:
                             with conn.cursor() as _c:
-                                _c.execute(sql_del, (key, str(int(self.ttl_seconds))))
+                                _c.execute(sql_del, (key, ttl_int))
                         except Exception as e:
                             logger.warning("dedup pg delete expired failed: %s", e, exc_info=True)
                         try:
                             with conn.cursor() as _c2:
-                                _c2.execute(sql_del2, (key, str(int(self.ttl_seconds))))
+                                _c2.execute(sql_del2, (key, ttl_int))
                         except Exception:
                             pass
                     with conn.cursor() as cur:
@@ -461,15 +490,22 @@ class DedupStore:
         if not self._is_pg or self.pool is None or _is_async_pool(self.pool):
             return None
         try:
-            # TTL via updated_at > now() - interval
-            ttl_clause = f"AND updated_at > now() - interval '{int(self.ttl_seconds)} seconds'" if self.ttl_seconds > 0 else ""
+            # TTL via updated_at > now() - %s * interval '1 second' 参数化，避免 f-string 注入且正确替换
+            if self.ttl_seconds > 0:
+                ttl_clause = "AND updated_at > now() - %s * INTERVAL '1 second'"
+                ttl_params = (int(self.ttl_seconds),)
+            else:
+                ttl_clause = ""
+                ttl_params = ()
             sql = f"SELECT key, tool, status, result, updated_at FROM dedup WHERE key=%s {ttl_clause}"
             sql2 = "SELECT idempotency_key, status, tool, result, error, created_at, updated_at FROM tool_call_dedup WHERE idempotency_key=%s"
             row = None
+            params = (key, *ttl_params) if ttl_clause else (key,)
             if hasattr(self.pool, "connection"):
                 with self.pool.connection() as conn:  # type: ignore
+                    _pg_set_dual_tenant_sync(conn, _pg_tenant_from_key(key))
                     try:
-                        cur = conn.execute(sql, (key,))  # type: ignore
+                        cur = conn.execute(sql, params)  # type: ignore
                         row = cur.fetchone()  # type: ignore
                         if row is not None:
                             # col names from cursor description when possible
@@ -482,7 +518,22 @@ class DedupStore:
                                     pass
                             return rec
                     except Exception:
-                        pass
+                        # 尝试带 ttl 参数的回退路径（兼容不同 psycopg 占位）
+                        try:
+                            with conn.cursor() as _c:  # type: ignore
+                                _c.execute(sql, params)
+                                row = _c.fetchone()
+                                if row is not None:
+                                    cols = [d[0] for d in _c.description] if getattr(_c, "description", None) else ["key", "tool", "status", "result", "updated_at"]
+                                    rec = dict(zip(cols, row if isinstance(row, (list, tuple)) else [row]))
+                                    if rec.get("result") is not None and isinstance(rec["result"], str):
+                                        try:
+                                            rec["result"] = json.loads(rec["result"])
+                                        except Exception:
+                                            pass
+                                    return rec
+                        except Exception:
+                            pass
                     # fallback to alias table
                     try:
                         with conn.cursor() as cur2:  # type: ignore
@@ -505,8 +556,9 @@ class DedupStore:
             elif hasattr(self.pool, "getconn"):
                 conn = self.pool.getconn()  # type: ignore
                 try:
+                    _pg_set_dual_tenant_sync(conn, _pg_tenant_from_key(key))
                     with conn.cursor() as cur:
-                        cur.execute(sql, (key,))
+                        cur.execute(sql, params)
                         row = cur.fetchone()
                         if row is not None:
                             cols = [d[0] for d in cur.description] if getattr(cur, "description", None) else ["key", "tool", "status", "result", "updated_at"]
@@ -545,6 +597,7 @@ class DedupStore:
             sql2 = "UPDATE tool_call_dedup SET status=%s, result=%s, error=%s, updated_at=now() WHERE idempotency_key=%s"
             if hasattr(self.pool, "connection"):
                 with self.pool.connection() as conn:  # type: ignore
+                    _pg_set_dual_tenant_sync(conn, _pg_tenant_from_key(key))
                     try:
                         cur = conn.execute(sql, (status, result_json, key))  # type: ignore
                         rc = getattr(cur, "rowcount", 0)
@@ -571,6 +624,7 @@ class DedupStore:
             elif hasattr(self.pool, "getconn"):
                 conn = self.pool.getconn()  # type: ignore
                 try:
+                    _pg_set_dual_tenant_sync(conn, _pg_tenant_from_key(key))
                     with conn.cursor() as cur:
                         cur.execute(sql, (status, result_json, key))
                         rc = getattr(cur, "rowcount", 0)
@@ -632,8 +686,15 @@ class DedupStore:
                 try:
                     try:
                         con.execute("BEGIN IMMEDIATE")
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        # 不再静默吞掉：记录并在 busy 时回退重试，避免并发丢失
+                        logger.debug("dedup BEGIN IMMEDIATE failed: %s", e)
+                        # 若已在事务中则继续，否则抛出以便回退到内存路径
+                        try:
+                            con.execute("ROLLBACK")
+                            con.execute("BEGIN IMMEDIATE")
+                        except Exception as e2:
+                            logger.warning("dedup BEGIN IMMEDIATE retry failed: %s", e2)
                     # TTL-aware: delete expired row first within same txn
                     if self.ttl_seconds > 0:
                         try:
@@ -856,7 +917,7 @@ class DedupStore:
             _dedup_observe("get", _start, _status)
 
     def wait_for(self, key: str, timeout: float = 5.0) -> dict[str, Any] | None:
-        """轮询等待终态（SUCCESS/FAILED），用于占位冲突时的 WAIT 语义。"""
+        """轮询等待终态（SUCCESS/FAILED），用于占位冲突时的 WAIT 语义。同步路径仍用 time.sleep。"""
         _start = time.monotonic()
         _status = "success"
         try:
@@ -872,3 +933,26 @@ class DedupStore:
             raise
         finally:
             _dedup_observe("wait_for", _start, _status)
+
+    async def wait_for_async(self, key: str, timeout: float = 5.0) -> dict[str, Any] | None:
+        """异步轮询等待终态 — 使用 await asyncio.sleep 避免阻塞事件循环。"""
+        _start = time.monotonic()
+        _status = "success"
+        try:
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                # get 是同步但无 IO 阻塞，仍可直接调用
+                rec = self.get(key)
+                if rec is not None and rec.get("status") in ("SUCCESS", "FAILED"):
+                    return rec
+                await asyncio.sleep(0.05)
+            return self.get(key)
+        except Exception:
+            _status = "error"
+            raise
+        finally:
+            _dedup_observe("wait_for", _start, _status)
+
+    # 兼容别名：若处于事件循环中，wait_for 将提示使用 wait_for_async
+    async def await_for(self, key: str, timeout: float = 5.0) -> dict[str, Any] | None:
+        return await self.wait_for_async(key, timeout=timeout)
