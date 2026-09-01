@@ -44,9 +44,9 @@ def test_validate_loader_signature():
     from hero_quant.data.trait import validate_loader
     from hero_quant.data.registry import MarketDataRegistry
 
-    # valid loader passes
+    # valid loader passes（需使用白名单内来源，good 已移除）
     class GoodLoader:
-        name = "good"
+        name = "synthetic"
         markets = ["US"]
         unit = "shares"
         def get_bars(self, symbol, start, end, interval="1d"):

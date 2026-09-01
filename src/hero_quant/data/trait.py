@@ -13,6 +13,9 @@ import inspect
 
 import pandas as pd
 
+# 白名单单源：统一由 hero_quant.data.sources 导出，避免双轨漂移
+from hero_quant.data.sources import VALID_SOURCES  # noqa: F401  # 模块级 re-export 供外部导入
+
 
 @runtime_checkable
 class SourceTrait(Protocol):
@@ -60,11 +63,8 @@ def validate_loader(loader: Any) -> None:
     失败抛 TypeError/ValueError；通过则静默返回。
     保留 runtime_checkable 的 isinstance 作为廉价预检，但不依赖它。
     """
-    # name whitelist — fail-closed but backward compat: missing name allowed for legacy loaders (warn)
-    VALID_SOURCES = [
-        "tencent", "synthetic", "yahoo", "akshare", "tushare", "em", "sina", "aliyun",
-        "binance", "okx", "coinbase", "ccxt", "dukascopy", "tiingo", "polygon", "alpha_vantage",
-    ]
+    # name whitelist — fail-closed；VALID_SOURCES 单源来自 hero_quant.data.sources
+    # 兼容：局部覆盖仅用于错误消息展示，校验仍以模块级 VALID_SOURCES 为准
     if hasattr(loader, "name"):
         name = getattr(loader, "name")
         if not isinstance(name, str) or not name.strip():

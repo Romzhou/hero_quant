@@ -18,6 +18,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# 白名单单源：避免 trait/registry 双轨漂移（YAGNI 最小，复用 sources 常量）
+from hero_quant.data.sources import VALID_SOURCES as _VALID_SOURCES  # noqa: E402  # 单源常量，需在 logger 之后
+
 _settings_mode_cache: str | None = None
 _settings_mode_cache_lock = threading.Lock()
 
@@ -78,26 +81,8 @@ class CrossSourceError(ValueError):
     """跨源收盘价偏差超 1% 时抛出，阻断不一致数据流入下游。"""
 
 
-# 16 源白名单为契约枚举；_traits 为类型注册，_loaders 为实例 fallback 链
-# 三者需一致：loader 的 name/source 必在白名单内；双轨保留以兼容实例级调度
-VALID_SOURCES = [
-    "tencent",
-    "synthetic",
-    "yahoo",
-    "akshare",
-    "tushare",
-    "em",
-    "sina",
-    "aliyun",
-    "binance",
-    "okx",
-    "coinbase",
-    "ccxt",
-    "dukascopy",
-    "tiingo",
-    "polygon",
-    "alpha_vantage",
-]
+# 16 源白名单单源已在文件顶部导入（_VALID_SOURCES）；此处别名兼容旧导入
+VALID_SOURCES = _VALID_SOURCES
 
 @dataclass
 class Provenance:
