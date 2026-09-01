@@ -20,7 +20,7 @@ def test_engine_event_pit():
 
     # sanity: valid PIT should NOT raise
     res = BacktestEngine().run(
-        prices, weights, costs=0.001, weights_on="2026-07-30", price_date="2026-08-01"
+        prices, weights, costs=0.001, weights_on="2026-07-30", price_date="2026-08-01", allow_synthetic=True
     )
     assert "equity" in res
 
@@ -85,7 +85,7 @@ def test_engine_zero_capital_guard():
     e.initial_capital = 0  # simulate mis-config after construction
     prices = pd.DataFrame({"close": [100, 101]}, index=pd.date_range("2026-08-01", periods=2))
     with pytest.raises(ValueError):
-        e.run(prices)
+        e.run(prices, allow_synthetic=True)
 
 
 def test_engine_invalid_date_raises():

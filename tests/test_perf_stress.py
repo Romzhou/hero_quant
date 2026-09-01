@@ -27,7 +27,7 @@ def test_backtest_throughput():
     prices = pd.DataFrame({"close": list(range(1000, 1100))}, index=pd.date_range("2026-08-01", periods=100))
     eng = BacktestEngine()
     t0 = time.perf_counter()
-    res = eng.run(prices, weights=[0.5, 0.5])
+    res = eng.run(prices, weights=[0.5, 0.5], allow_synthetic=True)
     assert res["metrics"]["sharpe"] is not None
     assert time.perf_counter() - t0 < 2.0
 

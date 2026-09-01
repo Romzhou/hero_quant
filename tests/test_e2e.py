@@ -23,7 +23,7 @@ def test_e2e_query_to_report(monkeypatch):
     # backtest
     prices = pd.DataFrame({"close":[b["close"] for b in bars[:5]]}, index=pd.date_range("2026-08-01", periods=min(5,len(bars))))
     eng = BacktestEngine()
-    res = eng.run(prices, weights=[0.5,0.5])
+    res = eng.run(prices, weights=[0.5,0.5], allow_synthetic=True)
     assert "equity" in res and res["metrics"]["sharpe"] is not None
 
     # agent loop 占位

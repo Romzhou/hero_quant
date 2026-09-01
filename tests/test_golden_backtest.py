@@ -34,7 +34,7 @@ def test_on_bar_pricing_uses_aligned():
     engine = BacktestEngine(initial_capital=1000.0)
 
     # Baseline run with natural _align (next close)
-    res_close = engine.run(prices, weights=[1.0], costs=0.0)
+    res_close = engine.run(prices, weights=[1.0], costs=0.0, allow_synthetic=True)
     equity_close = res_close["equity"]
 
     # Patch on_bar to return dramatically different aligned_price sequence
@@ -46,7 +46,7 @@ def test_on_bar_pricing_uses_aligned():
         return {"bar": bar, "idx": idx, "aligned_price": ladder[idx], "equity_prev": equity_prev}
 
     engine.on_bar = fake_on_bar
-    res_aligned = engine.run(prices, weights=[1.0], costs=0.0)
+    res_aligned = engine.run(prices, weights=[1.0], costs=0.0, allow_synthetic=True)
     equity_aligned = res_aligned["equity"]
 
     # Equity should differ when aligned_price drives pricing
@@ -71,7 +71,7 @@ def test_golden_tearsheet_oracle():
     )
     # Ensure deterministic alias price_date guard not triggered
     engine = BacktestEngine(initial_capital=1.0)
-    res = engine.run(prices, weights=[1.0], costs=0.0005)
+    res = engine.run(prices, weights=[1.0], costs=0.0005, allow_synthetic=True)
     assert "equity" in res
     assert "positions" in res
     assert "metrics" in res
