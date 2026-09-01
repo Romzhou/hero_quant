@@ -137,33 +137,43 @@ def aggregate_shadow(
                 sym, q = _shadow_qty_from_trade(tr)
                 add(sym, q)
 
-    # 预计算去重标记：journal 与 ledger 是否同源 —— P2: 修复 identity 对比为路径解析对比，避免同内容不同实例误判
-    # 原 `is` 仅当同一对象才命中，持同一文件的不同 Ledger 实例会被双计；改为 Path.resolve 对比
+    def _same_file_by_inode(a: Path, b: Path) -> bool:
+        """以 (st_dev, st_ino) 判同文件（P2），先 stat 再回退 resolve/absolute 对比."""
+        try:
+            sa = a.stat()
+            sb = b.stat()
+            # Windows 上 st_ino 可能为 0，回退到 resolve 对比；否则以 inode 判定
+            if sa.st_ino != 0 and sb.st_ino != 0:
+                return (sa.st_dev, sa.st_ino) == (sb.st_dev, sb.st_ino)
+            return a.resolve() == b.resolve()
+        except (OSError, ValueError, RuntimeError):
+            try:
+                return a.resolve() == b.resolve()
+            except Exception:
+                return a.absolute().as_posix() == b.absolute().as_posix()
+
+    # 预计算去重标记：journal 与 ledger 是否同源 —— P2: 以 (st_dev, st_ino) 判同文件，避免硬链接/同名不同 inode 误判
     same_ledger = False
     if journal is not None and ledger is not None:
         try:
             j_ledger = getattr(journal, "ledger", None)
             if j_ledger is not None and getattr(j_ledger, "path", None) is not None and getattr(ledger, "path", None) is not None:
-                same_ledger = Path(j_ledger.path).resolve() == Path(ledger.path).resolve()  # type: ignore[union-attr]
+                same_ledger = _same_file_by_inode(Path(j_ledger.path), Path(ledger.path))  # type: ignore[union-attr]
             else:
                 same_ledger = j_ledger is ledger  # 回退：无路径时仍用 identity
         except (OSError, ValueError, RuntimeError) as exc:
-            logger.warning("same_ledger resolve failed: %s", exc)
+            logger.warning("same_ledger resolve failed: %s", exc, exc_info=True)
             same_ledger = getattr(journal, "ledger", None) is ledger
-    # P2: same_file 去重与 same_ledger 统一语义，均用 resolve 对比；避免一条分支用 is 分支用 resolve 导致去重口径不一致而双计
+    # P2: same_file 去重与 same_ledger 统一语义，均以 inode 优先
     same_file = False
     lp: Path | None = None
     if ledger_path is not None:
         lp = Path(ledger_path)
         if journal is not None and hasattr(journal, "ledger") and getattr(journal.ledger, "path", None) is not None:
             try:
-                # P2: 统一用 resolve 比较，若失败则回退到绝对路径字符串比较，不直接置 False 导致漏去重
-                try:
-                    same_file = Path(journal.ledger.path).resolve() == lp.resolve()  # type: ignore[union-attr]
-                except (OSError, ValueError, RuntimeError):
-                    same_file = Path(journal.ledger.path).absolute().as_posix() == lp.absolute().as_posix()  # type: ignore[union-attr]
+                same_file = _same_file_by_inode(Path(journal.ledger.path), lp)  # type: ignore[union-attr]
             except (OSError, ValueError, RuntimeError) as exc:
-                logger.warning("same_file resolve failed: %s", exc)
+                logger.warning("same_file resolve failed: %s", exc, exc_info=True)
                 same_file = False
 
     # 来自 Ledger 对象：解析 shadow_record/trade 与直接 symbol 记录

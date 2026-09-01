@@ -187,107 +187,81 @@ class PgVectorSidecar:
             self._pool = None
             self._enabled = False
 
+    def _ensure_schema(self, conn, *, is_cursor: bool = False) -> None:
+        """抽 ensure_schema() 去重 DDL — 统一建扩展/表/索引，失败静默（P2）."""
+
+        def _exec(sql: str) -> bool:
+            """在 connection 或 cursor 上执行 DDL，失败返回 False."""
+            try:
+                if is_cursor:
+                    conn.execute(sql)  # type: ignore
+                else:
+                    try:
+                        conn.execute(sql)  # type: ignore
+                    except Exception:
+                        with conn.cursor() as _cur:  # type: ignore
+                            _cur.execute(sql)
+                return True
+            except Exception as _exc:
+                logger.debug("silent handled: offline-safe: memory sidecar/pgvector optional, fallback to local", exc_info=_exc)
+                return False
+
+        # 扩展
+        _exec("CREATE EXTENSION IF NOT EXISTS vector")
+        # 表：优先 vector 类型，回退 TEXT（仅两条 DDL，去重后不再 6 次重复）
+        vector_sql = f"CREATE TABLE IF NOT EXISTS memory_vectors (key TEXT PRIMARY KEY, content TEXT, embedding vector({self.dim}), namespace TEXT, created TIMESTAMPTZ DEFAULT now())"
+        text_sql = "CREATE TABLE IF NOT EXISTS memory_vectors (key TEXT PRIMARY KEY, content TEXT, embedding TEXT, namespace TEXT, created TIMESTAMPTZ DEFAULT now())"
+        created = _exec(vector_sql)
+        if not created:
+            created = _exec(text_sql)
+        # 索引（best-effort）
+        if created:
+            if not is_cursor:
+                try:
+                    conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_vectors_embedding ON memory_vectors USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100)")  # type: ignore
+                except Exception as _exc:
+                    logger.debug("silent handled: offline-safe: memory sidecar/pgvector optional, fallback to local", exc_info=_exc)
+                    pass
+                _exec("CREATE INDEX IF NOT EXISTS idx_memory_vectors_ns ON memory_vectors (namespace)")
+            else:
+                _exec("CREATE INDEX IF NOT EXISTS idx_memory_vectors_ns ON memory_vectors (namespace)")
+
     def _ensure_schema_sync(self) -> None:
-        """同步侧车表结构，失败不影响主流程。"""
+        """同步侧车表结构，失败不影响主流程 — 委托 ensure_schema() 去重 DDL."""
         if not self._enabled or self._is_async:
             return
-        # DDL 防御式执行：扩展、表、索引均为 best-effort，失败静默
         try:
             if self._pool is not None and hasattr(self._pool, "connection"):
                 with self._pool.connection() as conn:  # type: ignore
-                    try:
-                        conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
-                    except Exception as _exc:
-                        logger.debug("silent handled: offline-safe: memory sidecar/pgvector optional, fallback to local", exc_info=_exc)  # intentional: offline-safe: memory sidecar/pgvector optional, fallback to local
-                        pass  # intentional offline-safe: memory sidecar/pgvector optional, fallback to local
-                    # 优先创建 vector 类型列，失败则回退到 TEXT
-                    created = False
-                    try:
-                        conn.execute(
-                            f"CREATE TABLE IF NOT EXISTS memory_vectors (key TEXT PRIMARY KEY, content TEXT, embedding vector({self.dim}), namespace TEXT, created TIMESTAMPTZ DEFAULT now())"
-                        )
-                        created = True
-                    except Exception:
-                        try:
-                            conn.execute(
-                                "CREATE TABLE IF NOT EXISTS memory_vectors (key TEXT PRIMARY KEY, content TEXT, embedding TEXT, namespace TEXT, created TIMESTAMPTZ DEFAULT now())"
-                            )
-                            created = True
-                        except Exception:
-                            created = False
-                    # 索引为 best-effort，ivfflat 仅在 vector 类型时有效
-                    if created:
-                        try:
-                            # 仅 vector 类型成功时创建向量索引
-                            conn.execute(
-                                "CREATE INDEX IF NOT EXISTS idx_memory_vectors_embedding ON memory_vectors USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100)"
-                            )
-                        except Exception as _exc:
-                            logger.debug("silent handled: offline-safe: memory sidecar/pgvector optional, fallback to local", exc_info=_exc)  # intentional: offline-safe: memory sidecar/pgvector optional, fallback to local
-                            pass  # intentional offline-safe: memory sidecar/pgvector optional, fallback to local
-                        try:
-                            conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_vectors_ns ON memory_vectors (namespace)")
-                        except Exception as _exc:
-                            logger.debug("silent handled: offline-safe: memory sidecar/pgvector optional, fallback to local", exc_info=_exc)  # intentional: offline-safe: memory sidecar/pgvector optional, fallback to local
-                            pass  # intentional offline-safe: memory sidecar/pgvector optional, fallback to local
+                    self._ensure_schema(conn, is_cursor=False)
                     try:
                         conn.commit()  # type: ignore
                     except Exception as _exc:
-                        logger.debug("silent handled: offline-safe: memory sidecar/pgvector optional, fallback to local", exc_info=_exc)  # intentional: offline-safe: memory sidecar/pgvector optional, fallback to local
-                        pass  # intentional offline-safe: memory sidecar/pgvector optional, fallback to local
+                        logger.debug("silent handled: offline-safe: memory sidecar/pgvector optional, fallback to local", exc_info=_exc)
+                        pass
             elif self._pool is not None and hasattr(self._pool, "getconn"):
                 conn = self._pool.getconn()  # type: ignore
                 try:
                     with conn.cursor() as cur:
-                        try:
-                            cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
-                        except Exception as _exc:
-                            logger.debug("silent handled: offline-safe: memory sidecar/pgvector optional, fallback to local", exc_info=_exc)  # intentional: offline-safe: memory sidecar/pgvector optional, fallback to local
-                            pass  # intentional offline-safe: memory sidecar/pgvector optional, fallback to local
-                        try:
-                            cur.execute(
-                                f"CREATE TABLE IF NOT EXISTS memory_vectors (key TEXT PRIMARY KEY, content TEXT, embedding vector({self.dim}), namespace TEXT, created TIMESTAMPTZ DEFAULT now())"
-                            )
-                        except Exception:
-                            cur.execute(
-                                "CREATE TABLE IF NOT EXISTS memory_vectors (key TEXT PRIMARY KEY, content TEXT, embedding TEXT, namespace TEXT, created TIMESTAMPTZ DEFAULT now())"
-                            )
-                        try:
-                            cur.execute("CREATE INDEX IF NOT EXISTS idx_memory_vectors_ns ON memory_vectors (namespace)")
-                        except Exception as _exc:
-                            logger.debug("silent handled: offline-safe: memory sidecar/pgvector optional, fallback to local", exc_info=_exc)  # intentional: offline-safe: memory sidecar/pgvector optional, fallback to local
-                            pass  # intentional offline-safe: memory sidecar/pgvector optional, fallback to local
+                        self._ensure_schema(cur, is_cursor=True)
                     conn.commit()
                 finally:
                     try:
                         self._pool.putconn(conn)  # type: ignore
                     except Exception as _exc:
-                        logger.debug("silent handled: offline-safe: memory sidecar/pgvector optional, fallback to local", exc_info=_exc)  # intentional: offline-safe: memory sidecar/pgvector optional, fallback to local
-                        pass  # intentional offline-safe: memory sidecar/pgvector optional, fallback to local
+                        logger.debug("silent handled: offline-safe: memory sidecar/pgvector optional, fallback to local", exc_info=_exc)
+                        pass
             else:
-                # 无连接池时走一次性直连路径
                 try:
                     import psycopg  # type: ignore
 
                     with psycopg.connect(self.dsn, connect_timeout=5) as conn:  # type: ignore
                         with conn.cursor() as cur:
-                            try:
-                                cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
-                            except Exception as _exc:
-                                logger.debug("silent handled: offline-safe: memory sidecar/pgvector optional, fallback to local", exc_info=_exc)  # intentional: offline-safe: memory sidecar/pgvector optional, fallback to local
-                                pass  # intentional offline-safe: memory sidecar/pgvector optional, fallback to local
-                            try:
-                                cur.execute(
-                                    f"CREATE TABLE IF NOT EXISTS memory_vectors (key TEXT PRIMARY KEY, content TEXT, embedding vector({self.dim}), namespace TEXT, created TIMESTAMPTZ DEFAULT now())"
-                                )
-                            except Exception:
-                                cur.execute(
-                                    "CREATE TABLE IF NOT EXISTS memory_vectors (key TEXT PRIMARY KEY, content TEXT, embedding TEXT, namespace TEXT, created TIMESTAMPTZ DEFAULT now())"
-                                )
+                            self._ensure_schema(cur, is_cursor=True)
                         conn.commit()
                 except Exception as _exc:
-                    logger.debug("silent handled: offline-safe: memory sidecar/pgvector optional, fallback to local", exc_info=_exc)  # intentional: offline-safe: memory sidecar/pgvector optional, fallback to local
-                    pass  # intentional offline-safe: memory sidecar/pgvector optional, fallback to local
+                    logger.debug("silent handled: offline-safe: memory sidecar/pgvector optional, fallback to local", exc_info=_exc)
+                    pass
         except Exception as e:
             self._last_error = str(e)
             pass
@@ -916,6 +890,9 @@ class MemoryStore:
             raise ValueError("content must be non-empty str")
         now = time.time()
         ns_key = self._ns_key(key)
+        # P2: hash 移出 RLock — 纯计算在锁外，降低临界区（threading.RLock / exc_info=True 契约）
+        content_hash = hashlib.sha256(content.lower().strip().encode()).hexdigest()[:12]
+        full_hash = _content_hash(ns_key, content)
         # 30 秒滑动窗口去重：跨 key、大小写/空白归一
         with self._lock:
             # 定时清理过期哈希，避免内存膨胀
@@ -927,10 +904,6 @@ class MemoryStore:
                 # keep newest 2048
                 self._recent_hashes = dict(sorted_items[-2048:])
                 logger.debug("recent_hashes capped to 2048, evicted %d", len(sorted_items) - 2048)
-            # 内容归一哈希为去重核心
-            content_hash = hashlib.sha256(content.lower().strip().encode()).hexdigest()[:12]
-            # 同时校验 name:content 组合哈希，覆盖同内容不同键的重复
-            full_hash = _content_hash(ns_key, content)
             if content_hash in self._recent_hashes or full_hash in self._recent_hashes:
                 return
             self._recent_hashes[content_hash] = now
