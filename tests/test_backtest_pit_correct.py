@@ -136,3 +136,63 @@ def test_engine_on_tick_latency_breach():
     eng2 = BacktestEngine()
     res2 = eng2.on_tick({"price": 100, "symbol": "FAST"})
     assert res2["latency_ms"] < 200 or res2["latency_breach"] is False or res2["latency_ms"] < 250
+
+
+# --- Task 4: PIT fail-closed TDD ---
+
+def test_pit_fail_closed_raises_when_no_date():
+    """Task4-2a: 无 DatetimeIndex 且 allow_synthetic=False 时必须 raise PITViolation，而非 warning 回退。"""
+    from hero_quant.backtest.engine import BacktestEngine, PITViolation
+    import pandas as pd
+    import pytest
+
+    # 无 DatetimeIndex 的价格（RangeIndex），不传 weights_on/price_date
+    prices_no_index = pd.DataFrame({"close": [100, 101, 102]})
+    engine = BacktestEngine()
+    with pytest.raises(PITViolation):
+        engine.run(prices_no_index, weights=[1.0], allow_synthetic=False)
+    # 显式 price_date 也缺省时同样 fail-closed
+    prices_no_index2 = pd.DataFrame({"close": [100, 101]})
+    with pytest.raises(PITViolation):
+        engine.run(prices_no_index2, weights=[1.0], weights_on=None, price_date=None, allow_synthetic=False)
+
+
+def test_pit_allow_synthetic_true_uses_first_index():
+    """Task4-2a: 仅当 allow_synthetic==True 时才允许 pd_date=index[0] 合成。"""
+    from hero_quant.backtest.engine import BacktestEngine
+    import pandas as pd
+
+    prices_with_index = pd.DataFrame(
+        {"close": [100, 101, 102]}, index=pd.date_range("2026-08-01", periods=3)
+    )
+    engine = BacktestEngine()
+    # allow_synthetic=True 允许合成，应成功执行
+    res = engine.run(prices_with_index, weights=[1.0], allow_synthetic=True)
+    assert res is not None
+    assert "equity" in res
+    assert len(res["equity"]) == 3
+    # DatetimeIndex 合成路径：未显式传 price_date 时内部 pd_date 应取 index[0]
+    # 验证显式 price_date 亦通过
+    res2 = engine.run(
+        prices_with_index, weights=[1.0], price_date=prices_with_index.index[0], allow_synthetic=True
+    )
+    assert "equity" in res2
+
+
+def test_pit_second_branch_still_raises():
+    """Task4-2a: 次分支（有 DatetimeIndex 但 allow_synthetic 未显式 True）仍需 raise PITViolation。"""
+    from hero_quant.backtest.engine import BacktestEngine, PITViolation
+    import pandas as pd
+    import pytest
+
+    # 有 DatetimeIndex 但未传 price_date，allow_synthetic 默认为 False / 显式 False 均应 raise
+    prices = pd.DataFrame({"close": [100, 101, 102]}, index=pd.date_range("2026-08-01", periods=3))
+    engine = BacktestEngine()
+    with pytest.raises(PITViolation):
+        engine.run(prices, weights=[1.0], allow_synthetic=False)
+    with pytest.raises(PITViolation):
+        engine.run(prices, weights=[1.0])  # 默认 allow_synthetic=False
+    # 无 index 的退化路径同样保持 raise（首分支）
+    prices_no_index = pd.DataFrame({"close": [100, 101]})
+    with pytest.raises(PITViolation):
+        engine.run(prices_no_index, weights=[1.0])
