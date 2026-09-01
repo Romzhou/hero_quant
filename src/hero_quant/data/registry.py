@@ -11,7 +11,7 @@ import threading
 import time
 import logging
 from collections import deque
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from hero_quant.data.trait import SourceTrait
@@ -40,8 +40,8 @@ def _get_data_mode(*, force_refresh: bool = False) -> str:
 
             m = Settings().data_mode
             _settings_mode_cache = str(m).strip().lower() if isinstance(m, str) else "live"
-        except Exception as e:
-            logger.warning("settings load failed for provenance: %s", e, exc_info=e)
+        except (ImportError, AttributeError, ValueError, TypeError, OSError, RuntimeError) as e:  # 中文：窄化捕获，exc_info=True，threading.RLock 契约外使用 Lock
+            logger.warning("settings load failed for provenance: %s", e, exc_info=True)
             _settings_mode_cache = "synthetic"  # fail-closed SAFE default
         return _settings_mode_cache
 
@@ -120,7 +120,7 @@ class MarketDataRegistry:
         """列出已注册 Trait 名称。"""
         return list(self._traits.keys())
 
-    def register(self, loader):
+    def register(self, loader: Any) -> None:
         """注册 loader 实例，需满足 markets/unit/get_bars 最小协议。
 
         会调用 trait.validate_loader 做签名与类型校验（若可用），保留 runtime_checkable 浅层检查。
@@ -131,7 +131,7 @@ class MarketDataRegistry:
             _validate_loader(loader)
         except ImportError:
             pass
-        except Exception as e:
+        except (ValueError, TypeError, AttributeError) as e:  # 中文：窄化契约异常，exc_info 链
             # validate_loader raises ValueError/TypeError on contract violation
             raise ValueError(f"loader trait validation failed: {e}") from e
         if not (hasattr(loader, "markets") and hasattr(loader, "unit") and hasattr(loader, "get_bars")):
@@ -156,7 +156,7 @@ class MarketDataRegistry:
         return "UNKNOWN"
 
     @staticmethod
-    def _bars_empty(bars) -> bool:
+    def _bars_empty(bars: Any) -> bool:  # type: ignore[no-untyped-def]
         """判断 bars 是否为空，兼容 DataFrame 与 list，显式处理空/格式错误并记录日志。"""
         if bars is None:
             return True
@@ -164,23 +164,23 @@ class MarketDataRegistry:
             if hasattr(bars, "empty"):
                 try:
                     return bool(bars.empty)
-                except Exception as e:
-                    logger.warning("_bars_empty DataFrame.empty check failed: %s", e, exc_info=e)
+                except (ValueError, TypeError, AttributeError, RuntimeError) as e:  # 中文：窄化 DataFrame 属性异常
+                    logger.warning("_bars_empty DataFrame.empty check failed: %s", e, exc_info=True)
                     try:
                         return len(bars) == 0  # type: ignore[arg-type]
-                    except Exception as e2:
-                        logger.warning("_bars_empty len fallback failed: %s", e2, exc_info=e2)
+                    except (TypeError, ValueError, AttributeError, RuntimeError) as e2:  # 中文：窄化 len 异常
+                        logger.warning("_bars_empty len fallback failed: %s", e2, exc_info=True)
                         return True
             try:
                 return len(bars) == 0  # type: ignore[arg-type]
-            except Exception as e:
-                logger.warning("_bars_empty len check failed: %s", e, exc_info=e)
+            except (TypeError, ValueError, AttributeError, RuntimeError) as e:  # 中文：窄化 len 异常
+                logger.warning("_bars_empty len check failed: %s", e, exc_info=True)
                 return not bool(bars)
-        except Exception as e:
-            logger.warning("_bars_empty fallback failed: %s", e, exc_info=e)
+        except (TypeError, ValueError, AttributeError, RuntimeError) as e:  # 中文：窄化外层异常
+            logger.warning("_bars_empty fallback failed: %s", e, exc_info=True)
             try:
                 return not bool(bars)
-            except Exception:
+            except (TypeError, ValueError, AttributeError):
                 return True
 
     @staticmethod
@@ -386,7 +386,7 @@ class MarketDataRegistry:
                 continue
         return
 
-    def get_bars(self, symbol, start, end, interval="1d"):
+    def get_bars(self, symbol: str, start: str, end: str, interval: str = "1d") -> tuple[Any, "Provenance"]:
         """按市场路由获取 bars，记录审计日志并执行跨源校验；支持旧参数顺序兼容。"""
         _intervals = {"1d", "1m", "5m", "15m", "30m", "1h", "1wk", "1mo", "1D", "1W"}
         if start in _intervals and "-" in str(end) and "-" in str(interval):

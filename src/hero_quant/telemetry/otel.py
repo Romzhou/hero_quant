@@ -176,7 +176,7 @@ class SessionTelemetryCoordinator:
             try:
                 try:
                     infos = socket.getaddrinfo(host, None, family=socket.AF_UNSPEC, type=socket.SOCK_STREAM)
-                except (socket.gaierror, socket.herror, OSError) as e:
+                except (socket.gaierror, socket.herror, OSError):
                     logger.debug("OTLP endpoint DNS resolve no result", endpoint=_redact(endpoint), exc_info=True)
                     infos = []
                 for _family, _type, _proto, _canon, sockaddr in infos:
