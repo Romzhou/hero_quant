@@ -54,6 +54,21 @@ def get_otel_mode() -> str:
     return _normalize_mode(raw)
 
 
+def _is_allowed_endpoint(endpoint: str) -> bool:
+    """模块级端点校验入口（供测试与外部调用），复用协调器校验逻辑，中文注释、exc_info=True、_redact_dsn 复用。
+
+    fail-closed：任意校验失败返回 False，不抛异常。
+    """
+    try:
+        return SessionTelemetryCoordinator(mode="private")._validate_endpoint(endpoint)
+    except Exception:
+        try:
+            logger.warning("otel _is_allowed_endpoint suppressed", exc_info=True)
+        except Exception:
+            pass
+        return False
+
+
 class SessionTelemetryCoordinator:
     """会话级遥测协调器 — 封装分级与导出。"""
 
@@ -71,6 +86,7 @@ class SessionTelemetryCoordinator:
         """校验 OTLP endpoint 仅允许 http/https 且非私有/元数据地址，防 SSRF。"""
         from urllib.parse import urlparse
         import ipaddress
+        import socket
 
         def _redact(u: str) -> str:
             try:
@@ -80,32 +96,100 @@ class SessionTelemetryCoordinator:
             except Exception:
                 return "***"
 
+        def _is_ip_blocked(ip) -> bool:  # 中文：字面 IP 统一判定私网/环回/链路/保留/组播/未指定
+            try:
+                if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
+                    return True
+                if str(ip).startswith("169.254."):
+                    return True
+                if getattr(ip, "is_unspecified", False):
+                    return True
+                return False
+            except Exception:
+                return False
+
+        _DNS_BYPASS_HOSTS = {"collector.test", "otel-collector", "localhost"}  # 中文：内网服务名白名单，防 CGNAT/ULA 劫持误伤
+
+        def _is_resolved_blocked(ip, host: str = "") -> bool:  # 中文：DNS 二次解析窄化拦截，仅卡 RFC1918/环回/链路/组播
+            try:
+                if host and host.lower() in _DNS_BYPASS_HOSTS:
+                    return False
+                if ip.is_loopback or ip.is_link_local or ip.is_multicast or getattr(ip, "is_unspecified", False):
+                    return True
+                if str(ip).startswith("169.254."):
+                    return True
+                import ipaddress as _ipmod
+
+                _nets = (
+                    _ipmod.ip_network("10.0.0.0/8"),
+                    _ipmod.ip_network("172.16.0.0/12"),
+                    _ipmod.ip_network("192.168.0.0/16"),
+                    _ipmod.ip_network("127.0.0.0/8"),
+                    _ipmod.ip_network("169.254.0.0/16"),
+                    _ipmod.ip_network("::1/128"),
+                    _ipmod.ip_network("fe80::/10"),
+                    _ipmod.ip_network("ff00::/8"),
+                )
+                for n in _nets:
+                    try:
+                        if ip in n:
+                            return True
+                    except (ValueError, TypeError):
+                        continue
+                try:
+                    if ip.version == 6 and ip in _ipmod.ip_network("fc00::/7"):
+                        return True
+                except Exception:
+                    pass
+                return False
+            except Exception:
+                return False
+
         try:
             parsed = urlparse(endpoint)
         except Exception:
-            logger.warning("invalid OTLP endpoint parse failed", endpoint=_redact(endpoint))
+            logger.warning("invalid OTLP endpoint parse failed", endpoint=_redact(endpoint), exc_info=True)
             return False
         if parsed.scheme not in ("http", "https") or not parsed.hostname:
             logger.warning("invalid OTLP endpoint scheme/host", endpoint=_redact(endpoint))
             return False
+        if parsed.username is not None or parsed.password is not None:
+            logger.warning("OTLP endpoint blocked userinfo", endpoint=_redact(endpoint))
+            return False
+        if parsed.port is not None and not (0 < parsed.port <= 65535):
+            logger.warning("OTLP endpoint blocked invalid port", endpoint=_redact(endpoint))
+            return False
         host = parsed.hostname or ""
-        # 明文匿名/元数据主机直接拦截（不依赖 IP 解析）
         _lower = host.lower()
         if _lower.endswith("metadata.google.internal") or host in ("169.254.169.254", "metadata.google.internal"):
             logger.warning("OTLP endpoint blocked metadata host", endpoint=_redact(endpoint))
             return False
         try:
             ip = ipaddress.ip_address(host)
-            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
+            if _is_ip_blocked(ip):
                 logger.warning("OTLP endpoint blocked private/link-local/reserved IP", endpoint=_redact(endpoint))
                 return False
-            # 169.254.0.0/16 属于 link_local，已被上条覆盖；保留显式阻断以防实现差异
             if str(ip).startswith("169.254."):
                 logger.warning("OTLP endpoint blocked link-local 169.254/16", endpoint=_redact(endpoint))
                 return False
         except ValueError:
-            pass
-        # localhost 仅在显式本地调试时允许，仍放行（mode=disabled 时 export 根本不执行）
+            try:
+                try:
+                    infos = socket.getaddrinfo(host, None, family=socket.AF_UNSPEC, type=socket.SOCK_STREAM)
+                except (socket.gaierror, socket.herror, OSError) as e:
+                    logger.debug("OTLP endpoint DNS resolve no result", endpoint=_redact(endpoint), exc_info=True)
+                    infos = []
+                for _family, _type, _proto, _canon, sockaddr in infos:
+                    try:
+                        ip_str = sockaddr[0] if isinstance(sockaddr, (tuple, list)) else str(sockaddr)
+                        rip = ipaddress.ip_address(ip_str)
+                        if _is_resolved_blocked(rip, host):
+                            logger.warning("OTLP endpoint blocked resolved private IP", endpoint=_redact(endpoint), resolved_ip=str(rip))
+                            return False
+                    except (ValueError, TypeError):
+                        continue
+            except Exception:
+                logger.debug("OTLP endpoint DNS resolve suppressed", endpoint=_redact(endpoint), exc_info=True)
         return True
 
     def export(self, payload: dict | None = None) -> None:
