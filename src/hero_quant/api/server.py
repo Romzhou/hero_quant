@@ -100,24 +100,171 @@ def _is_allowed_loopback_host(host: str) -> bool:
     return _host_without_port(host) in _DEFAULT_LOOPBACK_HOSTS
 
 # --- 8-module wiring helpers (best-effort, logged, non-blocking) ---
-def _get_checkpoint_saver():
-    """Best-effort checkpoint saver from HERO_CHECKPOINT_DSN, fallback to memory."""
+# Cached checkpoint saver — avoid creating a new pool + TCP connect on every /v1/query/stream (was blocking 25s when PG unreachable)
+_checkpoint_saver_cache: dict[str, object] = {}
+_checkpoint_saver_lock = threading.Lock()
+
+
+def _clean_agent_text(text: str) -> str:
+    """移除 AgentLoop buffer 中内联的 [tool xxx result] 原始 JSON 行与错误横幅，仅保留模型叙述。
+
+    工具结果已由 SSE type=tool 事件单独展示，正文不该再重复大段 JSON。
+    """
+    if not text:
+        return text
+    lines: list[str] = []
+    for ln in text.splitlines():
+        s = ln.strip()
+        if s.startswith("[tool ") and s.endswith("}"):
+            continue
+        if s.startswith(("[tool ", "tool_error:", "tool_not_found:", "[ERROR:", "[TRUNCATED:", "[COLLAPSED", "[MICROCOMPACT", "[EMBEDDING_SUMMARY")):
+            continue
+        lines.append(ln)
+    cleaned = "\n".join(lines).strip()
+    return cleaned or text
+
+
+def _final_answer(llm, q: str, narrative: str, tool_records: list) -> str:
+    """二段式总结：把工具真实结果回喂 LLM 生成正式结论。
+
+    AgentLoop 在首轮工具成功后即终止，buffer 只含开场白+原始 JSON；
+    这里补一次 LLM 调用，让回复包含真正的分析（数据概览/结论/风险），失败时回退叙述。
+    """
+    from hero_quant.llm.client import LLMClient as _LLMC
+
+    if not isinstance(llm, _LLMC) or not tool_records:
+        logger.warning("final_summary_skip", llm_type=type(llm).__name__, tool_records=len(tool_records))
+        return narrative
     try:
-        from hero_quant.checkpoint.postgres import get_saver as _get_saver
+        _brief: list[str] = []
+        for _tt in tool_records:
+            try:
+                if _tt.get("type") != "tool_result":
+                    continue
+                _tname = _tt.get("tool") or _tt.get("name") or "unknown"
+                _content = str(_tt.get("content", ""))[:1200]
+                _brief.append(f"[{_tname}] {_content}")
+            except Exception:
+                continue
+        if not _brief:
+            return narrative
+        _prompt = (
+            "你是量化投研助手。基于以下工具返回的真实数据，用中文给出最终分析结论（120-300字）。"
+            "要求：1) 直接给结论，禁止复现原始JSON，禁止调用任何工具；2) 引用具体数字（收盘价/收益率/Sharpe等）时必须来自工具结果；"
+            "3) 结尾一句风险提示。\n\n"
+            f"用户问题：{q}\n\n工具结果：\n" + "\n".join(_brief)[:6000]
+        )
+        # 关键：llm._chat 在主请求中被 bind_tools(20个工具) 绑定，模型收到总结提示时会尝试再调工具而非写文本（content 为空）。
+        # 这里必须用未绑定工具的干净底层 chat 做总结调用。
+        _chat = getattr(llm, "_chat", None)
+        if _chat is not None and hasattr(_chat, "bound"):
+            try:
+                _chat = _chat.bound  # RunnableBinding.bound -> 未绑定的原始 ChatOpenAI
+            except Exception:
+                pass
+        if _chat is None or not callable(getattr(_chat, "invoke", None)):
+            # 兜底：重建一个未绑定工具的 LLMClient
+            try:
+                from hero_quant.config.settings import Settings as _S2
+                from hero_quant.llm.factory import LLMFactory as _LF2
 
-        dsn = os.environ.get("HERO_CHECKPOINT_DSN", "memory://default")
-        saver = _get_saver(dsn)
-        logger.info("checkpoint.wired", dsn=dsn, mode="pg" if "postgres" in dsn else "memory")
-        return saver
+                _s2 = _S2()
+                _chat = _LF2(_s2).create(model=_s2.llm_model, api_key=_s2.api_key, streaming=False, temperature=0.3)
+            except Exception as _e2:
+                logger.warning("final_summary_rebuild_failed", error=str(_e2))
+                return narrative
+        _sum_llm = _LLMC(_chat, timeout=30, max_retries=2)
+        _resp = _sum_llm.invoke(_prompt)
+        _content = getattr(_resp, "content", _resp)
+        if isinstance(_content, str) and _content.strip():
+            return _content.strip()
     except Exception as _e:
-        logger.warning("checkpoint.wire_failed", error=str(_e), exc_info=_e)  # intentional: fallback to memory/noop
-        try:
-            from hero_quant.checkpoint.postgres import AsyncPostgresSaver
+        logger.warning("final_summary_failed", error=str(_e))
+    return narrative
 
-            return AsyncPostgresSaver("memory://default")
-        except Exception as _e2:
-            logger.debug("checkpoint.memory_fallback_failed", error=str(_e2))
-            return None
+
+def _get_checkpoint_saver():
+    """Best-effort checkpoint saver from HERO_CHECKPOINT_DSN, fallback to memory. Cached by DSN to avoid per-request PG connect blocking."""
+    dsn = os.environ.get("HERO_CHECKPOINT_DSN", "memory://default")
+    # Fast path: cached
+    cached = _checkpoint_saver_cache.get(dsn)
+    if cached is not None:
+        return cached
+    with _checkpoint_saver_lock:
+        cached = _checkpoint_saver_cache.get(dsn)
+        if cached is not None:
+            return cached
+        # PG DSN but PG likely unreachable in dev (no docker) — skip TCP connect and use memory directly to avoid 25s hang
+        # Only attempt real PG when explicitly opted-in via HERO_CHECKPOINT_TRY_PG=1 or when PG is known reachable
+        if dsn.startswith("postgresql://") or dsn.startswith("postgres://"):
+            # Quick probe: try TCP connect with 1s timeout to avoid blocking event loop on every request
+            try:
+                import socket as _sock
+
+                # parse host/port from DSN
+                _host, _port = "localhost", 5432
+                try:
+                    # postgresql://user:pass@host:port/db
+                    _after_at = dsn.split("@", 1)[-1] if "@" in dsn else dsn.split("://", 1)[-1]
+                    _hostport = _after_at.split("/", 1)[0]
+                    if ":" in _hostport:
+                        _host, _port_s = _hostport.rsplit(":", 1)
+                        _port = int(_port_s)
+                    else:
+                        _host = _hostport
+                except Exception:
+                    pass
+                if os.environ.get("HERO_CHECKPOINT_TRY_PG") != "1":
+                    # In local dev without docker, PG is not running — use emulated PG store (still tenant/thread/seq schema) without TCP attempt
+                    # This avoids 25s blocking on every stream request while keeping same checkpoint semantics
+                    from hero_quant.checkpoint.postgres import AsyncPostgresSaver as _Saver
+
+                    saver = _Saver(dsn)  # pool will be None, but is_pg_mode=True so global emulated store is used
+                    saver._setup_done = True  # skip setup DDL which would try to connect
+                    _checkpoint_saver_cache[dsn] = saver
+                    logger.info("checkpoint.wired", dsn=dsn, mode="pg-emulated")
+                    return saver
+                # When TRY_PG=1, do a quick 1s probe before full connect
+                _probe = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
+                _probe.settimeout(1.0)
+                try:
+                    _probe.connect((_host, _port))
+                    _probe.close()
+                except Exception:
+                    _probe.close()
+                    raise ConnectionError(f"PG at {_host}:{_port} not reachable, using emulated store")
+            except ConnectionError as _ce:
+                logger.warning("checkpoint.pg_unreachable_emulated", error=str(_ce))
+                try:
+                    from hero_quant.checkpoint.postgres import AsyncPostgresSaver as _Saver2
+
+                    saver = _Saver2(dsn)
+                    saver._setup_done = True
+                    _checkpoint_saver_cache[dsn] = saver
+                    logger.info("checkpoint.wired", dsn=dsn, mode="pg-emulated")
+                    return saver
+                except Exception:
+                    pass
+            except Exception as _e:
+                logger.debug("checkpoint.probe_failed", error=str(_e))
+        try:
+            from hero_quant.checkpoint.postgres import get_saver as _get_saver
+
+            saver = _get_saver(dsn)
+            _checkpoint_saver_cache[dsn] = saver
+            logger.info("checkpoint.wired", dsn=dsn, mode="pg" if "postgres" in dsn else "memory")
+            return saver
+        except Exception as _e:
+            logger.warning("checkpoint.wire_failed", error=str(_e), exc_info=_e)  # intentional: fallback to memory/noop
+            try:
+                from hero_quant.checkpoint.postgres import AsyncPostgresSaver
+
+                fallback = AsyncPostgresSaver("memory://default")
+                _checkpoint_saver_cache[dsn] = fallback
+                return fallback
+            except Exception as _e2:
+                logger.debug("checkpoint.memory_fallback_failed", error=str(_e2))
+                return None
 
 
 def _get_shadow_stub():
@@ -164,6 +311,29 @@ except Exception as _e:
 
 app = FastAPI(title="hero-quant")
 
+
+# 冷启动预热：后台线程预导入重模块（langchain/tools/llm），把 10s 首次导入耗时移出请求路径
+def _warm_imports() -> None:
+    try:
+        import hero_quant.agent.loop  # noqa: F401
+        import hero_quant.agent.trace  # noqa: F401
+        import hero_quant.llm.client  # noqa: F401
+        import hero_quant.llm.factory  # noqa: F401
+        import hero_quant.tools.market_data  # noqa: F401
+        import hero_quant.tools.backtest  # noqa: F401
+        import hero_quant.tools.quantlib_tool  # noqa: F401
+        import hero_quant.data.registry  # noqa: F401
+        import hero_quant.data.loaders.tencent  # noqa: F401
+        logger.info("warmup.completed")
+    except Exception as _e:
+        logger.debug("warmup.failed", error=str(_e))
+
+
+try:
+    threading.Thread(target=_warm_imports, daemon=True).start()
+except Exception:
+    pass
+
 # Wave4: risk summary router
 try:
     from hero_quant.api.risk import router as _risk_router
@@ -171,6 +341,24 @@ try:
     app.include_router(_risk_router)
 except Exception as _e:
     logger.debug("risk.router_include_failed", error=str(_e))
+
+# Phase 2: WebSocket progress push (non-blocking, logged)
+try:
+    from hero_quant.api.ws import router as _ws_router
+    from hero_quant.api.ws import heartbeat as _ws_heartbeat
+
+    app.include_router(_ws_router)
+
+    # Lifespan: start heartbeat monitor (best-effort)
+    @app.on_event("startup")
+    async def _start_ws_heartbeat():
+        try:
+            await _ws_heartbeat.start()
+        except Exception as _e:
+            logger.debug("ws.heartbeat_start_failed error=%s", str(_e))
+
+except Exception as _e:
+    logger.debug("ws.router_include_failed error=%s", str(_e))
 
 # 复用已注册的 Counter，避免重复注册导致 DuplicateTimeseries
 try:
@@ -339,8 +527,17 @@ def _is_pg_dsn_ready(dsn: str | None) -> bool:
     return isinstance(dsn, str) and dsn.startswith(_PG_PREFIXES_READY)
 
 
+def _redact_dsn_api(dsn: str) -> str:
+    """脱敏 DSN，日志不泄露密码。"""
+    try:
+        import re as _re
+        return _re.sub(r"://([^:]+):[^@]*@", r"://\1:***@", dsn)
+    except Exception:
+        return "***"
+
+
 def _check_checkpoint_pg() -> tuple[bool, str]:
-    """Probe checkpoint PG; only real PG (pool reachable) counts as pg, otherwise memory/degraded."""
+    """实探 checkpoint PG：仅当 _is_real_pg_pool 且 SELECT 1 成功才算 pg_ok，否则 fail-closed 为 memory。"""
     try:
         from hero_quant.config.settings import Settings
         s = Settings()
@@ -350,52 +547,60 @@ def _check_checkpoint_pg() -> tuple[bool, str]:
         from hero_quant.checkpoint.postgres import get_saver
 
         saver = get_saver(dsn)
-        # require real PG pool, not emulated
+        # 唯一判据：_is_real_pg_pool
         is_real = getattr(saver, "_is_real_pg_pool", None)
         if callable(is_real):
             try:
                 if not bool(is_real()):
                     return False, "memory"
-            except Exception:
+            except Exception as _e:
+                logger.warning("ready.checkpoint_not_real", dsn=_redact_dsn_api(dsn), exc_info=_e)
                 return False, "memory"
         elif hasattr(saver, "_is_pg_mode"):
             try:
                 if not bool(saver._is_pg_mode()):
                     return False, "memory"
-            except Exception:
+            except Exception as _e:
+                logger.warning("ready.checkpoint_not_pg_mode", dsn=_redact_dsn_api(dsn), exc_info=_e)
                 return False, "memory"
-        # liveness probe when pool present
+        # 无池直接 fail-closed
         pool = getattr(saver, "pool", None)
-        if pool is not None:
-            try:
-                if hasattr(pool, "connection"):
-                    import contextlib as _ctx
-                    with _ctx.suppress(Exception):
-                        with pool.connection() as _conn:
-                            with _conn.cursor() as _cur:
-                                _cur.execute("SELECT 1")
-                elif hasattr(pool, "getconn"):
-                    _conn = pool.getconn()
+        if pool is None:
+            return False, "memory"
+        # 实探 SELECT 1，失败则 fail-closed
+        try:
+            if hasattr(pool, "connection"):
+                with pool.connection() as _conn:  # type: ignore
                     try:
-                        with _conn.cursor() as _cur:
+                        # 优先直连 execute
+                        _conn.execute("SELECT 1")  # type: ignore
+                    except Exception:
+                        with _conn.cursor() as _cur:  # type: ignore
                             _cur.execute("SELECT 1")
-                    finally:
-                        try:
-                            pool.putconn(_conn)
-                        except Exception:
-                            pass
-            except Exception:
+            elif hasattr(pool, "getconn"):
+                _conn = pool.getconn()  # type: ignore
+                try:
+                    with _conn.cursor() as _cur:
+                        _cur.execute("SELECT 1")
+                finally:
+                    try:
+                        pool.putconn(_conn)  # type: ignore
+                    except Exception as _e:
+                        logger.warning("ready.checkpoint_putconn_failed", dsn=_redact_dsn_api(dsn), exc_info=_e)
+            else:
+                logger.warning("ready.checkpoint_pool_no_conn", dsn=_redact_dsn_api(dsn))
                 return False, "memory"
-        else:
-            # no pool -> emulated only
+        except Exception as _e:
+            logger.warning("ready.checkpoint_select_failed", dsn=_redact_dsn_api(dsn), exc_info=_e)
             return False, "memory"
         return True, "pg"
     except Exception as _e:
-        logger.warning("ready.checkpoint_probe_failed", error=str(_e))
+        logger.warning("ready.checkpoint_probe_failed", dsn=_redact_dsn_api(dsn) if "dsn" in dir() else "***", exc_info=_e)
         return False, "memory"
 
 
 def _check_billing_pg() -> tuple[bool, str]:
+    """实探 billing PG：唯一判据 _is_real_pg 且 pool 探活 SELECT 1 成功才算 pg。"""
     try:
         from hero_quant.config.settings import Settings
         s = Settings()
@@ -407,35 +612,90 @@ def _check_billing_pg() -> tuple[bool, str]:
         from hero_quant.billing.service import BillingService
 
         svc = BillingService(dsn=dsn)
-        # require real PG driver, emulated does not count as pg
+        # 唯一判据：_is_real_pg 且 pool 存在
         is_real = getattr(svc, "_is_real_pg", None)
         if callable(is_real):
             try:
                 if not bool(is_real()):
                     return False, "memory"
-            except Exception:
+            except Exception as _e:
+                logger.warning("ready.billing_not_real", dsn=_redact_dsn_api(dsn or ""), exc_info=_e)
                 return False, "memory"
         elif hasattr(svc, "_is_pg_mode"):
             try:
                 if not bool(svc._is_pg_mode()):
                     return False, "memory"
-            except Exception:
+            except Exception as _e:
+                logger.warning("ready.billing_not_pg_mode", dsn=_redact_dsn_api(dsn or ""), exc_info=_e)
                 return False, "memory"
+        pool = getattr(svc, "_pool", None)
+        if pool is None:
+            return False, "memory"
+        # 实探 SELECT 1
+        try:
+            if hasattr(pool, "connection"):
+                with pool.connection() as _conn:  # type: ignore
+                    try:
+                        _conn.execute("SELECT 1")  # type: ignore
+                    except Exception:
+                        with _conn.cursor() as _c:  # type: ignore
+                            _c.execute("SELECT 1")
+            elif hasattr(pool, "getconn"):
+                _c2 = pool.getconn()  # type: ignore
+                try:
+                    with _c2.cursor() as _cur:
+                        _cur.execute("SELECT 1")
+                finally:
+                    try:
+                        pool.putconn(_c2)  # type: ignore
+                    except Exception as _e:
+                        logger.warning("ready.billing_putconn_failed", dsn=_redact_dsn_api(dsn or ""), exc_info=_e)
+            else:
+                logger.warning("ready.billing_pool_no_conn", dsn=_redact_dsn_api(dsn or ""))
+                return False, "memory"
+        except Exception as _e:
+            logger.warning("ready.billing_select_failed", dsn=_redact_dsn_api(dsn or ""), exc_info=_e)
+            return False, "memory"
         return True, "pg"
     except Exception as _e:
-        logger.warning("ready.billing_probe_failed", error=str(_e))
+        logger.warning("ready.billing_probe_failed", error=str(_e), exc_info=_e)
         return False, "memory"
 
 
 def _check_cohere() -> bool:
+    """Cohere 探活：无 key 直接 False；有 key 时尝试轻量探活，失败 fail-closed 为 False。"""
     try:
         from hero_quant.config.settings import Settings
 
         s = Settings()
-        _ = getattr(s, "cohere_api_key", "") or os.environ.get("COHERE_API_KEY", "") or ""
-        return True
-    except Exception:
-        return True
+        key = (getattr(s, "cohere_api_key", "") or os.environ.get("COHERE_API_KEY", "") or "").strip()
+        if not key:
+            return False
+        # 轻量探活：若可发起 rerank 健康检查则尝试，否则有 key 即视为可探活但不恒 True
+        # 离线环境下 httpx 探活失败则返回 False（不再恒 True）
+        try:
+            import httpx  # type: ignore
+            # 仅用 key 存在性 + 可选网络探活；默认超时 2s，不阻塞就绪探针过久
+            # 若 httpx 不可用则回退到 key 存在即 True（兼容旧逻辑的有 key 场景）
+            # 为避免外部依赖失败导致误判，这里仅当显式启用 COHERE_PROBE 时才做网络探活
+            if os.environ.get("COHERE_PROBE", "").strip().lower() in ("1", "true", "yes"):
+                try:
+                    resp = httpx.get(
+                        "https://api.cohere.ai/v1/models",
+                        headers={"Authorization": f"Bearer {key}"},
+                        timeout=2.0,
+                    )
+                    return 200 <= resp.status_code < 300
+                except Exception as _e:
+                    logger.warning("ready.cohere_probe_failed", exc_info=_e)
+                    return False
+            return True
+        except Exception:
+            # httpx 不可用时，有 key 即 True（不影响无 key 必 False 的 fail-closed）
+            return True
+    except Exception as _e:
+        logger.warning("ready.cohere_probe_error", exc_info=_e)
+        return False
 
 
 @app.get("/ready")
@@ -489,7 +749,7 @@ def metrics():
 
 
 @app.get("/v1/query")
-def query(q: str = "", use_graph: bool = False, replay_path: str | None = None, trace_dir: str | None = None, wall_time_budget: float | None = None, background_tasks: BackgroundTasks = BackgroundTasks([])):  # type: ignore[assignment]
+async def query(q: str = "", use_graph: bool = False, replay_path: str | None = None, trace_dir: str | None = None, wall_time_budget: float | None = None, background_tasks: BackgroundTasks = BackgroundTasks([])):  # type: ignore[assignment]
     # 可变默认防御：每请求新建独立实例
     background_tasks = BackgroundTasks()
     """同步查询：组装 AgentLoop 并返回 LoopResult 聚合 JSON。"""
@@ -661,14 +921,17 @@ def query(q: str = "", use_graph: bool = False, replay_path: str | None = None, 
             loop_kwargs["checkpoint"] = _saver
             loop_kwargs["checkpointer"] = _saver
         loop = AgentLoop(**loop_kwargs)
-        # telemetry observe wall_time around run (best-effort)
+        # telemetry observe wall_time around run (best-effort) — run in thread to not block event loop (was blocking /live + stream)
         _run_start = time.monotonic()
         try:
             from hero_quant.metrics import observe_wall_time as _observe_wt
             _observe_wt("agent_loop", 0, status="start")
         except Exception as _e:
             logger.debug("telemetry.wall_time_start_failed", error=str(_e))
-        res = loop.run(q)
+        try:
+            res = await asyncio.to_thread(loop.run, q)
+        except Exception:
+            res = loop.run(q)
         try:
             from hero_quant.metrics import observe_wall_time as _observe_wt2
             _observe_wt2("agent_loop", float(time.monotonic() - _run_start), status="success")
@@ -680,12 +943,23 @@ def query(q: str = "", use_graph: bool = False, replay_path: str | None = None, 
             _shadow = _get_shadow_stub()
         except Exception as _e:
             logger.warning("shadow.after_run_failed", error=str(_e), exc_info=_e)
-        out = {"query": q, "text": res.text, "reason": res.reason, "grounding_verified": res.grounding_verified, "trace_path": res.trace_path, "token_count": res.token_count}
+        out = {"query": q, "text": _clean_agent_text(res.text), "reason": res.reason, "grounding_verified": res.grounding_verified, "trace_path": res.trace_path, "token_count": res.token_count}
         if _shadow is not None:
             out["shadow"] = _shadow
         # interaction: if loop reason indicates approval needed, surface it
         if isinstance(res.reason, str) and "approval" in res.reason.lower() or res.reason == "need_approval":
             out["need_approval"] = True
+        # 显式关闭 TraceWriter 并清理临时目录（Windows 句柄释放，避免 cleanup 噪音）
+        try:
+            if trace is not None and hasattr(trace, "close"):
+                trace.close()
+        except Exception:
+            pass
+        try:
+            if _tmp_dir_obj is not None:
+                _tmp_dir_obj.cleanup()
+        except Exception:
+            pass
         return out
     except HTTPException:
         raise
@@ -695,13 +969,27 @@ def query(q: str = "", use_graph: bool = False, replay_path: str | None = None, 
 
 
 @app.post("/v1/query/ticket")
-def query_ticket():
-    """签发一个短时、单次消费的 SSE 查询票据。"""
+def query_ticket(request: Request):
+    """签发一个短时、单次消费的 SSE 查询票据（带滑动窗口限流）。"""
     if REQUEST_COUNTER is not None:
         try:
             REQUEST_COUNTER.labels(endpoint="/v1/query/ticket").inc()
         except Exception as _e:
             logger.debug("metrics.counter_failed", error=str(_e))
+    # Rate limit: 10 tickets per minute per IP (zset sliding window via Redis/fakeredis)
+    try:
+        from hero_quant.infra.redis import RateLimiter
+
+        limiter = RateLimiter()
+        # Use client host as key; fallback to "unknown" if unavailable
+        try:
+            client_ip = getattr(getattr(request, "client", None), "host", None) or "unknown"
+        except Exception:
+            client_ip = "unknown"
+        if not limiter.try_acquire_sync(f"ticket:{client_ip}", 10, 60):
+            return JSONResponse(status_code=429, content={"detail": "Too many ticket requests"})
+    except Exception as _e:
+        logger.debug("ticket.ratelimit_failed error=%s", str(_e))
     return {
         "ticket": issue_ticket(ttl=SSE_TICKET_TTL_SECONDS),
         "expires_in": SSE_TICKET_TTL_SECONDS,
@@ -709,7 +997,7 @@ def query_ticket():
 
 
 @app.get("/v1/query/stream")
-def query_stream(q: str = "", ticket: str | None = None, use_graph: bool = False, replay_path: str | None = None, trace_dir: str | None = None, wall_time_budget: float | None = None, background_tasks: BackgroundTasks = BackgroundTasks([])):  # type: ignore[assignment]
+async def query_stream(q: str = "", ticket: str | None = None, use_graph: bool = False, replay_path: str | None = None, trace_dir: str | None = None, wall_time_budget: float | None = None, background_tasks: BackgroundTasks = BackgroundTasks([])):  # type: ignore[assignment]
     background_tasks = BackgroundTasks()
     """SSE 查询流：真实 AgentLoop 驱动，产出 tool 轨迹 + 流式 delta + [DONE]。"""
     if REQUEST_COUNTER is not None:
@@ -887,7 +1175,13 @@ def query_stream(q: str = "", ticket: str | None = None, use_graph: bool = False
                 _owt("agent_loop_stream", 0, status="start")
             except Exception as _e:
                 logger.debug("telemetry.stream_start_failed", error=str(_e))
-            res = loop.run(q)
+            # Run synchronous AgentLoop in thread pool to avoid blocking event loop (was starving concurrent SSE + /live)
+            try:
+                res = await asyncio.to_thread(loop.run, q)
+            except Exception as _e:
+                # fallback: direct call if to_thread unavailable
+                logger.warning("loop.thread_fallback", error=str(_e))
+                res = loop.run(q)
             try:
                 from hero_quant.metrics import observe_wall_time as _owt2
                 _owt2("agent_loop_stream", float(time.monotonic() - _run_start2), status="success")
@@ -911,7 +1205,13 @@ def query_stream(q: str = "", ticket: str | None = None, use_graph: bool = False
                         try:
                             from hero_quant.agent.trace import TraceWriter as _TW
                             _tw = _TW(p)
-                            recs = await _async_tw_read(_tw)
+                            try:
+                                recs = await _async_tw_read(_tw)
+                            finally:
+                                try:
+                                    _tw.close()
+                                except Exception:
+                                    pass
                             for r in recs:
                                 if r.get("type") in ("tool_call", "tool_result"):
                                     if r not in tool_records:
@@ -962,26 +1262,19 @@ def query_stream(q: str = "", ticket: str | None = None, use_graph: bool = False
                     payload = {"type": "tool", "tool": ft["tool"], "status": "success", "preview": ft["preview"], "latencyMs": ft["latencyMs"]}
                     yield f"data: {_json.dumps(payload, ensure_ascii=False)}\n\n"
                     await asyncio.sleep(0.04)
-            text = res.text or ""
+            text = _clean_agent_text(res.text or "")
             if not text:
                 text = f"【回测完成】600519.SH 近一月等权 Sharpe 1.62 grounding_verified {res.grounding_verified}\n查询: {q}\n"
+            # 二段式总结：把工具真实结果回喂 LLM 生成正式结论（否则正文只有开场白）
+            yield f"data: {_json.dumps({'type': 'tool', 'tool': 'final_summary', 'status': 'running', 'preview': '生成最终结论…'}, ensure_ascii=False)}\n\n"
+            text = await asyncio.to_thread(_final_answer, llm, q, text, tool_records)
             if "grounding_verified" not in text.lower() and "grounding" not in text.lower():
                 text += f"\ngrounding_verified {res.grounding_verified}\n"
+            # 完整分块（旧逻辑在 >6 块时丢弃尾部导致回复截断），全部按 ~120 字符流式输出
             chunks: list[str] = []
-            _chunk_size = 80
+            _chunk_size = 120
             for i in range(0, len(text), _chunk_size):
-                chunks.append(text[i:i+_chunk_size])
-            if len(chunks) > 7:
-                _merged: list[str] = []
-                _step = max(1, len(chunks)//6)
-                for idx in range(0, len(chunks), _step):
-                    _merged.append("".join(chunks[idx:idx+_step]))
-                    if len(_merged) >= 6:
-                        break
-                chunks = _merged
-            elif len(chunks) < 5 and len(text) > 100:
-                _chunk_size = max(30, len(text)//6)
-                chunks = [text[i:i+_chunk_size] for i in range(0, len(text), _chunk_size)]
+                chunks.append(text[i:i + _chunk_size])
             for c in chunks:
                 if not c:
                     continue
@@ -1012,6 +1305,20 @@ def query_stream(q: str = "", ticket: str | None = None, use_graph: bool = False
                 logger.debug("best_effort.failed", error=str(_e))  # intentional offline-safe
                 pass  # intentional offline-safe
             yield "data: [DONE]\n\n"
+        finally:
+            # 显式关闭 TraceWriter：Windows 下文件句柄未释放会导致临时目录 cleanup 失败（PermissionError 噪音）
+            try:
+                for _tw in (trace,):
+                    if _tw is not None and hasattr(_tw, "close"):
+                        _tw.close()
+            except Exception:
+                pass
+            # 顺带清理流式临时目录（best-effort；若 close 已完成则此处可正常删除）
+            try:
+                if _tmp_stream_dir is not None:
+                    _tmp_stream_dir.cleanup()
+            except Exception:
+                pass
 
     return StreamingResponse(event_generator(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 

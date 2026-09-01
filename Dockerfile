@@ -29,6 +29,7 @@ ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 WORKDIR /app
 
 # Python deps first for layer caching — hash-pinned lock.
+# Task 9: psycopg[binary]>=3.1 + psycopg_pool via requirements-lock (hash-pinned, no extra apt needed; libpq via binary wheel).
 COPY requirements-lock.txt requirements-lock.txt
 RUN pip install --no-cache-dir --require-hashes -r requirements-lock.txt
 

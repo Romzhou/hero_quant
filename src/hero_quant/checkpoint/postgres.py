@@ -22,16 +22,16 @@ logger = logging.getLogger("hero_quant.checkpoint.postgres")
 # 默认 TTL 7 天 — 控制可恢复窗口，超时自动清理避免无限堆积
 DEFAULT_TTL_SECONDS = 7 * 24 * 3600
 
-# 可选 psycopg_pool — 真实 Postgres 时复用连接池，缺包时优雅降级为内存实现
+# 可选 psycopg_pool — 同步池优先（无 loop 可建），异步池需 loop，失败回退到同步；缺包时降级内存
 try:
-    from psycopg_pool import AsyncConnectionPool as _AsyncPool  # type: ignore
+    from psycopg_pool import ConnectionPool as _SyncPool  # type: ignore
 
-    ConnectionPool: Any = _AsyncPool  # type: ignore
+    ConnectionPool: Any = _SyncPool  # type: ignore
 except Exception:
     try:
-        from psycopg_pool import ConnectionPool as _SyncPool  # type: ignore
+        from psycopg_pool import AsyncConnectionPool as _AsyncPool  # type: ignore
 
-        ConnectionPool = _SyncPool  # type: ignore
+        ConnectionPool = _AsyncPool  # type: ignore
     except Exception:
         ConnectionPool = None  # type: ignore
 
@@ -133,7 +133,7 @@ def _evict_if_needed() -> None:
 
 
 def _redact_dsn(dsn: str) -> str:
-    """Fallback redactor if hashlib path fails."""
+    """脱敏 DSN 密码，日志仅输出 ***，保持 exc_info=True。"""
     try:
         import re as _re
         return _re.sub(r"://([^:]+):[^@]*@", r"://\1:***@", dsn)
@@ -278,15 +278,9 @@ class AsyncPostgresSaver:
             if self.dsn.startswith("memory://"):
                 self.pool = None
             elif _is_postgres_dsn(self.dsn):
-                if self.pool is None and ConnectionPool is not None:
-                    try:
-                        try:
-                            self.pool = ConnectionPool(conninfo=self.dsn, min_size=1, max_size=5)  # type: ignore
-                        except TypeError:
-                            self.pool = ConnectionPool(self.dsn)  # type: ignore
-                    except Exception:
-                        self.pool = None
-                # keep dsn as PG, pool may be None -> will use global emulated store as PG main path
+                # 惰性池：尊重显式注入的 pool，不自动建池（避免无 PG 时仍判真实）；探活/写入时按需建池
+                # keep dsn as PG, pool may be None -> emulated store, fail-closed on probe
+                pass
             else:
                 if self.pool is None and ConnectionPool is not None:
                     pass

@@ -41,6 +41,15 @@ except Exception:
     def _log_warning(msg, *args, **kwargs):
         _structlog.warning(msg, *args, **kwargs)
 
+# psycopg_pool 连接池（真实 PG 判据），缺包时优雅降级
+try:
+    from psycopg_pool import ConnectionPool as _BillingPool  # type: ignore
+except Exception:
+    try:
+        from psycopg_pool import AsyncConnectionPool as _BillingPool  # type: ignore
+    except Exception:
+        _BillingPool = None  # type: ignore
+
 _PG_PREFIXES = ("postgresql://", "postgres://", "postgresql+psycopg://")
 
 DDL_FACTORS = """
@@ -122,20 +131,18 @@ class BillingService:
         self._factors: Dict[str, dict] = {}
         self._purchases: List[dict] = []
         self._pool = None
-        # try asyncpg pool if PG DSN present
+        # 允许显式注入 pool（测试探活/真实环境预建池）
+        injected = kwargs.get("pool")
+        if injected is not None:
+            self._pool = injected
+        # 池为惰性创建：不立即建 psycopg 连接（避免无 PG 时仍判为真实）；探活时再建
+        self._asyncpg = None  # 兼容旧属性，真实性不再依赖 asyncpg
         if _is_pg_dsn(self.dsn):
-            try:
-                import asyncpg  # type: ignore
-                # pool creation is async, keep DSN for lazy connect
-                self._asyncpg = asyncpg
-            except Exception:
-                self._asyncpg = None  # type: ignore
-            # attempt to init global stores for emulated PG under lock (hashed key)
+            # 全局 emulated 存储（hashed key，脱敏；_BillingPool 预留探活路径）
             _k = _dsn_key(self.dsn)
             with _GLOBAL_LOCK:
                 _GLOBAL_FACTORS.setdefault(_k, {})  # type: ignore
                 _GLOBAL_PURCHASES.setdefault(_k, [])  # type: ignore
-            # minimal fix: log warning that real PG not implemented
             _log_pg_warning_once()
         else:
             self._asyncpg = None  # type: ignore
@@ -150,10 +157,13 @@ class BillingService:
         return True
 
     def _is_real_pg(self) -> bool:
-        """是否真实 PG 可用（驱动 + DSN）。用于区分 emulated 与真实持久化。"""
+        """唯一判据：是否真实 PG 可用（pool 非空且 DSN 为 PG）。无 pool 不伪成功。"""
         if not _is_pg_dsn(self.dsn):
             return False
-        # asyncpg 驱动是否可用视为真实 PG 能力标志
+        # 真实性唯一判据：pool 是否真实存在；兼容旧 asyncpg 亦视为真实
+        pool = getattr(self, "_pool", None)
+        if pool is not None:
+            return True
         return getattr(self, "_asyncpg", None) is not None
 
     def _get_global_factors(self) -> Dict[str, dict]:
@@ -280,8 +290,14 @@ class BillingService:
             self._factors[factor_id] = copy.deepcopy(factor)
         return copy.deepcopy(factor)
 
-    def _pg_publish_sync(self, factor: dict) -> None:
-        """Best-effort sync PG publish — no-op 桩，真实 PG 未接入时仅告警；真实 PG 时双写 SET LOCAL。"""
+    def _pg_publish_sync(self, factor: dict) -> bool:
+        """Best-effort sync PG publish — 无 pool 不伪成功（返回 False），有 pool 才做 SET LOCAL 双写并返回 True。"""
+        if not self._is_real_pg():
+            _log_warning("PG publish skipped (no real pool) tenant=%s dsna=%s", str(factor.get("tenant", "default")), "__hashed__", exc_info=False)
+            return False
+        if getattr(self, "_pool", None) is None:
+            _log_warning("PG publish no pool tenant=%s", str(factor.get("tenant", "default")), exc_info=False)
+            return False
         if self._is_real_pg() and getattr(self, "_pool", None) is not None:
             # real PG: SET LOCAL both keys inside txn (best-effort dual write)
             _tenant = str(factor.get("tenant", "default"))
@@ -310,14 +326,11 @@ class BillingService:
                                 except Exception:
                                     pass
                     except Exception as _e:
-                        _log_warning("billing SET LOCAL %s failed: %s", _k, _e)
+                        _log_warning("billing SET LOCAL %s failed: %s", _k, _e, exc_info=True)
                         continue
-        elif self._is_pg_mode() and not self._is_real_pg():
-            _log_warning("PG persistence degraded (emulated): using emulated store for tenant=%s", str(factor.get("tenant", "default")), exc_info=False)
-            _log_warning("PG persistence not implemented, using emulated store", exc_info=False)
-        else:
-            _log_warning("PG persistence not implemented, using emulated store", exc_info=False)
-        return None
+            return True
+        # 无真实池：已在入口返回 False
+        return False
 
     # 兼容别名：_pg_publish_noop 已在上方定义，此处保留 _pg_publish_sync 为真实入口
 
@@ -487,39 +500,40 @@ class BillingService:
             self._purchases.append(copy.deepcopy(receipt))
         return copy.deepcopy(receipt)
 
-    def _pg_purchase_sync(self, receipt: dict) -> None:
-        if self._is_real_pg() and getattr(self, "_pool", None) is not None:
-            _tenant = str(receipt.get("buyer_tenant") or receipt.get("tenant") or "default")
-            _log_warning("PG purchase SET LOCAL app.tenant=%s (dual write with app.current_tenant)", _tenant, exc_info=False)
-            pool = getattr(self, "_pool", None)
-            if pool is not None:
-                for _k in ("app.tenant", "app.current_tenant"):
-                    _sql = f"SET LOCAL {_k} = %s"
-                    try:
-                        if hasattr(pool, "connection"):
-                            with pool.connection() as _conn:  # type: ignore
-                                try:
-                                    _conn.execute(_sql, (_tenant,))  # type: ignore
-                                except Exception:
-                                    with _conn.cursor() as _c:  # type: ignore
-                                        _c.execute(_sql, (_tenant,))
-                        elif hasattr(pool, "getconn"):
-                            _conn2 = pool.getconn()  # type: ignore
+    def _pg_purchase_sync(self, receipt: dict) -> bool:
+        """无 pool 不伪成功（返回 False），有 pool 才做 SET LOCAL 双写并返回 True。"""
+        if not self._is_real_pg() or getattr(self, "_pool", None) is None:
+            _log_warning("PG purchase skipped (no real pool) tenant=%s", str(receipt.get("buyer_tenant") or receipt.get("tenant") or "default"), exc_info=False)
+            return False
+        _tenant = str(receipt.get("buyer_tenant") or receipt.get("tenant") or "default")
+        _log_warning("PG purchase SET LOCAL app.tenant=%s (dual write with app.current_tenant)", _tenant, exc_info=False)
+        pool = getattr(self, "_pool", None)
+        if pool is not None:
+            for _k in ("app.tenant", "app.current_tenant"):
+                _sql = f"SET LOCAL {_k} = %s"
+                try:
+                    if hasattr(pool, "connection"):
+                        with pool.connection() as _conn:  # type: ignore
                             try:
-                                with _conn2.cursor() as _c2:
-                                    _c2.execute(_sql, (_tenant,))
-                                _conn2.commit()
-                            finally:
-                                try:
-                                    pool.putconn(_conn2)  # type: ignore
-                                except Exception:
-                                    pass
-                    except Exception as _e:
-                        _log_warning("billing SET LOCAL %s failed: %s", _k, _e)
-                        continue
-        else:
-            _log_warning("PG persistence not implemented, using emulated store", exc_info=False)
-        return None
+                                _conn.execute(_sql, (_tenant,))  # type: ignore
+                            except Exception:
+                                with _conn.cursor() as _c:  # type: ignore
+                                    _c.execute(_sql, (_tenant,))
+                    elif hasattr(pool, "getconn"):
+                        _conn2 = pool.getconn()  # type: ignore
+                        try:
+                            with _conn2.cursor() as _c2:
+                                _c2.execute(_sql, (_tenant,))
+                            _conn2.commit()
+                        finally:
+                            try:
+                                pool.putconn(_conn2)  # type: ignore
+                            except Exception:
+                                pass
+                except Exception as _e:
+                    _log_warning("billing SET LOCAL %s failed: %s", _k, _e, exc_info=True)
+                    continue
+        return True
 
     def _pg_get_factor_sync(self, factor_id: str, tenant: str | None = None) -> dict | None:
         """PG 侧 factor 查询 no-op 桩（真实 PG 时应执行 SELECT with RLS）。"""

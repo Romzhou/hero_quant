@@ -21,6 +21,9 @@ dependencies = [
     "langchain-openai>=1.0,<2",
     "prometheus_client>=0.20,<1",
     "structlog>=24.0,<27",
+    "redis>=5.0,<7",
+    "psycopg[binary]>=3.1",
+    "psycopg_pool>=3.2",
 ]
 
 [project.optional-dependencies]
@@ -28,7 +31,7 @@ ashare = ["tushare>=1.2.89", "akshare>=1.12.0"]
 us = ["yfinance>=0.2.30"]
 crypto = ["ccxt>=4.5.71"]
 vector = ["polars>=1.0"]
-dev = ["pytest>=7.0", "pytest-cov>=4.0", "ruff>=0.9", "black>=24.0"]
+dev = ["pytest>=7.0", "pytest-cov>=4.0", "ruff>=0.9", "black>=24.0", "fakeredis>=2.0"]
 
 [project.urls]
 Repository = "https://github.com/your-org/hero-quant"
