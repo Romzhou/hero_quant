@@ -60,10 +60,16 @@ def validate(
     if not isinstance(prices, pd.DataFrame) or prices.empty:
         raise ValidationError("prices DataFrame is empty or not a DataFrame (fail-closed)")
 
-    # 0b. Duplicate DatetimeIndex check — duplicated timestamps would corrupt pct_change/ret alignment
+    # 0b. DatetimeIndex 去重校验 — 重复时间戳会导致 pct_change/ret 错位，fail-closed
     if isinstance(prices.index, pd.DatetimeIndex) and prices.index.has_duplicates:
         dup = prices.index[prices.index.duplicated()].unique().tolist()[:5]
         raise ValidationError(f"duplicated timestamps in prices index at {dup} (fail-closed)")
+
+    # 0c. DatetimeIndex 排序校验 — 未按时间递增会导致 pct_change/ret 错位，fail-closed
+    if isinstance(prices.index, pd.DatetimeIndex) and not prices.index.is_monotonic_increasing:
+        # 已去重，此处未递增即为乱序，拒绝以避免前视/错位收益
+        preview = prices.index[:5].tolist()
+        raise ValidationError(f"prices index not sorted monotonic increasing: {preview} (fail-closed)")
 
     # 1. PIT 校验：weights_on ≤ price_date 为正逻辑
     # Normalize TZ-aware vs naive to UTC consistently before comparison
