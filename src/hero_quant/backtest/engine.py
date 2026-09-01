@@ -277,6 +277,54 @@ class BacktestEngine:
             logger.warning("_align final fallback failed: %s", e, exc_info=True)
             raise ValueError(f"_align final fallback failed: {e}") from e
 
+    def _compute_turnover_rate(
+        self,
+        pos_proxy: pd.DataFrame,
+        gross_equity: pd.Series,
+        w: np.ndarray,
+        total_weight: float,
+        leverage: float | None = None,
+    ) -> pd.Series:
+        """单口径周转率：按持仓代理 pos_proxy 计算 turnover_rate，首日按 ‖w‖₁/total_weight（空仓 0）。
+
+        复用点：682-823 抽此帮手，net_ret 保持 gross，成本单次在主循环扣除，避免双计。
+        语义：turnover_series = pos_proxy.diff().abs().sum(axis=1).fillna(_init_turnover) 后除以 equity_safe；
+              首日不硬编码 1.0，按 ‖w‖₁/total_weight 修正，空仓为 0。
+        """
+        # 初始换手：首 Bar 持仓绝对和
+        try:
+            _init_turnover = float(pos_proxy.iloc[0].abs().sum())
+        except (ValueError, TypeError, AttributeError) as e:
+            logger.warning("init turnover fallback: %s", e, exc_info=True)
+            _init_turnover = 0.0
+        turnover_series = pos_proxy.diff().abs().sum(axis=1).fillna(_init_turnover)
+        equity_safe = gross_equity.replace(0, np.nan).fillna(self.initial_capital)
+        turnover_rate = turnover_series / equity_safe
+        turnover_rate = turnover_rate.replace([np.inf, -np.inf], 0.0).fillna(0.0)
+        # 首日换手：按实际持仓比例 ‖w‖₁/total_weight，空仓为 0 而非硬编码 1.0
+        if len(turnover_rate) > 0:
+            try:
+                w_arr = np.asarray(w, dtype=float)
+                sum_abs = float(np.abs(w_arr).sum())
+            except (ValueError, TypeError):
+                sum_abs = 0.0
+            _l1_ratio = sum_abs / float(total_weight) if total_weight else 0.0
+            # 杠杆缩放：与 run 中 leverage 语义一致，仅当杠杆有效时乘
+            lev = leverage
+            try:
+                lev_f = float(lev) if lev is not None and np.isfinite(float(lev)) else 1.0
+            except (ValueError, TypeError):
+                lev_f = 1.0
+            _expected_first = _l1_ratio * lev_f
+            # 单边口径：首日 turnover 即建仓单边换手，无需 /2（pos_proxy 换手已为单边绝对变动和）
+            # 仅当有持仓且首日为 0 时补齐为预期值，避免空仓扣费
+            if turnover_rate.iloc[0] == 0 and _expected_first > 0:
+                try:
+                    turnover_rate.iloc[0] = float(_expected_first)
+                except (ValueError, TypeError, IndexError) as e:
+                    logger.warning("turnover first-day patch failed: %s", e, exc_info=True)
+        return turnover_rate
+
     def _execute_bars(
         self,
         target_positions: pd.Series | np.ndarray | list,
@@ -672,27 +720,10 @@ class BacktestEngine:
                         )
                     else:
                         pos_proxy = pd.DataFrame({"position": gross_equity * float(w[0]) / total_weight}, index=prices.index)
-                try:
-                    _init_turnover = float(pos_proxy.iloc[0].abs().sum())
-                except (ValueError, TypeError, AttributeError) as e:
-                    logger.warning("init turnover fallback: %s", e, exc_info=True)
-                    _init_turnover = 0.0
-                turnover_series = pos_proxy.diff().abs().sum(axis=1).fillna(_init_turnover)
-                equity_safe = gross_equity.replace(0, np.nan).fillna(self.initial_capital)  # 避免除零
-                turnover_rate = turnover_series / equity_safe
-                turnover_rate = turnover_rate.replace([np.inf, -np.inf], 0.0).fillna(0.0)
-                # 首日换手：按实际持仓比例计算，空仓为 0 而非硬编码 1.0
-                if len(turnover_rate) > 0:
-                    _l1 = float(np.abs(w).sum()) / float(total_weight) if total_weight else 0.0
-                    _expected_first = _l1 * (float(leverage) if leverage and np.isfinite(leverage) else 1.0)
-                    # 仅当有持仓且首日换手为 0 时补齐为预期首日换手，避免空仓扣费
-                    if turnover_rate.iloc[0] == 0 and _expected_first > 0:
-                        try:
-                            turnover_rate.iloc[0] = float(_expected_first)
-                        except (ValueError, TypeError, IndexError):
-                            pass
+                # 单口径：委托 _compute_turnover_rate，net_ret 保持 gross，成本单次在主循环扣除
+                turnover_rate = self._compute_turnover_rate(pos_proxy, gross_equity, w, total_weight, leverage=leverage)
                 # 周期内收益保持 gross（含杠杆，不含成本），成本仅在主循环逐 Bar 扣除一次，避免双计
-                net_ret = daily_ret
+                net_ret = daily_ret.copy()
                 net_ret = net_ret.replace([np.inf, -np.inf], 0.0).fillna(0.0)
             except (ValueError, TypeError, AttributeError, KeyError, IndexError) as e:
                 logger.warning("turnover cost computation failed: %s", e, exc_info=True)
