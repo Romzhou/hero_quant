@@ -16,6 +16,7 @@ frontend/dist/
 .ruff_cache/
 # local plans not for github
 docs/plans/
+docs/plans/**
 docs/plan/
 # local logs / tmp
 forward-*.log
@@ -59,3 +60,6 @@ tmp_tests_*.log
 *resume_v2_defensive.md
 *AI_Agent_*.md
 docs/loop_mindmap.html
+docs/retrieval_eval.md
+interview_100q*.md
+interview-*.md
