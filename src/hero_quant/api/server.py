@@ -11,6 +11,7 @@ from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_
 
 import structlog
 import structlog.contextvars
+import hashlib
 import time
 import uuid
 import logging
@@ -310,6 +311,32 @@ except Exception as _e:
 
 
 app = FastAPI(title="hero-quant")
+
+
+
+def _client_ip(request: Request | None) -> str:
+    """提取客户端 IP（限流 key 用），失败回退 testclient/unknown。"""
+    try:
+        ip = getattr(getattr(request, "client", None), "host", None) or "unknown"
+    except Exception:
+        ip = "unknown"
+    return str(ip)
+
+
+def _check_rate_limit(request: Request | None, endpoint: str, max_requests: int, window_seconds: int = 60) -> JSONResponse | None:
+    """各 handler 首行限流：query 20/60、stream 10/60、trace 60/60、backtest 30/60。
+
+    超限返回 429 JSONResponse；异常 fail-open 返回 None（参考 ticket 限流 logger.debug 风格）。
+    """
+    try:
+        from hero_quant.infra.redis import RateLimiter
+
+        if not RateLimiter().try_acquire_sync(f"{endpoint}:{_client_ip(request)}", max_requests, window_seconds):
+            return JSONResponse(status_code=429, content={"detail": f"Too many {endpoint} requests"})
+    except Exception as _e:
+        logger.debug(f"{endpoint}.ratelimit_failed error={_e}")
+    return None
+
 
 
 # 冷启动预热：后台线程预导入重模块（langchain/tools/llm），把 10s 首次导入耗时移出请求路径
@@ -749,10 +776,13 @@ def metrics():
 
 
 @app.get("/v1/query")
-async def query(q: str = "", use_graph: bool = False, replay_path: str | None = None, trace_dir: str | None = None, wall_time_budget: float | None = None, background_tasks: BackgroundTasks = BackgroundTasks([])):  # type: ignore[assignment]
+async def query(request: Request, q: str = "", use_graph: bool = False, replay_path: str | None = None, trace_dir: str | None = None, wall_time_budget: float | None = None, background_tasks: BackgroundTasks = BackgroundTasks([])):  # type: ignore[assignment]
     # 可变默认防御：每请求新建独立实例
     background_tasks = BackgroundTasks()
     """同步查询：组装 AgentLoop 并返回 LoopResult 聚合 JSON。"""
+    _limited = _check_rate_limit(request, "query", 20, 60)
+    if _limited is not None:
+        return _limited
     if REQUEST_COUNTER is not None:
         try:
             REQUEST_COUNTER.labels(endpoint="/v1/query").inc()
@@ -997,9 +1027,12 @@ def query_ticket(request: Request):
 
 
 @app.get("/v1/query/stream")
-async def query_stream(q: str = "", ticket: str | None = None, use_graph: bool = False, replay_path: str | None = None, trace_dir: str | None = None, wall_time_budget: float | None = None, background_tasks: BackgroundTasks = BackgroundTasks([])):  # type: ignore[assignment]
+async def query_stream(request: Request, q: str = "", ticket: str | None = None, use_graph: bool = False, replay_path: str | None = None, trace_dir: str | None = None, wall_time_budget: float | None = None, background_tasks: BackgroundTasks = BackgroundTasks([])):  # type: ignore[assignment]
     background_tasks = BackgroundTasks()
     """SSE 查询流：真实 AgentLoop 驱动，产出 tool 轨迹 + 流式 delta + [DONE]。"""
+    _limited = _check_rate_limit(request, "stream", 10, 60)
+    if _limited is not None:
+        return _limited
     if REQUEST_COUNTER is not None:
         try:
             REQUEST_COUNTER.labels(endpoint="/v1/query/stream").inc()
@@ -1324,74 +1357,165 @@ async def query_stream(q: str = "", ticket: str | None = None, use_graph: bool =
 
 
 # 研究页回测产物：以 BacktestEngine 合成生成，保证 metrics/sharpe/date/tearsheet 齐全
+# L1 进程内缓存 + L2 Redis 聚合（hero:cache:backtest:bundle:{hash}，ex=600）。
 _backtest_cache = {}
 _backtest_cache_lock = threading.Lock()
+_BACKTEST_BUNDLE_CACHE_PREFIX = "hero:cache:backtest:bundle:"
+_BACKTEST_BUNDLE_LOCK_KEY = "hero:lock:backtest:bundle"
+
+
+def _backtest_bundle_cache_key() -> str:
+    """bundle 参数哈希 key（当前参数固定，保留 hash(params) 形态便于扩展）。"""
+    raw = json.dumps({"v": 1, "capital": 1.0, "weights": [0.5, 0.5]}, sort_keys=True)
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+    return f"{_BACKTEST_BUNDLE_CACHE_PREFIX}{digest}"
+
+
+def _read_backtest_bundle_cache() -> dict | None:
+    """优先读 Redis L2（JSON 反序列化；positions 存 CSV 文本，还原为 None 由调用方按 csv 用）。"""
+    try:
+        from hero_quant.infra.redis import get_redis_sync
+
+        client = get_redis_sync()
+        if client is None:
+            return None
+        raw = client.get(_backtest_bundle_cache_key())
+        if not raw:
+            return None
+        data = json.loads(raw)
+        if not isinstance(data, dict) or not isinstance(data.get("metrics"), dict):
+            return None
+        return data
+    except Exception as _e:
+        logger.debug(f"backtest.bundle_cache_read_failed error={_e}")
+        return None
+
+
+def _write_backtest_bundle_cache(bundle: dict) -> None:
+    """计算后写 L2（JSON ex=600；positions 为 DataFrame 时只存 csv/tearsheet/metrics）。"""
+    try:
+        from hero_quant.infra.redis import get_redis_sync
+
+        client = get_redis_sync()
+        if client is None:
+            return
+        payload = {
+            "metrics": bundle.get("metrics", {}),
+            "csv": bundle.get("csv", ""),
+            "tearsheet": bundle.get("tearsheet", ""),
+        }
+        client.set(_backtest_bundle_cache_key(), json.dumps(payload, ensure_ascii=False, default=str), ex=600)
+    except Exception as _e:
+        logger.debug(f"backtest.bundle_cache_write_failed error={_e}")
+
+
+def _compute_backtest_bundle() -> dict:
+    """重计算 bundle（调用方已持有本地互斥；内部不再加锁，避免非重入死锁）。"""
+    import pandas as pd
+    import numpy as np
+    from hero_quant.backtest.engine import BacktestEngine
+
+    # 确定性合成行情（20 日，类 600519.SH 走势）
+    dates = pd.date_range("2026-07-20", periods=20, freq="D")
+    # 确定性爬升叠加小幅正弦波动，无随机性
+    base = 1680.0
+    close_vals = [base + i * 1.8 + (3.0 if i % 5 == 0 else -1.2 if i % 7 == 0 else 0.6 * np.sin(i)) for i in range(20)]
+    prices = pd.DataFrame({"close": close_vals}, index=dates)
+    prices.index.name = "date"
+    eng = BacktestEngine(initial_capital=1.0)
+    res = eng.run(prices, weights=[0.5, 0.5])
+    metrics_data = res.get("metrics", {})
+    # 补齐关键指标缺省值
+    if "sharpe" not in metrics_data:
+        metrics_data["sharpe"] = 1.62
+    if "annual_return" not in metrics_data:
+        metrics_data["annual_return"] = 0.184
+    positions = res.get("positions")
+    # 生成带 date 表头的 CSV 文本
+    csv_text = ""
+    try:
+        if positions is not None and hasattr(positions, "to_csv"):
+            import io
+            buf = io.StringIO()
+            # 保证 index_label 为 date，便于前端/测试解析
+            positions.to_csv(buf, index=True, index_label="date")
+            csv_text = buf.getvalue()
+        else:
+            csv_text = "date,symbol,weight,close\n2026-08-12,600519.SH,0.5,1680.2\n"
+    except Exception:
+        csv_text = "date,symbol,weight,close\n2026-08-12,600519.SH,0.5,1680.2\n"
+    tearsheet = res.get("tearsheet", "")
+    if not tearsheet or "Tearsheet" not in tearsheet:
+        tearsheet = """<!doctype html><html><head><meta charset="utf-8"><title>Tearsheet</title></head><body><h1>Tearsheet — Production Core</h1><p>Sharpe 1.62 | Annual 18.4%</p><table><tr><th>Month</th><th>Return</th></tr><tr><td>2026-08</td><td>+0.82%</td></tr></table></body></html>"""
+    return {"metrics": metrics_data, "positions": positions, "csv": csv_text, "tearsheet": tearsheet}
+
+
+def _static_backtest_bundle() -> dict:
+    """静态兜底，保证接口始终可用。"""
+    return {
+        "metrics": {"sharpe": 1.62, "annual_return": 0.184, "max_drawdown": -0.032, "turnover": 0.42, "volatility": 0.18, "cumulative_return": 0.06},
+        "positions": None,
+        "csv": "date,symbol,weight,close\n2026-08-12,600519.SH,0.5,1680.2\n2026-08-13,600519.SH,0.5,1692.5\n",
+        "tearsheet": """<!doctype html><html><head><meta charset="utf-8"><title>Tearsheet</title></head><body><h1>Tearsheet — Production Core</h1><p>Sharpe 1.62 | Annual 18.4%</p></body></html>""",
+    }
+
 
 def _get_backtest_bundle():
-    """获取回测产物（metrics、持仓、tearsheet、CSV），带缓存；失败返回静态兜底。"""
+    """获取回测产物（metrics、持仓、tearsheet、CSV）：L1 内存 → L2 Redis → 计算。
+
+    计算段用 threading.Lock 本地互斥 + 可选 Redis SET NX 防多 worker 雷群（fakeredis 下兼容 fail-open）。
+    失败返回静态兜底。"""
     global _backtest_cache
     if _backtest_cache:
+        return _backtest_cache
+    cached = _read_backtest_bundle_cache()
+    if cached is not None:
+        _backtest_cache = cached
         return _backtest_cache
     with _backtest_cache_lock:
         if _backtest_cache:
             return _backtest_cache
-        # mark computing to prevent thundering herd (release lock before heavy compute)
+        cached = _read_backtest_bundle_cache()
+        if cached is not None:
+            _backtest_cache = cached
+            return _backtest_cache
+        # 可选 Redis 分布式锁防多 worker 雷群（拿不到则 fail-open 继续算；fakeredis 下兼容）。
+        _have_dlock = False
         try:
-            import pandas as pd
-            import numpy as np
-            from hero_quant.backtest.engine import BacktestEngine
+            from hero_quant.infra.redis import get_redis_sync
 
-            # 确定性合成行情（20 日，类 600519.SH 走势）
-            dates = pd.date_range("2026-07-20", periods=20, freq="D")
-            # 确定性爬升叠加小幅正弦波动，无随机性
-            base = 1680.0
-            close_vals = [base + i * 1.8 + (3.0 if i % 5 == 0 else -1.2 if i % 7 == 0 else 0.6 * np.sin(i)) for i in range(20)]
-            prices = pd.DataFrame({"close": close_vals}, index=dates)
-            prices.index.name = "date"
-            eng = BacktestEngine(initial_capital=1.0)
-            res = eng.run(prices, weights=[0.5, 0.5])
-            metrics_data = res.get("metrics", {})
-            # 补齐关键指标缺省值
-            if "sharpe" not in metrics_data:
-                metrics_data["sharpe"] = 1.62
-            if "annual_return" not in metrics_data:
-                metrics_data["annual_return"] = 0.184
-            positions = res.get("positions")
-            # 生成带 date 表头的 CSV 文本
-            csv_text = ""
-            try:
-                if positions is not None and hasattr(positions, "to_csv"):
-                    import io
-                    buf = io.StringIO()
-                    # 保证 index_label 为 date，便于前端/测试解析
-                    positions.to_csv(buf, index=True, index_label="date")
-                    csv_text = buf.getvalue()
-                else:
-                    csv_text = "date,symbol,weight,close\n2026-08-12,600519.SH,0.5,1680.2\n"
-            except Exception:
-                csv_text = "date,symbol,weight,close\n2026-08-12,600519.SH,0.5,1680.2\n"
-            tearsheet = res.get("tearsheet", "")
-            if not tearsheet or "Tearsheet" not in tearsheet:
-                tearsheet = """<!doctype html><html><head><meta charset="utf-8"><title>Tearsheet</title></head><body><h1>Tearsheet — Production Core</h1><p>Sharpe 1.62 | Annual 18.4%</p><table><tr><th>Month</th><th>Return</th></tr><tr><td>2026-08</td><td>+0.82%</td></tr></table></body></html>"""
-            with _backtest_cache_lock:
-                _backtest_cache = {"metrics": metrics_data, "positions": positions, "csv": csv_text, "tearsheet": tearsheet}
-            return _backtest_cache
+            _rc = get_redis_sync()
+            if _rc is not None:
+                try:
+                    if _rc.set(_BACKTEST_BUNDLE_LOCK_KEY, "1", nx=True, ex=30):
+                        _have_dlock = True
+                except Exception as _e:
+                    logger.debug(f"backtest.bundle_dlock_failed error={_e}")
         except Exception as _e:
-            logger.warning("backtest.bundle_failed_fallback", error=str(_e))  # intentional fallback to static
-            # 静态兜底，保证接口始终可用
-            with _backtest_cache_lock:
-                _backtest_cache = {
-                    "metrics": {"sharpe": 1.62, "annual_return": 0.184, "max_drawdown": -0.032, "turnover": 0.42, "volatility": 0.18, "cumulative_return": 0.06},
-                "positions": None,
-                "csv": "date,symbol,weight,close\n2026-08-12,600519.SH,0.5,1680.2\n2026-08-13,600519.SH,0.5,1692.5\n",
-                "tearsheet": """<!doctype html><html><head><meta charset="utf-8"><title>Tearsheet</title></head><body><h1>Tearsheet — Production Core</h1><p>Sharpe 1.62 | Annual 18.4%</p></body></html>""",
-            }
+            logger.debug(f"backtest.bundle_dlock_failed error={_e}")
+        try:
+            try:
+                bundle = _compute_backtest_bundle()
+            except Exception as _e:
+                logger.warning("backtest.bundle_failed_fallback", error=str(_e))  # intentional fallback to static
+                bundle = _static_backtest_bundle()
+            _backtest_cache = bundle
+            _write_backtest_bundle_cache(bundle)
             return _backtest_cache
+        finally:
+            if _have_dlock:
+                try:
+                    _rc.delete(_BACKTEST_BUNDLE_LOCK_KEY)  # type: ignore[union-attr]
+                except Exception as _e:
+                    logger.debug(f"backtest.bundle_dlock_release_failed error={_e}")
 
 
 @app.get("/v1/backtest/metrics.json")
-def backtest_metrics():
+def backtest_metrics(request: Request):
     """返回回测核心指标 JSON。"""
+    _limited = _check_rate_limit(request, "backtest", 30, 60)
+    if _limited is not None:
+        return _limited
     if REQUEST_COUNTER is not None:
         try:
             REQUEST_COUNTER.labels(endpoint="/v1/backtest/metrics.json").inc()
@@ -1403,8 +1527,11 @@ def backtest_metrics():
 
 
 @app.get("/v1/backtest/positions.csv")
-def backtest_positions():
+def backtest_positions(request: Request):
     """返回持仓 CSV，表头包含 date 列。"""
+    _limited = _check_rate_limit(request, "backtest", 30, 60)
+    if _limited is not None:
+        return _limited
     if REQUEST_COUNTER is not None:
         try:
             REQUEST_COUNTER.labels(endpoint="/v1/backtest/positions.csv").inc()
@@ -1417,8 +1544,11 @@ def backtest_positions():
 
 
 @app.get("/v1/backtest/tearsheet.html")
-def backtest_tearsheet():
+def backtest_tearsheet(request: Request):
     """返回回测 tearsheet HTML。"""
+    _limited = _check_rate_limit(request, "backtest", 30, 60)
+    if _limited is not None:
+        return _limited
     try:
         REQUEST_COUNTER.labels(endpoint="/v1/backtest/tearsheet.html").inc()
     except Exception as _e:
@@ -1435,6 +1565,9 @@ def trace_events(request: Request, offset: int = 0):
     """按 offset 返回追踪事件；Accept 为 text/event-stream 时以 SSE 流式返回。"""
     if offset < 0:
         raise HTTPException(status_code=400, detail="offset must be >=0")
+    _limited = _check_rate_limit(request, "trace", 60, 60)
+    if _limited is not None:
+        return _limited
     if REQUEST_COUNTER is not None:
         try:
             REQUEST_COUNTER.labels(endpoint="/v1/trace/events").inc()

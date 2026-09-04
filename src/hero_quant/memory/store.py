@@ -1495,7 +1495,10 @@ class MemoryStore:
             return []
 
     def search(self, query: str) -> list[dict]:
-        """混合检索：BM25 召回 + 向量余弦 via rank_fusion (0.5/0.5) + 可选 Cohere 重排（30s TTL）。"""
+        """混合检索：BM25 召回 + 向量余弦 via rank_fusion (0.5/0.5) + 可选 Cohere 重排（30s TTL）。
+
+        L1 进程内缓存命中直返；L2 Redis（hero:cache:memory:search:{ns}:{query}:{backend}）命中直返并回填 L1。
+        """
         if not query:
             return []
         try:
@@ -1506,6 +1509,33 @@ class MemoryStore:
         except Exception:
             _sck = None  # type: ignore
             _scached = None  # type: ignore
+        try:
+            from hero_quant.infra.redis import get_redis_sync as _get_redis_sync
+
+            _r = _get_redis_sync()
+            if _r is not None:
+                import hashlib as _hl
+                import json as _js
+
+                _lq = _hl.sha256(str(query).encode()).hexdigest()[:16]
+                _lk = f"hero:cache:memory:search:{self.namespace or 'default'}:{_lq}:{self.vector_backend}"
+                try:
+                    _raw = _r.get(_lk)
+                except Exception:
+                    _raw = None
+                if _raw:
+                    if isinstance(_raw, (bytes, bytearray)):
+                        _raw = bytes(_raw).decode("utf-8", errors="ignore")
+                    _hit = _js.loads(_raw)
+                    if isinstance(_hit, list):
+                        try:
+                            if _sck is not None:
+                                self._cache_set(self._retrieval_cache, _sck, [dict(x) for x in _hit])
+                        except Exception:
+                            pass
+                        return [dict(x) for x in _hit]
+        except Exception:
+            pass
         # 文本召回候选
         bm25_candidates = self._search_bm25_raw(query)
         # 向量召回候选
@@ -1656,6 +1686,19 @@ class MemoryStore:
         try:
             if _sck is not None:
                 self._cache_set(self._retrieval_cache, _sck, deduped)
+            try:
+                from hero_quant.infra.redis import get_redis_sync as _get_redis_sync2
+
+                _r2 = _get_redis_sync2()
+                if _r2 is not None:
+                    import hashlib as _hl2
+                    import json as _js2
+
+                    _lq2 = _hl2.sha256(str(query).encode()).hexdigest()[:16]
+                    _lk2 = f"hero:cache:memory:search:{self.namespace or 'default'}:{_lq2}:{self.vector_backend}"
+                    _r2.set(_lk2, _js2.dumps(deduped, ensure_ascii=False, default=str), ex=30)
+            except Exception:
+                pass
         except Exception:
             pass
         return deduped

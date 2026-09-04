@@ -17,6 +17,22 @@ services:
       start_period: 10s
     restart: unless-stopped
 
+  redis:
+    image: redis:7-alpine
+    # 淘汰策略 volatile-lru：仅带 TTL 的 key 可被淘汰。
+    # hero:ticket:*（security.issue_ticket SET NX EX）、hero:lock:*（RedisLock SET NX EX）
+    # 均带显式 EX，自然过期且淘汰方向为 fail-closed；hero:cache:* 可任意淘汰（可重算）。
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "128mb", "--maxmemory-policy", "volatile-lru"]
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+
   temporal:
     image: temporalio/auto-setup:1.26.2
     depends_on:
@@ -56,6 +72,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      redis:
+        condition: service_healthy
       temporal:
         condition: service_healthy
     ports:
@@ -64,6 +82,7 @@ services:
       - .env
     environment:
       HERO_CHECKPOINT_DSN: postgresql://heroquant:heroquant@postgres:5432/heroquant
+      HERO_REDIS_DSN: redis://redis:6379/0
       HERO_OTEL_MODE: shared
       OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318/v1/logs
     volumes:

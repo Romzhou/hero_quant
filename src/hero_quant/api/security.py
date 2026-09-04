@@ -31,9 +31,25 @@ SSE_TICKET_TTL_SECONDS = 60
 _MAX_TICKETS = 10000
 _tickets: dict[str, float] = {}
 _ticket_lock = threading.Lock()
-# NOTE: threading.Lock is per-process only — not cross-process safe.
-# 单进程内存票据，多进程部署需外置存储（Redis）；此处仅做本地限流与惰性 TTL 清理。
-# 票据为单次消费（consume 时 pop）防重放；避免日志中输出原始票据值。
+# NOTE: threading.Lock fallback only — primary store is Redis (SET NX EX + GET+DEL atomic).
+# 本地 _tickets 仅作为 Redis 不可用时的内存回退（仍受单进程限制）；生产为 Redis 强依赖。
+
+# Redis key prefix for tickets
+_REDIS_TICKET_PREFIX = "hero:ticket:"
+
+
+def _get_redis_for_ticket():
+    """Obtain sync Redis client for ticket operations; None if unavailable.
+
+    Uses infra.redis.get_redis_sync() which returns fakeredis in tests/local.
+    """
+    try:
+        from hero_quant.infra.redis import get_redis_sync
+
+        return get_redis_sync()
+    except Exception as e:
+        logger.debug("security.redis_unavailable error=%s", str(e))
+        return None
 
 
 def _purge_expired_tickets(now: float) -> None:
@@ -43,26 +59,24 @@ def _purge_expired_tickets(now: float) -> None:
             del _tickets[ticket]
 
 
-def issue_ticket(ttl: float = SSE_TICKET_TTL_SECONDS) -> str:
-    """生成一个带 TTL 的随机单次票据。"""
+def _issue_ticket_memory(ttl: float) -> str:
+    """Memory fallback for ticket issue."""
     now = time.monotonic()
     with _ticket_lock:
         _purge_expired_tickets(now)
         if len(_tickets) >= _MAX_TICKETS:
-            # 达到上限时淘汰最旧票据并告警，避免无界增长（不记录原始票据值）
             try:
                 oldest = next(iter(_tickets))
                 _tickets.pop(oldest, None)
                 logger.warning("security.ticket_store_full_evict", extra={"count": len(_tickets)})
             except (RuntimeError, StopIteration, ValueError, TypeError) as e:
-                logger.warning("security.ticket_evict_failed", error=str(e))
+                logger.warning("security.ticket_evict_failed error=%s", str(e))
         ticket = secrets.token_urlsafe(32)
         _tickets[ticket] = now + ttl
         return ticket
 
 
-def consume_ticket(ticket: str | None) -> bool:
-    """校验并消费票据，票据不存在、过期或已消费时返回 False。"""
+def _consume_ticket_memory(ticket: str | None) -> bool:
     if not ticket:
         return False
     now = time.monotonic()
@@ -70,6 +84,56 @@ def consume_ticket(ticket: str | None) -> bool:
         _purge_expired_tickets(now)
         expires_at = _tickets.pop(ticket, None)
         return expires_at is not None and expires_at > now
+
+
+def issue_ticket(ttl: float = SSE_TICKET_TTL_SECONDS) -> str:
+    """生成一个带 TTL 的随机单次票据 — 优先 Redis SET NX EX，原子且分布式。"""
+    ticket = secrets.token_urlsafe(32)
+    r = _get_redis_for_ticket()
+    if r is not None:
+        try:
+            key = f"{_REDIS_TICKET_PREFIX}{ticket}"
+            # Use SET with NX+EX — fakeredis supports this; ensure decoded responses not needed for SET
+            ok = r.set(key, "1", nx=True, ex=int(ttl))
+            if ok:
+                return ticket
+            # Extremely unlikely collision — retry once with new ticket
+            ticket2 = secrets.token_urlsafe(32)
+            key2 = f"{_REDIS_TICKET_PREFIX}{ticket2}"
+            r.set(key2, "1", nx=True, ex=int(ttl))
+            return ticket2
+        except Exception as e:
+            logger.warning("security.redis_issue_fallback_memory error=%s", str(e))
+    # Fallback to memory
+    return _issue_ticket_memory(ttl)
+
+
+def consume_ticket(ticket: str | None) -> bool:
+    """校验并消费票据 — 优先 Redis GET+DEL 原子语义，票据单次有效防重放。"""
+    if not ticket:
+        return False
+    r = _get_redis_for_ticket()
+    if r is not None:
+        try:
+            key = f"{_REDIS_TICKET_PREFIX}{ticket}"
+            # Atomic GET+DEL via Lua if available, else pipeline
+            try:
+                # Lua: if exists then del and return 1 else 0 — atomic on real Redis
+                result = r.eval("if redis.call('get', KEYS[1]) then return redis.call('del', KEYS[1]) else return 0 end", 1, key)
+                return bool(result)
+            except Exception:
+                # Fallback: get then del (fakeredis eval may not behave)
+                val = r.get(key)
+                if val is not None:
+                    try:
+                        r.delete(key)
+                    except Exception:
+                        pass
+                    return True
+                return False
+        except Exception as e:
+            logger.warning("security.redis_consume_fallback_memory error=%s", str(e))
+    return _consume_ticket_memory(ticket)
 
 
 def _get_whitelist_from_env() -> list[str]:
@@ -147,7 +211,7 @@ def verify_hmac(payload: bytes | Any, signature: str | None = None, secret: str 
                 if not isinstance(sig_hdr, str):
                     sig_hdr = str(sig_hdr)
         except (AttributeError, TypeError, ValueError) as e:
-            logger.warning("security.hmac_header_extract_failed", error=str(e))
+            logger.warning("security.hmac_header_extract_failed error=%s", str(e))
             sig_hdr = ""
         if not sig_hdr:
             # 无 HMAC 头即鉴权缺失，fail-closed（不再回落到 Bearer/sk 正则）
@@ -178,7 +242,7 @@ def verify_hmac(payload: bytes | Any, signature: str | None = None, secret: str 
                             try:
                                 res.close()
                             except (RuntimeError, AttributeError, TypeError) as ce:
-                                logger.warning("security.hmac_coro_close_failed", error=str(ce))
+                                logger.warning("security.hmac_coro_close_failed error=%s", str(ce))
                             # 同步环境无法 await，body 保持显参或空
                             body = b""
                         elif isinstance(res, (bytes, bytearray)):
@@ -188,7 +252,7 @@ def verify_hmac(payload: bytes | Any, signature: str | None = None, secret: str 
                         else:
                             body = b""
                     except (OSError, ValueError, TypeError, AttributeError) as e:
-                        logger.warning("security.hmac_body_call_failed", error=str(e))
+                        logger.warning("security.hmac_body_call_failed error=%s", str(e))
                         body = b""
                 # Starlette 缓存属性 _body
                 if body == b"":
@@ -198,17 +262,17 @@ def verify_hmac(payload: bytes | Any, signature: str | None = None, secret: str 
                             body = bytes(alt)
                             break
             except (OSError, ValueError, TypeError, AttributeError) as e:
-                logger.warning("security.hmac_body_extract_failed", error=str(e))
+                logger.warning("security.hmac_body_extract_failed error=%s", str(e))
                 body = b""
         try:
             expected_h = hmac.new(secret_env.encode(), body, hashlib.sha256).hexdigest()
         except (TypeError, ValueError) as e:
-            logger.warning("security.hmac_compute_failed", error=str(e))
+            logger.warning("security.hmac_compute_failed error=%s", str(e))
             return False
         try:
             return hmac.compare_digest(expected_h, sig_hdr.strip())
         except (TypeError, ValueError) as e:
-            logger.warning("security.hmac_compare_failed", error=str(e))
+            logger.warning("security.hmac_compare_failed error=%s", str(e))
             return False
 
     # 经典 HMAC 字节模式
@@ -223,12 +287,12 @@ def verify_hmac(payload: bytes | Any, signature: str | None = None, secret: str 
     try:
         expected = hmac.new(secret.encode(), payload, hashlib.sha256).hexdigest()
     except (TypeError, ValueError) as e:
-        logger.warning("security.hmac_compute_failed", error=str(e))
+        logger.warning("security.hmac_compute_failed error=%s", str(e))
         return False
     try:
         return hmac.compare_digest(expected, signature)
     except (TypeError, ValueError) as e:
-        logger.warning("security.hmac_compare_failed", error=str(e))
+        logger.warning("security.hmac_compare_failed error=%s", str(e))
         return False
 
 
@@ -247,7 +311,7 @@ def is_host_allowed(request: Any, allowed_hosts: list[str] | None = None) -> boo
             host = h.get("host") or ""
         # 不回退 request.url / client.host，避免 Host 伪造绕过
     except (AttributeError, TypeError, ValueError) as e:
-        logger.warning("security.host_extract_failed", error=str(e))
+        logger.warning("security.host_extract_failed error=%s", str(e))
         host = ""
     if not host:
         return False
@@ -301,12 +365,12 @@ def verify_api_key(request: Any, expected_key: str | None = None) -> bool:
         if not isinstance(provided, str):
             provided = str(provided)
     except (AttributeError, TypeError, ValueError) as e:
-        logger.warning("security.api_key_header_extract_failed", error=str(e))
+        logger.warning("security.api_key_header_extract_failed error=%s", str(e))
         provided = ""
     if not provided:
         return False
     try:
         return hmac.compare_digest(provided.strip(), expected_key.strip())
     except (TypeError, ValueError) as e:
-        logger.warning("security.api_key_compare_failed", error=str(e))
+        logger.warning("security.api_key_compare_failed error=%s", str(e))
         return False

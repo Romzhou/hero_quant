@@ -71,6 +71,20 @@ MODEL_CATALOG: Mapping[str, ModelInfo] = MappingProxyType(
             capabilities=("chat", "tool_calling", "structured_output"),
             context_window=1_000_000,
         ),
+        "deepseek-chat": ModelInfo(
+            name="deepseek-chat",
+            input_price_per_million_tokens=0.27,
+            output_price_per_million_tokens=1.10,
+            capabilities=("chat", "tool_calling", "structured_output"),
+            context_window=128_000,
+        ),
+        "deepseek-reasoner": ModelInfo(
+            name="deepseek-reasoner",
+            input_price_per_million_tokens=0.55,
+            output_price_per_million_tokens=2.19,
+            capabilities=("chat", "tool_calling", "reasoning"),
+            context_window=128_000,
+        ),
     }
 )
 

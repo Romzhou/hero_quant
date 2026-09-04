@@ -23,6 +23,13 @@ forward-*.log
 forward-*.js
 opencode-web*.log
 test-results/
+tmp_baseline.log
+tmp_*.log
+# frontend build info (local tsc artifacts)
+frontend/tsconfig.node.tsbuildinfo
+frontend/*.tsbuildinfo
+# interview / resume drafts (local only)
+面试基础对照表.md
 
 # local scan artifacts & docs drafts (not for commit)
 scan_resume_*.log

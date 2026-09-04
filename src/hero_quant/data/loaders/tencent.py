@@ -13,6 +13,8 @@ import urllib.parse
 import json
 import logging
 
+from hero_quant.infra.redis import cache
+
 logger = logging.getLogger(__name__)
 
 
@@ -92,6 +94,7 @@ class TencentLoader:
             import logging as _lg2
             _lg2.getLogger(__name__).warning("_rate_limit error: %s", e, exc_info=e)
 
+    @cache("market:bars", expire=60)
     def get_bars(self, symbol, start, end, interval="1d"):
         """拉取行情，兼容旧参数顺序并遵循 HERO_DATA_MODE 门控。"""
         _intervals = {"1d", "1m", "5m", "15m", "30m", "1h", "1wk", "1mo", "1D", "1W"}

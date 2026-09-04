@@ -10,8 +10,25 @@ import re
 import warnings
 from dataclasses import dataclass, field
 from functools import lru_cache
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+# Auto-load .env so `uvicorn hero_quant.api.server:app` picks up HERO_* without manual export.
+# Safe: override=False — explicit env vars still win; missing file is silently ignored.
+try:
+    from dotenv import load_dotenv as _load_dotenv
+
+    # Walk up from this file to repo root to find .env (src/hero_quant/config/ -> repo root)
+    _repo_root = Path(__file__).resolve().parents[3]
+    for _candidate in (_repo_root / ".env", Path.cwd() / ".env"):
+        if _candidate.is_file():
+            _load_dotenv(dotenv_path=_candidate, override=False)
+            break
+    else:
+        _load_dotenv(override=False)
+except Exception:
+    pass
 
 
 def _redact_dsn(dsn: str) -> str:
@@ -182,6 +199,43 @@ def _billing_dsn_from_env() -> str | None:
     return None
 
 
+def _redis_dsn_from_env() -> str | None:
+    """Redis DSN 解析，遵循单一 env gate 约束。
+
+    优先级：HERO_REDIS_DSN（含 redis:// 前缀校验） > HERO_REDIS_HOST/PORT/PASSWORD/DB 拼装 > REDIS_URL 兼容。
+    返回 None 表示未配置（调用方可回退 fakeredis 或 fail-closed）。
+    """
+    raw = os.getenv("HERO_REDIS_DSN", "")
+    if raw and raw.strip():
+        s = raw.strip()
+        if s.lower().startswith(("redis://", "rediss://", "unix://")):
+            return s
+        warnings.warn(f"HERO_REDIS_DSN does not look like redis DSN: {s!r}", UserWarning, stacklevel=2)
+        logger.warning("HERO_REDIS_DSN invalid redis DSN: %r", s)
+        return s  # 仍返回，交由 redis 库校验
+    # HERO_REDIS_HOST 拼装
+    host = (os.getenv("HERO_REDIS_HOST", "") or "").strip()
+    if host:
+        try:
+            port_raw = (os.getenv("HERO_REDIS_PORT", "6379") or "6379").strip()
+            port = int(port_raw) if port_raw else 6379
+        except (ValueError, TypeError):
+            port = 6379
+        pw = (os.getenv("HERO_REDIS_PASSWORD", "") or "").strip()
+        try:
+            db_raw = (os.getenv("HERO_REDIS_DB", "0") or "0").strip()
+            db = int(db_raw) if db_raw else 0
+        except (ValueError, TypeError):
+            db = 0
+        auth = f":{pw}@" if pw else ""
+        return f"redis://{auth}{host}:{port}/{db}"
+    # REDIS_URL 兼容
+    alt = (os.getenv("REDIS_URL", "") or "").strip()
+    if alt and alt.lower().startswith(("redis://", "rediss://")):
+        return alt
+    return None
+
+
 def _llm_model_slot_from_env(key: str) -> str:
     """读取独立 LLM 槽位，未设置时回退到 legacy 模型配置；均做 strip 处理。"""
     raw = os.getenv(key, "")
@@ -248,6 +302,7 @@ class Settings:
     checkpoint_ttl_seconds: int = field(default_factory=_checkpoint_ttl_from_env)
     billing_dsn: str | None = field(default_factory=_billing_dsn_from_env, repr=False)
     cohere_api_key: str = field(default_factory=lambda: os.getenv("COHERE_API_KEY", "") or "", repr=False)
+    redis_dsn: str | None = field(default_factory=_redis_dsn_from_env, repr=False)
 
 
 @lru_cache(maxsize=1)

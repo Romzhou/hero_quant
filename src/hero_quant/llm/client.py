@@ -7,6 +7,8 @@ import random
 import time
 from typing import Any
 
+from hero_quant.infra.redis import cache
+
 
 def _inc_llm_retry(reason: str = "error") -> None:
     try:
@@ -46,16 +48,58 @@ class LLMClient:
         self.usage = None
         self.last_usage = None
 
+    def _stream_with_chat(self, prompt: str, t: int | None):
+        """Internal: yield from underlying chat, handling both stream_chat and LangChain stream conventions."""
+        # Priority 1: legacy stream_chat (custom adapters)
+        fn = getattr(self._chat, "stream_chat", None)
+        if callable(fn):
+            try:
+                gen = fn(prompt, timeout=t)  # type: ignore[call-arg]
+            except TypeError:
+                gen = fn(prompt)  # type: ignore[call-arg]
+            yield from gen
+            return
+        # Priority 2: LangChain Runnable .stream(prompt) -> yields content chunks
+        fn = getattr(self._chat, "stream", None)
+        if callable(fn):
+            for chunk in fn(prompt):  # type: ignore[call-arg]
+                # Normalize LangChain AIMessageChunk to text dict for loop compatibility
+                if isinstance(chunk, str):
+                    yield {"type": "text", "text": chunk}
+                elif isinstance(chunk, dict):
+                    yield chunk
+                elif hasattr(chunk, "content"):
+                    text = getattr(chunk, "content", "")
+                    if text:
+                        # ToolCall chunks carry tool_calls
+                        tc = getattr(chunk, "tool_calls", None) or getattr(chunk, "tool_call_chunks", None)
+                        if tc:
+                            yield {"type": "tool_call", "tool_calls": tc, "text": text}
+                        else:
+                            yield {"type": "text", "text": text if isinstance(text, str) else str(text)}
+                    elif hasattr(chunk, "tool_calls") and getattr(chunk, "tool_calls"):
+                        yield {"type": "tool_call", "tool_calls": chunk.tool_calls, "text": ""}  # type: ignore[attr-defined]
+                else:
+                    yield {"type": "text", "text": str(chunk)}
+            return
+        # Priority 3: .invoke fallback streamed as single chunk
+        fn = getattr(self._chat, "invoke", None)
+        if callable(fn):
+            res = fn(prompt)  # type: ignore[call-arg]
+            text = getattr(res, "content", None) if not isinstance(res, str) else res
+            if text is None:
+                text = str(res)
+            yield {"type": "text", "text": text if isinstance(text, str) else str(text)}
+            return
+        raise AttributeError("underlying chat has no stream_chat/stream/invoke")
+
     def stream_chat(self, prompt: str, timeout: int | None = None):
         t = timeout if timeout is not None else self.timeout
         yielded = False
         for attempt in range(self.max_retries + 1):
             gen = None
             try:
-                try:
-                    gen = self._chat.stream_chat(prompt, timeout=t)
-                except TypeError:
-                    gen = self._chat.stream_chat(prompt)
+                gen = self._stream_with_chat(prompt, t)
                 try:
                     for chunk in gen:
                         yielded = True
@@ -142,6 +186,7 @@ class LLMClient:
                     raise
                 time.sleep(_retry_delay(attempt))
 
+    @cache("llm:invoke", expire=600)
     def invoke(self, prompt: str):
         if hasattr(self._chat, "invoke"):
             return self._invoke_with_retry(self._chat.invoke, prompt)

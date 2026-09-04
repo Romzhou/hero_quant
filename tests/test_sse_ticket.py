@@ -38,13 +38,26 @@ def test_expired_ticket_is_rejected_and_cleaned(monkeypatch):
     monkeypatch.setattr(security, "time", SimpleNamespace(monotonic=lambda: clock[0]))
 
     ticket = security.issue_ticket(ttl=60)
-    assert ticket in security._tickets
+    redis_client = security._get_redis_for_ticket()
+    if redis_client is not None:
+        # Redis语义：票据存于 hero:ticket:{t}，内存 _tickets 为空是预期的
+        key = f"{security._REDIS_TICKET_PREFIX}{ticket}"
+        assert redis_client.exists(key) == 1
+        # Redis TTL走真实时间，显式删除模拟过期后的清理语义
+        redis_client.delete(key)
+        response = TestClient(app).get("/v1/query/stream", params={"ticket": ticket})
 
-    clock[0] = 161.0
-    response = TestClient(app).get("/v1/query/stream", params={"ticket": ticket})
+        assert response.status_code == 403
+        assert redis_client.exists(key) == 0
+    else:
+        # 内存回退分支旧断言（无 Redis 时）
+        assert ticket in security._tickets
 
-    assert response.status_code == 403
-    assert ticket not in security._tickets
+        clock[0] = 161.0
+        response = TestClient(app).get("/v1/query/stream", params={"ticket": ticket})
+
+        assert response.status_code == 403
+        assert ticket not in security._tickets
 
 
 def test_existing_health_and_trace_sse_behavior_remains_available():
