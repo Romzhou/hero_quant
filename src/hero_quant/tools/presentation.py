@@ -6,6 +6,7 @@ code/both 为预留扩展，未来可接入统一渲染。
 
 from __future__ import annotations
 
+import copy
 from typing import Any, Dict, List
 
 
@@ -17,11 +18,16 @@ def _get_field(spec: Any, key: str, default: Any = None) -> Any:
 
 def present_as_native(spec: Any) -> Dict[str, Any]:
     """返回 OpenAI 兼容的 function 定义，兼容 ToolSpec 与 dict 输入。"""
-    name = _get_field(spec, "name", "unknown")
+    name = _get_field(spec, "name", None)
+    if not name:
+        raise ValueError(f"tool spec missing required 'name': {spec!r}")
     description = _get_field(spec, "description", "")
     parameters = _get_field(spec, "parameters", None)
     if parameters is None:
         parameters = {"type": "object", "properties": {}}
+    else:
+        # 中文：深拷贝隔离，调用方改返回体不得污染注册表共享状态
+        parameters = copy.deepcopy(parameters)
     return {
         "type": "function",
         "function": {
@@ -34,7 +40,9 @@ def present_as_native(spec: Any) -> Dict[str, Any]:
 
 def present_as_code(spec: Any) -> str:
     """返回 code 解释器风格的注释式展示。"""
-    name = _get_field(spec, "name", "unknown")
+    name = _get_field(spec, "name", None)
+    if not name:
+        raise ValueError(f"tool spec missing required 'name': {spec!r}")
     description = _get_field(spec, "description", "")
     return f"# Tool: {name}\n# {description}\n"
 
@@ -55,13 +63,14 @@ def present(spec: Any, presentAs: str = "native") -> Any:
 
 def present_definitions(presentAs: str = "native") -> List[Any]:
     """按请求形态返回全量工具定义（桩实现）。"""
-    from .registry import TOOL_REGISTRY, get_definitions
+    from .registry import TOOL_REGISTRY, _REGISTRY_LOCK, get_definitions
 
     if presentAs == "native":
         return get_definitions()
-    # code/both 形态逐个映射，复用 present() 的分发 — sorted for KV-cache stability
+    # 中文：持 RLock 遍历，避免并发注册时 dict 变更抛 RuntimeError/KeyError；sorted 保证 KV-cache 稳定
+    with _REGISTRY_LOCK:
+        specs = [TOOL_REGISTRY[name] for name in sorted(TOOL_REGISTRY.keys())]
     defs: List[Any] = []
-    for name in sorted(TOOL_REGISTRY.keys()):
-        spec = TOOL_REGISTRY[name]
+    for spec in specs:
         defs.append(present(spec, presentAs=presentAs))
     return defs

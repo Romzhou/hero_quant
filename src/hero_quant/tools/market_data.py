@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from typing import Any, Dict
 
 from hero_quant.tools.registry import TOOL_REGISTRY, tool
@@ -15,6 +16,7 @@ from hero_quant.tools.registry import TOOL_REGISTRY, tool
 _logger = logging.getLogger(__name__)
 
 _shared_registry = None
+_shared_lock = threading.RLock()  # 中文：保护 _shared_registry 的 check-then-act，避免并发重复初始化
 
 
 def _make_registry():
@@ -26,21 +28,24 @@ def _make_registry():
         from hero_quant.data.loaders.tencent import TencentLoader
 
         reg.register(TencentLoader())
-    except Exception as e:
+    except (ImportError, ValueError, TypeError, OSError, RuntimeError) as e:  # 中文：窄化捕获，避免宽 except 吞没校验错
         _logger.warning("failed to register TencentLoader: %s", e, exc_info=True)
     try:
         from hero_quant.data.loaders.yahoo import YahooLoader
 
         reg.register(YahooLoader())
-    except Exception as e:
+    except (ImportError, ValueError, TypeError, OSError, RuntimeError) as e:  # 中文：窄化捕获
         _logger.warning("failed to register YahooLoader: %s", e, exc_info=True)
     return reg
 
 
 def _get_shared_registry():
+    """线程安全获取共享 registry（双重检查 + RLock）。"""
     global _shared_registry
     if _shared_registry is None:
-        _shared_registry = _make_registry()
+        with _shared_lock:
+            if _shared_registry is None:
+                _shared_registry = _make_registry()
     return _shared_registry
 
 
@@ -50,20 +55,13 @@ def _synthetic_fallback(symbol: str, start: str, end: str):
         from hero_quant.data.loaders.tencent import generate_synthetic_bars  # type: ignore
 
         return generate_synthetic_bars(symbol, start, end)
-    except Exception as e:
+    except (ImportError, AttributeError, ValueError, TypeError, RuntimeError, OSError) as e:  # 中文：窄化捕获
         _logger.debug("public synthetic helper not available: %s", e, exc_info=True)
-    # local minimal fallback — standalone, no private loader reach
-    try:
-        # try to produce two bars with given dates
-        return [
-            {"date": start, "open": 100.0, "close": 100.5, "high": 101.0, "low": 99.5, "volume": 100},
-            {"date": end, "open": 100.5, "close": 101.0, "high": 101.5, "low": 100.0, "volume": 110},
-        ]
-    except Exception as e:
-        _logger.debug("local synthetic fallback failed: %s", e, exc_info=True)
-        return [
-            {"date": start, "open": 100.0, "close": 100.0, "high": 100.0, "low": 100.0, "volume": 100},
-        ]
+    # 本地最小合成 — 直接返回字面量（构造不可能抛，避免无效包裹）
+    return [
+        {"date": start, "open": 100.0, "close": 100.5, "high": 101.0, "low": 99.5, "volume": 100},
+        {"date": end, "open": 100.5, "close": 101.0, "high": 101.5, "low": 100.0, "volume": 110},
+    ]
 
 
 @tool(
@@ -106,49 +104,43 @@ def get_market_data(
     if spec is not None:
         try:
             is_safe = bool(spec.is_concurrency_safe({"symbol": symbol, "interval": interval}))
-        except Exception:
+        except (AttributeError, TypeError, ValueError, RuntimeError) as e:  # 中文：窄化捕获
+            _logger.debug("is_concurrency_safe check failed: %s", e, exc_info=True)
             is_safe = False
-    # Try registry with both loaders
+    # 复用共享 registry，避免每调用重建
     try:
-        reg = _make_registry()
-        # use public API instead of private _loaders
-        try:
-            is_empty = len(reg) == 0
-        except Exception:
-            # fallback to check via get_bars failure
-            is_empty = False
-            try:
-                # if __len__ not supported, try attribute
-                is_empty = not getattr(reg, "_loaders", [])
-            except Exception:
-                is_empty = False
-        if is_empty:
-            raise ImportError("pip install hero-quant[us] or [ashare] - no loader registered")
+        reg = _get_shared_registry()
+        # MarketDataRegistry.get_bars 已在无 loader 时抛 ImportError，无需 len(reg) 私有探测
         bars, prov = reg.get_bars(symbol, start, end, interval=interval)
         provenance = {"source": getattr(prov, "source", "unknown"), "unit": getattr(prov, "unit", "shares")}
         # 透传 provenance 额外字段，便于上游追踪来源细节
         if hasattr(prov, "extra") and prov.extra:
             provenance["extra"] = prov.extra
         return {"bars": bars, "provenance": provenance, "ok": True, "concurrency_safe": is_safe}
-    except Exception as e:
-        # CrossSourceError 必须透传，不得静默回退合成
+    except Exception as e:  # 中文：集中分发，需窄化后再决定合成或透传
         from hero_quant.data.registry import CrossSourceError as _CSE
+
         if isinstance(e, _CSE):
             _logger.warning("cross_source check blocked get_market_data for %s: %s", symbol, e, exc_info=True)
             raise
-        # misconfiguration should fail fast, not synthesize
+        if isinstance(e, (ValueError, TypeError)):
+            # 校验类错误 fail-closed，不得合成冒充 live
+            _logger.warning("get_market_data validation failed for %s: %s", symbol, e, exc_info=True)
+            raise
         if isinstance(e, ImportError) or "no loader" in str(e).lower():
             raise RuntimeError("market data misconfigured: no loader available") from e
-        # 异常时仍返回合成数据并附带错误信息，避免 Agent 中断（非校验错误）
-        _logger.warning("get_market_data fallback to synthetic for %s: %s", symbol, e, exc_info=True)
-        bars = _synthetic_fallback(symbol, start, end)
-        return {
-            "bars": bars,
-            "provenance": {"source": "synthetic", "unit": "shares"},
-            "ok": False,
-            "error": str(e),
-            "concurrency_safe": is_safe,
-        }
+        if isinstance(e, (TimeoutError, ConnectionError, OSError, RuntimeError)):
+            # 仅瞬时/网络/运行时错误回退合成，且标记 ok:False + provenance synthetic 不可用作 live
+            _logger.warning("get_market_data fallback to synthetic for %s: %s", symbol, e, exc_info=True)
+            bars = _synthetic_fallback(symbol, start, end)
+            return {
+                "bars": bars,
+                "provenance": {"source": "synthetic", "unit": "shares"},
+                "ok": False,
+                "error": str(e),
+                "concurrency_safe": is_safe,
+            }
+        raise
 
 
 @tool(
@@ -303,10 +295,17 @@ def get_bars_range(
             provenance = {"source": getattr(prov, "source", "unknown"), "unit": getattr(prov, "unit", "shares")}
             data[sym] = {"bars": bars, "provenance": provenance, "ok": True}
         except Exception as e:
-            # fallback to synthetic per-symbol but with error context
+            from hero_quant.data.registry import CrossSourceError as _CSE
+
+            if isinstance(e, _CSE):
+                raise
+            # 非 CrossSource 场景按 symbol 回退合成，但标记 ok:False + provenance synthetic
             try:
                 bars_fb = _synthetic_fallback(sym, start, end)
                 data[sym] = {"bars": bars_fb, "provenance": {"source": "synthetic", "unit": "shares"}, "ok": False, "error": str(e)}
-            except Exception as e2:
+            except (OSError, RuntimeError, ValueError, TypeError) as e2:  # 中文：窄化捕获
+                _logger.warning("synthetic fallback failed for %s: %s", sym, e2, exc_info=True)
                 data[sym] = {"bars": [], "ok": False, "error": str(e2)}
-    return {"data": data, "ok": True}
+    # 聚合顶层 ok：仅当全部 symbol ok 时才 True，否则 False（避免全回退仍 True 冒充 live）
+    all_ok = bool(data) and all(v.get("ok", False) for v in data.values())
+    return {"data": data, "ok": all_ok}
