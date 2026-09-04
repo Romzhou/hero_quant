@@ -19,6 +19,20 @@ REF_PATTERN = re.compile(r"^(?:\$\{(?P<braced>[^}]+)\}$|\$(?P<var2>[A-Za-z_][A-Z
 _GENERIC_REF = re.compile(r"\$\{([^}]+)\}")
 
 
+def _check_fd_0600(fd: int, path: Path) -> None:
+    """fd 版 0600 检查（open 后 fstat，无 TOCTOU）。供 _read_credential_file 复用。
+
+    PermissionError 直接抛，不可被 OSError 吞（PermissionError 是 OSError 子类，调用方须先接 PermissionError）。
+    """
+    try:
+        st = os.fstat(fd)
+    except OSError as e:
+        raise ValueError(f"cannot stat credential file {path}: {e}") from e
+    mode = st.st_mode & 0o777
+    if mode != 0o600:
+        raise PermissionError(f"credential file {path} permissions {oct(mode)} not 0600")
+
+
 def _check_0600(path: Path, *, strict: bool = True) -> None:
     """检查文件权限是否为 0600，非 0600 时告警（防多用户可读导致泄露）。
 
@@ -58,8 +72,12 @@ def _read_credential_file(path: Path) -> str:
                     inside = str(target).startswith(str(parent_resolved) + os.sep) or str(target) == str(parent_resolved)
                 if not inside:
                     raise PermissionError(f"credential symlink target outside allowed dir: {path} -> {target}")
+            except PermissionError:
+                raise
             except OSError as e:
                 raise PermissionError(f"credential symlink validation failed for {path}: {e}") from e
+    except PermissionError:
+        raise
     except OSError as e:
         # is_symlink/resolve failed
         raise PermissionError(f"credential symlink check failed for {path}: {e}") from e
@@ -72,14 +90,8 @@ def _read_credential_file(path: Path) -> str:
         # ELOOP indicates symlink when O_NOFOLLOW set
         raise ValueError(f"cannot open credential file {path}: {e}") from e
     try:
-        # atomic 0600 check on fd (avoid TOCTOU stat before open)
-        try:
-            st = os.fstat(fd)
-            mode = st.st_mode & 0o777
-            if mode != 0o600:
-                raise PermissionError(f"credential file {path} permissions {oct(mode)} not 0600")
-        except OSError as e:
-            raise ValueError(f"cannot stat credential file {path}: {e}") from e
+        # 原子 0600 检查走 _check_fd_0600（fd 版，无 TOCTOU；PermissionError 不被 OSError 吞）
+        _check_fd_0600(fd, path)
         # read via fd
         import io
 
@@ -91,6 +103,18 @@ def _read_credential_file(path: Path) -> str:
             os.close(fd)
         except Exception:
             pass
+
+
+def _default_has_traversal(default: str) -> bool:
+    """默认值路径穿越判定：只拦真正的穿越形态（.. + 分隔符），放行 base64 等含 / 合法值。"""
+    d = default.strip()
+    if d in ("..", "."):
+        return True
+    if d.startswith(("../", "..\\")):
+        return True
+    if "/../" in d or "\\..\\" in d or d.endswith(("/..", "\\..")):
+        return True
+    return False
 
 
 def _resolve_env_key(key: str) -> str | None:
@@ -114,12 +138,12 @@ def resolve(ref: str) -> str:
         kind = m.groupdict().get("kind")
         if var:
             var = var.strip()
-            # 支持 ${VAR:-default} 语义：unset 或空字符串均回落到 default；含 / 或 .. 的路径默认值视为潜在注入，拒绝
+            # 支持 ${VAR:-default} 语义：unset 或空字符串均回落到 default；真穿越形态才拒绝
             if ":-" in var:
                 key, default = var.split(":-", 1)
                 val = _resolve_env_key(key.strip())
                 if not val:  # None or "" -> fallback
-                    if "/" in default or ".." in default:
+                    if _default_has_traversal(default):
                         raise ValueError(f"credential default contains path traversal: {default!r}")
                     return default
                 return val
@@ -153,7 +177,7 @@ def resolve(ref: str) -> str:
                 v = _resolve_env_key(k.strip())
                 if v is not None and v != "":
                     return v
-                if "/" in default or ".." in default:
+                if _default_has_traversal(default):
                     raise ValueError(f"credential default contains path traversal: {default!r}")
                 return default
             v = _resolve_env_key(key)
@@ -164,14 +188,16 @@ def resolve(ref: str) -> str:
         return _GENERIC_REF.sub(_repl, ref)
 
     # 无模式的纯值：若指向已存在文件则按凭据文件读取（支持热重载）— 原子 O_NOFOLLOW
-    p_plain = Path(ref)
-    # 仅当路径看起来像文件路径时尝试原子读取；不存在则回落为原值
-    try:
-        return _read_credential_file(p_plain)
-    except PermissionError:
-        raise
-    except (FileNotFoundError, ValueError, OSError):
-        pass
+    # 中文：纯值探测只对像路径的短字符串做（<=512 且无换行/NUL），否则直接回落原值，防无意义 IO 与意外语义
+    if len(ref) <= 512 and "\n" not in ref and "\r" not in ref and "\x00" not in ref:
+        p_plain = Path(ref)
+        # 仅当路径看起来像文件路径时尝试原子读取；不存在则回落为原值
+        try:
+            return _read_credential_file(p_plain)
+        except PermissionError:
+            raise
+        except (FileNotFoundError, ValueError, OSError):
+            pass
 
     return ref
 
@@ -188,12 +214,16 @@ def write_credential_file(path: str | Path, content: str) -> Path:
         try:
             import os as _os
             _os.chmod(p.parent, 0o700)
-        except Exception:
-            pass
+        except Exception as e:
+            # 中文：目录权限失败必须 loud，不可吞（fail-closed）
+            raise PermissionError(f"chmod 0700 failed for credential dir {p.parent}: {e}") from e
+    except OSError as e:
+        raise PermissionError(f"mkdir failed for credential dir {p.parent}: {e}") from e
     # use atomic temp with random suffix in same dir, mode 0o600, no world-readable window
     # handle multi-suffix correctly via p.name prefix, not with_suffix
     fd, tmp_path = tempfile.mkstemp(dir=str(p.parent), prefix=p.name + ".tmp.")
     tmp = Path(tmp_path)
+    _write_failed: Exception | None = None
     try:
         try:
             os.fchmod(fd, 0o600)
@@ -205,11 +235,20 @@ def write_credential_file(path: str | Path, content: str) -> Path:
                 raise PermissionError(f"chmod 0600 failed for temp credential file {tmp_path}: {e2}") from e2
         os.write(fd, content.encode("utf-8"))
         os.fsync(fd)
+    except Exception as exc:
+        # 中文：write/fsync 失败记下，fd 关闭后再清 tmp（Windows 句柄开着时 unlink 会被拒）
+        _write_failed = exc
+        raise
     finally:
         try:
             os.close(fd)
         except Exception:
             pass
+        if _write_failed is not None:
+            try:
+                tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
     # ensure tmp is 0600 before replace (in case fchmod not available)
     try:
         os.chmod(tmp, 0o600)
