@@ -9,15 +9,8 @@ from typing import Mapping
 
 DEFAULT_MODEL = "gpt-4o-mini"
 
-# invariant: safety-net key must exist — fail fast at import
-if DEFAULT_MODEL not in {
-    "gpt-4o-mini",
-    "gpt-4o",
-    "gpt-4.1-mini",
-    "gpt-4.1",
-}:
-    # deferred check after MODEL_CATALOG defined below will re-validate; keep import-time guard
-    pass
+# 中文：已移除对常量集合的 no-op import-time guard（原检查恒为 False，仅 pass）；
+# 真实 fail-fast 由下方 MODEL_CATALOG 校验保证。
 
 
 @dataclass(frozen=True, slots=True)

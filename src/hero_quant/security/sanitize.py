@@ -38,6 +38,9 @@ def safe_ticker_component(ticker: str, *, max_len: int = 32) -> str:
         raise ValueError(f"ticker must be a non-empty string, got {ticker!r}")
     if len(ticker) > max_len:
         raise ValueError(f"ticker exceeds {max_len} chars: {ticker!r}")
+    # 中文：尾点/空格校验必须在正则前，否则空格被正则拦截导致分支不可达
+    if ticker.endswith(".") or ticker.endswith(" "):
+        raise ValueError(f"ticker cannot end with dot or space: {ticker!r}")
     if not _TICKER_PATH_RE.fullmatch(ticker):
         raise ValueError(
             f"ticker contains characters not allowed in a filesystem path: {ticker!r}"
@@ -50,8 +53,6 @@ def safe_ticker_component(ticker: str, *, max_len: int = 32) -> str:
     # 针对含扩展的如 CON.txt 亦需拒绝，按首段判断
     if base_name in _RESERVED_NAMES or ticker.upper() in _RESERVED_NAMES:
         raise ValueError(f"ticker is Windows reserved name: {ticker!r}")
-    if ticker.endswith(".") or ticker.endswith(" "):
-        raise ValueError(f"ticker cannot end with dot or space: {ticker!r}")
     return ticker
 
 
@@ -63,11 +64,14 @@ def safe_join(base: str | Path, ticker: str, *, max_len: int = 32) -> Path:
     """
     validated = safe_ticker_component(ticker, max_len=max_len)
     base_p = Path(base)
-    # 规范化后校验是否仍在 base 内
+    # 中文：分拆 resolve 调用并窄化捕获，避免 broad Exception 吞没无关错误
     try:
         target = (base_p / validated).resolve()
+    except (OSError, ValueError, RuntimeError) as e:
+        raise ValueError(f"invalid base or ticker path: {e}") from e
+    try:
         base_resolved = base_p.resolve()
-    except Exception as e:
+    except (OSError, ValueError, RuntimeError) as e:
         raise ValueError(f"invalid base or ticker path: {e}") from e
     # is_relative_to 在 Python 3.9+ 可用；兼容处理
     try:

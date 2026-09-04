@@ -27,8 +27,9 @@ try:
             break
     else:
         _load_dotenv(override=False)
-except Exception:
-    pass
+except (ImportError, OSError, ValueError, TypeError, RuntimeError) as e:
+    # 中文：窄化捕获 dotenv 加载异常并记录，避免静默吞没配置失败
+    logger.debug("dotenv autoload skipped: %s", e)
 
 
 def _redact_dsn(dsn: str) -> str:
@@ -36,9 +37,9 @@ def _redact_dsn(dsn: str) -> str:
     if not isinstance(dsn, str) or "://" not in dsn:
         return "***"
     try:
-        # keep username, hide password: postgresql://user:pass@host -> postgresql://user:***@host
-        return re.sub(r"://([^:]+):[^@]*@", r"://\1:***@", dsn)
-    except Exception:
+        # 中文：同时覆盖 user:pass@ 与 :pass@（空用户名）两种带口令形态
+        return re.sub(r"://([^/@]*):[^@]*@", r"://\1:***@", dsn)
+    except (TypeError, ValueError, AttributeError):
         return "***"
 
 
@@ -180,11 +181,13 @@ def _checkpoint_ttl_from_env() -> int:
 
 def _billing_dsn_from_env() -> str | None:
     """billing PG DSN, separate env, fallback to checkpoint PG only with warning (avoid silent shared DB)."""
-    # Primary: explicit billing DSN
-    for k in ("HERO_BILLING_DSN",):
-        raw = os.getenv(k, "") or ""
-        if isinstance(raw, str) and raw.strip() and raw.strip().lower().startswith(_PG_PREFIXES):
-            return raw.strip()
+    # 中文：显式 billing DSN 若存在但非法前缀需告警而非静默忽略（fail-visible）
+    raw = (os.getenv("HERO_BILLING_DSN", "") or "").strip()
+    if raw:
+        if raw.lower().startswith(_PG_PREFIXES):
+            return raw
+        warnings.warn(f"HERO_BILLING_DSN does not look like PG DSN: {_redact_dsn(raw)!r}", UserWarning, stacklevel=2)
+        logger.warning("HERO_BILLING_DSN invalid PG DSN: %r", _redact_dsn(raw))
     # Explicit opt-in fallback: warn about isolation when reusing checkpoint DSN
     for k in ("HERO_PG_DSN", "HERO_CHECKPOINT_DSN"):
         raw = os.getenv(k, "") or ""
@@ -210,8 +213,8 @@ def _redis_dsn_from_env() -> str | None:
         s = raw.strip()
         if s.lower().startswith(("redis://", "rediss://", "unix://")):
             return s
-        warnings.warn(f"HERO_REDIS_DSN does not look like redis DSN: {s!r}", UserWarning, stacklevel=2)
-        logger.warning("HERO_REDIS_DSN invalid redis DSN: %r", s)
+        warnings.warn(f"HERO_REDIS_DSN does not look like redis DSN: {_redact_dsn(s)!r}", UserWarning, stacklevel=2)
+        logger.warning("HERO_REDIS_DSN invalid redis DSN: %r", _redact_dsn(s))
         return s  # 仍返回，交由 redis 库校验
     # HERO_REDIS_HOST 拼装
     host = (os.getenv("HERO_REDIS_HOST", "") or "").strip()
@@ -219,13 +222,19 @@ def _redis_dsn_from_env() -> str | None:
         try:
             port_raw = (os.getenv("HERO_REDIS_PORT", "6379") or "6379").strip()
             port = int(port_raw) if port_raw else 6379
-        except (ValueError, TypeError):
+        except (ValueError, TypeError) as e:
+            # 中文：非法 PORT 静默回退难排查，需告警
+            warnings.warn(f"Invalid HERO_REDIS_PORT={port_raw!r}: {e}, using 6379", UserWarning, stacklevel=2)
+            logger.warning("Invalid HERO_REDIS_PORT %r: %s, using 6379", port_raw, e)
             port = 6379
         pw = (os.getenv("HERO_REDIS_PASSWORD", "") or "").strip()
         try:
             db_raw = (os.getenv("HERO_REDIS_DB", "0") or "0").strip()
             db = int(db_raw) if db_raw else 0
-        except (ValueError, TypeError):
+        except (ValueError, TypeError) as e:
+            # 中文：非法 DB 静默回退难排查，需告警
+            warnings.warn(f"Invalid HERO_REDIS_DB={db_raw!r}: {e}, using 0", UserWarning, stacklevel=2)
+            logger.warning("Invalid HERO_REDIS_DB %r: %s, using 0", db_raw, e)
             db = 0
         auth = f":{pw}@" if pw else ""
         return f"redis://{auth}{host}:{port}/{db}"

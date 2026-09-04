@@ -7,9 +7,6 @@ import random
 import time
 from typing import Any
 
-from hero_quant.infra.redis import cache
-
-
 def _inc_llm_retry(reason: str = "error") -> None:
     try:
         from hero_quant.metrics import inc_llm_retry
@@ -56,6 +53,7 @@ class LLMClient:
             try:
                 gen = fn(prompt, timeout=t)  # type: ignore[call-arg]
             except TypeError:
+                # 中文：后端不支持 timeout 形参时回退为无超时调用（已尝试透传，降级可接受）
                 gen = fn(prompt)  # type: ignore[call-arg]
             yield from gen
             return
@@ -149,12 +147,6 @@ class LLMClient:
                 except Exception:
                     pass
                 if attempt == self.max_retries:
-                    # 最终失败若为超时再计一次超时，保证计数可见
-                    if isinstance(e, TimeoutError):
-                        try:
-                            _inc_llm_timeout()
-                        except Exception:
-                            pass
                     raise
                 time.sleep(_retry_delay(attempt))
 
@@ -178,30 +170,49 @@ class LLMClient:
                 except Exception:
                     pass
                 if attempt == self.max_retries:
-                    if isinstance(e, TimeoutError):
-                        try:
-                            _inc_llm_timeout()
-                        except Exception:
-                            pass
                     raise
                 time.sleep(_retry_delay(attempt))
 
-    @cache("llm:invoke", expire=600)
+    # 中文：移除跨实例串味的缓存（原 @cache 仅以 prompt 为键，跨模型/实例复用导致污染）
     def invoke(self, prompt: str):
         if hasattr(self._chat, "invoke"):
-            return self._invoke_with_retry(self._chat.invoke, prompt)
+            # 中文：透传 timeout，兼容不支持 timeout 的后端
+            try:
+                return self._invoke_with_retry(self._chat.invoke, prompt, timeout=self.timeout)
+            except TypeError:
+                return self._invoke_with_retry(self._chat.invoke, prompt)
         if hasattr(self._chat, "chat"):
-            return self._invoke_with_retry(self._chat.chat, prompt)
+            try:
+                return self._invoke_with_retry(self._chat.chat, prompt, timeout=self.timeout)
+            except TypeError:
+                return self._invoke_with_retry(self._chat.chat, prompt)
         if callable(self._chat):
-            return self._invoke_with_retry(self._chat, prompt)
+            try:
+                return self._invoke_with_retry(self._chat, prompt, timeout=self.timeout)
+            except TypeError:
+                return self._invoke_with_retry(self._chat, prompt)
         if hasattr(self._chat, "stream_chat"):
-            # fallback to stream_chat as invoke
-            return "".join(self.stream_chat(prompt))
+            # 中文：stream_chat 产出为 dict，需提取 text 字段拼接，避免 TypeError
+            parts: list[str] = []
+            for chunk in self.stream_chat(prompt):
+                if isinstance(chunk, str):
+                    parts.append(chunk)
+                elif isinstance(chunk, dict):
+                    txt = chunk.get("text", "")
+                    if txt:
+                        parts.append(txt if isinstance(txt, str) else str(txt))
+                else:
+                    parts.append(str(chunk))
+            return "".join(parts)
         raise AttributeError("underlying chat has no invoke/chat/__call__/stream_chat")
 
     def chat(self, prompt: str):
         if hasattr(self._chat, "chat"):
-            return self._invoke_with_retry(self._chat.chat, prompt)
+            # 中文：透传 timeout，兼容不支持 timeout 的后端
+            try:
+                return self._invoke_with_retry(self._chat.chat, prompt, timeout=self.timeout)
+            except TypeError:
+                return self._invoke_with_retry(self._chat.chat, prompt)
         return self.invoke(prompt)
 
     def __call__(self, prompt: str):

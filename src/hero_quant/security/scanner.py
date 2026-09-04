@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import re
+import logging
 import unicodedata
 
 # Cover the delimiter forms used by ChatML, Qwen, DeepSeek, Llama, and Gemma.
 # - Increased upper bound to 200 to avoid bypass via >80 chars; no hard upper bound would be safer but 200 balances false positives.
 # - Fullwidth variant now excludes both ASCII '>'/'|' and fullwidth '＞'/'｜'.
-# - </?s> is word-bounded to avoid flagging "a <s> b" benign usage.
+# - </?s> 为单词边界匹配（word-bounded），避免误中嵌入单词的 <s> 形态（如 <strong>），但不隔离空格包裹形态。
 _SPECIAL_TOKEN_RE = re.compile(
     r"(?:"
     r"<\|[^>\r\n＞｜\|]{1,200}\|>"
@@ -65,10 +66,11 @@ def neutralize(text: str) -> str:
     # Strip extended invisible set so embedded zero-width inside token is removed
     cleaned = text.translate(_ZERO_WIDTH_TRANSLATION)
     # NFKC handles fullwidth homoglyph variants (e.g., fullwidth ＜)
+    # 中文：窄化 NFKC 异常捕获（仅文本/值错误），避免吞没无关异常
     try:
         cleaned = unicodedata.normalize("NFKC", cleaned)
-    except Exception:
-        pass
+    except (ValueError, TypeError, AttributeError) as e:
+        logging.getLogger(__name__).debug("scanner.normalize_failed: %s", e)
     return _SPECIAL_TOKEN_RE.sub(_escape_special_token, cleaned)
 
 
@@ -79,10 +81,5 @@ def strip_zero_width(text: str) -> str:
 
 def sanitize(text: str) -> str:
     """Atomic helper: strip invisibles -> NFKC -> neutralize in one step."""
-    # Order matters: strip then NFKC then neutralize
-    cleaned = strip_zero_width(text)
-    try:
-        cleaned = unicodedata.normalize("NFKC", cleaned)
-    except Exception:
-        pass
-    return _SPECIAL_TOKEN_RE.sub(_escape_special_token, cleaned)
+    # 中文：复用 neutralize 统一 NFKC 与转义逻辑，避免与 neutralize 重复实现分叉
+    return neutralize(text)
