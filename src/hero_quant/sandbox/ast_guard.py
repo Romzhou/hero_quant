@@ -118,19 +118,22 @@ def _load_pyproject_roots() -> set[str]:
             pyproject = candidate
             break
     if pyproject is None:
-        cwd_candidate = Path.cwd() / "pyproject.toml"
-        if cwd_candidate.is_file():
-            pyproject = cwd_candidate
-    if pyproject is None:
+        # 安全：不再回退 CWD 的 pyproject.toml——工作区文件属攻击者可控输入，
+        # 允许其注入导入根即 allowlist 投毒；fail-closed 仅用静态根
         return roots
     try:
         try:
             import tomllib  # type: ignore  # Python 3.11+ 标准库
         except ModuleNotFoundError:
-            import tomli as tomllib  # type: ignore  # 兼容低版本
+            try:
+                import tomli as tomllib  # type: ignore  # 兼容低版本
+            except ImportError as e:
+                # 双缺失时 fail-closed 返回空集，不让 ModuleNotFoundError 外泄破坏调用方
+                logger.warning("toml parser unavailable, using static roots: %s", e, exc_info=True)
+                return roots
 
         data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as e:
+    except (OSError, ValueError, ImportError) as e:
         # 窄化为 OSError / TOMLDecodeError（ValueError 覆盖 TOMLDecodeError）
         logger.warning("failed to load pyproject %s: %s", pyproject, e)
         return roots
@@ -163,23 +166,28 @@ def _get_dynamic_roots() -> set[str]:
 
 
 def _get_allowed_roots() -> set[str]:
-    """返回完整的白名单集合（静态+动态+扩展），用于懒加载初始化。"""
+    """返回完整的白名单集合（静态+动态+扩展），用于懒加载初始化。
+
+    信任边界声明（trusted input）：pyproject.toml 被视为受信输入（与仓库同等信任等级），
+    其新增依赖经懒合并后自动放行；is_allowlist_synced_with_pyproject() 仅做
+    审计提示，不做强制门控——审计时以本声明为准。
+    """
     return set(_STATIC_ALLOWED) | set(_QUANTLIB_EXTRA) | set(_get_dynamic_roots())
 
 
 _STATIC_ROOTS: set[str] = set(_STATIC_ALLOWED) | set(_QUANTLIB_EXTRA)
 # 导入时仅静态可审计集合；动态 roots 首次 via _get_allowed_roots() 懒合并（避免顶层 I/O 副作用）
 # 对外仍暴露 ALLOWED_ROOTS 变量，校验走 _get_allowed_roots() / get_allowed_roots() 懒合并
+# 注意：ALLOWED_ROOTS 为可变集合，reload_allowed_roots() 原地更新（不清换身份），
+# 持有引用的调用方可观测到最新合并结果
 ALLOWED_ROOTS: set[str] = set(_STATIC_ROOTS)
-_HAS_DYNAMIC_ATTR = False  # 标记是否已动态合并，避免 __getattr__ 与变量共存冲突
 
 
 def reload_allowed_roots() -> set[str]:
-    """按需将 pyproject 动态 roots 合并进 ALLOWED_ROOTS 并返回拷贝（幂等）。"""
-    global ALLOWED_ROOTS, _HAS_DYNAMIC_ATTR
+    """按需将 pyproject 动态 roots 合并进 ALLOWED_ROOTS 并返回拷贝（幂等，原地更新）。"""
     merged = _get_allowed_roots()
-    ALLOWED_ROOTS = set(merged)
-    _HAS_DYNAMIC_ATTR = True
+    ALLOWED_ROOTS.clear()
+    ALLOWED_ROOTS.update(merged)
     return set(ALLOWED_ROOTS)
 
 # 显式黑名单：拦截可导致命令执行/网络外联/底层逃逸的根模块与调用
@@ -222,7 +230,10 @@ BANNED_DUNDER_ATTRS = {
     "__getattribute__",
     "__subclasscheck__",
 }
-# 属性级黑名单：(base, attr)，防止通过 os.system 等间接执行
+# 属性级黑名单：(base, attr)，防止通过 os.system 等间接执行；
+# 亦覆盖 allowlist 库的文件 I/O 与外联旁路做纵深防御——即使 OS 层缺失，
+# 显式写文件/外联调用也在此被拦；真正的文件与网络隔离仍由 OS 层强制，
+# 本守卫不声称单独 containment（见 check_import_allowlist 文档）
 BANNED_ATTRS = {
     ("os", "system"),
     ("os", "popen"),
@@ -238,6 +249,27 @@ BANNED_ATTRS = {
     ("subprocess", "run"),
     ("subprocess", "check_call"),
     ("subprocess", "check_output"),
+    # allowlist 库的文件/网络旁路（纵深防御）：Path 写文件、http 客户端外联、
+    # 行情库下载——导入本身放行以便纯计算复用，但显式 I/O/外联调用在此拦截
+    ("Path", "read_text"),
+    ("Path", "write_text"),
+    ("Path", "read_bytes"),
+    ("Path", "write_bytes"),
+    ("Path", "unlink"),
+    ("Path", "open"),
+    ("httpx", "get"),
+    ("httpx", "post"),
+    ("httpx", "put"),
+    ("httpx", "delete"),
+    ("httpx", "patch"),
+    ("httpx", "request"),
+    ("httpx", "stream"),
+    ("requests", "get"),
+    ("requests", "post"),
+    ("yfinance", "download"),
+    ("ccxt", "fetch_ohlcv"),
+    ("polars", "read_csv"),
+    ("polars", "scan_csv"),
 }
 
 
@@ -292,14 +324,11 @@ def _is_banned_attribute(node: ast.Attribute, alias_map: dict[str, str] | None =
     effective = alias_map.get(root, root)
     if (effective, attr) in BANNED_ATTRS:
         return True
+    if (root, attr) in BANNED_ATTRS:
+        # 别名/类名直引（如 from pathlib import Path 后 Path.read_text）
+        return True
     # 受限根的任意属性均视为高危；链式解析后命中 banned root 即拦截
     if effective in BANNED_IMPORT_ROOTS:
-        return True
-    if effective in {"ctypes", "socket", "requests"}:
-        return True
-    if effective == "subprocess":
-        return True
-    if effective == "os" and attr in {"system", "popen", "execve", "spawnl", "spawnlp", "execv", "execl"}:
         return True
     return False
 
@@ -369,19 +398,15 @@ def check_import_allowlist(code: str) -> bool:
             if isinstance(func, ast.Name) and func.id in BANNED_CALL_NAMES:
                 return False  # 拦截 eval/exec/__import__/compile/open/breakpoint 等
             if isinstance(func, ast.Name) and func.id in BANNED_GETATTR_NAMES:
-                # getattr 家族一律拦截；额外防御：若参数含 dunder 字符串也拦截
-                # 已在上层直接 return False，此处保留参数检查以便未来细粒度放行时仍能拦截 getattr(x,"__class__")
-                has_dunder_arg = False
+                # getattr 家族一律拦截（含参数为 banned 根或 dunder 的情形）
                 for arg in node.args:
                     if isinstance(arg, ast.Constant) and isinstance(arg.value, str) and arg.value in BANNED_DUNDER_ATTRS:
-                        has_dunder_arg = True
+                        return False
                     root = _get_root_name(arg)
                     if root is not None:
                         effective = alias_map.get(root, root)
                         if effective in BANNED_IMPORT_ROOTS:
                             return False
-                if has_dunder_arg:
-                    return False
                 return False
             # from-import 别名直接调用：`from os import system as s; s(...)`
             if isinstance(func, ast.Name) and func.id in alias_map:

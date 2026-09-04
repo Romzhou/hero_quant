@@ -57,15 +57,19 @@ def resolve_policy(mode: str, workspace_root: str | None = None) -> dict:
         policy["writableRoots"] = roots
         policy["enforcement"] = "full"
     elif mode == "read-only":
-        tmp_canonical = canonical_path("/tmp")
-        roots = _deduplicate_preserve_order([tmp_canonical])
-        policy["writableRoots"] = roots
+        # 安全：只读模式名实相符，可写根为空；/tmp 暂存如需开放须由调用方显式声明，
+        # 不在此隐式授信（防下游 enforcement 误放行只读模式写 /tmp）
+        policy["writableRoots"] = []
         policy["enforcement"] = "full"
         if "canonicalPath" not in policy:
             try:
                 policy["canonicalPath"] = str(Path.cwd().resolve())
             except (OSError, ValueError, RuntimeError):
-                policy["canonicalPath"] = str(Path(".").resolve())
+                # 回退 resolve 亦可能因同因失败，转 ValueError 守 resolve_policy 契约
+                try:
+                    policy["canonicalPath"] = str(Path(".").resolve())
+                except (OSError, ValueError, RuntimeError) as e2:
+                    raise ValueError(f"cannot resolve canonicalPath: {e2}") from e2
     else:  # danger-full-access
         policy["writableRoots"] = ["/"]  # 全盘可写，仅用于显式危险模式
         policy["enforcement"] = "partial"  # 标记为未强隔离
@@ -74,7 +78,11 @@ def resolve_policy(mode: str, workspace_root: str | None = None) -> dict:
                 try:
                     policy["canonicalPath"] = str(Path.cwd().resolve())
                 except (OSError, ValueError, RuntimeError):
-                    policy["canonicalPath"] = str(Path(".").resolve())
+                    # 回退 resolve 亦可能因同因失败，转 ValueError 守 resolve_policy 契约
+                    try:
+                        policy["canonicalPath"] = str(Path(".").resolve())
+                    except (OSError, ValueError, RuntimeError) as e2:
+                        raise ValueError(f"cannot resolve canonicalPath: {e2}") from e2
 
     return policy
 
@@ -87,9 +95,12 @@ def is_path_writable(path: str, policy: dict) -> bool:
     or enforce via OS-level sandbox (namespaces).
     未来路径（如 /tmp/a/b 尚未创建）用非 strict 解析，仅规范化 .. 与大小写，不要求存在。
     """
+    # 安全：空/非法类型路径永不可写——Path('') 归一到 cwd，误判为可写即逃逸
+    if not isinstance(path, str) or not path:
+        return False
     try:
         cp = str(Path(path).resolve())
-    except (OSError, ValueError, RuntimeError):
+    except (OSError, ValueError, RuntimeError, TypeError):
         return False
     cp_norm = os.path.normcase(cp)
     for r in policy.get("writableRoots", []):

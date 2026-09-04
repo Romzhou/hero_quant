@@ -78,7 +78,8 @@ def is_path_writable(path: str, policy: dict) -> bool:
     """
     try:
         cp = str(Path(path).resolve())
-    except (OSError, ValueError, RuntimeError):
+    except (OSError, ValueError, RuntimeError, TypeError, AttributeError):
+        # fail-closed：非法类型/解析失败一律不可写（TypeError 覆盖 None/int 输入）
         return False
     roots = policy.get("writableRoots") or []
     if not roots:
@@ -147,7 +148,8 @@ class BaseSandbox(ABC):
                     "--bind", ws_canonical, ws_canonical,
                     "--dev", "/dev",
                     "--proc", "/proc",
-                    "--bind", "/tmp", "/tmp",
+                    # 安全：/tmp 私有化（--tmpfs），防跨沙箱污染/tmp 竞态
+                    "--tmpfs", "/tmp",
                     "--unshare-all",
                     "--die-with-parent",
                     "--",
@@ -176,7 +178,8 @@ class LocalShellBackend(BaseSandbox):
             raise ValueError("str cmd not allowed; use List[str]")
         pol = self._policy if self._policy else {}
         wrapped = self.confine(cmd, pol)  # 仅当 bwrap 可用时才加前缀
-        result = subprocess.run(wrapped, shell=False, capture_output=True, text=True)
+        # 安全：显式超时防 hung 子进程 DoS 调用线程（fail-closed 转异常上浮）
+        result = subprocess.run(wrapped, shell=False, capture_output=True, text=True, timeout=60)
         return result.stdout, result.stderr, result.returncode
 
     def confine(self, argv: List[str], policy: dict) -> List[str]:
@@ -190,8 +193,11 @@ class LocalShellBackend(BaseSandbox):
 
     @property
     def enforcement(self) -> str:
-        # danger-full-access 视为未隔离（partial），其余为 full
+        # danger-full-access 视为未隔离（partial）；其余需 bwrap 真实可用才算 full，
+        # 否则调用方会高估隔离等级（fail-closed 语义）
         if isinstance(self._policy, dict) and self._policy.get("mode") == "danger-full-access":
+            return "partial"
+        if not _has_bwrap():
             return "partial"
         return "full"
 
@@ -210,8 +216,9 @@ class DockerBackend(BaseSandbox):
         pol = self._policy if self._policy else {}
         wrapped = self.confine(cmd, pol)
         # 统一以 try/exec 判定可用性，避免 Path.exists -> Popen 的 TOCTOU；缺失时 fail-closed
+        # 显式超时防 hung 子进程 DoS
         try:
-            result = subprocess.run(wrapped, shell=False, capture_output=True, text=True)
+            result = subprocess.run(wrapped, shell=False, capture_output=True, text=True, timeout=60)
         except FileNotFoundError as e:
             raise SandboxUnavailableError(f"docker/bwrap launcher not found: {e}") from e
         return result.stdout, result.stderr, result.returncode

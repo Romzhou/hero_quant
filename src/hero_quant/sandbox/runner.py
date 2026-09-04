@@ -20,8 +20,10 @@ from typing import Any, Dict, List, Tuple
 
 from . import ast_guard
 from .base import BaseSandbox
+from .base import SandboxUnavailableError
 
 # 便捷导出：保持与 ast_guard 同一身份，避免 bare re-export 被 ruff 误判为死代码
+# 异常身份统一：以 base.SandboxUnavailableError 为 canonical，不再自立类（防分叉）
 SandboxViolation = ast_guard.SandboxViolation
 check_source = ast_guard.check_source
 
@@ -37,10 +39,6 @@ LandlockEnforcement = str  # 'full' | 'partial' | 'unusable'
 # 合约要求的错误前缀——调用方同时依赖退出码 125 与此外缀来判定启动器失败
 _FATAL_PREFIX = "landlock-run: "
 _NOT_ENFORCED_MSG = "landlock is not enforced by this kernel (ABI unsupported or disabled)"
-
-
-class SandboxUnavailableError(RuntimeError):
-    """Fail-closed 隔离不可用错误：要求强隔离但内核/二进制无法提供时抛出。"""
 
 
 # ---------------------------------------------------------------------------
@@ -148,10 +146,13 @@ def grant_args(grants: Dict[str, List[str]]) -> List[str]:
 
 def _run_probe_binary(launcher: str, timeout_ms: int = 2000) -> Tuple[int, str, str]:
     """执行 ``launcher --probe`` 并返回 (exit_code, stdout, stderr)，带超时保护防挂死。"""
+    # 非法超时 fail-closed：0/负值不再静默代入 2s，直接合成失败输出
+    if not isinstance(timeout_ms, (int, float)) or timeout_ms <= 0:
+        return LAUNCHER_FAILURE_EXIT, "", f"{_FATAL_PREFIX}invalid probe timeout: {timeout_ms!r}\n"
     try:
         result = subprocess.run(
             [launcher, "--probe"],
-            timeout=timeout_ms / 1000 if timeout_ms else 2,
+            timeout=timeout_ms / 1000,
             capture_output=True,
             text=True,
         )
@@ -162,6 +163,9 @@ def _run_probe_binary(launcher: str, timeout_ms: int = 2000) -> Tuple[int, str, 
         return LAUNCHER_FAILURE_EXIT, "", f"{_FATAL_PREFIX}{e}\n"
     except subprocess.TimeoutExpired:
         return LAUNCHER_FAILURE_EXIT, "", f"{_FATAL_PREFIX}probe timed out after {timeout_ms}ms\n"
+    except ValueError as e:
+        # 超时/参数非法 fail-closed 映射为 125，不外泄 ValueError 破坏探针三态契约
+        return LAUNCHER_FAILURE_EXIT, "", f"{_FATAL_PREFIX}probe invalid argument: {e}\n"
 
 
 def probe_raw(
@@ -181,12 +185,10 @@ def probe_raw(
     if exit_code != 0 and not err.startswith(_FATAL_PREFIX):
         err = f"{_FATAL_PREFIX}{err}" if err else f"{_FATAL_PREFIX}{_NOT_ENFORCED_MSG}\n"
     if exit_code == 0:
-        # 成功时 stdout 应包含 enforced 标识；空输出时按 fully enforced 兜底
-        if "partially enforced" in out or "fully enforced" in out:
-            pass
-        else:
-            if not out.strip():
-                out = "landlock: fully enforced\n"
+        # 安全：仅显式 enforced 标识判 full；空/不可识别输出 fail-closed 转失败，
+        # 防伪造/损坏 launcher 以空输出冒充完全隔离
+        if "partially enforced" not in out and "fully enforced" not in out:
+            return LAUNCHER_FAILURE_EXIT, out, f"{_FATAL_PREFIX}{_NOT_ENFORCED_MSG}\n"
     return exit_code, out, err
 
 
@@ -208,10 +210,40 @@ def _execute_python_impl(
     globals_dict: dict | None = None,
     locals_dict: dict | None = None,
 ) -> dict:
-    """共享的 Python 执行实现：先 AST 守卫再 compile/exec，消除重复。"""
+    """共享的 Python 执行实现：先 AST 守卫再 compile/exec，消除重复。
+
+    纵深防御（ast_guard 为第一道，此处为第二道）：
+    - 空源 fail-closed 拒绝，不静默返回成功空 dict；
+    - 裸危险名引用（如 ``f = open``）亦拒绝，不止拦 Call 形态；
+    - 注入受限 builtins（最小安全子集），同进程 exec 不暴露完整内置能力；
+    - 文件/网络隔离仍由 OS 层（Landlock/bwrap/Docker）强制，本函数不声称 containment。
+    """
+    import ast as _ast
+    import builtins as _builtins
+
+    if not source or not source.strip():
+        raise SandboxViolation("empty source refused (fail-closed)")
     ast_guard.check_source(source)
+    # 裸名引用检查：Load 上下文引用 eval/exec/open 等即拒（防 ``f = open`` 绕过 Call 拦截）
+    _tree = _ast.parse(source)
+    for _node in _ast.walk(_tree):
+        if isinstance(_node, _ast.Name) and isinstance(_node.ctx, _ast.Load):
+            if _node.id in ast_guard.BANNED_CALL_NAMES or _node.id in ast_guard.BANNED_GETATTR_NAMES:
+                raise SandboxViolation(f"banned builtin reference: {_node.id}")
     code = compile(source, "<sandbox>", "exec")
+    _safe_names = (
+        "isinstance", "issubclass", "len", "range", "enumerate",
+        "str", "int", "float", "bool", "list", "dict", "tuple", "set", "frozenset",
+        "min", "max", "sum", "abs", "round", "sorted", "zip", "map", "filter",
+        "any", "all", "repr", "Exception", "ValueError", "TypeError", "RuntimeError",
+    )
+    _safe_builtins = {k: getattr(_builtins, k) for k in _safe_names if hasattr(_builtins, k)}
+    # __import__ 必须透传真实实现：import 语句与第三方库的传递导入依赖完整导入机制；
+    # 门控在静态 check_source（用户源码中的危险导入/调用已先行拒绝），此处不做运行时二次拦截
+    _safe_builtins["__import__"] = _builtins.__import__
     g_dict: dict = {} if globals_dict is None else dict(globals_dict)
+    # 调用方显式给的 __builtins__ 予以尊重；否则注入受限子集（纵深防御）
+    g_dict.setdefault("__builtins__", _safe_builtins)
     if locals_dict is None:
         exec(code, g_dict)  # type: ignore[arg-type]
         return g_dict
@@ -283,20 +315,16 @@ class LandlockSandbox(BaseSandbox):
             try:
                 return super().confine(argv, merged)
             except SandboxUnavailableError:
+                # base 与 runner 已统一身份，此处单捕即覆盖两处来源，不再宽 except 兜底
                 return list(argv)
-            except Exception as e:
-                # 窄化：仅基类的 SandboxUnavailableError 转 no-op，其余原样抛出
-                try:
-                    from .base import SandboxUnavailableError as _BaseUE  # type: ignore
-
-                    if isinstance(e, _BaseUE):
-                        return list(argv)
-                except (ImportError, OSError):
-                    pass
-                raise
 
         # 构造授权：根目录只读，工作区与 /tmp 可写
-        ws = merged.get("workspaceRoot") or merged.get("workspace_root") or merged.get("canonicalPath") or "/tmp"
+        # 缺 workspace 键 fail-closed：不再默认共享 /tmp（防跨租户干扰）
+        ws = merged.get("workspaceRoot") or merged.get("workspace_root") or merged.get("canonicalPath")
+        if not ws:
+            raise SandboxUnavailableError(
+                f"{_FATAL_PREFIX}workspaceRoot required for workspace-write (exit {LAUNCHER_FAILURE_EXIT})"
+            )
         # symlink 拒绝：工作区本身若为符号链接则直接 fail-closed，防止 TOCTOU 逃逸
         try:
             if Path(ws).is_symlink():
@@ -308,9 +336,16 @@ class LandlockSandbox(BaseSandbox):
                 f"{_FATAL_PREFIX}workspaceRoot unavailable: {ws} (exit {LAUNCHER_FAILURE_EXIT})"
             ) from e
         try:
-            ws_canonical = str(Path(ws).resolve())
-        except (OSError, RuntimeError, ValueError):
-            ws_canonical = str(ws)
+            # strict 解析 + 目录校验：缺失/悬空链接 fail-closed，不回退未解析路径
+            ws_canonical = str(Path(ws).resolve(strict=True))
+        except (OSError, RuntimeError, ValueError) as e:
+            raise SandboxUnavailableError(
+                f"{_FATAL_PREFIX}workspaceRoot unavailable: {ws} (exit {LAUNCHER_FAILURE_EXIT})"
+            ) from e
+        if not Path(ws_canonical).is_dir():
+            raise SandboxUnavailableError(
+                f"{_FATAL_PREFIX}workspaceRoot not a directory: {ws} (exit {LAUNCHER_FAILURE_EXIT})"
+            )
         grants = {
             "readOnly": ["/"],
             "readWrite": [ws_canonical, "/tmp"],
@@ -341,31 +376,80 @@ class LandlockSandbox(BaseSandbox):
         # 构造隔离后的 argv（可能是 landlock 前缀或 bwrap/no-op 回退）
         wrapped = self.confine(argv, {})
         # 非 Linux 下 landlock 前缀无意义，避免 ENOENT；已在上方处理 require_enforcement 分支
+        # 宽松模式亦不静默裸跑：先试 bwrap 回退，再试原 argv（loud 警告），全失败则 fail-closed
         if wrapped and wrapped[0] == self._launcher and sys.platform != "linux":
             if not require_enforcement:
+                import logging as _logging
+
                 fallback = super().confine(argv, self._policy)
                 try:
                     result = subprocess.run(fallback, shell=False, capture_output=True, text=True, timeout=timeout)
-                except FileNotFoundError:
-                    result = subprocess.run(argv, shell=False, capture_output=True, text=True, timeout=timeout)
+                except (FileNotFoundError, PermissionError, OSError, subprocess.TimeoutExpired) as e:
+                    _logging.getLogger(__name__).warning(
+                        "landlock unavailable, sandboxed fallback failed, running without isolation: %s",
+                        e, exc_info=True,
+                    )
+                    try:
+                        result = subprocess.run(argv, shell=False, capture_output=True, text=True, timeout=timeout)
+                    except (OSError, subprocess.TimeoutExpired) as e2:
+                        raise SandboxUnavailableError(f"{_FATAL_PREFIX}{e2} (exit {LAUNCHER_FAILURE_EXIT})") from e2
                 return result.stdout, result.stderr, result.returncode
         # Linux 下若二进制缺失，探针已为 unusable，此处包裹应为 no-op；防御性再检查
         if wrapped and wrapped[0] == self._launcher:
             if not Path(self._launcher).exists() and shutil.which(self._launcher) is None:
                 if not require_enforcement:
-                    fallback = super().confine(argv, self._policy)
-                    result = subprocess.run(fallback, shell=False, capture_output=True, text=True, timeout=timeout)
+                    import logging as _logging
+
+                    _logging.getLogger(__name__).warning(
+                        "landlock launcher missing, trying bwrap fallback before raw argv"
+                    )
+                    try:
+                        fallback = super().confine(argv, self._policy)
+                        result = subprocess.run(fallback, shell=False, capture_output=True, text=True, timeout=timeout)
+                    except (FileNotFoundError, PermissionError, OSError, subprocess.TimeoutExpired):
+                        # bwrap 亦不可用才退到原 argv（loud 警告），失败则 fail-closed
+                        _logging.getLogger(__name__).warning(
+                            "sandboxed fallback failed, running without isolation", exc_info=True
+                        )
+                        try:
+                            result = subprocess.run(argv, shell=False, capture_output=True, text=True, timeout=timeout)
+                        except (OSError, subprocess.TimeoutExpired) as e2:
+                            raise SandboxUnavailableError(
+                                f"{_FATAL_PREFIX}{e2} (exit {LAUNCHER_FAILURE_EXIT})"
+                            ) from e2
                     return result.stdout, result.stderr, result.returncode
                 raise SandboxUnavailableError(f"{_FATAL_PREFIX}launcher not found: {self._launcher} (exit {LAUNCHER_FAILURE_EXIT})")
 
         try:
             result = subprocess.run(wrapped, shell=False, capture_output=True, text=True, timeout=timeout)
-        except FileNotFoundError as e:
-            # 二进制缺失时宽松模式回退到原 argv，严格模式转为 fail-closed 异常
+        except (FileNotFoundError, PermissionError, OSError) as e:
+            # 启动器失败 fail-closed 收口：缺失/无权限/不可执行一律转 SandboxUnavailableError；
+            # 宽松模式先试 bwrap 再试原 argv（loud 警告），全失败仍抛
             if not require_enforcement:
-                result = subprocess.run(argv, shell=False, capture_output=True, text=True, timeout=timeout)
+                import logging as _logging
+
+                _logging.getLogger(__name__).warning(
+                    "launcher failed, trying bwrap fallback before raw argv: %s", e, exc_info=True
+                )
+                try:
+                    fallback = super().confine(argv, self._policy)
+                    result = subprocess.run(fallback, shell=False, capture_output=True, text=True, timeout=timeout)
+                except (FileNotFoundError, PermissionError, OSError, subprocess.TimeoutExpired):
+                    _logging.getLogger(__name__).warning(
+                        "sandboxed fallback failed, running without isolation", exc_info=True
+                    )
+                    try:
+                        result = subprocess.run(argv, shell=False, capture_output=True, text=True, timeout=timeout)
+                    except (OSError, subprocess.TimeoutExpired) as e2:
+                        raise SandboxUnavailableError(
+                            f"{_FATAL_PREFIX}{e2} (exit {LAUNCHER_FAILURE_EXIT})"
+                        ) from e2
                 return result.stdout, result.stderr, result.returncode
             raise SandboxUnavailableError(f"{_FATAL_PREFIX}{e} (exit {LAUNCHER_FAILURE_EXIT})") from e
+        except subprocess.TimeoutExpired as e:
+            raise SandboxUnavailableError(
+                f"{_FATAL_PREFIX}execution timed out: {e} (exit {LAUNCHER_FAILURE_EXIT})"
+            ) from e
         return result.stdout, result.stderr, result.returncode
 
     def execute_python(  # type: ignore[no-redef]
@@ -398,19 +482,13 @@ def dispatch_tool(tool_spec: Any, args: dict | None = None, policy: dict | None 
         args = {}
     pol = policy or {}
     name = getattr(tool_spec, "name", "") if tool_spec is not None else ""
-    # python 工具走受控 exec
+    # python 工具走受控 exec（fail-closed 上浮 SandboxViolation/ValueError，不吞）
     if name in ("execute_python", "python", "run_python"):
         src = args.get("source") or args.get("code") or ""
-        try:
-            return execute_python(src, args.get("globals"), args.get("locals"))
-        except Exception:
-            # 保持与沙箱层一致的错误前缀
-            raise
+        return execute_python(src, args.get("globals"), args.get("locals"))
     # 非 python：尝试通过沙箱隔离执行；工具本身可能是任意 callable，回退为直接调用
-    try:
-        from .base import SandboxUnavailableError as _BaseSandboxError  # type: ignore
-    except (ImportError, OSError):
-        _BaseSandboxError = SandboxUnavailableError  # type: ignore
+    # 异常身份已统一（base 为 canonical），单捕即覆盖两处来源；编程错误
+    # （SandboxViolation/TypeError）与子进程超时上浮，不吞为 dict（fail-closed）
     try:
         # 若 tool_spec 有可调用 func，则尝试隔离包裹其命令形式
         sandbox = LandlockSandbox(policy=pol)
@@ -422,7 +500,7 @@ def dispatch_tool(tool_spec: Any, args: dict | None = None, policy: dict | None 
         if isinstance(cmd, (list, tuple)):
             out, err, code = sandbox.execute(list(cmd), require_enforcement=require_enforcement)  # type: ignore[arg-type]
             if code != 0:
-                return f"tool_error: {err or out} (code {code})"
+                return {"error": f"tool_error: {err or out} (code {code})"}
             return out
         # 回退直接调用 — 默认禁止，直调仅在显式 allow_direct_call 且非 workspace-write 时允许
         func = getattr(tool_spec, "func", None)
@@ -435,9 +513,10 @@ def dispatch_tool(tool_spec: Any, args: dict | None = None, policy: dict | None 
                     return {"error": f"sandbox unavailable: {_FATAL_PREFIX}{_NOT_ENFORCED_MSG} (exit {LAUNCHER_FAILURE_EXIT})"}
                 return {"error": f"tool_error: direct func call forbidden without allow_direct_call (mode={mode})"}
             return func(**args) if isinstance(args, dict) else func(args)
-        return None
-    except (SandboxUnavailableError, _BaseSandboxError) as e:  # type: ignore
+        return {"error": "tool_error: no cmd/argv and no callable func"}
+    except SandboxUnavailableError as e:
         # fail-closed 但对工具层转为可观测的结构化 error
         return {"error": f"sandbox unavailable: {e}"}
-    except Exception as e:
-        return {"error": f"tool_error: {e}"}
+    except (SandboxViolation, TypeError, subprocess.TimeoutExpired):
+        # 编程错误与超时上浮，调用方必须感知而非误读 dict
+        raise
