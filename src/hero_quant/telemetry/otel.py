@@ -9,7 +9,11 @@ from __future__ import annotations
 
 import atexit
 import os
+import socket as _socket
 import threading
+import time
+from typing import Any
+
 import structlog
 logger = structlog.get_logger("telemetry.otel")
 
@@ -18,6 +22,27 @@ _OTEL_PROVIDER_LOCK = threading.Lock()
 _OTEL_CACHED_PROVIDER = None  # type: ignore
 _OTEL_CACHED_PROCESSOR = None  # type: ignore
 _OTEL_CACHED_ENDPOINT: str | None = None
+
+# 中文：DNS 解析缓存（TTL），避免每 export 阻塞 DNS；超时 2s，失败 fail-closed。
+# 缓存强引用解析器对象并用同一性比较（不用 id()，避免 CPython 地址重用命中脏缓存）。
+_DNS_CACHE: dict[str, tuple[float, Any, list]] = {}
+_DNS_CACHE_LOCK = threading.Lock()
+_DNS_CACHE_TTL_SECONDS = 300.0
+_DNS_TIMEOUT_SECONDS = 2.0
+
+# 中文：单测桩主机（仅测试夹具，非安全白名单）。扫描 G3#95 要求删除 broad bypass；
+# 旧单测桩（collector.test/otel-collector）如需放行，必须显式 env opt-in，生产默认关闭。
+_TEST_FIXTURE_HOSTS = frozenset({"otel-collector", "collector.test"})
+
+
+def _test_fixture_opt_in(host: str) -> bool:
+    """测试夹具放行判定：桩主机 + 显式 HERO_OTEL_ALLOW_TEST_HOSTS=1 才生效（生产默认关闭 fail-closed）。"""
+    try:
+        if (host or "").lower() not in _TEST_FIXTURE_HOSTS:
+            return False
+        return os.environ.get("HERO_OTEL_ALLOW_TEST_HOSTS", "").strip().lower() in ("1", "true", "yes")
+    except (AttributeError, ValueError, TypeError):
+        return False
 
 # 合法模式（小写归一），含历史别名以保证兼容
 _VALID_MODES = {"disabled", "shared", "private", "enabled", "sampling", "minimal", "full", "internal", "anonymous"}
@@ -36,6 +61,39 @@ _SHARING_MAP = {
     "anonymous": "shared",
     "full": "private",
 }
+
+
+def _cached_getaddrinfo(host: str) -> list:
+    """带 TTL/超时的 DNS 解析缓存。
+
+    中文：命中 TTL 直接返回（不阻塞）；未命中则带超时解析，失败抛 gaierror 由调用方 fail-closed。
+    """
+    now = time.monotonic()
+    resolver = _socket.getaddrinfo
+    with _DNS_CACHE_LOCK:
+        hit = _DNS_CACHE.get(host.lower())
+        if hit is not None and now - hit[0] < _DNS_CACHE_TTL_SECONDS and hit[1] is resolver:
+            return hit[2]
+    _socket.setdefaulttimeout(_DNS_TIMEOUT_SECONDS)
+    try:
+        infos = resolver(host, None, family=_socket.AF_UNSPEC, type=_socket.SOCK_STREAM)
+    finally:
+        try:
+            _socket.setdefaulttimeout(None)
+        except (OSError, ValueError):
+            pass
+    with _DNS_CACHE_LOCK:
+        _DNS_CACHE[host.lower()] = (now, resolver, infos)
+        if len(_DNS_CACHE) > 1024:
+            oldest = min(_DNS_CACHE, key=lambda k: _DNS_CACHE[k][0])
+            _DNS_CACHE.pop(oldest, None)
+    return infos
+
+
+def _clear_dns_cache() -> None:
+    """测试钩子：清空 DNS 缓存。"""
+    with _DNS_CACHE_LOCK:
+        _DNS_CACHE.clear()
 
 
 def _normalize_mode(raw: str | None) -> str:
@@ -61,10 +119,10 @@ def _is_allowed_endpoint(endpoint: str) -> bool:
     """
     try:
         return SessionTelemetryCoordinator(mode="private")._validate_endpoint(endpoint)
-    except Exception:
+    except (ValueError, TypeError, AttributeError, OSError, RuntimeError):
         try:
             logger.warning("otel _is_allowed_endpoint suppressed", exc_info=True)
-        except Exception:
+        except (ValueError, TypeError, AttributeError, OSError, RuntimeError):
             pass
         return False
 
@@ -83,7 +141,11 @@ class SessionTelemetryCoordinator:
         return _SHARING_MAP.get(self.mode, "disabled")
 
     def _validate_endpoint(self, endpoint: str) -> bool:
-        """校验 OTLP endpoint 仅允许 http/https 且非私有/元数据地址，防 SSRF。"""
+        """校验 OTLP endpoint 仅允许 http/https 且非私有/元数据地址，防 SSRF。
+
+        中文：fail-closed。无 broad bypass（白名单名同样走 DNS 解析后判定）；
+        DNS 经带超时/TTL 缓存解析，失败拒绝；端口异常不逃逸。
+        """
         from urllib.parse import urlparse
         import ipaddress
         import socket
@@ -93,30 +155,22 @@ class SessionTelemetryCoordinator:
                 from hero_quant.config.settings import _redact_dsn as _rd
 
                 return _rd(u)
-            except Exception:
+            except (ImportError, AttributeError, ValueError, TypeError):
                 return "***"
 
         def _is_ip_blocked(ip) -> bool:  # 中文：字面 IP 统一判定私网/环回/链路/保留/组播/未指定
             try:
                 if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
                     return True
-                if str(ip).startswith("169.254."):
-                    return True
                 if getattr(ip, "is_unspecified", False):
                     return True
                 return False
-            except Exception:
+            except (ValueError, TypeError, AttributeError):
                 return False
 
-        _DNS_BYPASS_HOSTS = {"collector.test", "otel-collector", "localhost"}  # 中文：内网服务名白名单，防 CGNAT/ULA 劫持误伤
-
-        def _is_resolved_blocked(ip, host: str = "") -> bool:  # 中文：DNS 二次解析窄化拦截，仅卡 RFC1918/环回/链路/组播
+        def _is_resolved_blocked(ip, host: str = "") -> bool:  # 中文：解析 IP 窄化拦截（RFC1918/环回/链路/组播/ULA/未指定）
             try:
-                if host and host.lower() in _DNS_BYPASS_HOSTS:
-                    return False
                 if ip.is_loopback or ip.is_link_local or ip.is_multicast or getattr(ip, "is_unspecified", False):
-                    return True
-                if str(ip).startswith("169.254."):
                     return True
                 import ipaddress as _ipmod
 
@@ -129,6 +183,7 @@ class SessionTelemetryCoordinator:
                     _ipmod.ip_network("::1/128"),
                     _ipmod.ip_network("fe80::/10"),
                     _ipmod.ip_network("ff00::/8"),
+                    _ipmod.ip_network("fc00::/7"),
                 )
                 for n in _nets:
                     try:
@@ -136,18 +191,13 @@ class SessionTelemetryCoordinator:
                             return True
                     except (ValueError, TypeError):
                         continue
-                try:
-                    if ip.version == 6 and ip in _ipmod.ip_network("fc00::/7"):
-                        return True
-                except Exception:
-                    pass
                 return False
-            except Exception:
+            except (ValueError, TypeError, AttributeError):
                 return False
 
         try:
             parsed = urlparse(endpoint)
-        except Exception:
+        except (ValueError, TypeError, AttributeError):
             logger.warning("invalid OTLP endpoint parse failed", endpoint=_redact(endpoint), exc_info=True)
             return False
         if parsed.scheme not in ("http", "https") or not parsed.hostname:
@@ -156,7 +206,12 @@ class SessionTelemetryCoordinator:
         if parsed.username is not None or parsed.password is not None:
             logger.warning("OTLP endpoint blocked userinfo", endpoint=_redact(endpoint))
             return False
-        if parsed.port is not None and not (0 < parsed.port <= 65535):
+        try:
+            port = parsed.port
+        except ValueError:
+            logger.warning("OTLP endpoint blocked invalid port", endpoint=_redact(endpoint))
+            return False
+        if port is not None and not (0 < port <= 65535):
             logger.warning("OTLP endpoint blocked invalid port", endpoint=_redact(endpoint))
             return False
         host = parsed.hostname or ""
@@ -169,27 +224,33 @@ class SessionTelemetryCoordinator:
             if _is_ip_blocked(ip):
                 logger.warning("OTLP endpoint blocked private/link-local/reserved IP", endpoint=_redact(endpoint))
                 return False
-            if str(ip).startswith("169.254."):
-                logger.warning("OTLP endpoint blocked link-local 169.254/16", endpoint=_redact(endpoint))
-                return False
         except ValueError:
+            # 中文：非字面主机走带超时/TTL 缓存 DNS；失败 fail-closed（拒绝），不放行。
             try:
+                infos = _cached_getaddrinfo(host)
+            except (socket.gaierror, socket.herror, OSError, ValueError, TypeError, RuntimeError):
+                # 中文：测试夹具 opt-in（显式 env）才放行桩主机；生产默认 fail-closed。
+                if _test_fixture_opt_in(host):
+                    return True
+                logger.warning("OTLP endpoint blocked DNS failure", endpoint=_redact(endpoint))
+                return False
+            if not infos:
+                if _test_fixture_opt_in(host):
+                    return True
+                logger.warning("OTLP endpoint blocked DNS empty", endpoint=_redact(endpoint))
+                return False
+            for _family, _type, _proto, _canon, sockaddr in infos:
                 try:
-                    infos = socket.getaddrinfo(host, None, family=socket.AF_UNSPEC, type=socket.SOCK_STREAM)
-                except (socket.gaierror, socket.herror, OSError):
-                    logger.debug("OTLP endpoint DNS resolve no result", endpoint=_redact(endpoint), exc_info=True)
-                    infos = []
-                for _family, _type, _proto, _canon, sockaddr in infos:
-                    try:
-                        ip_str = sockaddr[0] if isinstance(sockaddr, (tuple, list)) else str(sockaddr)
-                        rip = ipaddress.ip_address(ip_str)
-                        if _is_resolved_blocked(rip, host):
-                            logger.warning("OTLP endpoint blocked resolved private IP", endpoint=_redact(endpoint), resolved_ip=str(rip))
-                            return False
-                    except (ValueError, TypeError):
-                        continue
-            except Exception:
-                logger.debug("OTLP endpoint DNS resolve suppressed", endpoint=_redact(endpoint), exc_info=True)
+                    ip_str = sockaddr[0] if isinstance(sockaddr, (tuple, list)) else str(sockaddr)
+                    rip = ipaddress.ip_address(ip_str)
+                    if _is_resolved_blocked(rip, host):
+                        # 中文：测试夹具 opt-in（显式 env）才放行桩主机；生产默认 fail-closed。
+                        if _test_fixture_opt_in(host):
+                            return True
+                        logger.warning("OTLP endpoint blocked resolved private IP", endpoint=_redact(endpoint), resolved_ip=str(rip))
+                        return False
+                except (ValueError, TypeError):
+                    continue
         return True
 
     def export(self, payload: dict | None = None) -> None:
@@ -206,7 +267,6 @@ class SessionTelemetryCoordinator:
         if not self._validate_endpoint(endpoint):
             return
         # --- 尝试 OTel SDK 批量管线 ---
-        _sdk_available = False
         global _OTEL_CACHED_PROVIDER, _OTEL_CACHED_PROCESSOR, _OTEL_CACHED_ENDPOINT
         try:
             try:
@@ -233,40 +293,47 @@ class SessionTelemetryCoordinator:
                     raise ImportError("OTLPLogExporter not available")
             except ImportError:
                 raise
-            _sdk_available = True
-            # 单例复用：仅在 endpoint 变化或首次时创建
+            # 中文：锁内只做快照/发布（不阻塞 shutdown）；旧管线出锁后关闭，并发 export 不被 stall。
+            old_provider = None
+            old_processor = None
+            provider = None
+            need_build = False
             with _OTEL_PROVIDER_LOCK:
                 if _OTEL_CACHED_PROVIDER is None or _OTEL_CACHED_ENDPOINT != endpoint:
-                    # 清理旧管线
-                    if _OTEL_CACHED_PROVIDER is not None:
-                        try:
-                            if hasattr(_OTEL_CACHED_PROVIDER, "shutdown"):
-                                _OTEL_CACHED_PROVIDER.shutdown()  # type: ignore
-                        except Exception:
-                            pass
-                        try:
-                            if _OTEL_CACHED_PROCESSOR is not None and hasattr(_OTEL_CACHED_PROCESSOR, "shutdown"):
-                                _OTEL_CACHED_PROCESSOR.shutdown()  # type: ignore
-                        except Exception:
-                            pass
-                    try:
-                        exporter = OTLPLogExporter(endpoint=endpoint)  # type: ignore[call-arg]
-                    except TypeError:
-                        exporter = OTLPLogExporter(endpoint)  # type: ignore[call-arg]
-                    processor = BatchLogRecordProcessor(exporter)  # type: ignore
-                    provider = LoggerProvider()  # type: ignore
-                    provider.add_log_record_processor(processor)  # type: ignore
+                    old_provider = _OTEL_CACHED_PROVIDER
+                    old_processor = _OTEL_CACHED_PROCESSOR
+                    _OTEL_CACHED_PROVIDER = None
+                    _OTEL_CACHED_PROCESSOR = None
+                    _OTEL_CACHED_ENDPOINT = None
+                    need_build = True
+                else:
+                    provider = _OTEL_CACHED_PROVIDER
+            # 中文：阻塞 shutdown 移出锁外（shutdown_otel 同款快照模式）。
+            for _old in (old_provider, old_processor):
+                if _old is None:
+                    continue
+                try:
+                    if hasattr(_old, "shutdown"):
+                        _old.shutdown()  # type: ignore
+                except (ValueError, TypeError, AttributeError, OSError, RuntimeError):
+                    pass
+            if need_build:
+                try:
+                    exporter = OTLPLogExporter(endpoint=endpoint)  # type: ignore[call-arg]
+                except TypeError:
+                    exporter = OTLPLogExporter(endpoint)  # type: ignore[call-arg]
+                processor = BatchLogRecordProcessor(exporter)  # type: ignore
+                provider = LoggerProvider()  # type: ignore
+                provider.add_log_record_processor(processor)  # type: ignore
+                with _OTEL_PROVIDER_LOCK:
                     _OTEL_CACHED_PROVIDER = provider
                     _OTEL_CACHED_PROCESSOR = processor
                     _OTEL_CACHED_ENDPOINT = endpoint
-                else:
-                    provider = _OTEL_CACHED_PROVIDER
-                    processor = _OTEL_CACHED_PROCESSOR
 
             otel_logger = None
             try:
                 otel_logger = provider.get_logger("hero_quant.telemetry")  # type: ignore
-            except Exception as e:  # noqa: BLE001 - 离线安全契约：telemetry 侧路永不抛错
+            except (ValueError, TypeError, AttributeError, OSError, RuntimeError) as e:
                 logger.warning("otel get_logger failed: %s", e, exc_info=True)
                 try:
                     from opentelemetry._logs import get_logger as _api_get_logger  # type: ignore
@@ -297,15 +364,14 @@ class SessionTelemetryCoordinator:
                         provider.force_flush(timeout_millis=1000)  # type: ignore
                     except TypeError:
                         provider.force_flush()  # type: ignore
-            except Exception as _exc:  # noqa: BLE001 - 离线安全契约：telemetry 侧路永不抛错
+            except (ValueError, TypeError, AttributeError, OSError, RuntimeError) as _exc:
                 logger.warning("otel force_flush failed: %s", _exc, exc_info=True)
             return
         except ImportError:
             pass
-        except Exception as e:  # noqa: BLE001 - 离线安全契约：SDK 路径失败仅告警
+        except (ValueError, TypeError, AttributeError, OSError, RuntimeError) as e:
+            # 中文：SDK 路径失败仅告警，随后落到 urllib 回退（不再 early return 丢遥测）。
             logger.warning("otel sdk export failed: %s", e, exc_info=True)
-            if _sdk_available:
-                return
             pass
 
         # --- 回退：urllib 同步 POST JSON ---
@@ -330,7 +396,8 @@ class SessionTelemetryCoordinator:
             req = urllib.request.Request(endpoint, data=data, headers={"Content-Type": "application/json"})
             with urllib.request.urlopen(req, timeout=0.5) as _resp:  # noqa: S310
                 pass
-        except Exception as e:  # noqa: BLE001 - 离线安全契约：urllib 回退失败仅告警
+        except (ValueError, TypeError, AttributeError, OSError, RuntimeError) as e:
+            # 中文：离线安全契约：urllib 回退失败仅告警，不抛错。
             logger.warning("otel urllib export failed: %s", e, exc_info=True)
             return
         return
@@ -360,8 +427,6 @@ def shutdown_otel() -> None:
                 obj.shutdown()  # type: ignore[union-attr]
         except (ValueError, TypeError, AttributeError, OSError, RuntimeError):
             pass
-        except Exception:
-            logger.debug("shutdown_otel suppressed exception", exc_info=True)
 
 
 atexit.register(shutdown_otel)

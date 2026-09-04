@@ -13,21 +13,49 @@ import asyncio
 import functools
 import json
 import logging
+import secrets
 import threading as _threading
 import time
+import uuid
 from contextlib import asynccontextmanager
 from typing import Any, Callable, Dict
 
 logger = logging.getLogger(__name__)
 
-_REDIS_PREFIX_TICKET = "hero:ticket:"
+# 中文：限流/缓存键前缀（ticket 键前缀收敛到 api.security._REDIS_TICKET_PREFIX，避免多处命名空间分叉）。
 _REDIS_PREFIX_RATELIMIT = "hero:ratelimit:"
 _REDIS_PREFIX_CACHE = "hero:cache:"
 
-_redis_instance: Any | None = None
-_redis_lock = asyncio.Lock() if False else None  # placeholder, real lock is threading
-
+# 中文：sync/async 客户端分离存储，互不污染（单全局曾导致 async 路径拿到 sync 客户端）。
+_redis_sync_instance: Any | None = None
+_redis_async_instance: Any | None = None
 _redis_thread_lock = _threading.Lock()
+_redis_async_lock: asyncio.Lock | None = None
+
+try:  # 中文：窄化捕获 eval/命令错误类型（fakeredis 不支持 eval 时走兼容路径）。
+    from redis.exceptions import RedisError as _RedisError
+    from redis.exceptions import ResponseError as _RedisResponseError
+
+    _REDIS_ERRORS = (_RedisError, OSError, ValueError, TypeError, AttributeError, RuntimeError)
+    _EVAL_ERRORS = (_RedisResponseError, TypeError, ValueError, AttributeError, RuntimeError)
+except ImportError:  # 中文：未安装 redis-py 时退化为标准异常元组。
+    _REDIS_ERRORS = (OSError, ValueError, TypeError, AttributeError, RuntimeError)
+    _EVAL_ERRORS = (TypeError, ValueError, AttributeError, RuntimeError)
+
+
+def _get_async_lock() -> asyncio.Lock:
+    """返回异步路径锁（懒创建 asyncio.Lock；threading.Lock 绝不横跨 await）。"""
+    global _redis_async_lock
+    if _redis_async_lock is None:
+        _redis_async_lock = asyncio.Lock()
+    return _redis_async_lock
+
+
+async def _await_if_needed(value: Any) -> Any:
+    """兼容 sync/async 客户端：协程则 await，否则直接返回。"""
+    if asyncio.iscoroutine(value):
+        return await value
+    return value
 
 
 def _get_redis_dsn() -> str | None:
@@ -36,7 +64,7 @@ def _get_redis_dsn() -> str | None:
         from hero_quant.config.settings import Settings
 
         return Settings().redis_dsn
-    except Exception as e:
+    except (ImportError, AttributeError, ValueError, TypeError, OSError, RuntimeError) as e:
         logger.debug("redis.settings_load_failed error=%s", str(e))
         return None
 
@@ -102,19 +130,19 @@ def _create_fakeredis():
             return _SyncToAsyncRedis(fake)
         except ImportError:
             return None
-    except Exception as e:
+    except (ImportError, OSError, ValueError, TypeError, AttributeError, RuntimeError) as e:
         logger.warning("redis.fakeredis_create_failed error=%s", str(e))
         return None
 
 
 def get_redis_sync():
     """Sync getter for non-async contexts (security.py). Returns sync redis or fakeredis sync."""
-    global _redis_instance
-    if _redis_instance is not None:
-        return _redis_instance
+    global _redis_sync_instance
+    if _redis_sync_instance is not None:
+        return _redis_sync_instance
     with _redis_thread_lock:
-        if _redis_instance is not None:
-            return _redis_instance
+        if _redis_sync_instance is not None:
+            return _redis_sync_instance
         dsn = _get_redis_dsn()
         if dsn:
             try:
@@ -123,25 +151,27 @@ def get_redis_sync():
                 inst = _redis_sync.from_url(dsn, decode_responses=True, socket_connect_timeout=2, socket_timeout=2)
                 try:
                     inst.ping()
-                except Exception as e:
+                except _REDIS_ERRORS as e:
                     logger.warning("redis.ping_failed_fallback_fakeredis error=%s", str(e))
                     fake = _create_fakeredis_sync_fallback()
                     if fake is not None:
-                        _redis_instance = fake
-                        return _redis_instance
-                _redis_instance = inst
-                logger.info("redis.connected", dsn=_redact_dsn(dsn))
-                return _redis_instance
+                        _redis_sync_instance = fake
+                        return _redis_sync_instance
+                    # 中文：ping 失败且无回退时不缓存坏客户端（fail-closed 返回 None）。
+                    return None
+                _redis_sync_instance = inst
+                logger.info("redis.connected redacted=%s", _redact_dsn(dsn))
+                return _redis_sync_instance
             except ImportError:
                 logger.warning("redis.not_installed_try_fakeredis")
-            except Exception as e:
+            except _REDIS_ERRORS as e:
                 logger.warning("redis.connect_failed_try_fakeredis error=%s", str(e))
         # Fallback: fakeredis sync
         fake = _create_fakeredis_sync_fallback()
         if fake is not None:
-            _redis_instance = fake
+            _redis_sync_instance = fake
             logger.info("redis.fakeredis_sync_active")
-            return _redis_instance
+            return _redis_sync_instance
         return None
 
 
@@ -160,8 +190,9 @@ def _redact_dsn(dsn: str) -> str:
     try:
         import re
 
-        return re.sub(r"://([^:]+):[^@]*@", r"://\1:***@", dsn)
-    except Exception:
+        # 中文：同时覆盖 user:pass@ 与 :pass@（空用户名）两种带口令形态。
+        return re.sub(r"://([^/@]*):[^@]*@", r"://\1:***@", dsn)
+    except (TypeError, ValueError, AttributeError):
         return "***"
 
 
@@ -170,13 +201,15 @@ async def get_redis():
 
     优先 HERO_REDIS_DSN，失败或未配置时回退 fakeredis（保证 tests 不依赖真实 Redis）。
     调用方若需强依赖可自行判断 get_redis() 是否为 fakeredis。
+    中文：async 路径用 asyncio 锁（同步锁绝不横跨 await，避免阻塞事件循环线程）。
     """
-    global _redis_instance
-    if _redis_instance is not None:
-        return _redis_instance
-    with _redis_thread_lock:
-        if _redis_instance is not None:
-            return _redis_instance
+    global _redis_async_instance
+    if _redis_async_instance is not None:
+        return _redis_async_instance
+    lock = _get_async_lock()
+    async with lock:
+        if _redis_async_instance is not None:
+            return _redis_async_instance
         dsn = _get_redis_dsn()
         if dsn:
             try:
@@ -185,41 +218,56 @@ async def get_redis():
                 inst = aioredis.from_url(dsn, decode_responses=True, socket_connect_timeout=2, socket_timeout=2)
                 try:
                     await inst.ping()
-                    _redis_instance = inst
-                    logger.info("redis.connected_async", dsn=_redact_dsn(dsn))
-                    return _redis_instance
-                except Exception as e:
+                    _redis_async_instance = inst
+                    logger.info("redis.connected_async redacted=%s", _redact_dsn(dsn))
+                    return _redis_async_instance
+                except _REDIS_ERRORS as e:
                     logger.warning("redis.async_ping_failed_fallback error=%s", str(e))
                     try:
                         await inst.aclose()
-                    except Exception:
+                    except _REDIS_ERRORS:
                         pass
+                    # 中文：ping 失败时不缓存坏客户端，继续走 fakeredis 回退。
             except ImportError:
                 logger.warning("redis.async_not_installed_fallback")
-            except Exception as e:
+            except _REDIS_ERRORS as e:
                 logger.warning("redis.async_connect_failed error=%s", str(e))
         fake = _create_fakeredis()
         if fake is not None:
-            _redis_instance = fake
+            _redis_async_instance = fake
             logger.info("redis.fakeredis_async_active")
-            return _redis_instance
+            return _redis_async_instance
         return None
 
 
 def set_redis_instance(inst: Any) -> None:
-    """Test hook: inject a Redis instance (e.g. fakeredis)."""
-    global _redis_instance
-    with _redis_thread_lock:
-        _redis_instance = inst
+    """Test hook: inject a Redis instance (e.g. fakeredis). Sync/async 双槽同注，避免类型污染测试。"""
+    global _redis_async_instance, _redis_sync_instance
+    _redis_async_instance = inst
+    _redis_sync_instance = inst
 
 
 def clear_redis_instance() -> None:
-    global _redis_instance
+    global _redis_async_instance, _redis_sync_instance
     with _redis_thread_lock:
-        _redis_instance = None
+        _redis_async_instance = None
+        _redis_sync_instance = None
 
 
 # ── Cache decorator (ported from python-redis-module-skill) ──
+
+
+# 中文：缓存 dataclass 白名单（fail-closed：未注册类型只回退纯 dict，不做任意 import）。
+_CACHE_DATACLASS_ALLOW: dict[str, Any] = {}
+
+
+def register_cache_dataclass(cls: type) -> type:
+    """注册允许从缓存重建的 dataclass 类型（白名单制，防任意 import 注入）。"""
+    try:
+        _CACHE_DATACLASS_ALLOW[f"{cls.__module__}.{cls.__qualname__}"] = cls
+    except (AttributeError, TypeError):
+        pass
+    return cls
 
 
 def _cache_build_key(key_prefix: str, func: Callable, args: tuple, kwargs: dict) -> str:
@@ -242,12 +290,12 @@ def _cache_build_key(key_prefix: str, func: Callable, args: tuple, kwargs: dict)
                         parts.append(str(v))
                     else:
                         parts.append(json.dumps(v, sort_keys=True, ensure_ascii=False, default=str))
-                except Exception:
+                except (ValueError, TypeError, AttributeError):
                     parts.append(str(v))
         if parts:
             return f"{_REDIS_PREFIX_CACHE}{key_prefix}:{':'.join(parts)}"
         return fallback
-    except Exception:
+    except (ValueError, TypeError, AttributeError):
         return fallback
 
 
@@ -269,28 +317,36 @@ def _to_cacheable(obj: Any) -> Any:
 
 
 def _from_cacheable(obj: Any) -> Any:
-    """Reverse _to_cacheable; dataclass reconstructs via import, falls back to plain data dict."""
+    """Reverse _to_cacheable；dataclass 仅重建白名单注册类型，否则回退纯 data dict（防任意 import 注入）。"""
     if isinstance(obj, dict):
         if set(obj.keys()) == {"__hero_tuple__"}:
             return tuple(_from_cacheable(x) for x in obj["__hero_tuple__"])
         if set(obj.keys()) == {"__hero_dataclass__"}:
-            meta = obj["__hero_dataclass__"]
+            meta = obj["__hero_dataclass__"] if isinstance(obj.get("__hero_dataclass__"), dict) else {}
             try:
-                import importlib as _il
-
-                mod = _il.import_module(meta["module"])
-                cls = mod
-                for part in str(meta["qualname"]).split("."):
-                    cls = getattr(cls, part)
-                data = {k: _from_cacheable(v) for k, v in meta["data"].items()}
+                data = {k: _from_cacheable(v) for k, v in meta.get("data", {}).items()} if isinstance(meta.get("data"), dict) else {}
+            except (AttributeError, TypeError, ValueError):
+                logger.debug("redis.cache_dataclass_data_bad")
+                return {}
+            # 中文：白名单查类（fail-closed：未注册只返回纯 dict，不做 import_module/getattr 链）。
+            cls = None
+            try:
+                key = f"{meta.get('module')}.{meta.get('qualname')}"
+                cls = _CACHE_DATACLASS_ALLOW.get(key)
+            except (AttributeError, TypeError):
+                cls = None
+            if cls is None:
+                return data
+            try:
                 return cls(**data)
-            except Exception as e:
+            except (TypeError, ValueError, AttributeError) as e:
                 logger.debug("redis.cache_dataclass_rebuild_failed error=%s", str(e))
-                try:
-                    return {k: _from_cacheable(v) for k, v in meta.get("data", {}).items()}
-                except Exception:
-                    return None
-        return {k: _from_cacheable(v) for k, v in obj.items()}
+                return data
+        try:
+            return {k: _from_cacheable(v) for k, v in obj.items()}
+        except (AttributeError, TypeError, ValueError):
+            logger.debug("redis.cache_dict_rebuild_failed")
+            return {}
     if isinstance(obj, list):
         return [_from_cacheable(x) for x in obj]
     return obj
@@ -300,16 +356,34 @@ def _cache_get_decoded(redis_client: Any, cache_key: str) -> tuple[bool, Any]:
     """Try L2 get; returns (hit, value). Miss on any error or empty."""
     try:
         cached = redis_client.get(cache_key)
-    except Exception as e:
+    except _REDIS_ERRORS as e:
         logger.debug("redis.cache_get_failed error=%s", str(e))
         return False, None
     if not cached:
         return False, None
     try:
         if isinstance(cached, (bytes, bytearray)):
-            cached = bytes(cached).decode("utf-8", errors="ignore")
+            cached = bytes(cached).decode("utf-8")
         return True, _from_cacheable(json.loads(cached))
-    except Exception as e:
+    except (ValueError, TypeError, AttributeError, UnicodeDecodeError) as e:
+        logger.debug("redis.cache_decode_failed error=%s", str(e))
+        return False, None
+
+
+async def _cache_aget_decoded(redis_client: Any, cache_key: str) -> tuple[bool, Any]:
+    """异步 L2 get（await）；返回 (hit, value)，失败/空 miss。"""
+    try:
+        cached = await _await_if_needed(redis_client.get(cache_key))
+    except _REDIS_ERRORS as e:
+        logger.debug("redis.cache_get_failed error=%s", str(e))
+        return False, None
+    if not cached:
+        return False, None
+    try:
+        if isinstance(cached, (bytes, bytearray)):
+            cached = bytes(cached).decode("utf-8")
+        return True, _from_cacheable(json.loads(cached))
+    except (ValueError, TypeError, AttributeError, UnicodeDecodeError) as e:
         logger.debug("redis.cache_decode_failed error=%s", str(e))
         return False, None
 
@@ -320,19 +394,34 @@ def _cache_set_encoded(redis_client: Any, cache_key: str, result: Any, expire: i
         payload = json.dumps(_to_cacheable(result), ensure_ascii=False, default=str)
     except TypeError:
         return
-    except Exception as e:
+    except (ValueError, AttributeError) as e:
         logger.debug("redis.cache_encode_failed error=%s", str(e))
         return
     try:
         redis_client.set(cache_key, payload, ex=expire)
-    except Exception as e:
+    except _REDIS_ERRORS as e:
+        logger.debug("redis.cache_set_failed error=%s", str(e))
+
+
+async def _cache_aset_encoded(redis_client: Any, cache_key: str, result: Any, expire: int) -> None:
+    """异步 encode + set（await）；不可缓存类型跳过。"""
+    try:
+        payload = json.dumps(_to_cacheable(result), ensure_ascii=False, default=str)
+    except TypeError:
+        return
+    except (ValueError, AttributeError) as e:
+        logger.debug("redis.cache_encode_failed error=%s", str(e))
+        return
+    try:
+        await _await_if_needed(redis_client.set(cache_key, payload, ex=expire))
+    except _REDIS_ERRORS as e:
         logger.debug("redis.cache_set_failed error=%s", str(e))
 
 
 def cache(key_prefix: str, expire: int = 300):
     """Sync/async isomorphic cache decorator — get/set via Redis, JSON serialized.
 
-    Sync functions stay sync, async functions stay async (both use get_redis_sync).
+    Sync 函数走 get_redis_sync 同步 get/set；async 函数走 get_redis 异步 get/set（不阻塞 loop）。
     Key: hero:cache:{prefix}:{signature-ordered params} (self/cls dropped).
     Non-JSON-native results (e.g. DataFrame) skip caching fail-open.
 
@@ -346,18 +435,19 @@ def cache(key_prefix: str, expire: int = 300):
 
             @functools.wraps(func)
             async def async_wrapper(*args, **kwargs) -> Any:
+                # 中文：async 路径 await 异步客户端（sync get/set 会阻塞 loop 且协程永不命中）。
                 try:
                     cache_key = _cache_build_key(key_prefix, func, args, kwargs)
-                except Exception:
+                except (ValueError, TypeError, AttributeError):
                     return await func(*args, **kwargs)
-                redis_client = get_redis_sync()
+                redis_client = await get_redis()
                 if redis_client is not None:
-                    hit, val = _cache_get_decoded(redis_client, cache_key)
+                    hit, val = await _cache_aget_decoded(redis_client, cache_key)
                     if hit:
                         return val
                 result = await func(*args, **kwargs)
                 if redis_client is not None:
-                    _cache_set_encoded(redis_client, cache_key, result, expire)
+                    await _cache_aset_encoded(redis_client, cache_key, result, expire)
                 return result
 
             return async_wrapper
@@ -366,7 +456,7 @@ def cache(key_prefix: str, expire: int = 300):
         def sync_wrapper(*args, **kwargs) -> Any:
             try:
                 cache_key = _cache_build_key(key_prefix, func, args, kwargs)
-            except Exception:
+            except (ValueError, TypeError, AttributeError):
                 return func(*args, **kwargs)
             redis_client = get_redis_sync()
             if redis_client is not None:
@@ -386,8 +476,37 @@ def cache(key_prefix: str, expire: int = 300):
 # ── Distributed lock (ported) ──
 
 
+_RATELIMIT_LUA = """
+local key = KEYS[1]
+local now = tonumber(ARGV[1])
+local window = tonumber(ARGV[2])
+local limit = tonumber(ARGV[3])
+local member = ARGV[4]
+redis.call('ZREMRANGEBYSCORE', key, 0, now - window)
+local current = redis.call('ZCARD', key)
+if current >= limit then
+  return 0
+end
+redis.call('ZADD', key, now, member)
+redis.call('EXPIRE', key, window)
+return 1
+"""
+
+# 中文：锁释放 Lua（token 比对后删；过期后他人加锁时旧持有者不得误删）。
+_LOCK_RELEASE_LUA = "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end"
+
+
+async def _eval_or_fallback(client: Any, script: str, nkeys: int, *args: Any) -> Any:
+    """优先 eval 原子执行；fakeredis 不支持 eval 时按“单锁收拢”语义走兼容路径（调用方保证原子性）。"""
+    try:
+        res = client.eval(script, nkeys, *args)
+        return await _await_if_needed(res)
+    except _EVAL_ERRORS:
+        return None
+
+
 class RedisLock:
-    """Distributed lock via SET NX EX + DEL, async context manager."""
+    """Distributed lock via SET NX EX + token compare-del, async context manager."""
 
     def __init__(self, key_prefix: str = "hero:lock:"):
         self.key_prefix = key_prefix
@@ -400,14 +519,17 @@ class RedisLock:
             yield True
             return
         lock_key = f"{self.key_prefix}{key}"
+        # 中文：唯一 token 标识持有者（常量值曾导致过期后误删他人锁）。
+        token = f"{uuid.uuid4().hex}:{secrets.token_hex(8)}"
         acquired = False
         for _ in range(retry):
             try:
-                ok = await redis_client.set(lock_key, "1", nx=True, ex=timeout)
+                res = redis_client.set(lock_key, token, nx=True, ex=timeout)
+                ok = await _await_if_needed(res)
                 if ok:
                     acquired = True
                     break
-            except Exception as e:
+            except _REDIS_ERRORS as e:
                 logger.debug("redis.lock_set_failed error=%s", str(e))
                 break
             await asyncio.sleep(delay)
@@ -416,9 +538,14 @@ class RedisLock:
         try:
             yield True
         finally:
+            # 中文：token 比对后删（Lua）；eval 不可用时读比对后删（仍带 token 校验）。
             try:
-                await redis_client.delete(lock_key)
-            except Exception:
+                done = await _eval_or_fallback(redis_client, _LOCK_RELEASE_LUA, 1, lock_key, token)
+                if done is None:
+                    cur = await _await_if_needed(redis_client.get(lock_key))
+                    if cur == token:
+                        await _await_if_needed(redis_client.delete(lock_key))
+            except _REDIS_ERRORS:
                 pass
 
 
@@ -426,26 +553,37 @@ class RedisLock:
 
 
 class RateLimiter:
-    """Sliding window rate limiter via sorted set."""
+    """Sliding window rate limiter via sorted set（单 round-trip Lua 原子判定，防并发超发）。"""
 
     def __init__(self, key_prefix: str = _REDIS_PREFIX_RATELIMIT):
         self.key_prefix = key_prefix
+
+    def _lua_args(self, window_key: str, max_requests: int, window_seconds: int) -> tuple:
+        """构造 Lua 参数：成员唯一（uuid），同毫秒调用各自计数。"""
+        now = time.time()
+        member = f"{now}:{uuid.uuid4().hex}"
+        return (window_key, str(now), str(window_seconds), str(max_requests), member)
 
     async def try_acquire(self, key: str, max_requests: int, window_seconds: int = 60) -> bool:
         redis_client = await get_redis()
         if redis_client is None:
             return True  # No Redis — allow
         window_key = f"{self.key_prefix}{key}"
-        now = time.time()
         try:
-            await redis_client.zremrangebyscore(window_key, 0, now - window_seconds)
-            current = await redis_client.zcard(window_key)
-            if current >= max_requests:
+            res = await _eval_or_fallback(redis_client, _RATELIMIT_LUA, 1, *self._lua_args(window_key, max_requests, window_seconds))
+            if res is not None:
+                return bool(int(res))
+            # 中文：eval 不可用（fakeredis）时退化为“单锁收拢”本地判定：仍用唯一成员计数。
+            now = time.time()
+            member = f"{now}:{uuid.uuid4().hex}"
+            await _await_if_needed(redis_client.zremrangebyscore(window_key, 0, now - window_seconds))
+            current = await _await_if_needed(redis_client.zcard(window_key))
+            if int(current) >= max_requests:
                 return False
-            await redis_client.zadd(window_key, {str(now): now})
-            await redis_client.expire(window_key, window_seconds)
+            await _await_if_needed(redis_client.zadd(window_key, {member: now}))
+            await _await_if_needed(redis_client.expire(window_key, window_seconds))
             return True
-        except Exception as e:
+        except _REDIS_ERRORS as e:
             logger.debug("redis.ratelimit_failed error=%s", str(e))
             return True
 
@@ -455,16 +593,35 @@ class RateLimiter:
         if redis_client is None:
             return True
         window_key = f"{self.key_prefix}{key}"
-        now = time.time()
         try:
+            res = redis_client.eval(_RATELIMIT_LUA, 1, *self._lua_args(window_key, max_requests, window_seconds))
+            if res is not None:
+                return bool(int(res))
+            now = time.time()
+            member = f"{now}:{uuid.uuid4().hex}"
             redis_client.zremrangebyscore(window_key, 0, now - window_seconds)
             current = redis_client.zcard(window_key)
-            if current >= max_requests:
+            if int(current) >= max_requests:
                 return False
-            redis_client.zadd(window_key, {str(now): now})
+            redis_client.zadd(window_key, {member: now})
             redis_client.expire(window_key, window_seconds)
             return True
-        except Exception as e:
+        except _EVAL_ERRORS:
+            # 中文：eval 不可用（旧 fakeredis）时退化为唯一成员计数的本地判定。
+            try:
+                now = time.time()
+                member = f"{now}:{uuid.uuid4().hex}"
+                redis_client.zremrangebyscore(window_key, 0, now - window_seconds)
+                current = redis_client.zcard(window_key)
+                if int(current) >= max_requests:
+                    return False
+                redis_client.zadd(window_key, {member: now})
+                redis_client.expire(window_key, window_seconds)
+                return True
+            except _REDIS_ERRORS as e:
+                logger.debug("redis.ratelimit_sync_failed error=%s", str(e))
+                return True
+        except _REDIS_ERRORS as e:
             logger.debug("redis.ratelimit_sync_failed error=%s", str(e))
             return True
 
@@ -480,8 +637,8 @@ class Counter:
         if client is None:
             return 0
         try:
-            return int(await client.incr(key, amount))
-        except Exception as e:
+            return int(await _await_if_needed(client.incr(key, amount)))
+        except _REDIS_ERRORS as e:
             logger.debug("redis.counter_incr_failed error=%s", str(e))
             return 0
 
@@ -492,7 +649,7 @@ class Counter:
             return 0
         try:
             return int(client.incr(key, amount))
-        except Exception as e:
+        except _REDIS_ERRORS as e:
             logger.debug("redis.counter_incr_sync_failed error=%s", str(e))
             return 0
 
@@ -521,27 +678,29 @@ class RedisStream:
             # Ensure all values are strings for Redis
             str_data = {k: str(v) for k, v in data.items()}
             try:
-                return await client.xadd(stream, str_data, maxlen=self.STREAM_MAXLEN, approximate=True)
+                res = client.xadd(stream, str_data, maxlen=self.STREAM_MAXLEN, approximate=True)
+                return await _await_if_needed(res)
             except TypeError:
                 # Older fakeredis/redis without maxlen kwargs — plain xadd then trim
-                msg_id = await client.xadd(stream, str_data)
+                msg_id = await _await_if_needed(client.xadd(stream, str_data))
                 try:
-                    await client.xtrim(stream, maxlen=self.STREAM_MAXLEN, approximate=True)
-                except Exception:
+                    await _await_if_needed(client.xtrim(stream, maxlen=self.STREAM_MAXLEN, approximate=True))
+                except _REDIS_ERRORS:
                     pass
                 return msg_id
-        except Exception as e:
+        except _REDIS_ERRORS as e:
             logger.debug("redis.stream_publish_failed error=%s", str(e))
             return ""
 
-    async def publish_sync(self, stream: str, data: Dict[str, Any]) -> str:
+    def publish_sync(self, stream: str, data: Dict[str, Any]) -> str:
+        """同步发布（普通 def：同步 xadd，不阻塞事件循环）。"""
         client = get_redis_sync()
         if client is None:
             return ""
         try:
             str_data = {k: str(v) for k, v in data.items()}
             return client.xadd(stream, str_data)
-        except Exception as e:
+        except _REDIS_ERRORS as e:
             logger.debug("redis.stream_publish_sync_failed error=%s", str(e))
             return ""
 
@@ -559,18 +718,18 @@ class RedisStream:
             return []
         # Ensure the consumer group exists (idempotent; mkstream for first publish races)
         try:
-            await client.xgroup_create(stream, group, id="0", mkstream=True)
-        except Exception as e:
+            await _await_if_needed(client.xgroup_create(stream, group, id="0", mkstream=True))
+        except _REDIS_ERRORS as e:
             msg = str(e).lower()
             if "busygroup" not in msg and "exists" not in msg:
                 logger.debug("redis.stream_group_create_failed error=%s", str(e))
         try:
-            resp = await client.xreadgroup(group, consumer, {stream: ">"}, count=count, block=block)
-        except Exception as e:
+            resp = await _await_if_needed(client.xreadgroup(group, consumer, {stream: ">"}, count=count, block=block))
+        except _REDIS_ERRORS as e:
             logger.debug("redis.stream_xreadgroup_fallback error=%s", str(e))
             try:
-                resp = await client.xread({stream: "0"}, count=count, block=block)
-            except Exception as e2:
+                resp = await _await_if_needed(client.xread({stream: "0"}, count=count, block=block))
+            except _REDIS_ERRORS as e2:
                 logger.debug("redis.stream_xread_failed error=%s", str(e2))
                 return []
         out: list[tuple[str, Dict[str, Any]]] = []
@@ -578,7 +737,7 @@ class RedisStream:
             for _stream, messages in resp or []:
                 for msg_id, fields in messages:
                     out.append((msg_id if isinstance(msg_id, str) else str(msg_id), dict(fields)))
-        except Exception as e:
+        except (TypeError, ValueError, AttributeError) as e:
             logger.debug("redis.stream_parse_failed error=%s", str(e))
             return []
         return out
@@ -591,8 +750,8 @@ class RedisStream:
         if client is None:
             return 0
         try:
-            return int(await client.xack(stream, group, *ids))
-        except Exception as e:
+            return int(await _await_if_needed(client.xack(stream, group, *ids)))
+        except _REDIS_ERRORS as e:
             logger.debug("redis.stream_ack_failed error=%s", str(e))
             return 0
 

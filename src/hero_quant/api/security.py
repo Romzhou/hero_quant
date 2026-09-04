@@ -13,17 +13,12 @@ import hmac
 import inspect
 import logging
 import os
-import re
 import secrets
 import threading
 import time
 from typing import Any
 
-# 复用脱敏正则以无泄露方式判断凭据前缀是否存在（仅脱敏/日志用途，不用于鉴权放行）
-_BEARER_RE = re.compile(r"Bearer\s+[A-Za-z0-9\-_\.=~\+/]+=*", re.IGNORECASE)
-_SK_RE = re.compile(r"sk-[A-Za-z0-9]{10,}")
-_AKIA_RE = re.compile(r"AKIA[0-9A-Z]{16}")
-_JWT_RE = re.compile(r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}")
+# 中文：凭据形态正典在 hero_quant.security.redaction（本文件不重复定义死正则，避免分叉）。
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +42,7 @@ def _get_redis_for_ticket():
         from hero_quant.infra.redis import get_redis_sync
 
         return get_redis_sync()
-    except Exception as e:
+    except (ImportError, AttributeError, ValueError, TypeError, OSError, RuntimeError) as e:
         logger.debug("security.redis_unavailable error=%s", str(e))
         return None
 
@@ -88,50 +83,70 @@ def _consume_ticket_memory(ticket: str | None) -> bool:
 
 def issue_ticket(ttl: float = SSE_TICKET_TTL_SECONDS) -> str:
     """生成一个带 TTL 的随机单次票据 — 优先 Redis SET NX EX，原子且分布式。"""
+    # 中文：TTL 有界 fail-closed：非数值回退默认 60s；>3600 收敛 3600（防常驻票据）。
+    try:
+        ttl_int = int(ttl)
+    except (TypeError, ValueError):
+        ttl_int = SSE_TICKET_TTL_SECONDS
+    if ttl_int > 3600:
+        ttl_int = 3600
+    # 中文：ttl<=0 语义为立即过期（签发即不可消费；兼容旧契约，不落 Redis 避免 EX 非法）。
+    if ttl_int <= 0:
+        ticket = secrets.token_urlsafe(32)
+        return ticket
     ticket = secrets.token_urlsafe(32)
     r = _get_redis_for_ticket()
     if r is not None:
         try:
             key = f"{_REDIS_TICKET_PREFIX}{ticket}"
             # Use SET with NX+EX — fakeredis supports this; ensure decoded responses not needed for SET
-            ok = r.set(key, "1", nx=True, ex=int(ttl))
+            ok = r.set(key, "1", nx=True, ex=ttl_int)
             if ok:
                 return ticket
             # Extremely unlikely collision — retry once with new ticket
             ticket2 = secrets.token_urlsafe(32)
             key2 = f"{_REDIS_TICKET_PREFIX}{ticket2}"
-            r.set(key2, "1", nx=True, ex=int(ttl))
+            r.set(key2, "1", nx=True, ex=ttl_int)
             return ticket2
-        except Exception as e:
+        except (AttributeError, TypeError, ValueError, OSError, RuntimeError) as e:
             logger.warning("security.redis_issue_fallback_memory error=%s", str(e))
     # Fallback to memory
-    return _issue_ticket_memory(ttl)
+    return _issue_ticket_memory(ttl_int)
 
 
 def consume_ticket(ticket: str | None) -> bool:
-    """校验并消费票据 — 优先 Redis GET+DEL 原子语义，票据单次有效防重放。"""
+    """校验并消费票据 — 优先 Redis GETDEL 原子语义，票据单次有效防重放。
+
+    中文：fail-closed 且原子。优先服务端原子 GETDEL（fakeredis/redis-py 均支持）；
+    GETDEL 不可用才走 Lua；Redis 未命中回查内存（flap 时内存签发的票仍可消费）。
+    全程无裸 GET-then-DEL 回退（并发重放缺口）。
+    """
     if not ticket:
         return False
     r = _get_redis_for_ticket()
     if r is not None:
         try:
             key = f"{_REDIS_TICKET_PREFIX}{ticket}"
-            # Atomic GET+DEL via Lua if available, else pipeline
+            # 中文：原子 GETDEL（Redis>=6.2 语义，单 round-trip 防重放）。
             try:
-                # Lua: if exists then del and return 1 else 0 — atomic on real Redis
-                result = r.eval("if redis.call('get', KEYS[1]) then return redis.call('del', KEYS[1]) else return 0 end", 1, key)
-                return bool(result)
-            except Exception:
-                # Fallback: get then del (fakeredis eval may not behave)
-                val = r.get(key)
+                val = r.getdel(key)
                 if val is not None:
-                    try:
-                        r.delete(key)
-                    except Exception:
-                        pass
                     return True
-                return False
-        except Exception as e:
+            except (AttributeError, TypeError, ValueError, OSError, RuntimeError):
+                # 中文：无 getdel 的旧客户端走 Lua 原子比较删除。
+                try:
+                    result = r.eval(
+                        "if redis.call('get', KEYS[1]) then return redis.call('del', KEYS[1]) else return 0 end",
+                        1,
+                        key,
+                    )
+                    if bool(result):
+                        return True
+                except (AttributeError, TypeError, ValueError, OSError, RuntimeError):
+                    pass
+            # 中文：Redis 未命中回查内存（签发时 Redis 不可用→内存，恢复后仍可消费）。
+            return _consume_ticket_memory(ticket)
+        except (AttributeError, TypeError, ValueError, OSError, RuntimeError) as e:
             logger.warning("security.redis_consume_fallback_memory error=%s", str(e))
     return _consume_ticket_memory(ticket)
 
@@ -153,19 +168,23 @@ def _normalize_host(host: str) -> str:
     h = host.strip().lower()
     if not h:
         return ""
-    # IPv6 字面量 [::1]:8000 -> [::1] (keep brackets for consistent allowlist comparison)
+    # 中文：IPv6 字面量 [::1]:8000 -> [::1]；尾部非空且非 :数字端口时保留原样（fail-closed 失配）。
     if h.startswith("["):
         end = h.find("]")
         if end != -1:
             inner = h[1:end].strip()
-            return f"[{inner}]"
+            rest = h[end + 1 :].strip()
+            if rest == "":
+                return f"[{inner}]"
+            if rest.startswith(":") and rest[1:].isdigit():
+                return f"[{inner}]"
+            return h
         return h
-    # 普通 host 去端口：用 rsplit 避免破坏 IPv6（未加括号的 ::1 直接保留）
-    # 仅当最后一段为纯数字端口时才剥离
-    if ":" in h:
-        last = h.rsplit(":", 1)
-        if len(last) == 2 and last[1].isdigit():
-            return last[0]
+    # 中文：仅单冒号才可能是 host:port；多冒号为未加括号 IPv6，必须原样保留（::1 切勿按 rsplit 切）。
+    if h.count(":") == 1:
+        host_part, _, port = h.partition(":")
+        if port.isdigit():
+            return host_part
     return h
 
 
@@ -344,7 +363,7 @@ def verify_api_key(request: Any, expected_key: str | None = None) -> bool:
             if isinstance(host, str) and host.strip() in ("127.0.0.1", "::1", "localhost"):
                 return True
             return False
-        except Exception:
+        except (AttributeError, TypeError, ValueError):
             return False
     if expected_key is None:
         expected_key = os.environ.get("HERO_API_KEY", "")
