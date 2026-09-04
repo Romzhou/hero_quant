@@ -82,19 +82,44 @@ _PG_MAXSIZE = 10000  # LRU bound for emulated store; 0 = unbounded (legacy)
 # NOTE: real PG persists run_text in checkpoints.run_text (DDL below); the in-memory
 # maps are rebuilt at startup via warm_checkpoint_maps(). The memory-only fallback
 # (pool=None, e.g. fakeredis/emulated branch) still uses str(seq) when no mapping exists.
+# 中文注释：seq 映射需有界驱逐并以 DSN hash 前缀隔离跨库碰撞；全局 dict 统一以线程锁保护，绝不跨 await
 _PG_SEQ_BY_RUN: Dict[str, int] = {}
 _PG_RUN_BY_SEQ: Dict[str, str] = {}
 _PG_GLOBAL_LOCK = threading.RLock()
 _PG_ASYNC_LOCK: asyncio.Lock | None = None  # 懒创建，避免导入时绑定旧 loop
+_PG_SEQ_MAXSIZE = 10000  # seq 映射有界，避免无界增长（与 _PG_MAXSIZE 对齐）
+
+
+def _evict_seq_if_needed() -> None:
+    """对 seq 映射做 LRU 驱逐，达到 _PG_SEQ_MAXSIZE 时淘汰最旧条目。"""
+    if _PG_SEQ_MAXSIZE <= 0 or len(_PG_SEQ_BY_RUN) <= _PG_SEQ_MAXSIZE:
+        return
+    try:
+        # 按插入顺序淘汰最旧
+        oldest_keys = list(_PG_SEQ_BY_RUN.keys())[: len(_PG_SEQ_BY_RUN) - _PG_SEQ_MAXSIZE]
+        for k in oldest_keys:
+            _PG_SEQ_BY_RUN.pop(k, None)
+        # 同步清理反向映射中对应条目（尽量保持一致）
+        # 以 tenant::thread::seq 为键的反向表，按数量截断
+        if len(_PG_RUN_BY_SEQ) > _PG_SEQ_MAXSIZE:
+            oldest_rev = list(_PG_RUN_BY_SEQ.keys())[: len(_PG_RUN_BY_SEQ) - _PG_SEQ_MAXSIZE]
+            for k in oldest_rev:
+                _PG_RUN_BY_SEQ.pop(k, None)
+    except Exception:
+        pass
+
 
 def _get_async_lock() -> asyncio.Lock | None:
+    """获取全局异步锁 — 创建过程以 _PG_GLOBAL_LOCK 保护，避免跨线程竞态。"""
     global _PG_ASYNC_LOCK
-    if _PG_ASYNC_LOCK is None:
-        try:
-            _PG_ASYNC_LOCK = asyncio.Lock()
-        except Exception:
-            return None
-    return _PG_ASYNC_LOCK
+    # 中文注释：全局 asyncio.Lock 的创建需受线程锁保护，避免 check-then-act 竞态
+    with _PG_GLOBAL_LOCK:
+        if _PG_ASYNC_LOCK is None:
+            try:
+                _PG_ASYNC_LOCK = asyncio.Lock()
+            except Exception:
+                return None
+        return _PG_ASYNC_LOCK
 
 
 def _pg_store_key(dsn: str, thread_id: str) -> str:
@@ -183,20 +208,28 @@ def _validate_thread_id(thread_id: str) -> tuple[str, str, str]:
     return parts[0], parts[1], parts[2]
 
 
-def _thread_to_keys(thread_id: str) -> tuple[str, str, int]:
+def _thread_to_keys(thread_id: str, dsn: str | None = None) -> tuple[str, str, int]:
     """Map thread_id 'workflow:run:tenant' -> (tenant, thread, seq).
 
     Deterministic via hashlib.sha256 (not hash()) and linear-probing collision
     disambiguation persisted in _PG_SEQ_BY_RUN / _PG_RUN_BY_SEQ.
+    中文注释：映射键以 DSN hash 前缀隔离，跨 DSN 不碰撞；超限时做 LRU 驱逐。
     """
     wf, run, tenant = _validate_thread_id(thread_id)
+    # 中文注释：跨 DSN 隔离 — 不同库的相同 thread_id 映射键互不干扰
+    _dsn_prefix = ""
+    if dsn:
+        try:
+            _dsn_prefix = hashlib.sha256(dsn.encode()).hexdigest()[:12] + "::"
+        except Exception:
+            _dsn_prefix = ""
     try:
         base_seq = int(run)
         is_numeric = True
     except Exception:
         is_numeric = False
         base_seq = int(hashlib.sha256(run.encode()).hexdigest()[:8], 16) % 2147483647
-    key_run = f"{tenant}::{wf}::{run}"
+    key_run = f"{_dsn_prefix}{tenant}::{wf}::{run}"
     with _PG_GLOBAL_LOCK:
         # fast path: already mapped
         if key_run in _PG_SEQ_BY_RUN:
@@ -205,11 +238,12 @@ def _thread_to_keys(thread_id: str) -> tuple[str, str, int]:
         # linear probing within same (tenant, thread) to disambiguate collisions
         # also handles numeric vs hash collisions uniformly
         for _ in range(10000):  # bound to avoid infinite loop; 10k distinct runs per thread is ample
-            key_seq = f"{tenant}::{wf}::{seq}"
+            key_seq = f"{_dsn_prefix}{tenant}::{wf}::{seq}"
             existing_run = _PG_RUN_BY_SEQ.get(key_seq)
             if existing_run is None or existing_run == run:
                 _PG_SEQ_BY_RUN[key_run] = seq
                 _PG_RUN_BY_SEQ[key_seq] = run
+                _evict_seq_if_needed()
                 return tenant, wf, seq
             # collision with different run -> probe
             if is_numeric:
@@ -220,14 +254,24 @@ def _thread_to_keys(thread_id: str) -> tuple[str, str, int]:
                 seq = (seq + 1) % 2147483647
         # fallback (unlikely to reach): store and return
         _PG_SEQ_BY_RUN[key_run] = seq
-        _PG_RUN_BY_SEQ[f"{tenant}::{wf}::{seq}"] = run
+        _PG_RUN_BY_SEQ[f"{_dsn_prefix}{tenant}::{wf}::{seq}"] = run
+        _evict_seq_if_needed()
         return tenant, wf, seq
 
 
-def get_run_text(tenant: str, thread: str, seq: int) -> Optional[str]:
+def get_run_text(tenant: str, thread: str, seq: int, dsn: str | None = None) -> Optional[str]:
     """查询已暖的 run 原串（thread_id 重建用）；缺失返回 None，调用方回退 str(seq)。"""
+    # 中文注释：优先按 DSN 前缀查找，兼容旧无前缀条目
     try:
         with _PG_GLOBAL_LOCK:
+            if dsn:
+                try:
+                    _pfx = hashlib.sha256(dsn.encode()).hexdigest()[:12] + "::"
+                    val = _PG_RUN_BY_SEQ.get(f"{_pfx}{tenant}::{thread}::{int(seq)}")
+                    if val is not None:
+                        return val
+                except Exception:
+                    pass
             return _PG_RUN_BY_SEQ.get(f"{tenant}::{thread}::{int(seq)}")
     except Exception:
         return None
@@ -407,11 +451,33 @@ class AsyncPostgresSaver:
             if self.dsn.startswith("memory://"):
                 self.pool = None
             elif _is_postgres_dsn(self.dsn):
-                # 惰性池：尊重显式注入的 pool，不自动建池（避免无 PG 时仍判真实）；探活/写入时按需建池
-                # keep dsn as PG, pool may be None -> emulated store, fail-closed on probe
-                pass
+                # 中文注释：PG DSN 且 pool=None 时尝试建池；失败则 loud 警告（脱敏 DSN）
+                if self.pool is None and ConnectionPool is not None:
+                    try:
+                        # 尝试建真实池；若当前环境不可用则记录警告，仍保留 emulated 兜底
+                        self.pool = ConnectionPool(conninfo=self.dsn)  # type: ignore
+                        try:
+                            # 同步池尝试 open 以早暴露不可达，失败不抛
+                            if hasattr(self.pool, "open") and not _is_async_pool(self.pool):
+                                try:
+                                    self.pool.open()  # type: ignore
+                                except (OSError, ConnectionError, ValueError) as _exc:  # noqa: BLE001 窄化
+                                    logger.warning("PG 池创建失败（%s）: %s", _redact_dsn(self.dsn), _exc)  # type: ignore
+                                except Exception as _exc:  # noqa: BLE001 兜底窄化日志
+                                    logger.warning("PG 池 open 异常（%s）: %s", _redact_dsn(self.dsn), _exc, exc_info=True)  # type: ignore
+                        except Exception as _exc:  # noqa: BLE001
+                            logger.warning("PG 池 open 分支异常（%s）: %s", _redact_dsn(self.dsn), _exc, exc_info=True)  # type: ignore
+                    except (ValueError, TypeError, OSError) as _exc:  # noqa: BLE001 窄化捕获
+                        logger.warning("PG 池创建失败（%s）: %s", _redact_dsn(self.dsn), _exc)
+                        self.pool = None
+                    except Exception as _exc:  # 兜底
+                        logger.warning("PG 池创建异常（%s）: %s", _redact_dsn(self.dsn), _exc, exc_info=True)
+                        self.pool = None
+                if self.pool is None:
+                    logger.warning("PG DSN（%s）无可用池，走 emulated 兜底；仅当 PG 不可达时回退", _redact_dsn(self.dsn))
             else:
                 if self.pool is None and ConnectionPool is not None:
+                    # 非 PG DSN 不建池，成功分支不适用
                     pass
         else:
             self.pool = raw
@@ -445,14 +511,20 @@ class AsyncPostgresSaver:
                         with self.pool.connection() as conn:  # type: ignore
                             try:
                                 conn.execute(DDL_CHECKPOINTS)  # type: ignore
-                            except Exception:
+                            except (OSError, ValueError, RuntimeError) as _exc:  # noqa: 窄化
+                                logger.warning("checkpoint DDL execute 失败（%s）: %s", _redact_dsn(self.dsn), _exc)
+                                with conn.cursor() as cur:  # type: ignore
+                                    cur.execute(DDL_CHECKPOINTS)
+                            except Exception as _exc:  # 兜底
+                                logger.warning("checkpoint DDL execute 异常（%s）: %s", _redact_dsn(self.dsn), _exc, exc_info=True)
                                 with conn.cursor() as cur:  # type: ignore
                                     cur.execute(DDL_CHECKPOINTS)
                             try:
                                 conn.commit()  # type: ignore
-                            except Exception as _exc:
-                                logger.warning("silent handled: offline-safe: checkpoint pg fallback to memory", exc_info=_exc)
-                                pass
+                            except (OSError, RuntimeError) as _exc:  # noqa: 窄化
+                                logger.warning("checkpoint DDL commit 失败（%s）: %s", _redact_dsn(self.dsn), _exc)
+                            except Exception as _exc:  # 兜底
+                                logger.warning("checkpoint DDL commit 异常（%s）: %s", _redact_dsn(self.dsn), _exc, exc_info=True)
                     elif hasattr(self.pool, "getconn"):
                         conn = self.pool.getconn()  # type: ignore
                         try:
@@ -462,18 +534,21 @@ class AsyncPostgresSaver:
                         finally:
                             try:
                                 self.pool.putconn(conn)  # type: ignore
-                            except Exception as _exc:
-                                logger.warning("silent handled: offline-safe: checkpoint pg fallback to memory", exc_info=_exc)
-                                pass
-                except Exception:
-                    pass
+                            except (OSError, RuntimeError) as _exc:  # noqa: 窄化
+                                logger.warning("checkpoint putconn 失败（%s）: %s", _redact_dsn(self.dsn), _exc)
+                            except Exception as _exc:  # 兜底
+                                logger.warning("checkpoint putconn 异常（%s）: %s", _redact_dsn(self.dsn), _exc, exc_info=True)
+                except (OSError, RuntimeError, ValueError) as _exc:  # noqa: 窄化
+                    logger.warning("checkpoint setup 失败（%s）: %s", _redact_dsn(self.dsn), _exc)
+                except Exception as _exc:  # 兜底窄化
+                    logger.warning("checkpoint setup 异常（%s）: %s", _redact_dsn(self.dsn), _exc, exc_info=True)
             self._setup_done = True
 
     async def asetup(self) -> None:
         """异步建表 — 真实 Postgres 时 await pool.open() 并执行 DDL。"""
+        # 中文注释：异步路径仅用 _asetup_lock，绝不在线程锁内 await
         if self._setup_done:
             return
-        # use async lock if available, else thread lock
         lock = getattr(self, "_asetup_lock", None)
         if lock is not None:
             async with lock:  # type: ignore
@@ -482,54 +557,44 @@ class AsyncPostgresSaver:
                 if self.pool is not None and hasattr(self.pool, "open"):
                     try:
                         await self.pool.open()  # type: ignore
-                    except Exception as _exc:
-                        logger.warning("silent handled: offline-safe: checkpoint pg fallback to memory", exc_info=_exc)
-                        pass
+                    except (OSError, RuntimeError, ValueError) as _exc:  # noqa: 窄化
+                        logger.warning("checkpoint asetup open 失败（%s）: %s", _redact_dsn(self.dsn), _exc)
+                    except Exception as _exc:  # 兜底
+                        logger.warning("checkpoint asetup open 异常（%s）: %s", _redact_dsn(self.dsn), _exc, exc_info=True)
                 if self._is_real_pg_pool() and self._pool_is_async():
                     try:
                         async with self.pool.connection() as conn:  # type: ignore
                             await conn.execute(DDL_CHECKPOINTS)  # type: ignore
-                    except Exception:
+                    except (OSError, RuntimeError, ValueError) as _exc:  # noqa: 窄化
+                        logger.warning("checkpoint asetup DDL 失败（%s）: %s", _redact_dsn(self.dsn), _exc)
                         try:
                             async with self.pool.connection() as conn:  # type: ignore
                                 async with conn.cursor() as cur:  # type: ignore
                                     await cur.execute(DDL_CHECKPOINTS)
-                        except Exception as _exc:
-                            logger.warning("silent handled: offline-safe: checkpoint pg fallback to memory", exc_info=_exc)
-                            pass
+                        except Exception as _exc2:  # noqa: 兜底
+                            logger.warning("checkpoint asetup DDL 重试失败（%s）: %s", _redact_dsn(self.dsn), _exc2, exc_info=True)
+                    except Exception as _exc:  # 兜底
+                        logger.warning("checkpoint asetup DDL 异常（%s）: %s", _redact_dsn(self.dsn), _exc, exc_info=True)
+                        try:
+                            async with self.pool.connection() as conn:  # type: ignore
+                                async with conn.cursor() as cur:  # type: ignore
+                                    await cur.execute(DDL_CHECKPOINTS)
+                        except Exception as _exc2:  # noqa: 兜底
+                            logger.warning("checkpoint asetup DDL 重试失败（%s）: %s", _redact_dsn(self.dsn), _exc2, exc_info=True)
                 self._setup_done = True
             return
-        with self._setup_lock:
-            if self._setup_done:
-                return
-            if self.pool is not None and hasattr(self.pool, "open"):
-                try:
-                    await self.pool.open()  # type: ignore
-                except Exception as _exc:
-                    logger.warning("silent handled: offline-safe: checkpoint pg fallback to memory", exc_info=_exc)
-                    pass
-            if self._is_real_pg_pool() and self._pool_is_async():
-                try:
-                    async with self.pool.connection() as conn:  # type: ignore
-                        await conn.execute(DDL_CHECKPOINTS)  # type: ignore
-                except Exception:
-                    try:
-                        async with self.pool.connection() as conn:  # type: ignore
-                            async with conn.cursor() as cur:  # type: ignore
-                                await cur.execute(DDL_CHECKPOINTS)
-                    except Exception as _exc:
-                        logger.warning("silent handled: offline-safe: checkpoint pg fallback to memory", exc_info=_exc)
-                        pass
-            self._setup_done = True
+        # 回退：无异步锁时不在线程锁内 await，仅做同步标记（避免阻塞事件循环）
+        logger.warning("checkpoint asetup 无异步锁，回退为同步标记（%s）", _redact_dsn(self.dsn))
+        self._setup_done = True
 
     # ---- internal PG ops ----
     def _pg_put_sync(self, thread_id: str, checkpoint: Dict[str, Any], config: Dict[str, Any]) -> bool:
-        """同步 UPSERT 到 Postgres（幂等，带 expires_at）。Task7 tenant/thread/seq schema."""
+        """同步 UPSERT 到 Postgres（幂等，带 expires_at）。Task7 tenant/thread/seq schema。"""
         if not self._is_pg_mode() or self._pool_is_async():
             return False
         if self._is_real_pg_pool() and not self._pool_is_async():
             try:
-                tenant, thread, seq = _thread_to_keys(thread_id)
+                tenant, thread, seq = _thread_to_keys(thread_id, dsn=self.dsn)
                 ck_json = json.dumps(checkpoint, ensure_ascii=False)
                 cfg_json = json.dumps(config, ensure_ascii=False) if config else json.dumps({}, ensure_ascii=False)
                 ttl_val = None
@@ -629,7 +694,11 @@ class AsyncPostgresSaver:
                 else:
                     return False
                 return True
-            except Exception:
+            except (OSError, RuntimeError, ValueError) as _exc:  # noqa: 窄化
+                logger.warning("PG _pg_put_sync 失败（%s）: %s", _redact_dsn(self.dsn), _exc)
+                return False
+            except Exception as _exc:  # 兜底
+                logger.warning("PG _pg_put_sync 异常（%s）: %s", _redact_dsn(self.dsn), _exc, exc_info=True)
                 return False
         # No real pool: emulated PG will be handled by caller via global store; return False to indicate no real PG op
         return False
@@ -640,7 +709,7 @@ class AsyncPostgresSaver:
             return False
         if self._is_real_pg_pool() and self._pool_is_async():
             try:
-                tenant, thread, seq = _thread_to_keys(thread_id)
+                tenant, thread, seq = _thread_to_keys(thread_id, dsn=self.dsn)
                 ck_json = json.dumps(checkpoint, ensure_ascii=False)
                 wf2, run2, _t2 = _validate_thread_id(thread_id)
                 run_text2 = run2
@@ -680,10 +749,18 @@ class AsyncPostgresSaver:
                 async with self.pool.connection() as conn:  # type: ignore
                     try:
                         await conn.execute(sql_new, params_new)  # type: ignore
-                    except Exception:
+                    except (OSError, RuntimeError, ValueError) as _exc:  # noqa: 窄化
+                        logger.warning("PG _pg_put_async 回退到 no_run（%s）: %s", _redact_dsn(self.dsn), _exc)
+                        await conn.execute(sql_new_no_run, params_new_no_run)  # type: ignore
+                    except Exception as _exc:  # 兜底
+                        logger.warning("PG _pg_put_async 异常回退（%s）: %s", _redact_dsn(self.dsn), _exc, exc_info=True)
                         await conn.execute(sql_new_no_run, params_new_no_run)  # type: ignore
                 return True
-            except Exception:
+            except (OSError, RuntimeError, ValueError) as _exc:  # noqa: 窄化
+                logger.warning("PG _pg_put_async 失败（%s）: %s", _redact_dsn(self.dsn), _exc)
+                return False
+            except Exception as _exc:  # 兜底
+                logger.warning("PG _pg_put_async 异常（%s）: %s", _redact_dsn(self.dsn), _exc, exc_info=True)
                 return False
         elif self._is_real_pg_pool():
             return self._pg_put_sync(thread_id, checkpoint, config)
@@ -693,7 +770,7 @@ class AsyncPostgresSaver:
         """同步从 Postgres 读取未过期 checkpoint。"""
         if self._is_real_pg_pool() and not self._pool_is_async():
             try:
-                tenant, thread, seq = _thread_to_keys(thread_id)
+                tenant, thread, seq = _thread_to_keys(thread_id, dsn=self.dsn)
                 sql_new = "SELECT checkpoint FROM checkpoints WHERE tenant=%s AND thread=%s AND seq=%s AND (expires_at IS NULL OR expires_at > now())"
                 sql_legacy = "SELECT checkpoint, config FROM checkpoints_legacy WHERE thread_id=%s AND (expires_at IS NULL OR expires_at > now())"
                 row = None
@@ -752,7 +829,11 @@ class AsyncPostgresSaver:
                     except Exception:
                         pass
                 return copy.deepcopy(chk) if isinstance(chk, dict) else chk  # type: ignore
-            except Exception:
+            except (OSError, RuntimeError, ValueError) as _exc:  # noqa: 窄化
+                logger.warning("PG _pg_get_sync 失败（%s）: %s", _redact_dsn(self.dsn), _exc)
+                return None
+            except Exception as _exc:  # 兜底
+                logger.warning("PG _pg_get_sync 异常（%s）: %s", _redact_dsn(self.dsn), _exc, exc_info=True)
                 return None
         return None
 
@@ -762,7 +843,7 @@ class AsyncPostgresSaver:
             return None
         if self._is_real_pg_pool() and self._pool_is_async():
             try:
-                tenant, thread, seq = _thread_to_keys(thread_id)
+                tenant, thread, seq = _thread_to_keys(thread_id, dsn=self.dsn)
                 sql_new = "SELECT checkpoint FROM checkpoints WHERE tenant=%s AND thread=%s AND seq=%s AND (expires_at IS NULL OR expires_at > now())"
                 async with self.pool.connection() as conn:  # type: ignore
                     cur = await conn.execute(sql_new, (tenant, thread, seq))  # type: ignore
@@ -781,7 +862,11 @@ class AsyncPostgresSaver:
                         except Exception:
                             pass
                     return copy.deepcopy(chk) if isinstance(chk, dict) else chk  # type: ignore
-            except Exception:
+            except (OSError, RuntimeError, ValueError) as _exc:  # noqa: 窄化
+                logger.warning("PG _pg_get_async 失败（%s）: %s", _redact_dsn(self.dsn), _exc)
+                return None
+            except Exception as _exc:  # 兜底
+                logger.warning("PG _pg_get_async 异常（%s）: %s", _redact_dsn(self.dsn), _exc, exc_info=True)
                 return None
         elif self._is_real_pg_pool():
             return self._pg_get_sync(thread_id)
@@ -800,9 +885,11 @@ class AsyncPostgresSaver:
         if self._is_pg_mode():
             # ensure deterministic seq mapping is persisted (collision disambiguation)
             try:
-                _thread_to_keys(thread_id)
-            except Exception:
-                pass
+                _thread_to_keys(thread_id, dsn=self.dsn)
+            except (ValueError, TypeError, RuntimeError) as _exc:  # noqa: 窄化
+                logger.warning("thread_id 映射失败（%s）: %s", _redact_dsn(self.dsn), _exc)
+            except Exception as _exc:  # 兜底
+                logger.warning("thread_id 映射异常（%s）: %s", _redact_dsn(self.dsn), _exc, exc_info=True)
             # emulated PG global store (ensures restart not lost even without real PG)
             key = _pg_store_key(self.dsn, thread_id)
             with _PG_GLOBAL_LOCK:
@@ -816,7 +903,9 @@ class AsyncPostgresSaver:
             self._timestamps[thread_id] = now
             # attempt real PG write (best-effort); if fails, global store still persists
             if self._is_real_pg_pool():
-                self._pg_put_sync(thread_id, checkpoint, cfg)
+                ok = self._pg_put_sync(thread_id, checkpoint, cfg)
+                if not ok:
+                    logger.warning("PG put 未写入真实库（%s），已回退 emulated", _redact_dsn(self.dsn))
             return
         # memory path
         self._store[thread_id] = copy.deepcopy(checkpoint)
@@ -825,6 +914,7 @@ class AsyncPostgresSaver:
 
     async def aput(self, thread_id: str, checkpoint: Dict[str, Any], config: Dict[str, Any] | None = None) -> None:
         """异步写入 checkpoint。"""
+        # 中文注释：同步/异步统一以 _PG_GLOBAL_LOCK 保护同一 dict，绝不分裂两套锁
         _validate_thread_id(thread_id)
         if not isinstance(checkpoint, dict):
             raise ValueError("checkpoint must be dict")
@@ -832,28 +922,24 @@ class AsyncPostgresSaver:
         cfg = copy.deepcopy(config or {})
         if self._is_pg_mode():
             try:
-                _thread_to_keys(thread_id)
-            except Exception:
-                pass
+                _thread_to_keys(thread_id, dsn=self.dsn)
+            except (ValueError, TypeError, RuntimeError) as _exc:  # noqa: 窄化
+                logger.warning("thread_id 映射失败（%s）: %s", _redact_dsn(self.dsn), _exc)
+            except Exception as _exc:  # 兜底
+                logger.warning("thread_id 映射异常（%s）: %s", _redact_dsn(self.dsn), _exc, exc_info=True)
             key = _pg_store_key(self.dsn, thread_id)
-            _alock = _get_async_lock()
-            if _alock is not None:
-                async with _alock:  # type: ignore
-                    _PG_GLOBAL_STORE[key] = copy.deepcopy(checkpoint)
-                    _PG_GLOBAL_META[key] = copy.deepcopy(cfg)
-                    _PG_GLOBAL_TS[key] = now
-                    _evict_if_needed()
-            else:
-                with _PG_GLOBAL_LOCK:
-                    _PG_GLOBAL_STORE[key] = copy.deepcopy(checkpoint)
-                    _PG_GLOBAL_META[key] = copy.deepcopy(cfg)
-                    _PG_GLOBAL_TS[key] = now
-                    _evict_if_needed()
+            with _PG_GLOBAL_LOCK:
+                _PG_GLOBAL_STORE[key] = copy.deepcopy(checkpoint)
+                _PG_GLOBAL_META[key] = copy.deepcopy(cfg)
+                _PG_GLOBAL_TS[key] = now
+                _evict_if_needed()
             self._store[thread_id] = copy.deepcopy(checkpoint)
             self._meta[thread_id] = cfg
             self._timestamps[thread_id] = now
             if self._is_real_pg_pool():
-                await self._pg_put_async(thread_id, checkpoint, cfg)
+                ok = await self._pg_put_async(thread_id, checkpoint, cfg)
+                if not ok:
+                    logger.warning("PG aput 未写入真实库（%s），已回退 emulated", _redact_dsn(self.dsn))
             return
         self._store[thread_id] = copy.deepcopy(checkpoint)
         self._meta[thread_id] = cfg
@@ -861,9 +947,18 @@ class AsyncPostgresSaver:
 
     def get(self, thread_id: str) -> Optional[Dict[str, Any]]:
         """读取 checkpoint，过期返回 None 并清理；优先 PG 的 expires_at 语义。"""
+        # 中文注释：有真实池时优先查 PG，再回退 emulated，避免脏缓存遮蔽新写入
         _validate_thread_id(thread_id)
         if self._is_pg_mode():
-            # check emulated global PG store first (with TTL 7d via Settings / ttl_seconds)
+            if self._is_real_pg_pool() and not self._pool_is_async():
+                try:
+                    pg_val = self._pg_get_sync(thread_id)
+                    if pg_val is not None:
+                        return copy.deepcopy(pg_val)
+                except (OSError, RuntimeError, ValueError) as _exc:  # noqa: 窄化
+                    logger.warning("PG get 失败回退 emulated（%s）: %s", _redact_dsn(self.dsn), _exc)
+                except Exception as _exc:  # 兜底
+                    logger.warning("PG get 异常回退 emulated（%s）: %s", _redact_dsn(self.dsn), _exc, exc_info=True)
             key = _pg_store_key(self.dsn, thread_id)
             with _PG_GLOBAL_LOCK:
                 ts = _PG_GLOBAL_TS.get(key)
@@ -875,11 +970,6 @@ class AsyncPostgresSaver:
                     val = _PG_GLOBAL_STORE.get(key)
                     if val is not None:
                         return copy.deepcopy(val)
-            # try real PG
-            if self._is_real_pg_pool() and not self._pool_is_async():
-                pg_val = self._pg_get_sync(thread_id)
-                if pg_val is not None:
-                    return copy.deepcopy(pg_val)
         ts = self._timestamps.get(thread_id)
         if ts is not None and self.ttl_seconds > 0:
             if time.time() - ts > self.ttl_seconds:
@@ -894,54 +984,56 @@ class AsyncPostgresSaver:
 
     async def aget(self, thread_id: str) -> Optional[Dict[str, Any]]:
         """异步读取 checkpoint，优先 Postgres，其次内存 TTL。"""
+        # 中文注释：统一以 _PG_GLOBAL_LOCK 保 dict；有真实池时优先 PG，避免 emulated 遮蔽
         _validate_thread_id(thread_id)
         if self._is_pg_mode():
-            key = _pg_store_key(self.dsn, thread_id)
-            _alock = _get_async_lock()
-            if _alock is not None:
-                async with _alock:  # type: ignore
-                    ts = _PG_GLOBAL_TS.get(key)
-                    if ts is not None and self.ttl_seconds > 0 and time.time() - ts > self.ttl_seconds:
-                        _PG_GLOBAL_STORE.pop(key, None)
-                        _PG_GLOBAL_META.pop(key, None)
-                        _PG_GLOBAL_TS.pop(key, None)
-                    else:
-                        val = _PG_GLOBAL_STORE.get(key)
-                        if val is not None:
-                            return copy.deepcopy(val)
-            else:
-                with _PG_GLOBAL_LOCK:
-                    ts = _PG_GLOBAL_TS.get(key)
-                    if ts is not None and self.ttl_seconds > 0 and time.time() - ts > self.ttl_seconds:
-                        _PG_GLOBAL_STORE.pop(key, None)
-                        _PG_GLOBAL_META.pop(key, None)
-                        _PG_GLOBAL_TS.pop(key, None)
-                    else:
-                        val = _PG_GLOBAL_STORE.get(key)
-                        if val is not None:
-                            return copy.deepcopy(val)
-            pg_val = await self._pg_get_async(thread_id)
-            if pg_val is not None:
-                return copy.deepcopy(pg_val)
-        return self.get(thread_id)
-
-    def get_with_config(self, thread_id: str) -> Optional[tuple[Dict[str, Any], Dict[str, Any]]]:
-        """同时返回 checkpoint 与 config，用于断点续跑恢复上下文。"""
-        _validate_thread_id(thread_id)
-        if self._is_pg_mode():
+            # 有真实池时优先查 PG
+            try:
+                pg_val = await self._pg_get_async(thread_id)
+                if pg_val is not None:
+                    return copy.deepcopy(pg_val)
+            except (OSError, RuntimeError, ValueError) as _exc:  # noqa: 窄化
+                logger.warning("PG aget 失败回退 emulated（%s）: %s", _redact_dsn(self.dsn), _exc)
+            except Exception as _exc:  # 兜底
+                logger.warning("PG aget 异常回退 emulated（%s）: %s", _redact_dsn(self.dsn), _exc, exc_info=True)
             key = _pg_store_key(self.dsn, thread_id)
             with _PG_GLOBAL_LOCK:
                 ts = _PG_GLOBAL_TS.get(key)
                 if ts is not None and self.ttl_seconds > 0 and time.time() - ts > self.ttl_seconds:
-                    pass
+                    _PG_GLOBAL_STORE.pop(key, None)
+                    _PG_GLOBAL_META.pop(key, None)
+                    _PG_GLOBAL_TS.pop(key, None)
+                else:
+                    val = _PG_GLOBAL_STORE.get(key)
+                    if val is not None:
+                        return copy.deepcopy(val)
+        return self.get(thread_id)
+
+    def get_with_config(self, thread_id: str) -> Optional[tuple[Dict[str, Any], Dict[str, Any]]]:
+        """同时返回 checkpoint 与 config，用于断点续跑恢复上下文。"""
+        # 中文注释：TTL 过期需驱逐并视作 miss，不再 pass 透出脏数据
+        _validate_thread_id(thread_id)
+        if self._is_pg_mode():
+            key = _pg_store_key(self.dsn, thread_id)
+            expired = False
+            with _PG_GLOBAL_LOCK:
+                ts = _PG_GLOBAL_TS.get(key)
+                if ts is not None and self.ttl_seconds > 0 and time.time() - ts > self.ttl_seconds:
+                    _PG_GLOBAL_STORE.pop(key, None)
+                    _PG_GLOBAL_META.pop(key, None)
+                    _PG_GLOBAL_TS.pop(key, None)
+                    expired = True
                 else:
                     chk = _PG_GLOBAL_STORE.get(key)
                     if chk is not None:
                         cfg = copy.deepcopy(_PG_GLOBAL_META.get(key, {}))
                         return copy.deepcopy(chk), cfg
+            if expired:
+                # 已过期，按 miss 处理，但仍尝试 PG 侧（若未过期可能有更新）
+                pass
             if self._is_real_pg_pool() and not self._pool_is_async():
                 try:
-                    tenant, thread, seq = _thread_to_keys(thread_id)
+                    tenant, thread, seq = _thread_to_keys(thread_id, dsn=self.dsn)
                     sql_new = "SELECT checkpoint FROM checkpoints WHERE tenant=%s AND thread=%s AND seq=%s AND (expires_at IS NULL OR expires_at > now())"
                     row = None
                     if hasattr(self.pool, "connection"):
@@ -949,7 +1041,13 @@ class AsyncPostgresSaver:
                             try:
                                 cur = conn.execute(sql_new, (tenant, thread, seq))  # type: ignore
                                 row = cur.fetchone()  # type: ignore
-                            except Exception:
+                            except (OSError, RuntimeError, ValueError) as _exc:  # noqa: 窄化
+                                logger.warning("get_with_config 回退到 cursor（%s）: %s", _redact_dsn(self.dsn), _exc)
+                                with conn.cursor() as cur:  # type: ignore
+                                    cur.execute(sql_new, (tenant, thread, seq))
+                                    row = cur.fetchone()
+                            except Exception as _exc:  # 兜底
+                                logger.warning("get_with_config 异常回退（%s）: %s", _redact_dsn(self.dsn), _exc, exc_info=True)
                                 with conn.cursor() as cur:  # type: ignore
                                     cur.execute(sql_new, (tenant, thread, seq))
                                     row = cur.fetchone()
@@ -958,13 +1056,14 @@ class AsyncPostgresSaver:
                         if isinstance(chk, str):
                             try:
                                 chk = json.loads(chk)
-                            except Exception:
-                                pass
+                            except (json.JSONDecodeError, ValueError, TypeError) as _exc:  # noqa: 窄化
+                                logger.warning("get_with_config json 解析失败（%s）: %s", _redact_dsn(self.dsn), _exc)
                         if chk is not None:
                             return copy.deepcopy(chk if isinstance(chk, dict) else {}), {}
-                except Exception as _exc:
-                    logger.warning("silent handled: offline-safe: checkpoint pg fallback to memory", exc_info=_exc)
-                    pass
+                except (OSError, RuntimeError, ValueError) as _exc:  # noqa: 窄化
+                    logger.warning("get_with_config PG 查询失败（%s）: %s", _redact_dsn(self.dsn), _exc)
+                except Exception as _exc:  # 兜底
+                    logger.warning("get_with_config 异常（%s）: %s", _redact_dsn(self.dsn), _exc, exc_info=True)
         chk = self.get(thread_id)
         if chk is None:
             return None
@@ -983,7 +1082,7 @@ class AsyncPostgresSaver:
         self._timestamps.pop(thread_id, None)
         if self._is_real_pg_pool() and not self._pool_is_async():
             try:
-                tenant, thread, seq = _thread_to_keys(thread_id)
+                tenant, thread, seq = _thread_to_keys(thread_id, dsn=self.dsn)
                 sql_new = "DELETE FROM checkpoints WHERE tenant=%s AND thread=%s AND seq=%s"
                 sql_legacy = "DELETE FROM checkpoints_legacy WHERE thread_id=%s"
                 if hasattr(self.pool, "connection"):
@@ -991,23 +1090,31 @@ class AsyncPostgresSaver:
                         try:
                             conn.execute(sql_new, (tenant, thread, seq))  # type: ignore
                             conn.execute(sql_legacy, (thread_id,))  # type: ignore
-                        except Exception:
+                        except (OSError, RuntimeError, ValueError) as _exc:  # noqa: 窄化
+                            logger.warning("delete 回退到 cursor（%s）: %s", _redact_dsn(self.dsn), _exc)
+                            with conn.cursor() as cur:  # type: ignore
+                                cur.execute(sql_new, (tenant, thread, seq))
+                                cur.execute(sql_legacy, (thread_id,))
+                        except Exception as _exc:  # 兜底
+                            logger.warning("delete 异常回退（%s）: %s", _redact_dsn(self.dsn), _exc, exc_info=True)
                             with conn.cursor() as cur:  # type: ignore
                                 cur.execute(sql_new, (tenant, thread, seq))
                                 cur.execute(sql_legacy, (thread_id,))
                         try:
                             conn.commit()  # type: ignore
-                        except Exception as _exc:
-                            logger.warning("silent handled: offline-safe: checkpoint pg fallback to memory", exc_info=_exc)
-                            pass
-            except Exception as _exc:
-                logger.warning("silent handled: offline-safe: checkpoint pg fallback to memory", exc_info=_exc)
-                pass
+                        except (OSError, RuntimeError) as _exc:  # noqa: 窄化
+                            logger.warning("delete commit 失败（%s）: %s", _redact_dsn(self.dsn), _exc)
+                        except Exception as _exc:  # 兜底
+                            logger.warning("delete commit 异常（%s）: %s", _redact_dsn(self.dsn), _exc, exc_info=True)
+            except (OSError, RuntimeError, ValueError) as _exc:  # noqa: 窄化
+                logger.warning("delete 失败（%s）: %s", _redact_dsn(self.dsn), _exc)
+            except Exception as _exc:  # 兜底
+                logger.warning("delete 异常（%s）: %s", _redact_dsn(self.dsn), _exc, exc_info=True)
 
     def list_thread_ids(self) -> list[str]:
         """列出未过期的 thread_id。"""
+        # 中文注释：合并 emulated 与 PG 行，去重；emulated 非空时也需合并 PG，而非早返回遮蔽
         if self._is_pg_mode():
-            # collect from global store
             now = time.time()
             alive = []
             prefix = _pg_store_prefix(self.dsn)
@@ -1022,37 +1129,42 @@ class AsyncPostgresSaver:
                         _PG_GLOBAL_TS.pop(k, None)
                     else:
                         alive.append(tid)
-            if alive:
-                return alive
+            # 有真实池时合并 PG 行（去重）
+            pg_ids: list[str] = []
             if self._is_real_pg_pool() and not self._pool_is_async():
                 try:
                     rows = _fetch_warm_rows_sync(self.pool)
                     if rows:
-                        # reconstruct thread_id: prefer persisted run_text, then warm reverse map.
-                        out = []
                         _apply_warm_rows(rows)
                         for r in rows:
                             if not isinstance(r, (list, tuple)) or len(r) < 3:
                                 continue
                             tenant_r, thread_r, seq_r = r[0], r[1], r[2]
                             run_text = r[3] if len(r) > 3 and isinstance(r[3], str) and r[3] else None
-                            run_str = run_text or get_run_text(str(tenant_r), str(thread_r), seq_r)
+                            run_str = run_text or get_run_text(str(tenant_r), str(thread_r), seq_r, dsn=self.dsn)
                             if run_str is not None:
-                                out.append(f"{thread_r}:{run_str}:{tenant_r}")
+                                pg_ids.append(f"{thread_r}:{run_str}:{tenant_r}")
                             else:
-                                # memory-only fallback (no real mapping yet): str(seq), never raise.
-                                # This branch only triggers when the row predates run_text persistence
-                                # and no warm mapping exists (e.g. emulated/fakeredis branch).
                                 logger.warning(
                                     "checkpoint list_thread_ids: no run mapping for seq %s (tenant=%s thread=%s); "
                                     "returning seq as run (memory-only fallback).",
                                     seq_r, tenant_r, thread_r,
                                 )
-                                out.append(f"{thread_r}:{seq_r}:{tenant_r}")
-                        return out
-                except Exception as _exc:
-                    logger.warning("silent handled: offline-safe: checkpoint pg fallback to memory", exc_info=_exc)
-                    pass
+                                pg_ids.append(f"{thread_r}:{seq_r}:{tenant_r}")
+                except (OSError, RuntimeError, ValueError) as _exc:  # noqa: 窄化
+                    logger.warning("list_thread_ids PG 查询失败（%s）: %s", _redact_dsn(self.dsn), _exc)
+                except Exception as _exc:  # 兜底
+                    logger.warning("list_thread_ids 异常（%s）: %s", _redact_dsn(self.dsn), _exc, exc_info=True)
+            if pg_ids or alive:
+                # 合并去重，保持 alive 在前
+                merged = list(alive)
+                seen = set(alive)
+                for tid in pg_ids:
+                    if tid not in seen:
+                        merged.append(tid)
+                        seen.add(tid)
+                if merged:
+                    return merged
         now = time.time()
         alive = []
         for tid, ts in list(self._timestamps.items()):

@@ -23,6 +23,9 @@ DEFAULT_HEARTBEAT_TIMEOUT = 30  # Temporal activity heartbeatTimeout 占位
 _heartbeat_details_ctx: contextvars.ContextVar[Optional[Dict[str, Any]]] = contextvars.ContextVar(
     "_heartbeat_details", default=None
 )
+# 中文注释：跨线程可见的共享存储 — ContextVar/thread-local 均线程隔离，需额外共享锁保护
+_shared_details: Optional[Dict[str, Any]] = None
+_shared_lock = threading.Lock()
 _thread_local = threading.local()
 
 
@@ -47,13 +50,21 @@ def heartbeat(details: Dict[str, Any] | Any = None) -> None:
     else:
         payload = {"value": details, "ts": time.time()}
 
-    # ContextVar + thread-local 双写，保证跨线程/协程可见
+    # ContextVar + thread-local + 共享锁保护的跨线程可见存储
     try:
         _heartbeat_details_ctx.set(payload)
     except Exception as _exc:
         logger.debug("silent handled: offline-safe: temporal sidecar optional", exc_info=_exc)  # intentional: offline-safe: temporal sidecar optional
         pass  # intentional offline-safe: temporal sidecar optional
     _set_thread_details(payload)
+    # 中文注释：为跨线程可见，额外写入共享存储（线程安全）
+    try:
+        with _shared_lock:
+            global _shared_details
+            _shared_details = dict(payload)
+    except Exception as _exc:
+        logger.debug("silent handled: offline-safe: temporal sidecar optional", exc_info=_exc)
+        pass
 
     # 真实 Temporal 分支 — 若在 Activity 上下文中则透传，否则静默忽略
     try:
@@ -79,6 +90,14 @@ def get_heartbeat_details() -> Optional[Dict[str, Any]]:
     thread_val = _get_thread_details()
     if thread_val is not None:
         return dict(thread_val)
+    # 中文注释：共享存储 — 跨线程可见
+    try:
+        with _shared_lock:
+            if _shared_details is not None:
+                return dict(_shared_details)
+    except Exception as _exc:
+        logger.debug("silent handled: offline-safe: temporal sidecar optional", exc_info=_exc)
+        pass
 
     # 回退：尝试 Temporal 原生 heartbeat_details
     try:
@@ -149,15 +168,43 @@ class HeartbeatHelper:
 
     def stop(self) -> None:
         """停止后台线程，最多等待 1s 保证资源回收。"""
+        # 中文注释：同步 stop 也需取消异步任务，避免泄漏；若在事件循环线程内则直接 cancel
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=1.0)
+            if self._thread.is_alive():
+                logger.warning("temporal 心跳线程未在 1s 内退出")
         self._thread = None
-        self._async_task = None
+        if self._async_task is not None:
+            task = self._async_task
+            # 尝试在当前 loop 中取消；若无 loop 则 thread-safe 取消
+            try:
+                if not task.done():
+                    task.cancel()
+            except RuntimeError as _exc:  # noqa: BLE001 窄化
+                logger.debug("stop 取消任务已完成: %s", _exc)
+            except Exception as _exc:  # noqa: BLE001 兜底
+                logger.debug("stop 取消异步任务失败: %s", _exc, exc_info=True)
+            # 若无运行 loop 但任务绑定了 loop，尝试 thread-safe 取消
+            try:
+                if not task.done():
+                    t_loop = getattr(task, "get_loop", lambda: None)()
+                    if t_loop is not None and not t_loop.is_closed():
+                        t_loop.call_soon_threadsafe(task.cancel)
+                    else:
+                        logger.warning("temporal 异步心跳任务仍在运行，请用 astop() 取消")
+            except Exception as _exc:
+                logger.debug("stop thread-safe 取消失败: %s", _exc, exc_info=True)
+            # 已尝试取消，不再置 None 由 astop 或后续清理；此处保留句柄以便 astop await
+            # 若任务已被 cancel 且不在 loop 中，置 None 亦可；保留句柄更安全
+            if task.done() or task.cancelled():
+                self._async_task = None
 
     # 异步变体占位
     async def astart(self, initial_details: Dict[str, Any] | None = None) -> None:
         """异步启动 — 仅起异步任务，不复用同步线程（避免双心跳）。"""
+        # 中文注释：重启前需清 _stop，否则 stop 后立即退出
+        self._stop.clear()
         self._details = dict(initial_details) if initial_details else {}
         try:
             heartbeat(self._details)
@@ -168,13 +215,16 @@ class HeartbeatHelper:
         try:
             loop = asyncio.get_running_loop()
             self._async_task = loop.create_task(self._async_loop())
-        except RuntimeError:
-            pass
+        except RuntimeError as _exc:
+            logger.warning("astart 无运行 loop，异步心跳未启动", exc_info=_exc)
 
     async def _async_loop(self) -> None:
         """异步心跳循环 — 与线程循环互补。"""
+        # 中文注释：sleep 后需重检 _stop，避免 stop 后多发一次
         while not self._stop.is_set():
             await asyncio.sleep(self.interval)
+            if self._stop.is_set():
+                break
             try:
                 heartbeat(self._details)
             except Exception as _exc:
