@@ -51,10 +51,30 @@ def estimate_tokens(text: Any) -> int:
         return max(0, len(text) // 4)
     if text is None:
         return 0
-    try:
-        # Handle bytes, bytearray, etc. safely
-        if isinstance(text, (bytes, bytearray)):
+    # 中文：bytes 需先解码再计字符
+    if isinstance(text, (bytes, bytearray)):
+        try:
             return max(0, len(text.decode("utf-8", errors="ignore")) // 4)
+        except Exception as exc:
+            logging.getLogger(__name__).debug("estimate_tokens bytes decode failed: %s", exc)
+            return max(0, len(str(text)) // 4)
+    # 中文：dict 需 JSON 序列化后计长度，避免 len(dict)//4 少计
+    if isinstance(text, dict):
+        import json as _js
+
+        try:
+            dumped = _js.dumps(text, ensure_ascii=False, default=str)
+            if not isinstance(dumped, str):
+                dumped = str(dumped)
+            return max(0, len(dumped) // 4)
+        except Exception as exc:
+            logging.getLogger(__name__).warning("estimate_tokens dict dump failed: %s", exc, exc_info=True)
+            try:
+                return max(0, len(str(text)) // 4)
+            except Exception as exc2:
+                logging.getLogger(__name__).warning("estimate_tokens str fallback failed: %s", exc2, exc_info=True)
+                return 0
+    try:
         return max(0, len(text) // 4)  # type: ignore[arg-type]
     except Exception as exc:
         logging.getLogger(__name__).debug("estimate_tokens len failed for %r: %s", type(text).__name__, exc)
@@ -814,6 +834,9 @@ class AgentLoop:
             # 5) 累积流式增量、更新 token 计数并收集工具调用
             tool_calls_this_iter: List[Dict[str, Any]] = []
             _chunk_error: Optional[Exception] = None
+            # 中文：记录本轮起始长度，重试时回滚避免重复拼 partial
+            _iter_start_len = len(buffer)
+            _iter_start_token_count = token_count
             try:
                 for chunk in stream:  # type: ignore[union-attr]
                     # chunk 可能是 dict/str/对象，需分别处理
@@ -937,6 +960,12 @@ class AgentLoop:
                     except Exception:
                         should = False
                 if should:
+                    # 中文：回滚本轮已追加的 partial，避免重试重复拼
+                    try:
+                        buffer = buffer[:_iter_start_len]
+                        token_count = _iter_start_token_count
+                    except Exception:
+                        pass
                     try:
                         if retry_policy is not None:
                             retry_policy.sleep(iterations)
@@ -1041,7 +1070,17 @@ class AgentLoop:
                             import json as _json
 
                             args = _json.loads(args) if args.strip() else {}
-                        except Exception:
+                        except Exception as _je:
+                            # 中文：记录坏 JSON 细节并落 trace，fail-visible
+                            try:
+                                logging.getLogger(__name__).warning("tool %s bad JSON args %r: %s", tool_name, args[:500], _je)
+                            except Exception:
+                                pass
+                            if trace_writer is not None:
+                                try:
+                                    trace_writer.append({"type": "tool_args_error", "iteration": iterations, "tool": tool_name, "error": str(_je)})
+                                except Exception:
+                                    pass
                             args = {}
                     if not isinstance(args, dict):
                         args = {"value": args}
@@ -1194,9 +1233,11 @@ class AgentLoop:
 
                 # 并发执行只读工具
                 if concurrent_items:
-                    # 线程数不超过并发项数量且上限 8，避免过度并发
+                    # 中文：线程数不超过并发项数量且上限 8，避免过度并发
                     max_workers = min(len(concurrent_items), 8)
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    # 中文：不用 with（其 exit 会 wait=True 阻塞），手动管理并 wait=False
+                    executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
+                    try:
                         future_map: Dict[Any, Dict[str, Any]] = {}
                         for item in concurrent_items:
                             fut = executor.submit(_exec_spec, item["spec"], item["args"])
@@ -1211,9 +1252,12 @@ class AgentLoop:
                                 else:
                                     res, err = fut.result()
                             except concurrent.futures.TimeoutError as e:
-                                # 超时转为 tool_error: timeout
+                                # 中文：超时转为 tool_error，非阻塞收集
                                 res, err = f"tool_error: timeout after {t_ms}ms", e
-                                # NOTE: fut.cancel() is ineffective once the thread is running; do not pretend to stop work.
+                                try:
+                                    fut.cancel()
+                                except Exception:
+                                    pass
                             except (KeyboardInterrupt, SystemExit, GeneratorExit):
                                 raise
                             except Exception as e:
@@ -1223,6 +1267,15 @@ class AgentLoop:
                         for item in concurrent_items:
                             res, err = results_map[str(id(item))]
                             _handle_result(item["tool_name"], res, err)
+                    finally:
+                        # 中文：非阻塞关闭，超时线程不阻塞主循环
+                        try:
+                            executor.shutdown(wait=False, cancel_futures=True)
+                        except TypeError:
+                            try:
+                                executor.shutdown(wait=False)
+                            except Exception:
+                                pass
 
                 # 串行执行写工具/非安全工具
                 for item in serial_items:

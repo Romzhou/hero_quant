@@ -11,17 +11,18 @@ checkpointer 复用 HERO_CHECKPOINT_DSN 经 checkpoint.postgres.get_saver
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import os
+import threading
 from typing import Any, List, Optional
 
 from pydantic import BaseModel, ConfigDict
 
 logger = logging.getLogger(__name__)
 
-_init_lock = asyncio.Lock()
-_graph_lock = asyncio.Lock()
+# 中文：sync 初始化需用 threading.Lock，asyncio.Lock 不能在 sync 场景下 await
+_init_lock = threading.Lock()
+_graph_lock = threading.Lock()
 
 
 class AgentState(BaseModel):
@@ -121,13 +122,18 @@ class AgentContainer:
         """初始化 Agent Graph（幂等：重复调用返回同一编译产物）。"""
         if self.graph is not None:
             return self.graph
-        try:
-            self.init_checkpointer()
-        except Exception:
-            pass
-        self.graph = _build_agent_graph(self.checkpointer)
-        logger.info("agent graph compiled")
-        return self.graph
+        # 中文：双检锁保证并发下仅编译一次
+        with _graph_lock:
+            if self.graph is not None:
+                return self.graph
+            try:
+                self.init_checkpointer()
+            except Exception as exc:
+                # 中文：窄化捕获并记录，避免静默丢错
+                logger.warning("agent checkpointer init failed, using bare graph: %s", exc)
+            self.graph = _build_agent_graph(self.checkpointer)
+            logger.info("agent graph compiled")
+            return self.graph
 
 
 def inject_agent_container(app, container: AgentContainer | None = None) -> AgentContainer:

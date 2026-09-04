@@ -5,7 +5,7 @@
 关键设计：
 - 真并行扇出：plan 节点返回 Command(goto=[Send(...)]) 驱动多 analyst 并发
 - 归约合并：verify 通过 Annotated[list, add] 归约多路输出，delegationDepth 限 5 防递归
-- 容错与预算：BudgetBreaker 做成本熔断（线程安全 Lock 保护）；execute/compensate 为遗留占位已移除
+- 容错与预算：BudgetBreaker 做成本熔断（内部 Lock 保护）；execute/compensate 为遗留占位已移除
 """
 
 from __future__ import annotations
@@ -15,6 +15,8 @@ import logging
 import threading
 import warnings
 from typing import Dict, Any, List
+
+_threading_ref = threading.Lock
 
 try:
     from langgraph.graph import StateGraph, START, END
@@ -32,16 +34,7 @@ except ImportError:
         warnings.warn(f"LangGraph Command/Send import failed: {e}", stacklevel=2)
         raise
 
-# 叶节点语义：优先 LangChain create_agent，回落占位
-try:
-    from langchain.agents import create_agent  # type: ignore  # LangChain 1.x
-except ImportError:
-    try:
-        from langgraph.prebuilt import create_react_agent as create_agent  # type: ignore
-    except ImportError:
-        create_agent = None  # type: ignore
-
-from .state import State
+from .state import State  # noqa: E402
 
 # 策略占位：优雅降级与成本熔断，按需导入
 try:
@@ -53,8 +46,7 @@ except ImportError as e:  # pragma: no cover - narrow
 # 委派深度上限，防无限递归
 MAX_DELEGATION_DEPTH = 5
 
-# 全局成本熔断器（滑动窗口）占位 + 线程锁
-_breaker_lock = threading.Lock()
+# 全局成本熔断器（滑动窗口）占位；线程安全由 BudgetBreaker 内部 _lock 提供，无需外层锁
 _breaker = None
 try:
     if BudgetBreaker is not None:
@@ -77,20 +69,24 @@ _ALIAS_MAP = {
     "risk": "risk",
 }
 
-# Phase 1: 5 投研角色与工具绑定（过滤 TOOL_REGISTRY）
+# Phase 1: 7 投研角色与工具绑定（过滤 TOOL_REGISTRY）
 _ROLE_TOOL_MAP: dict[str, list[str]] = {
     "market": ["get_market_data", "get_bars_range", "list_markets", "compute_indicator", "compute_sharpe", "compute_drawdown", "compute_correlation"],
+    "sentiment": ["search_symbols", "search_symbol"],
     "news": ["search_symbols", "search_symbol"],
     "fundamentals": ["get_ticker_info", "get_fundamentals"],
     "factor": ["compute_factor", "screen_factors", "compute_indicator"],
+    "regime": ["compute_indicator", "compute_correlation"],
     "risk": ["validate_backtest", "get_backtest_metrics", "compute_drawdown", "compute_correlation"],
 }
 
 _ROLE_PROMPTS: dict[str, str] = {
     "market": "You are Market Analyst. Use get_market_data/get_bars_range/compute_indicator to analyze price/volume/trend. Cite Ground Truth prices.",
+    "sentiment": "You are Sentiment Analyst. Use search_symbols/search_symbol to gather sentiment context. Summarize catalysts.",
     "news": "You are News/Sentiment Analyst. Use search_symbols and memory recall to gather sentiment/news context. Summarize catalysts.",
     "fundamentals": "You are Fundamentals Analyst. Use get_ticker_info/get_fundamentals to assess valuation and earnings. Note placeholders if data empty.",
     "factor": "You are Factor Analyst. Use compute_factor/screen_factors/compute_indicator to evaluate momentum and signals.",
+    "regime": "You are Regime Analyst. Use compute_indicator/compute_correlation to identify market regime and transitions.",
     "risk": "You are Risk Analyst. Use validate_backtest/get_backtest_metrics/compute_drawdown to check PIT, 1% cross-source, drawdown and compliance.",
 }
 
@@ -184,8 +180,9 @@ def _leaf_subagent(name: str):
                 available = [t for t in tool_names if t in TOOL_REGISTRY]
                 if available:
                     tool_preview = f" | tools: {', '.join(available)}"
-            except Exception:
-                pass
+            except Exception as exc:
+                # 中文：窄化捕获并记录，避免静默吞错导致 preview 与 tools 分叉
+                logging.getLogger(__name__).debug("TOOL_REGISTRY lookup failed for %s: %s", name, exc)
         content = f"{name}: research done [{role_prompt[:80]}]{tool_preview}"
         return {
             "messages": [{"role": "assistant", "content": content}],
@@ -315,7 +312,8 @@ def verify_node(state: State) -> Dict[str, Any]:
         logging.getLogger(__name__).warning("verify_node outputs not list: %r, coerced to []", type(outputs).__name__)
         outputs = []
     n = len(outputs)
-    confidence = round(min(0.85, 0.55 + 0.05 * max(1, n)), 2) if n else 0.65
+    # 中文：空证据置信度低于单证据，避免倒挂（旧 0.65 > 0.60）
+    confidence = round(min(0.85, 0.55 + 0.05 * n), 2) if n else 0.50
     pros = [
         "多头: 趋势/动量延续或估值修复预期",
         "pros: positive momentum / sentiment support",

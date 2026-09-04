@@ -8,6 +8,7 @@ AgentLoop 经 duck-typing 注入/写回时复用。
 
 from __future__ import annotations
 
+import html
 from collections import deque
 from dataclasses import dataclass
 from typing import Any, Dict, List
@@ -28,10 +29,13 @@ class MemoryBuffer:
     """对话记忆缓冲区（基于 deque 实现 O(1) 自动裁剪）。"""
 
     def __init__(self, max_turns: int = 20):
+        # 中文：校验 max_turns 避免 0/负数 丢全部或抛裸 ValueError
+        if not isinstance(max_turns, int) or isinstance(max_turns, bool) or max_turns <= 0:
+            raise ValueError(f"max_turns must be a positive int, got {max_turns!r}")
         self.max_turns = max_turns
         self._messages: deque = deque(maxlen=max_turns * 2)
-        # 系统消息单独保存（不受裁剪影响）
-        self._system_messages: deque = deque(maxlen=10)
+        # 中文：系统消息不受裁剪影响，无界 deque
+        self._system_messages: deque = deque()
 
     def add_user_message(self, content: str):
         """添加用户消息"""
@@ -43,8 +47,11 @@ class MemoryBuffer:
 
     def add_tool_result(self, tool_name: str, result: str):
         """添加工具结果"""
+        # 中文：转义 XML 注入，防闭合标签破坏下游解析
+        safe_name = html.escape(tool_name, quote=True)
+        safe_result = html.escape(result)
         self._messages.append(
-            Message(role="tool", content=f'<tool_result name="{tool_name}">{result}</tool_result>')
+            Message(role="tool", content=f'<tool_result name="{safe_name}">{safe_result}</tool_result>')
         )
 
     def add_system_message(self, content: str):
@@ -87,9 +94,16 @@ class MemoryBuffer:
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "MemoryBuffer":
         """反序列化"""
+        # 中文：校验输入形态，fail-visible
+        if not isinstance(data, dict):
+            raise ValueError(f"invalid buffer data: {type(data).__name__}")
         buffer = cls(max_turns=data.get("max_turns", 20))
         for m in data.get("messages", []):
-            msg = Message(m["role"], m["content"])
+            try:
+                role, content = m["role"], m["content"]
+            except (KeyError, TypeError) as e:
+                raise ValueError(f"invalid message entry: {m!r}") from e
+            msg = Message(role, content)
             if msg.role == "system":
                 buffer._system_messages.append(msg)
             else:

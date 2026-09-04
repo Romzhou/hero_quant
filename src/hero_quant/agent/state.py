@@ -52,13 +52,24 @@ def _keep_last(a: Any, b: Any) -> Any:
     return b if b is not None else a
 
 
-def _max_depth(a: int | None, b: int | None) -> int | None:
-    """delegation_depth 归约：取最大值，None 视为缺省."""
-    if a is None:
-        return b
-    if b is None:
-        return a
-    return a if a >= b else b
+def _max_depth(a: Any, b: Any) -> Any:
+    """delegation_depth 归约：取最大值，None 视为缺省；非 int 宽容 coerce."""
+    # 中文：防御式 coerce，避免上游传入 str 等导致 TypeError 崩图
+    def _coerce(x: Any) -> int | None:
+        if x is None:
+            return None
+        try:
+            return int(x)
+        except (ValueError, TypeError):
+            return None
+
+    a_int = _coerce(a)
+    b_int = _coerce(b)
+    if a_int is None:
+        return b_int
+    if b_int is None:
+        return a_int
+    return a_int if a_int >= b_int else b_int
 
 
 class State(TypedDict, total=False):
