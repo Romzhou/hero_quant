@@ -3,6 +3,8 @@ import json
 import pathlib
 import tempfile
 
+import pytest
+
 
 def test_run_batch_regional():
     from hero_quant.backtest.bench import run_batch, _resolve_benchmark
@@ -68,13 +70,12 @@ def test_run_batch_engine_exception_logged(caplog):
     from unittest.mock import patch
     from hero_quant.backtest import bench as bench_mod
     # Force engine.run to raise
+    # 新契约（fail-closed）：策略腿失败直接传播，不伪装零收益
     with patch.object(bench_mod.BacktestEngine, "run", side_effect=RuntimeError("engine boom")):
         caplog.set_level(logging.WARNING)
         with tempfile.TemporaryDirectory() as tmp:
-            res = run_batch(["AAPL"], dates=["2024-01-01"], output_dir=tmp, allow_synthetic=True)
-            # Should still produce fallback metrics
-            assert "AAPL" in res
-            assert res["AAPL"]["sharpe"] == 0.0
+            with pytest.raises(RuntimeError):
+                run_batch(["AAPL"], dates=["2024-01-01"], output_dir=tmp, allow_synthetic=True)
             # Should have logged warning with exc_info
             assert any("engine run failed" in rec.message for rec in caplog.records)
 
@@ -82,7 +83,6 @@ def test_run_batch_engine_exception_logged(caplog):
 def test_run_batch_io_failure_surfaces(tmp_path):
     """Task13-12b: bench IO failures for metrics.json/tearsheet must surface (raise), not silent pass."""
     from hero_quant.backtest.bench import run_batch
-    import pathlib
     import pytest
     # Use a file as output_dir to force failure (bench should raise)
     file_path = tmp_path / "blockfile"

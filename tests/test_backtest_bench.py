@@ -43,15 +43,12 @@ def test_bench_synthetic_fallback_marks_provenance():
     from hero_quant.backtest import bench as bench_mod
     from hero_quant.backtest.bench import run_batch
 
-    # 仅策略引擎失败，基准正常 — 验证 fallback 标记
+    # 新契约（fail-closed）：策略腿失败直接传播，不伪装 fallback 收益；
+    # 基准腿失败才标记 benchmark_error/failed（见 test_b1_bench_benchmark_failure_marked）
     with patch.object(bench_mod.BacktestEngine, "run", side_effect=RuntimeError("engine boom")):
         with tempfile.TemporaryDirectory() as tmp:
-            res = run_batch(["AAPL"], dates=["2024-01-01"], output_dir=tmp, allow_synthetic=True)
-            assert res["AAPL"]["provenance"] == "synthetic_fallback"
-            # 兜底指标应为零化，且仍含 disclosure 等诚实字段
-            assert res["AAPL"]["sharpe"] == 0.0
-            assert "disclosure" in res["AAPL"]
-            assert "non-PIT" in res["AAPL"]["disclosure"] or "non_pit" in res["AAPL"]
+            with pytest.raises(RuntimeError):
+                run_batch(["AAPL"], dates=["2024-01-01"], output_dir=tmp, allow_synthetic=True)
 
 
 def test_disclosure_canonical_no_warning():
@@ -126,9 +123,9 @@ def test_validation_sorted_datetimeindex_passes():
 
 
 def test_validation_non_datetimeindex_no_sort_raise():
-    """非 DatetimeIndex（如 RangeIndex）不应触发排序校验。"""
-    from hero_quant.backtest.validation import validate
+    """新契约（fail-closed）：非 DatetimeIndex 直接拒绝（时序错位风险）。"""
+    from hero_quant.backtest.validation import ValidationError, validate
 
     df = pd.DataFrame({"close": [100.0, 101.0, 102.0]})
-    # RangeIndex 时不校验排序，仅校验空/价格
-    assert validate(df) is None
+    with pytest.raises(ValidationError):
+        validate(df)

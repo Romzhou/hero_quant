@@ -317,8 +317,12 @@ class BacktestEngine:
                 lev_f = 1.0
             _expected_first = _l1_ratio * lev_f
             # 单边口径：首日 turnover 即建仓单边换手，无需 /2（pos_proxy 换手已为单边绝对变动和）
-            # 仅当有持仓且首日为 0 时补齐为预期值，避免空仓扣费
-            if turnover_rate.iloc[0] == 0 and _expected_first > 0:
+            # 仅当有持仓且首日近零时补齐为预期值，避免空仓扣费（容差防浮点漏检）
+            try:
+                _first_is_zero = math.isclose(float(turnover_rate.iloc[0]), 0.0, abs_tol=1e-12)
+            except (ValueError, TypeError, IndexError):
+                _first_is_zero = False
+            if _first_is_zero and _expected_first > 0:
                 try:
                     turnover_rate.iloc[0] = float(_expected_first)
                 except (ValueError, TypeError, IndexError) as e:
@@ -749,6 +753,9 @@ class BacktestEngine:
             logger.debug("_turnover_rate lookup failed: %s", e)
             _turnover_rate = None
         prev_aligned_price: pd.Series | None = None
+        # 中文：对齐收益记到执行 Bar——本轮算出的 aligned 收益存 pending，下轮再用；
+        # 首 Bar 用 close 口径（尚未执行），末 Bar 用上一轮 pending（不再是 0）。
+        pending_aligned: float | None = None
         for i in range(len(prices)):
             bar = prices.iloc[i]
             # 事件钩子：Bar→Signal→对齐（Wave5：aligned_price 参与 equity 定价）
@@ -809,6 +816,11 @@ class BacktestEngine:
                 gross_i = 0.0
             # 若本 Bar 有有效 aligned_ret，则以 aligned 定价覆盖 gross
             ret_gross = gross_i
+            # 中文：执行 Bar 归属——用上一轮 pending（i-1 信号在 _align(i-1) 执行的收益），
+            # 本轮新算的存 pending 供下轮；不把 P[i+1]/P[i] 记到 bar i（timing shift）。
+            if pending_aligned is not None and np.isfinite(pending_aligned):
+                ret_gross = float(pending_aligned)
+            pending_aligned = None
             if aligned_ret_raw is not None:
                 try:
                     if not is_multi:
@@ -819,7 +831,7 @@ class BacktestEngine:
                     else:
                         aligned_scaled = float(aligned_ret_raw)
                     if np.isfinite(aligned_scaled):
-                        ret_gross = aligned_scaled
+                        pending_aligned = float(aligned_scaled)
                 except (ValueError, TypeError) as e:
                     logger.warning("aligned_scaled computation failed: %s", e, exc_info=True)
                     pass
@@ -868,7 +880,11 @@ class BacktestEngine:
                 eq = self.initial_capital
             equity_vals.append(float(eq))
 
-            # 构建当 Bar 原始目标持仓（按权重比例分配组合权益）
+            # 构建当 Bar 原始目标持仓（按权重比例分配组合权益，同步收益口径乘杠杆）
+            try:
+                _lev = float(leverage) if leverage is not None and np.isfinite(float(leverage)) else 1.0
+            except (ValueError, TypeError):
+                _lev = 1.0
             if is_multi:
                 price_cols = list(price_matrix.columns)
                 n_use = min(len(w), len(price_cols))
@@ -876,19 +892,19 @@ class BacktestEngine:
                 for ci in range(n_use):
                     col = str(price_cols[ci])
                     wi = float(w[ci])
-                    raw[col] = eq * wi / total_weight
+                    raw[col] = eq * wi / total_weight * _lev
                 # 若权重少于资产数，未覆盖资产持仓为 0 不显式存储；若权重多于资产，忽略多余
                 if not raw:
-                    raw = {"position": eq * float(w[0]) / total_weight}
+                    raw = {"position": eq * float(w[0]) / total_weight * _lev}
             else:
                 n_assets = len(w)
                 if n_assets > 1:
-                    raw = {f"asset_{i}": eq * float(wi) / total_weight for i, wi in enumerate(w)}
+                    raw = {f"asset_{i}": eq * float(wi) / total_weight * _lev for i, wi in enumerate(w)}
                 else:
-                    raw = {"position": eq * float(w[0]) / total_weight}
+                    raw = {"position": eq * float(w[0]) / total_weight * _lev}
             raw_s = pd.Series(raw, dtype=float)
-            # 资金预检等比缩放，确保名义敞口不超过权益
-            scaled = self._execute_bars(raw_s, available_capital=eq)
+            # 资金预检等比缩放：杠杆下名义敞口上限为 eq*lev，不再按 1× 缩掉合法杠杆
+            scaled = self._execute_bars(raw_s, available_capital=eq * _lev)
             raw_positions_rows.append(scaled)
 
         # 统一收盘基准用于兜底
@@ -913,29 +929,33 @@ class BacktestEngine:
         equity.name = "equity"
         equity.index = prices.index
 
-        # 由事件循环产出的已缩放持仓
+        # 由事件循环产出的已缩放持仓（回落路径与主循环同口径：归一权重×杠杆）
+        try:
+            _lev_fb = float(leverage) if leverage is not None and np.isfinite(float(leverage)) else 1.0
+        except (ValueError, TypeError):
+            _lev_fb = 1.0
         try:
             if raw_positions_rows and len(raw_positions_rows) == len(prices):
                 positions = pd.DataFrame(raw_positions_rows, index=prices.index)
                 # 单资产场景列名为 position 的一致性保证
                 if positions.shape[1] == 0:
-                    positions = pd.DataFrame({"position": equity * float(w[0]) / total_weight}, index=prices.index)
+                    positions = pd.DataFrame({"position": equity * float(w[0]) / total_weight * _lev_fb}, index=prices.index)
             else:
                 # 回落的向量化路径（正常不应触发）
                 if is_multi:
                     price_cols = list(price_matrix.columns)
                     n_use = min(len(w), len(price_cols))
-                    pos_dict = {str(price_cols[i]): equity * float(w[i]) / total_weight for i in range(n_use)}
+                    pos_dict = {str(price_cols[i]): equity * float(w[i]) / total_weight * _lev_fb for i in range(n_use)}
                     if not pos_dict:
-                        pos_dict = {"position": equity * float(w[0]) / total_weight}
+                        pos_dict = {"position": equity * float(w[0]) / total_weight * _lev_fb}
                     positions = pd.DataFrame(pos_dict, index=prices.index)
                 else:
                     n_assets = len(w)
                     if n_assets > 1:
-                        pos_dict = {f"asset_{i}": equity * float(wi) / total_weight for i, wi in enumerate(w)}
+                        pos_dict = {f"asset_{i}": equity * float(wi) / total_weight * _lev_fb for i, wi in enumerate(w)}
                         positions = pd.DataFrame(pos_dict, index=prices.index)
                     else:
-                        positions = pd.DataFrame({"position": equity * float(w[0]) / total_weight}, index=prices.index)
+                        positions = pd.DataFrame({"position": equity * float(w[0]) / total_weight * _lev_fb}, index=prices.index)
         except (ValueError, TypeError, AttributeError, KeyError, IndexError) as e:
             logger.warning("positions construction failed: %s", e, exc_info=True)
             positions = pd.DataFrame({"position": equity}, index=prices.index)
@@ -954,33 +974,45 @@ class BacktestEngine:
         # 生成 tearsheet
         tearsheet_html = self._build_tearsheet(equity, metrics)
 
-        # 若指定输出目录则落盘产物
+        # 若指定输出目录则落盘产物 — 原子写：先写 tmp 目录再整体 rename，失败不留部分产物
         if output_dir is not None:
             out = pathlib.Path(output_dir)
+            _tmp_out = out.parent / (out.name + ".tmp")
             try:
-                out.mkdir(parents=True, exist_ok=True)
+                import shutil as _shutil
+
+                if _tmp_out.exists():
+                    _shutil.rmtree(_tmp_out)
+                _tmp_out.mkdir(parents=True, exist_ok=True)
             except (OSError, ValueError) as e:
                 logger.warning("output_dir mkdir failed: %s", e, exc_info=True)
                 raise
             try:
-                positions.to_csv(out / "positions.csv")
+                positions.to_csv(_tmp_out / "positions.csv")
             except (OSError, IOError, ValueError, AttributeError) as e:
                 logger.warning("positions.csv write failed: %s", e, exc_info=True)
                 raise
             try:
-                fills.to_csv(out / "fills.csv")
+                fills.to_csv(_tmp_out / "fills.csv")
             except (OSError, IOError, ValueError, AttributeError) as e:
                 logger.warning("fills.csv write failed: %s", e, exc_info=True)
                 raise
             try:
-                (out / "metrics.json").write_text(json.dumps(metrics, indent=2, ensure_ascii=False), encoding="utf-8")
+                (_tmp_out / "metrics.json").write_text(json.dumps(metrics, indent=2, ensure_ascii=False), encoding="utf-8")
             except (OSError, IOError, ValueError, TypeError) as e:
                 logger.warning("metrics.json write failed: %s", e, exc_info=True)
                 raise
             try:
-                (out / "tearsheet.html").write_text(tearsheet_html, encoding="utf-8")
+                (_tmp_out / "tearsheet.html").write_text(tearsheet_html, encoding="utf-8")
             except (OSError, IOError, ValueError, TypeError) as e:
                 logger.warning("tearsheet.html write failed: %s", e, exc_info=True)
+                raise
+            try:
+                if out.exists():
+                    _shutil.rmtree(out)
+                _tmp_out.rename(out)
+            except (OSError, ValueError) as e:
+                logger.warning("output_dir publish failed: %s", e, exc_info=True)
                 raise
 
         result: dict = {

@@ -55,10 +55,17 @@ def validate(
         price_date = args[1]
     if currency is None and len(args) >= 3:
         currency = args[2]
+    # 中文：未知 kwargs fail-closed（防拼写错误关闭校验，如 weights_onn）
+    if kwargs:
+        raise ValidationError(f"unknown kwargs rejected (fail-closed): {sorted(kwargs)}")
 
     # 0. 空帧必须显式拒绝 — 禁止空 DataFrame 绕过所有校验
     if not isinstance(prices, pd.DataFrame) or prices.empty:
         raise ValidationError("prices DataFrame is empty or not a DataFrame (fail-closed)")
+
+    # 0a. 非 DatetimeIndex 直接拒绝 — 回测必须有时序索引，否则 pct_change/ret 错位（fail-closed）
+    if not isinstance(prices.index, pd.DatetimeIndex):
+        raise ValidationError(f"prices index must be DatetimeIndex, got {type(prices.index).__name__} (fail-closed)")
 
     # 0b. DatetimeIndex 去重校验 — 重复时间戳会导致 pct_change/ret 错位，fail-closed
     if isinstance(prices.index, pd.DatetimeIndex) and prices.index.has_duplicates:
@@ -96,33 +103,36 @@ def validate(
                 f"PIT violation: weights_on {ts_w.date()} > price_date {ts_p.date()} uses future data"
             )
 
-    # 2. 非正价格拒绝：close ≤ 0 视为脏数据；同时 fail-closed on NaN/non-numeric
+    # 2. 非正价格拒绝：close ≤ 0 视为脏数据；同时 fail-closed on NaN/non-numeric；
+    # 有 close 时同步校验兄弟价格列（单 close 分支不跳过 siblings）
     if isinstance(prices, pd.DataFrame) and "close" in prices.columns:
-        try:
-            # 数值化后检查，避免字符串误判；NaN/null 视为脏数据直接拒绝
-            close = pd.to_numeric(prices["close"], errors="coerce")
-            # fail-closed: any NaN (including coercion-introduced) 或非正均拒绝
-            if close.isna().any() or (close <= 0).any():
-                # 更精确提示：区分 NaN 与非正
-                if close.isna().any():
-                    # 检测是否由非数值 coercion 产生
-                    mask = prices["close"].notna() & close.isna()
-                    bad_idx = mask[mask].index.tolist()[:5]
-                    raise ValidationError(
-                        f"non-numeric/NaN price detected in prices['close'] at {bad_idx} (fail-closed)"
-                    )
-                raise ValidationError("non-positive price detected in prices['close']")
-        except ValidationError:
-            raise
-        except (ValueError, TypeError, AttributeError) as e:
-            logger.warning("price validation conversion failed: %s", e, exc_info=True)
-            raise ValidationError(f"price validation failed: {e}") from e
+        _price_cols = ["close"] + [c for c in prices.columns if c != "close" and str(c).lower() not in NON_PRICE_COLS]
+        for _pc in _price_cols:
+            try:
+                # 数值化后检查，避免字符串误判；NaN/null 视为脏数据直接拒绝
+                _series = pd.to_numeric(prices[_pc], errors="coerce")
+                # fail-closed: any NaN (including coercion-introduced) 或非正均拒绝
+                if _series.isna().any() or (_series <= 0).any():
+                    # 更精确提示：区分 NaN 与非正
+                    if _series.isna().any():
+                        # 检测是否由非数值 coercion 产生
+                        mask = prices[_pc].notna() & _series.isna()
+                        bad_idx = mask[mask].index.tolist()[:5]
+                        raise ValidationError(
+                            f"non-numeric/NaN price detected in prices[{_pc!r}] at {bad_idx} (fail-closed)"
+                        )
+                    raise ValidationError(f"non-positive price detected in prices[{_pc!r}]")
+            except ValidationError:
+                raise
+            except (ValueError, TypeError, AttributeError) as e:
+                logger.warning("price validation conversion failed: %s", e, exc_info=True)
+                raise ValidationError(f"price validation failed: {e}") from e
     else:
         # multi-asset DataFrame without single "close" column: validate each column as price series
         if isinstance(prices, pd.DataFrame):
             for col in prices.columns:
-                # skip non-price metadata columns shared with engine NON_PRICE_COLS
-                if col.lower() in NON_PRICE_COLS:
+                # skip non-price metadata columns shared with engine NON_PRICE_COLS（str() 防非字符串列名崩）
+                if str(col).lower() in NON_PRICE_COLS:
                     continue
                 try:
                     series = pd.to_numeric(prices[col], errors="coerce")

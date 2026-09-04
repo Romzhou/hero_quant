@@ -13,11 +13,20 @@ import pandas as pd
 
 def sharpe_ratio(equity: pd.Series, risk_free: float = 0.0, periods: int = 252) -> float:
     """年化 Sharpe：(日超额均值 / 日波动) * sqrt(252)，空/零波动回落 0。"""
+    import math
+
     if equity is None or len(equity) < 2:
         return 0.0
     # 日收益序列
     ret = equity.pct_change().dropna()
-    if ret.empty or ret.std(ddof=1) == 0 or np.isnan(ret.std(ddof=1)):
+    if ret.empty:
+        return 0.0
+    try:
+        _std = float(ret.std(ddof=1))
+    except (ValueError, TypeError):
+        return 0.0
+    # 中文：容差零判断 + NaN/Inf 不安全比较一律回落（1e-13 级抖动视为零波动）
+    if not np.isfinite(_std) or math.isclose(_std, 0.0, abs_tol=1e-9):
         return 0.0  # 零波动或无效数据无法定义 Sharpe
     # 年化无风险折为日
     rf_daily = risk_free / periods
@@ -52,15 +61,27 @@ def max_drawdown(equity: pd.Series) -> float:
 
 def annual_return(equity: pd.Series, periods: int = 252) -> float:
     """年化收益（CAGR）：(end/start)^(252/n)-1，起点为 0 或空回落 0。"""
+    import math
+
     if equity is None or len(equity) < 2:
         return 0.0
     s = pd.Series(equity) if not isinstance(equity, pd.Series) else equity
     if isinstance(equity, pd.DataFrame):
         s = equity.iloc[:, 0]
-    start = float(s.iloc[0])  # 起点净值
-    end = float(s.iloc[-1])  # 终点净值
-    if start == 0 or np.isnan(start) or np.isnan(end):
-        return 0.0  # 起点为零无法定义 CAGR
+    # 中文：头部数值化，脏数据（字符串/None）coerce 后 dropna，空则回落 0 不抛错
+    try:
+        s = pd.to_numeric(s, errors="coerce").dropna()
+    except (ValueError, TypeError, AttributeError):
+        return 0.0
+    if len(s) < 2:
+        return 0.0
+    try:
+        start = float(s.iloc[0])  # 起点净值
+        end = float(s.iloc[-1])  # 终点净值
+    except (ValueError, TypeError):
+        return 0.0
+    if not np.isfinite(start) or not np.isfinite(end) or math.isclose(start, 0.0, abs_tol=1e-12):
+        return 0.0  # 起点为零/非有限无法定义 CAGR
     # guard len<2 already returned; n = number of periods = len-1 (off-by-one fix)
     n = len(s) - 1
     if n <= 0:
@@ -91,6 +112,7 @@ def turnover(
         总变动（买入 amount = 卖出 amount），而换手率按惯例为单边口径，
         故除以 2 得到单边换手率，避免对同一资金流动双计。例如 w=[0,1,0]
         时 sum(|Δw|)=2，但单边换手应为 1.0。
+    口径统一：与 positions 路径一致取日均（/(n-1)），w=[0,1,0,1,0] 得 0.5。
     """
     import logging
 
@@ -101,20 +123,29 @@ def turnover(
                 # 多资产：每日各标的绝对变动求和后取均值
                 diff = positions.diff().abs().sum(axis=1).dropna()
                 if not diff.empty:
-                    return float(diff.mean())
+                    _m = float(diff.mean())
+                    return _m if np.isfinite(_m) else 0.0
             elif isinstance(positions, pd.Series):
                 diff = positions.diff().abs().dropna()
                 if not diff.empty:
-                    return float(diff.mean())
+                    _m = float(diff.mean())
+                    return _m if np.isfinite(_m) else 0.0
         except (ValueError, TypeError, AttributeError) as e:
             logger.warning("turnover computation failed: %s", e)
             return 0.0
-    # 无持仓时的权重回落：稳定权重视为低换手
+    # 无持仓时的权重回落：稳定权重视为低换手（日均单边口径，与 positions 路径一致）；
+    # 输入含 NaN/Inf 视为不可信，直接回落 0.0，不清洗后计算（防脏权重伪装有效换手）
     if weights is not None:
         try:
-            _w = np.asarray(weights, dtype=float)
-            if _w.size > 1:
-                return float(np.abs(np.diff(_w)).sum() / 2)
+            _arr = np.asarray(weights, dtype=float)
+            if _arr.size > 1 and not np.all(np.isfinite(_arr)):
+                return 0.0
+            _w = pd.to_numeric(pd.Series(weights), errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+            if len(_w) > 1:
+                _d = _w.diff().abs().dropna()
+                if not _d.empty:
+                    _m = float(_d.sum() / 2 / len(_d))
+                    return _m if np.isfinite(_m) else 0.0
             return 0.0
         except (ValueError, TypeError) as e:
             logger.warning("turnover weights fallback failed: %s", e)
@@ -198,11 +229,26 @@ def compute_metrics(
     mdd = max_drawdown(s)
     to = turnover(positions, weights)
 
-    # 年化波动率与累计收益
+    # 年化波动率与累计收益（容差零判断 + 有限性清洗，不泄漏 NaN/Inf）
     try:
         ret = s.pct_change().dropna()
-        vol = float(ret.std(ddof=1) * np.sqrt(252)) if not ret.empty and ret.std(ddof=1) != 0 else 0.0  # 252 交易日年化
-        cum_ret = float(s.iloc[-1] / s.iloc[0] - 1) if s.iloc[0] != 0 else 0.0
+        ret = ret.replace([np.inf, -np.inf], np.nan).dropna()
+        if not ret.empty:
+            _std = float(ret.std(ddof=1))
+            if np.isfinite(_std) and not math.isclose(_std, 0.0, abs_tol=1e-9):
+                vol = float(_std * np.sqrt(252)) if np.isfinite(_std * np.sqrt(252)) else 0.0  # 252 交易日年化
+            else:
+                vol = 0.0
+        else:
+            vol = 0.0
+        _s0 = float(s.iloc[0])
+        _s1 = float(s.iloc[-1])
+        if np.isfinite(_s0) and np.isfinite(_s1) and not math.isclose(_s0, 0.0, abs_tol=1e-12):
+            cum_ret = float(_s1 / _s0 - 1)
+            if not np.isfinite(cum_ret):
+                cum_ret = 0.0
+        else:
+            cum_ret = 0.0
     except (ValueError, TypeError, AttributeError, ZeroDivisionError) as e:
         logger.warning("compute_metrics ret/vol failed: %s", e)
         vol = 0.0

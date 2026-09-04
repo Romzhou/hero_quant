@@ -155,7 +155,7 @@ def test_bench_run_batch_backward_compatible_and_disclosure():
     # old call must still work
     with tempfile.TemporaryDirectory() as tmp:
         dates = ["2024-01-01", "2024-01-02", "2024-01-03", "2024-01-04", "2024-01-05"]
-        metrics = run_batch(["AAPL"], dates=dates, output_dir=tmp)
+        metrics = run_batch(["AAPL"], dates=dates, output_dir=tmp, allow_synthetic=True)
         assert "AAPL" in metrics
         assert "sharpe" in metrics["AAPL"]
         # new: disclosure fields
@@ -175,7 +175,7 @@ def test_bench_run_batch_backward_compatible_and_disclosure():
         # helpers optional but tearsheet should mention disclosure
         # check bench's disclosures via run_batch output_dir tearsheet? bench run_batch writes only metrics.json; disclosure still in metrics
         # also test that run_batch accepts news_records kw without breaking
-        metrics2 = run_batch(["AAPL"], dates=dates, output_dir=tmp, news_records=SAMPLE)
+        metrics2 = run_batch(["AAPL"], dates=dates, output_dir=tmp, news_records=SAMPLE, allow_synthetic=True)
         assert "AAPL" in metrics2
 
 
@@ -188,7 +188,7 @@ def test_bench_tearsheet_or_output_contains_non_pit_hint():
     dates = ["2024-01-01", "2024-01-02", "2024-01-03", "2024-01-04", "2024-01-05"]
     # output_dir is directory -> must generate metrics.json and tearsheet.html with non-PIT disclosure
     with tempfile.TemporaryDirectory() as tmp:
-        metrics = run_batch(["600519.SS"], dates=dates, output_dir=tmp)
+        metrics = run_batch(["600519.SS"], dates=dates, output_dir=tmp, allow_synthetic=True)
         v = metrics["600519.SS"]
         combined = json.dumps(v, ensure_ascii=False).lower()
         assert "non-pit" in combined or "unavailable" in combined or "disclosure" in combined or "pit" in combined, f"bench ticker metrics missing PIT disclosure hint: {v}"
@@ -205,7 +205,7 @@ def test_bench_tearsheet_or_output_contains_non_pit_hint():
     # output_dir is .json file -> keep original semantics, do not forcibly side-write tearsheet.html
     with tempfile.TemporaryDirectory() as tmp2:
         json_path = pathlib.Path(tmp2) / "out.json"
-        metrics2 = run_batch(["600519.SS"], dates=dates, output_dir=str(json_path))
+        metrics2 = run_batch(["600519.SS"], dates=dates, output_dir=str(json_path), allow_synthetic=True)
         assert json_path.exists(), "metrics json file should be written when output_dir is .json"
         sibling_html = pathlib.Path(tmp2) / "tearsheet.html"
         side_html = json_path.with_suffix(".html")

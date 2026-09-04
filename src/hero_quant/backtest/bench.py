@@ -86,6 +86,9 @@ def _build_pit_disclosure(news_records: list[dict] | None = None) -> str:
 
             txt = _gd(news_records)
             if isinstance(txt, str) and txt.strip():
+                # 中文：委托返回缺 non-PIT 标记时补上，不直接透传伪装 PIT
+                if "non-PIT" not in txt and "non-pit" not in txt.lower():
+                    return txt.rstrip() + " [non-PIT source/unavailable]"
                 return txt
         except (ImportError, AttributeError, TypeError, ValueError) as e:
             import logging as _logging3
@@ -184,8 +187,25 @@ def _resolve_benchmark(
     ticker: str,
     benchmark_map: dict | None = None,
     benchmark_ticker: str | None = None,
+    *,
+    _resolved_map: dict | None = None,
+    _resolved_ticker: str | None = None,
+    _resolved: bool = False,
 ) -> str:
-    """按后缀映射为 ticker 解析对应区域基准；显式基准优先。"""
+    """按后缀映射为 ticker 解析对应区域基准；显式基准优先。
+
+    _resolved=True 时直接用已解析的 _resolved_map/_resolved_ticker，不重建 Settings
+   （run_batch 循环内复用，避免每 ticker 重复构造）。
+    """
+    if _resolved:
+        if _resolved_ticker:
+            return _resolved_ticker
+        bmap = _resolved_map if _resolved_map is not None else dict(DEFAULT_BENCHMARK_MAP)
+        tu = str(ticker).upper()
+        for suffix, bench in sorted(bmap.items(), key=lambda kv: len(kv[0]), reverse=True):
+            if suffix and tu.endswith(suffix.upper()):
+                return bench
+        return bmap.get("", "SPY")
     explicit = _effective_benchmark_ticker(benchmark_ticker)
     if explicit:
         return explicit
@@ -269,22 +289,11 @@ def run_batch(
     **kwargs,
 ) -> dict:
     """批量执行回测并计算相对基准的 alpha：为每只 ticker 合成价格、运行引擎、对比基准收益。"""
-    # 兼容：dates / news_records 可能经 kwargs 传入（旧调用兼容）
-    if dates is None and "dates" in kwargs:
-        dates = kwargs.pop("dates")
-    if news_records is None and "news_records" in kwargs:
-        news_records = kwargs.pop("news_records")
-    if news_records is None and "news" in kwargs:
-        news_records = kwargs.pop("news")
-    # 兼容 news 相关的 snapshot 别名透传给 disclosure 辅助（不影响核心回测）
-    kwargs.pop("snapshot_date", None)
-    kwargs.pop("available_at", None)
-    kwargs.pop("snapshot", None)
-    kwargs.pop("snapshot_time", None)
-    kwargs.pop("avail_at", None)
-    kwargs.pop("pit_snapshot", None)
-    if tickers is None:
-        tickers = []
+    # 中文：fail-closed 前置——合成价必须显式 opt-in，空输入也不静默返回 {}
+    if not allow_synthetic:
+        raise ValueError("bench run_batch synthetic requires allow_synthetic=True (fail-closed); pass allow_synthetic=True or provide real price data")
+    if not tickers:
+        raise ValueError("bench run_batch requires non-empty tickers (fail-closed)")
     if isinstance(tickers, str):
         tickers = [tickers]  # 单字符串归一为列表
 
@@ -300,7 +309,8 @@ def run_batch(
 
     for ticker in tickers:
         t = str(ticker)
-        bench = _resolve_benchmark(t, benchmark_map=_cached_bmap, benchmark_ticker=_cached_bench_ticker)
+        # 中文：复用循环外已解析的基准（_resolved），不每 ticker 重建 Settings
+        bench = _resolve_benchmark(t, _resolved_map=_cached_bmap, _resolved_ticker=_cached_bench_ticker, _resolved=True)
         prices = _synthetic_prices(idx, t)
         bench_prices = _synthetic_prices(idx, bench)
 
@@ -311,9 +321,9 @@ def run_batch(
         try:
             res = engine.run(prices, **_engine_kwargs)
         except (ValueError, RuntimeError) as e:
-            # bench 层失败以零化指标兜底但需显式标记 provenance.synthetic，避免上游误判为正常收益
+            # 中文：策略腿失败直接传播（fail-closed），不伪装零收益；基准腿才标记兜底
             logger.warning("engine run failed for %s: %s", t, e, exc_info=True)
-            res = {"metrics": {"sharpe": 0.0, "cumulative_return": 0.0, "annual_return": 0.0, "max_drawdown": 0.0, "turnover": 0.0, "volatility": 0.0, "provenance": "synthetic_fallback"}}
+            raise
         except Exception as e:
             logger.error("unexpected engine run failure for %s: %s", t, e, exc_info=True)
             raise
@@ -321,21 +331,30 @@ def run_batch(
             bench_res = engine.run(bench_prices, **_engine_kwargs)
         except (ValueError, RuntimeError) as e:
             logger.warning("engine bench run failed for %s (%s): %s", t, bench, e, exc_info=True)
-            bench_res = {"metrics": {"cumulative_return": 0.0}}
+            bench_res = {"metrics": {"cumulative_return": 0.0, "benchmark_error": str(e)[:500], "failed": True}, "failed": True}
         except Exception as e:
             logger.error("unexpected bench engine failure for %s (%s): %s", t, bench, e, exc_info=True)
             raise
 
         strat_metrics = dict(res.get("metrics", {}))
+        _bench_failed = bool(bench_res.get("failed")) or "benchmark_error" in bench_res.get("metrics", {})
         bench_cum = float(bench_res.get("metrics", {}).get("cumulative_return", 0.0))
         strat_cum = float(strat_metrics.get("cumulative_return", 0.0))
-        alpha = float(strat_cum - bench_cum)  # 超额收益 = 策略累计 - 基准累计
+        # 中文：基准腿失败时 alpha 置 None，不可用 0.0 伪装有效值
+        alpha = float(strat_cum - bench_cum) if not _bench_failed else None
 
         # 丰富指标：注入基准与 alpha 字段便于对比
         enriched = dict(strat_metrics)
         enriched["benchmark"] = bench
         enriched["benchmark_return"] = bench_cum
         enriched["alpha"] = alpha
+        if _bench_failed:
+            enriched["benchmark_error"] = bench_res.get("metrics", {}).get("benchmark_error", "benchmark leg failed")
+            enriched["failed"] = enriched.get("failed", False) or True
+        if res.get("failed"):
+            enriched["failed"] = True
+            if res.get("error"):
+                enriched["error"] = res["error"]
         enriched["alpha_vs"] = f"alpha vs {bench}"
         enriched["ticker"] = t
         # PIT 披露：诚实标注 non-PIT（避免伪造 PIT）
@@ -401,18 +420,18 @@ def run_batch(
                 raise ValueError(f"output_dir traversal detected: {output_dir!r} escapes {_base}")
         else:
             # no ".." and relative — optionally validate single-component via safe_join
+            # 中文：safe_join 的 ValueError 是拒绝信号，必须传播；仅 import/类型问题可跳过
             try:
                 from hero_quant.security.sanitize import safe_join as _safe_join  # type: ignore
-
-                if len(_p.parts) == 1 and _p.suffix.lower() != ".json":
-                    try:
-                        _safe_join(_base, _p.name)
-                    except ValueError:
-                        pass
             except ImportError:
-                pass
-            except (ValueError, TypeError, AttributeError, OSError) as e:
-                logger.debug("output_dir safe_join check skipped: %s", e)
+                _safe_join = None  # type: ignore[assignment]
+            if _safe_join is not None and len(_p.parts) == 1 and _p.suffix.lower() != ".json":
+                try:
+                    _safe_join(_base, _p.name)
+                except ValueError:
+                    raise
+                except (TypeError, AttributeError, OSError) as e:
+                    logger.debug("output_dir safe_join check skipped: %s", e)
         out = pathlib.Path(output_dir)
         # 若给出的是 .json 文件路径则直接写入其本身，不强行旁写 tearsheet
         if out.suffix.lower() == ".json":
