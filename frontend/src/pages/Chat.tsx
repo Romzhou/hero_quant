@@ -4,6 +4,7 @@
  * - 数据流：输入 q → 订阅 /v1/query/stream（优先 EventSource，超时或无消息回退 fetch ReadableStream）→ 解析 data: 行
  *   约定 JSON 字段：delta/text/content/answer 为增量文本，type=="tool" 为工具轨迹，type=="error" 为错误，[DONE] 为结束
  * - 渲染：delta 逐片追加到 assistant 消息，tool 事件聚合到 traceByMsgId 渲染轨迹条；支持 AbortController 中断与空响应兜底
+ * - 泄漏防护：AbortController + mountedRef 守卫 + 单 rAF 合并 + reader cancel/releaseLock
  */
 import { useEffect, useRef, useState } from "react"
 import { useChatStore } from "../store/chat"
@@ -25,28 +26,35 @@ export const TOOL_STATUS_CLASS: Record<ToolCall["status"], string> = {
   pending: "border-white/10 bg-white/5 text-slate-400 animate-pulse",
 }
 
-// 纯函数：统一解析 SSE payload，fetch 回退与 EventSource 共用，满足 68-72 去重
+// 嵌套三元消除：轨迹点颜色映射表，提升可读性并满足 no-nested-ternary
+export const TRACE_DOT_CLASS: Record<ToolCall["status"], string> = {
+  success: "bg-emerald-400",
+  error: "bg-red-400",
+  pending: "bg-white/10",
+}
+
+// 纯函数：统一解析 SSE payload，fetch 回退与 EventSource 共用
 export function parseSseData(raw: string): { kind: "delta" | "tool" | "error"; delta?: string; tool?: { tool: string; status: ToolCall["status"]; preview?: string; latencyMs?: number; rawId?: string }; error?: string } | null {
   if (!raw || raw === SSE_DONE) return null
   try {
-    const j = JSON.parse(raw)
+    const j = JSON.parse(raw) as Record<string, unknown>
     if (j.type === "tool") {
       const tname = (j.tool || j.name || "unknown_tool") as string
       const status = (j.status as ToolCall["status"]) || "success"
-      const preview = j.preview ?? j.msg ?? j.detail ?? undefined
-      const latencyMs = j.latencyMs ?? j.latency ?? j.durationMs ?? undefined
-      const rawId = j.id != null ? String(j.id) : (j.tool_call_id != null ? String(j.tool_call_id) : undefined)
+      const preview = (j.preview ?? j.msg ?? j.detail ?? undefined) as string | undefined
+      const latencyMs = (j.latencyMs ?? j.latency ?? j.durationMs ?? undefined) as number | undefined
+      const rawId = j.id !== null && j.id !== undefined ? String(j.id) : (j.tool_call_id !== null && j.tool_call_id !== undefined ? String(j.tool_call_id) : undefined)
       return { kind: "tool", tool: { tool: tname, status, preview, latencyMs, rawId } }
     }
     if (j.type === "error") {
-      return { kind: "error", error: j.msg || j.message || "stream error" }
+      return { kind: "error", error: (j.msg as string) || (j.message as string) || "stream error" }
     }
     // 兼容：含 tool 字段但未标 type 且无 delta 时视为轨迹
     if (j.tool && !("delta" in j) && !("text" in j) && !("content" in j) && !("answer" in j)) {
       const tname = (j.tool || j.name) as string
-      return { kind: "tool", tool: { tool: tname, status: (j.status as ToolCall["status"]) || "success", preview: j.preview, latencyMs: j.latencyMs, rawId: j.id != null ? String(j.id) : undefined } }
+      return { kind: "tool", tool: { tool: tname, status: (j.status as ToolCall["status"]) || "success", preview: j.preview as string | undefined, latencyMs: j.latencyMs as number | undefined, rawId: j.id !== null && j.id !== undefined ? String(j.id) : undefined } }
     }
-    const delta = j.delta || j.text || j.content || j.answer || ""
+    const delta = (j.delta as string) || (j.text as string) || (j.content as string) || (j.answer as string) || ""
     if (delta) return { kind: "delta", delta }
     // 无可识别字段时视为无操作，避免误判为 delta 空
     return null
@@ -69,6 +77,12 @@ export default function Chat() {
   const rafIdsRef = useRef<number[]>([])
   const timeoutIdsRef = useRef<number[]>([])
   const toolSeqRef = useRef(0)
+  // 单 rAF 合并：全局仅保留一个待执行的滚动任务，避免逐 delta 独立 rAF 导致布局抖动与 rafIds 无限增长
+  const pendingScrollRef = useRef<number | null>(null)
+  // 卸载防护：标记组件是否已卸载，避免异步回调在卸载后 setState
+  const mountedRef = useRef(true)
+  // 活跃消息：仅当前流式消息展示“等待工具调度”占位，避免全局 streaming 导致历史消息错位高亮
+  const activeAidRef = useRef<string | null>(null)
 
   function trackRaf(id: number) {
     rafIdsRef.current.push(id)
@@ -87,11 +101,14 @@ export default function Chat() {
     timeoutIdsRef.current.forEach(id => clearTimeout(id))
     rafIdsRef.current = []
     timeoutIdsRef.current = []
+    pendingScrollRef.current = null
   }
 
   // 卸载清理 — 关闭 SSE/Abort 并清理 pending rAF/setTimeout，避免泄漏与 setState on unmounted
   useEffect(() => {
+    mountedRef.current = true
     return () => {
+      mountedRef.current = false
       abortAll()
     }
   }, [])
@@ -104,9 +121,36 @@ export default function Chat() {
     else el.scrollTop = top
   }
 
+  // 单 rAF 调度：合并多次 delta 触发的滚动为一次
+  function scheduleScroll() {
+    if (pendingScrollRef.current !== null) return
+    const raf = requestAnimationFrame(() => {
+      pendingScrollRef.current = null
+      scrollToBottom()
+    })
+    pendingScrollRef.current = raf
+    trackRaf(raf)
+  }
+
+  // 抽取公共 upsert：消除 handlePayload 与 EventSource onmessage 的双份聚合逻辑
+  function upsertTrace(aid: string, e: { tool: string; status: ToolCall["status"]; preview?: string; latencyMs?: number; rawId?: string }) {
+    const uniqueId = e.rawId ?? `${e.tool}-${toolSeqRef.current++}-${crypto.randomUUID()}`
+    setTraceByMsgId(prev => {
+      const cur = prev[aid] ?? []
+      if (e.rawId) {
+        const exists = cur.find(c => c.id === e.rawId)
+        if (exists) {
+          return { ...prev, [aid]: cur.map(c => c.id === e.rawId ? { ...c, status: e.status, preview: e.preview ?? c.preview, latencyMs: e.latencyMs ?? c.latencyMs } : c) }
+        }
+      }
+      return { ...prev, [aid]: [...cur, { id: uniqueId, tool: e.tool, status: e.status, preview: e.preview, latencyMs: e.latencyMs }] }
+    })
+  }
+
   async function send() {
-    const q = input.trim()
-    if (!q || streaming) return
+    // 闭包 stale 修复：从 store 实时读取 input/streaming，避免 demo 按钮 setInput 后仍读到旧闭包空值
+    const q = (useChatStore.getState().input ?? "").trim()
+    if (!q || useChatStore.getState().streaming) return
     const userMsg = { id: crypto.randomUUID(), role: "user" as const, content: q }
     push(userMsg)
     setInput("")
@@ -117,11 +161,14 @@ export default function Chat() {
     push({ id: aid, role: "assistant", content: "" })
     // 初始化空轨迹，占位保证 UI 结构稳定，后续由后端 type=="tool" 事件填充
     setTraceByMsgId(s => ({ ...s, [aid]: [] }))
+    activeAidRef.current = aid
 
     // 中断上一轮未结束的流，避免并发 SSE 串扰 — 必须同时关闭 EventSource
     abortAll()
     const controller = new AbortController()
     abortRef.current = controller
+    // 泄漏防护：在每次异步分支前检查 mounted 与 signal，避免卸载后 setState
+    const isAlive = () => mountedRef.current && !controller.signal.aborted
 
     const issueSseTicket = async () => {
       const resp = await fetch(API_ENDPOINTS.TICKET, {
@@ -130,9 +177,12 @@ export default function Chat() {
         signal: controller.signal,
       })
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
-      const payload = await resp.json() as { ticket?: unknown } | null
-      if (!payload || typeof payload !== "object" || typeof (payload as any).ticket !== "string" || !(payload as any).ticket) throw new Error("SSE ticket missing")
-      return (payload as { ticket: string }).ticket
+      // 严格票据校验：不使用 any，使用 unknown + 显式类型守卫
+      const payload: unknown = await resp.json()
+      if (!payload || typeof payload !== "object" || !("ticket" in payload)) throw new Error("SSE ticket missing")
+      const ticket = (payload as { ticket?: unknown }).ticket
+      if (typeof ticket !== "string" || !ticket) throw new Error("SSE ticket missing")
+      return ticket
     }
 
     let acc = ""
@@ -141,14 +191,14 @@ export default function Chat() {
 
     const appendDelta = (delta: string) => {
       if (!delta) return
+      if (!isAlive()) return
       hasDelta = true
       acc += delta
-      // 直接写 Zustand，避免闭包 messages 过期；用 raf 聚合滚动避免每片 delta 强制布局抖动
+      // 直接写 Zustand，避免闭包 messages 过期；用单 rAF 聚合滚动避免每片 delta 强制布局抖动
       useChatStore.setState(s => ({
         messages: s.messages.map(m => m.id === aid ? { ...m, content: acc } : m),
       }))
-      const raf = requestAnimationFrame(() => scrollToBottom())
-      trackRaf(raf)
+      scheduleScroll()
     }
 
     const handlePayload = (raw: string) => {
@@ -159,19 +209,9 @@ export default function Chat() {
         return
       }
       if (parsed.kind === "tool" && parsed.tool) {
+        if (!isAlive()) return
         const { tool: tname, status, preview, latencyMs, rawId } = parsed.tool
-        const uniqueId = rawId ?? `${tname}-${toolSeqRef.current++}-${crypto.randomUUID()}`
-        setTraceByMsgId(prev => {
-          const cur = prev[aid] ?? []
-          // 若后端提供 rawId 且已存在则更新，否则新增一条独立调用（不按 tool name 合并）
-          if (rawId) {
-            const exists = cur.find(c => c.id === rawId)
-            if (exists) {
-              return { ...prev, [aid]: cur.map(c => c.id === rawId ? { ...c, status, preview: preview ?? c.preview, latencyMs: latencyMs ?? c.latencyMs } : c) }
-            }
-          }
-          return { ...prev, [aid]: [...cur, { id: uniqueId, tool: tname, status, preview, latencyMs }] }
-        })
+        upsertTrace(aid, { tool: tname, status, preview, latencyMs, rawId })
         return
       }
       if (parsed.kind === "error" && parsed.error) {
@@ -199,38 +239,44 @@ export default function Chat() {
       const decoder = new TextDecoder()
       let buffer = ""
       let outerDone = false
-      while (true) {
-        const { done, value } = await reader.read()
-        if (done) break
-        buffer += decoder.decode(value, { stream: true })
-        buffer = buffer.replace(/\r\n/g, "\n")
-        let idx: number
-        while ((idx = buffer.indexOf("\n\n")) !== -1) {
-          const rawEvent = buffer.slice(0, idx)
-          buffer = buffer.slice(idx + 2)
-          if (!rawEvent.trim()) continue
-          const dataLines = rawEvent
-            .split("\n")
-            .filter(l => l.startsWith("data:"))
-            .map(l => l.replace(/^data:\s*/, ""))
-          if (dataLines.length === 0) continue
-          const data = dataLines.join("\n")
-          if (data === SSE_DONE) { outerDone = true; break }
-          handlePayload(data)
+      // 泄漏防护：确保 reader 在错误/中断/abort 时也能 cancel 并 releaseLock
+      try {
+        while (true) {
+          const { done, value } = await reader.read()
+          if (done) break
+          buffer += decoder.decode(value, { stream: true })
+          buffer = buffer.replace(/\r\n/g, "\n")
+          let idx: number
+          while ((idx = buffer.indexOf("\n\n")) !== -1) {
+            const rawEvent = buffer.slice(0, idx)
+            buffer = buffer.slice(idx + 2)
+            if (!rawEvent.trim()) continue
+            const dataLines = rawEvent
+              .split("\n")
+              .filter(l => l.startsWith("data:"))
+              .map(l => l.replace(/^data:\s*/, ""))
+            if (dataLines.length === 0) continue
+            const data = dataLines.join("\n")
+            if (data === SSE_DONE) { outerDone = true; break }
+            handlePayload(data)
+          }
+          if (outerDone) break
         }
-        if (outerDone) break
-      }
-      // flush decoder 尾部，避免末尾无 \n\n 的帧丢失
-      buffer += decoder.decode()
-      if (buffer.trim()) {
-        const tailLines = buffer.split("\n").filter(l => l.startsWith("data:")).map(l => l.replace(/^data:\s*/, ""))
-        const tailData = tailLines.join("\n").trim()
-        if (tailData && tailData !== SSE_DONE) handlePayload(tailData)
-      }
-      if (!hasDelta && !acc) {
-        useChatStore.setState(s => ({
-          messages: s.messages.map(m => m.id === aid ? { ...m, content: EMPTY_FALLBACK_MSG } : m),
-        }))
+        // flush decoder 尾部，避免末尾无 \n\n 的帧丢失
+        buffer += decoder.decode()
+        if (buffer.trim()) {
+          const tailLines = buffer.split("\n").filter(l => l.startsWith("data:")).map(l => l.replace(/^data:\s*/, ""))
+          const tailData = tailLines.join("\n").trim()
+          if (tailData && tailData !== SSE_DONE) handlePayload(tailData)
+        }
+        if (!hasDelta && !acc && isAlive()) {
+          useChatStore.setState(s => ({
+            messages: s.messages.map(m => m.id === aid ? { ...m, content: EMPTY_FALLBACK_MSG } : m),
+          }))
+        }
+      } finally {
+        try { await reader.cancel() } catch {}
+        try { reader.releaseLock() } catch {}
       }
     }
 
@@ -252,7 +298,7 @@ export default function Chat() {
               esRef.current = null
               if (!settled) {
                 settled = true
-                if (!hasDelta && !acc) {
+                if (!hasDelta && !acc && isAlive()) {
                   useChatStore.setState(s => ({
                     messages: s.messages.map(m => m.id === aid ? { ...m, content: EMPTY_FALLBACK_MSG } : m),
                   }))
@@ -264,18 +310,9 @@ export default function Chat() {
             const parsed = parseSseData(data)
             if (!parsed) return
             if (parsed.kind === "tool" && parsed.tool) {
+              if (!isAlive()) return
               const { tool: tname, status, preview, latencyMs, rawId } = parsed.tool
-              const uniqueId = rawId ?? `${tname}-${toolSeqRef.current++}-${crypto.randomUUID()}`
-              setTraceByMsgId(prev => {
-                const cur = prev[aid] ?? []
-                if (rawId) {
-                  const exists = cur.find(c => c.id === rawId)
-                  if (exists) {
-                    return { ...prev, [aid]: cur.map(c => c.id === rawId ? { ...c, status, preview: preview ?? c.preview, latencyMs: latencyMs ?? c.latencyMs } : c) }
-                  }
-                }
-                return { ...prev, [aid]: [...cur, { id: uniqueId, tool: tname, status, preview, latencyMs }] }
-              })
+              upsertTrace(aid, { tool: tname, status, preview, latencyMs, rawId })
               return
             }
             if (parsed.kind === "error" && parsed.error) {
@@ -312,7 +349,7 @@ export default function Chat() {
               if (!settled) {
                 settled = true
                 // if we already got messages, treat as complete
-                if (!hasDelta && !acc) {
+                if (!hasDelta && !acc && isAlive()) {
                   useChatStore.setState(s => ({
                     messages: s.messages.map(m => m.id === aid ? { ...m, content: EMPTY_FALLBACK_MSG } : m),
                   }))
@@ -343,7 +380,7 @@ export default function Chat() {
             }
           }, SSE_CONNECT_TIMEOUT_MS)
           trackTimeout(tid as unknown as number)
-        } catch (err) {
+        } catch (_err) {
           // 环境不支持 EventSource 时直接走 fetch 回退
           fetchFallback()
             .then(() => {
@@ -355,7 +392,7 @@ export default function Chat() {
             .catch((e2) => {
               if (!settled) {
                 settled = true
-                reject(e2)
+                reject(e2 as Error)
               }
             })
         }
@@ -367,8 +404,8 @@ export default function Chat() {
     } catch (e: unknown) {
       if ((e as Error)?.name === "AbortError") return
       const msg = e instanceof Error ? e.message : String(e)
-      // 仅在无任何 delta 时展示错误，避免已流式部分内容被错误覆盖
-      if (!hasDelta) {
+      // 仅在无任何 delta 时展示错误，避免已流式部分内容被错误覆盖；同时守卫卸载
+      if (!hasDelta && isAlive()) {
         setError(msg)
         useChatStore.setState(s => ({
           messages: s.messages.map(m => m.id === aid ? { ...m, content: `请求失败：${msg}` } : m),
@@ -379,13 +416,17 @@ export default function Chat() {
         })
       }
     } finally {
-      setStreaming(false)
+      if (isAlive()) setStreaming(false)
+      else {
+        // 卸载后仍需重置 streaming 状态但通过守卫避免 setState 冲突，依赖 store 直接写入需再次检查
+        try { if (mountedRef.current) setStreaming(false) } catch {}
+      }
       abortRef.current = null
-      esRef.current?.close()
+      try { esRef.current?.close() } catch {}
       esRef.current = null
-      // 收尾滚动到底，确保最后 delta 可见
-      const raf = requestAnimationFrame(() => scrollToBottom())
-      trackRaf(raf)
+      activeAidRef.current = null
+      // 收尾滚动到底，确保最后 delta 可见（单 rAF 合并）
+      scheduleScroll()
     }
   }
 
@@ -462,13 +503,13 @@ export default function Chat() {
                           {traceByMsgId[m.id].map(t => (
                             <div
                               key={t.id + "-dot"}
-                              className={"h-1 flex-1 rounded-full " + (t.status === "success" ? "bg-emerald-400" : t.status === "error" ? "bg-red-400" : "bg-white/10")}
+                              className={"h-1 flex-1 rounded-full " + TRACE_DOT_CLASS[t.status]}
                             />
                           ))}
                         </div>
                       </div>
                     )}
-                    {traceByMsgId[m.id]?.length === 0 && streaming && (
+                    {traceByMsgId[m.id]?.length === 0 && streaming && m.id === activeAidRef.current && (
                       <div className="mt-3 rounded-xl border border-dashed border-white/10 bg-ink-900/40 px-3 py-2 text-[11px] text-slate-500">等待工具调度… 后端将以 type=tool 事件推送 preview/latency</div>
                     )}
                   </>
