@@ -8,19 +8,38 @@
 from __future__ import annotations
 
 import contextvars
+import re
 import uuid
 from typing import Optional
 
 _trace_id_var: contextvars.ContextVar[str] = contextvars.ContextVar("trace_id", default="-")
 _request_id_var: contextvars.ContextVar[str] = contextvars.ContextVar("request_id", default="-")
 
+# 请求头白名单：兼容 pr3i-trace-123 这类合法 ID，拒绝空白/CRLF/非法字符/超长输入
+_TRACE_ID_RE = re.compile(r"[A-Za-z0-9\-_.:]{1,128}\Z")
+_MAX_TRACE_ID_LEN = 128
+
+
+def _clean_trace_id(raw: object) -> str | None:
+    """校验外部传入的 trace/request id；非法返回 None，走生成回退。"""
+    if not isinstance(raw, str):
+        return None
+    rid = raw.strip()
+    if not rid or len(rid) > _MAX_TRACE_ID_LEN:
+        return None
+    if _TRACE_ID_RE.fullmatch(rid) is None:
+        return None
+    return rid
+
 
 def set_trace_id(trace_id: Optional[str] = None) -> str:
-    """设置当前上下文 trace_id，None 则自动生成 16 位 hex。"""
-    if trace_id is None:
-        trace_id = uuid.uuid4().hex[:16]
-    _trace_id_var.set(trace_id)
-    return trace_id
+    """设置当前上下文 trace_id，None/空则自动生成 16 位 hex（同步 request_id）。"""
+    cleaned = _clean_trace_id(trace_id) if trace_id is not None else None
+    if not cleaned:
+        cleaned = uuid.uuid4().hex[:16]
+    _trace_id_var.set(cleaned)
+    _request_id_var.set(cleaned)
+    return cleaned
 
 
 def get_trace_id() -> str:
@@ -52,15 +71,19 @@ try:
         """
 
         async def dispatch(self, request: Request, call_next):
-            rid = request.headers.get("x-request-id") or request.headers.get("x-trace-id")
-            if not rid:
-                rid = uuid.uuid4().hex[:16]
-            set_trace_id(rid)
-            _request_id_var.set(rid)
-            response: Response = await call_next(request)
-            response.headers["X-Request-ID"] = rid
-            response.headers["X-Trace-Id"] = rid
-            return response
+            raw = request.headers.get("x-request-id") or request.headers.get("x-trace-id")
+            rid = _clean_trace_id(raw) or uuid.uuid4().hex[:16]
+            t1 = _trace_id_var.set(rid)
+            t2 = _request_id_var.set(rid)
+            try:
+                response: Response = await call_next(request)
+                response.headers["X-Request-ID"] = rid
+                response.headers["X-Trace-Id"] = rid
+                return response
+            finally:
+                # token 复位：异常也不泄漏到复用 task/测试/后台任务
+                _trace_id_var.reset(t1)
+                _request_id_var.reset(t2)
 
 except ImportError:  # pragma: no cover - 无 starlette 时跳过
     TraceIdMiddleware = None  # type: ignore[assignment]
