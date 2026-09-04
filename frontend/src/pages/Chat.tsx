@@ -15,7 +15,7 @@ export const API_ENDPOINTS = {
   STREAM: "/v1/query/stream",
 } as const
 export const SSE_DONE = "[DONE]"
-export const SSE_CONNECT_TIMEOUT_MS = 1200
+export const SSE_CONNECT_TIMEOUT_MS = 5500
 export const SSE_FILL_DELAY_MS = 80
 export const EMPTY_FALLBACK_MSG = "模型未返回内容，请检查 HERO_API_KEY 配置（当前为合成演示模式）"
 
@@ -183,7 +183,10 @@ export default function Chat() {
     }
 
     // fetch 回退：手动解析 SSE 帧，兼容不支持 EventSource 或代理缓冲的场景
+    // 互斥：回退前确保 EventSource 已关闭，避免与主链路抢用已消费的一次性 ticket（曾导致 403→无回显）
     const fetchFallback = async () => {
+      try { esRef.current?.close() } catch {}
+      esRef.current = null
       const ticket = await issueSseTicket()
       const url = `${API_ENDPOINTS.STREAM}?q=${encodeURIComponent(q)}&ticket=${encodeURIComponent(ticket)}`
       const resp = await fetch(url, {

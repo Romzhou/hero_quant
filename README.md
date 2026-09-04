@@ -10,6 +10,9 @@
   <img src="https://img.shields.io/badge/React-19-61DAFB?logo=react" alt="React 19" />
   <img src="https://img.shields.io/badge/License-MIT-yellow" alt="MIT" />
   <img src="https://img.shields.io/badge/Tests-277_passed-brightgreen" alt="tests" />
+  <img src="https://img.shields.io/badge/Security-Headers_nosniff_frame--deny-blue" alt="Security Headers" />
+  <img src="https://img.shields.io/badge/PII-Fernet_masked-informational" alt="PII" />
+  <img src="https://img.shields.io/badge/Audit-tool_call_structured-success" alt="Audit" />
 </p>
 
 > 批判性借鉴 [HKUDS/Vibe-Trading](https://github.com/HKUDS/Vibe-Trading) 的 8 大工程模式（AgentLoop 状态机 / 上下文折叠 / Grounding 证据账本 / Tool 自动发现 / 行情 Fallback+Provenance / 回测引擎 / 治理 Hash 链 / 供应链契约），绿地重写核心业务，单进程 + Docker 单机可部署。
@@ -108,7 +111,9 @@ docker run -p 127.0.0.1:8899:8899 --env-file .env hero-quant:0.2.0
 ## API
 
 - `GET /live` 存活、`GET /ready` 就绪、`GET /metrics` Prometheus、`GET /v1/query?q=...` 同步、`GET /v1/query/stream?q=...` SSE 流式
-- `X-Request-ID` 贯穿日志，`POST /v1/query` 接受 `{query, stream:true}`（前端 `Chat.tsx:29` 已接 SSE + tool 轨迹水位）
+- `POST /v1/query/ticket` SSE 票据签发、`GET /v1/backtest/metrics.json` 回测指标、`GET /v1/backtest/positions.csv` 持仓、`GET /v1/backtest/tearsheet.html` 报告、`GET /v1/trace/events` 追踪事件、`GET /v1/risk/summary` 风险摘要（+ 别名 `/risk/summary`）、`WS /ws/trace` 与 `WS /ws/query` 进度推送
+- `X-Request-ID` 贯穿日志（`TraceIdMiddleware` 透传 `x-request-id`/`x-trace-id` 并回写响应头），安全头 `X-Content-Type-Options: nosniff` + `X-Frame-Options: DENY`（`SecurityHeadersMiddleware`），审计 `api.audit` 结构化 tool 调用，PII 经 `PII_ENCRYPTION_KEY` Fernet 加密（缺失回退掩码）
+- `POST /v1/query` 接受 `{query, stream:true}`（前端 `Chat.tsx:29` 已接 SSE + tool 轨迹水位）
 
 示例：
 

@@ -23,8 +23,15 @@ def test_health_and_metrics_and_wall_time():
     r = c.get("/live")
     assert r.status_code == 200
     assert r.json()["status"] == "ok"
-    # /ready
-    assert c.get("/ready").status_code == 200
+    # /ready：容忍本地 PG 缺席（无 PG 时 503 + memory 回退为预期语义）
+    ready = c.get("/ready")
+    assert ready.status_code in (200, 503)
+    body = ready.json()
+    if ready.status_code == 503:
+        assert body.get("status") == "degraded"
+        assert body.get("checkpoint") == "memory"
+    else:
+        assert body.get("status") == "ok"
     # /metrics contains wall_time
     m = c.get("/metrics")
     assert m.status_code == 200

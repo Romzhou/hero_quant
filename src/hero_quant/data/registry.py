@@ -200,25 +200,25 @@ class MarketDataRegistry:
                 try:
                     if len(bars) == 0:
                         return None
-                except Exception as e:
+                except (TypeError, ValueError, AttributeError) as e:
                     logger.warning("_first_close len check failed: %s", e, exc_info=e)
                     return None
                 # explicit column check - do not fallback to first column
                 try:
                     has_close = "close" in bars.columns
-                except Exception as e:
+                except (TypeError, ValueError, AttributeError) as e:
                     logger.warning("_first_close columns check failed: %s", e, exc_info=e)
                     return None
                 if not has_close:
                     try:
                         cols = list(bars.columns) if hasattr(bars.columns, "__iter__") else []
-                    except Exception:
+                    except (TypeError, ValueError, AttributeError):
                         cols = []
                     logger.warning("_first_close DataFrame missing 'close' column, columns=%s", cols)
                     return None
                 try:
                     val = bars.iloc[0]["close"]
-                except Exception as e:
+                except (IndexError, KeyError, ValueError, TypeError, AttributeError) as e:
                     logger.warning("_first_close DataFrame iloc access failed: %s", e, exc_info=e)
                     return None
                 # handle pd.NA / NaN / None
@@ -226,19 +226,19 @@ class MarketDataRegistry:
                     import pandas as pd
                     if pd.isna(val):
                         return None
-                except Exception:
+                except (ValueError, TypeError, AttributeError):
                     pass
                 if val is None:
                     return None
                 try:
                     f = float(val)
-                except Exception as e:
+                except (ValueError, TypeError) as e:
                     logger.warning("_first_close DataFrame close conversion failed: %s val=%r", e, val, exc_info=e)
                     return None
                 if math.isnan(f):
                     return None
                 return f
-            except Exception as e:
+            except (ValueError, TypeError, AttributeError, IndexError, KeyError, RuntimeError) as e:
                 logger.warning("_first_close DataFrame branch error: %s", e, exc_info=e)
                 return None
         # list/dict branch: explicit close key check
@@ -250,7 +250,7 @@ class MarketDataRegistry:
                     break
                 else:
                     return None
-            except Exception as e:
+            except (TypeError, ValueError, AttributeError) as e:
                 logger.warning("_first_close list slice failed: %s", e, exc_info=e)
                 return None
             if first is None:
@@ -266,11 +266,11 @@ class MarketDataRegistry:
                     import pandas as pd
                     if pd.isna(v):
                         return None
-                except Exception:
+                except (ValueError, TypeError, AttributeError):
                     pass
                 try:
                     f = float(v)
-                except Exception as e:
+                except (ValueError, TypeError) as e:
                     logger.warning("_first_close dict close conversion failed: %s val=%r", e, v, exc_info=e)
                     return None
                 if math.isnan(f):
@@ -279,7 +279,7 @@ class MarketDataRegistry:
             else:
                 logger.warning("_first_close unsupported bar type: %r", type(first))
                 return None
-        except Exception as e:
+        except (ValueError, TypeError, AttributeError) as e:
             logger.warning("_first_close list branch error: %s", e, exc_info=e)
             return None
         return None
@@ -334,7 +334,7 @@ class MarketDataRegistry:
             # NaN already normalized to None in _first_close, but guard
             if isinstance(ref_close, float) and math.isnan(ref_close):
                 return
-        except Exception as e:
+        except (ValueError, TypeError, ArithmeticError) as e:
             logger.warning("cross_source check _first_close error for %s: %s", symbol, e, exc_info=e)
             return
         current_source = getattr(prov, "source", "") if prov else ""  # 跳过自身避免自比
@@ -381,7 +381,7 @@ class MarketDataRegistry:
                         )
             except CrossSourceError:
                 raise
-            except Exception as e:
+            except (ValueError, TypeError, ArithmeticError) as e:
                 logger.warning("cross_source compare error for %s: %s vs %s: %s", symbol, current_source, loader_source, e, exc_info=e)
                 continue
         return

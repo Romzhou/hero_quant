@@ -410,6 +410,65 @@ try:
 except Exception as _e:
     logger.debug("ws.router_include_failed error=%s", str(_e))
 
+# R1 lifespan: trace consumer 接线（每 worker 一个消费者；stop_event 在 shutdown 置位）
+_trace_consumer_stop: asyncio.Event | None = None
+_trace_consumer_task: asyncio.Task | None = None
+
+
+def _get_trace_consumer_stop() -> asyncio.Event:
+    """获取（或创建）trace consumer 的 stop_event，startup 时 clear 复用。"""
+    global _trace_consumer_stop
+    if _trace_consumer_stop is None:
+        _trace_consumer_stop = asyncio.Event()
+    return _trace_consumer_stop
+
+
+@app.on_event("startup")
+def _inject_r1_state_on_startup() -> None:
+    """R1: lifespan state 注入 — memory_store + agent 容器；异常仅 debug，不阻断启动。"""
+    try:
+        import hero_quant.agent.memory.store as _memory_store_mod
+
+        _memory_store_mod.inject_memory_store(app)
+    except Exception as _e:
+        logger.debug("r1.memory_inject_failed", error=str(_e))
+    try:
+        import hero_quant.agent.container as _agent_container_mod
+
+        _agent_container_mod.inject_agent_container(app)
+    except Exception as _e:
+        logger.debug("r1.agent_inject_failed", error=str(_e))
+
+
+@app.on_event("startup")
+async def _start_trace_consumer() -> None:
+    """R1: startup 启动 run_trace_consumer(stop_event)，异常仅 debug 不阻断启动。"""
+    global _trace_consumer_task
+    try:
+        stop = _get_trace_consumer_stop()
+        stop.clear()
+        import hero_quant.api.ws as _ws_consumer_mod
+
+        _trace_consumer_task = asyncio.create_task(_ws_consumer_mod.run_trace_consumer(stop))
+    except Exception as _e:
+        logger.debug("r1.consumer_start_failed", error=str(_e))
+
+
+@app.on_event("shutdown")
+def _stop_trace_consumer() -> None:
+    """R1: shutdown 置位 stop_event 并尽力取消 consumer 任务。"""
+    global _trace_consumer_task
+    try:
+        _get_trace_consumer_stop().set()
+    except Exception as _e:
+        logger.debug("r1.consumer_stop_failed", error=str(_e))
+    try:
+        task = _trace_consumer_task
+        if task is not None and not task.done():
+            task.cancel()
+    except Exception as _e:
+        logger.debug("r1.consumer_cancel_failed", error=str(_e))
+
 # 复用已注册的 Counter，避免重复注册导致 DuplicateTimeseries
 try:
     REQUEST_COUNTER = Counter("hero_quant_requests_total", "Total requests", ["endpoint"])
@@ -557,6 +616,18 @@ async def _security_headers_and_host_check(request: Request, call_next):
     response.headers.setdefault("Content-Security-Policy", _CSP_POLICY)
     response.headers.setdefault("X-Frame-Options", "DENY")
     return response
+
+
+# R1: TraceId + SecurityHeaders 纯中间件挂载（otel @app.middleware 定义之后；离线安全）
+try:
+    from hero_quant.api.middleware import SecurityHeadersMiddleware as _R1SecurityHeadersMiddleware
+    from hero_quant.api.middleware import TraceIdMiddleware as _R1TraceIdMiddleware
+
+    if _R1TraceIdMiddleware is not None:
+        app.add_middleware(_R1TraceIdMiddleware)
+    app.add_middleware(_R1SecurityHeadersMiddleware)
+except Exception as _e:
+    logger.debug("r1.middleware_mount_failed", error=str(_e))
 
 
 @app.get("/live")

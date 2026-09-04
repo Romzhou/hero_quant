@@ -33,9 +33,12 @@ def test_export_no_endpoint_is_noop(monkeypatch):
     SessionTelemetryCoordinator = _reload_otel()
     coord = SessionTelemetryCoordinator(mode="private")
     with mock.patch("urllib.request.urlopen") as mock_urlopen:
-        coord.export({"path": "/live", "trace_id": "t1"})
+        result = coord.export({"path": "/live", "trace_id": "t1"})
         mock_urlopen.assert_not_called()
-        assert True  # TODO: strengthen to real invariant
+        assert result is None, "无 endpoint 时 export 必须为 no-op（返回 None）"
+        assert coord.mode == "private"
+        assert coord.sharing() == "private"
+        assert coord.is_enabled() is True
     _cleanup_fake_otel()
 
 
@@ -139,8 +142,10 @@ def test_export_offline_safe_when_batch_raises(monkeypatch):
     with mock.patch.dict(sys.modules, _patch_dict2):
         SessionTelemetryCoordinator = _reload_otel()
         coord = SessionTelemetryCoordinator(mode="private")
-        coord.export({"path": "/live"})
-        assert True  # TODO: strengthen to real invariant
+        result = coord.export({"path": "/live"})
+        assert result is None, "Batch 抛错时 export 必须离线安全（不抛、返回 None）"
+        assert coord.mode == "private"
+        assert coord.is_enabled() is True
     _cleanup_fake_otel()
 
 
@@ -163,8 +168,8 @@ def test_export_fallback_to_urllib_when_sdk_missing(monkeypatch):
         coord.export({"path": "/live"})
         assert mock_urlopen.called, "fallback urllib should be used when BatchLogRecordProcessor unavailable"
     with mock.patch("urllib.request.urlopen", side_effect=RuntimeError("offline")):
-        coord.export({"path": "/live"})
-        assert True  # TODO: strengthen to real invariant
+        result = coord.export({"path": "/live"})
+        assert result is None, "urllib 离线时 export 必须吞错（不抛、返回 None）"
     _cleanup_fake_otel()
 
 
