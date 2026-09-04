@@ -22,10 +22,10 @@ def test_graph_selected_validation_and_mutable_copy():
 
 def test_graph_verify_falsy_or_chain_fixed():
     from hero_quant.agent.graph import verify_node
-    # empty list should give confidence 0.65, not hide via falsy or
+    # 新契约：空证据 0.50 < 单证据 0.60，防倒挂（n==0:0.65 > n==1:0.60 已修复）
     state = {"subagent_outputs": []}
     res = verify_node(state)
-    assert res["confidence"] == 0.65
+    assert res["confidence"] == 0.50
     # None with intermediate_results should also handle
     state2 = {"subagent_outputs": None, "intermediate_results": [{"agent": "market", "output": "x"}]}
     res2 = verify_node(state2)
@@ -33,7 +33,7 @@ def test_graph_verify_falsy_or_chain_fixed():
     # invalid type coerced to empty
     state3 = {"subagent_outputs": "not-a-list"}
     res3 = verify_node(state3)
-    assert res3["confidence"] == 0.65
+    assert res3["confidence"] == 0.50
 
 
 def test_graph_plan_delegation_depth_invalid():

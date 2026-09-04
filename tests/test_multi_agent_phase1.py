@@ -1,10 +1,11 @@
 """Phase 1: 5 投研角色与工具绑定回归."""
 
-from hero_quant.agent.graph import _ROLE_TOOL_MAP, _ROLE_PROMPTS, _get_role_tools, _get_role_prompt
+from hero_quant.agent.graph import _ROLE_TOOL_MAP, _get_role_tools, _get_role_prompt
 
 
 def test_role_tool_map_covers_five_roles():
-    assert set(_ROLE_TOOL_MAP.keys()) == {"market", "news", "fundamentals", "factor", "risk"}
+    # 新契约：补 sentiment/regime 后为 7 角色（原 5 角色已含，C3 补齐前视）
+    assert set(_ROLE_TOOL_MAP.keys()) == {"market", "news", "fundamentals", "factor", "risk", "sentiment", "regime"}
     # risk no duplicate tool
     assert len(_ROLE_TOOL_MAP["risk"]) == len(set(_ROLE_TOOL_MAP["risk"])) or True  # allow dup but check unique later
 
