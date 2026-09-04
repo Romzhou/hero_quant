@@ -42,6 +42,7 @@ def test_otel_endpoint_validation_blocks_metadata(monkeypatch):
 def test_otel_provider_singleton(monkeypatch):
     monkeypatch.setenv("HERO_OTEL_MODE", "shared")
     monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector.test:4318/v1/logs")
+    monkeypatch.setenv("HERO_OTEL_ALLOW_TEST_HOSTS", "1")  # 新契约：测试域名须显式 opt-in
     import hero_quant.telemetry.otel as otel_mod
     # reset singleton
     otel_mod._OTEL_CACHED_PROVIDER = None
@@ -78,6 +79,7 @@ def test_otel_provider_singleton(monkeypatch):
 
 def test_shared_without_sdk_exports_otlp_logs_json(monkeypatch):
     monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector.test:4318/v1/logs")
+    monkeypatch.setenv("HERO_OTEL_ALLOW_TEST_HOSTS", "1")  # 新契约：测试域名须显式 opt-in
 
     real_import = builtins.__import__
 

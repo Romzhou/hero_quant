@@ -45,6 +45,7 @@ def test_export_no_endpoint_is_noop(monkeypatch):
 def test_export_with_endpoint_uses_batch_not_throw(monkeypatch):
     monkeypatch.setenv("HERO_OTEL_MODE", "private")
     monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318/v1/logs")
+    monkeypatch.setenv("HERO_OTEL_ALLOW_TEST_HOSTS", "1")  # 新契约：测试域名须显式 opt-in
     fake_logger_provider_cls = mock.MagicMock(name="LoggerProvider")
     fake_provider_instance = mock.MagicMock(name="provider")
     fake_logger_provider_cls.return_value = fake_provider_instance
@@ -100,6 +101,7 @@ def test_export_with_endpoint_uses_batch_not_throw(monkeypatch):
 def test_export_offline_safe_when_batch_raises(monkeypatch):
     monkeypatch.setenv("HERO_OTEL_MODE", "private")
     monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318/v1/logs")
+    monkeypatch.setenv("HERO_OTEL_ALLOW_TEST_HOSTS", "1")  # 新契约：测试域名须显式 opt-in
     fake_logger_provider_cls = mock.MagicMock(name="LoggerProvider")
     fake_provider_instance = mock.MagicMock(name="provider")
     fake_provider_instance.get_logger.side_effect = RuntimeError("collector offline")
@@ -152,6 +154,7 @@ def test_export_offline_safe_when_batch_raises(monkeypatch):
 def test_export_fallback_to_urllib_when_sdk_missing(monkeypatch):
     monkeypatch.setenv("HERO_OTEL_MODE", "private")
     monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318/v1/logs")
+    monkeypatch.setenv("HERO_OTEL_ALLOW_TEST_HOSTS", "1")  # 新契约：测试域名须显式 opt-in
     for m in list(sys.modules.keys()):
         if m.startswith("opentelemetry.sdk") or m.startswith("opentelemetry.exporter"):
             sys.modules.pop(m, None)
@@ -176,6 +179,7 @@ def test_export_fallback_to_urllib_when_sdk_missing(monkeypatch):
 def test_export_disabled_never_exports(monkeypatch):
     monkeypatch.setenv("HERO_OTEL_MODE", "disabled")
     monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318/v1/logs")
+    monkeypatch.setenv("HERO_OTEL_ALLOW_TEST_HOSTS", "1")  # 新契约：测试域名须显式 opt-in
     fake_batch_cls = mock.MagicMock(name="BatchLogRecordProcessor")
     sdk_logs_export_mod = types.ModuleType("opentelemetry.sdk._logs.export")
     sdk_logs_export_mod.BatchLogRecordProcessor = fake_batch_cls
