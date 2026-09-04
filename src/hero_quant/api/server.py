@@ -455,8 +455,8 @@ async def _start_trace_consumer() -> None:
 
 
 @app.on_event("shutdown")
-def _stop_trace_consumer() -> None:
-    """R1: shutdown 置位 stop_event 并尽力取消 consumer 任务。"""
+async def _stop_trace_consumer() -> None:
+    """R1: shutdown 置位 stop_event 并 await 取消 consumer 任务（带超时）。"""
     global _trace_consumer_task
     try:
         _get_trace_consumer_stop().set()
@@ -466,23 +466,41 @@ def _stop_trace_consumer() -> None:
         task = _trace_consumer_task
         if task is not None and not task.done():
             task.cancel()
+            try:
+                # 等待任务清理完成，超时 fail-closed 避免阻塞 shutdown
+                await asyncio.wait_for(task, timeout=2.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+            except Exception as _e:
+                logger.debug("r1.consumer_cancel_failed", error=str(_e))
     except Exception as _e:
         logger.debug("r1.consumer_cancel_failed", error=str(_e))
 
-# 复用已注册的 Counter，避免重复注册导致 DuplicateTimeseries
+# 复用已注册的 Counter，避免重复注册导致 DuplicateTimeseries（使用公开 API）
 try:
     REQUEST_COUNTER = Counter("hero_quant_requests_total", "Total requests", ["endpoint"])
 except Exception:
-    # 已通过 hero_quant.metrics 注册——复用现有收集器
+    # 已通过 hero_quant.metrics 注册——复用现有收集器（不用私有 API）
     try:
-        from prometheus_client import REGISTRY as _REG
-
-        REQUEST_COUNTER = _REG._names_to_collectors["hero_quant_requests_total"]  # type: ignore[attr-defined]
+        from prometheus_client import REGISTRY as _REG  # noqa: F401
+        from prometheus_client import REGISTRY as _REG2
+        # 中文：优先用公开 get_sample_value 探测，否则回退 metrics 单例
+        _existing = None
+        try:
+            # 尝试通过公开方法获取已注册 collector
+            _existing = _REG2.get_sample_value("hero_quant_requests_total")  # type: ignore[attr-defined]
+        except Exception:
+            _existing = None
+        if _existing is not None:
+            # 已存在则复用 metrics 模块单例（公开路径）
+            from hero_quant.metrics import REQUEST_COUNTER as _MRC  # type: ignore
+            REQUEST_COUNTER = _MRC  # type: ignore
+        else:
+            from hero_quant.metrics import REQUEST_COUNTER as _MRC2  # type: ignore
+            REQUEST_COUNTER = _MRC2  # type: ignore
     except Exception:
-        # 回退到 metrics 模块的计数器
         try:
             from hero_quant.metrics import REQUEST_COUNTER as _MRC  # type: ignore
-
             REQUEST_COUNTER = _MRC  # type: ignore
         except Exception:
             REQUEST_COUNTER = None  # type: ignore
@@ -494,16 +512,15 @@ try:
         ["endpoint"],
     )
 except Exception:
-    # 已注册（如测试中重载）——复用现有收集器
+    # 已注册（如测试中重载）——复用现有收集器（不用私有 API）
     try:
-        from prometheus_client import REGISTRY
-
-        REQUEST_DURATION = REGISTRY._names_to_collectors["http_request_duration_seconds"]  # type: ignore[attr-defined]
+        from prometheus_client import REGISTRY as _REG3  # noqa: F401
+        from hero_quant.metrics import REQUEST_DURATION as _MRD  # type: ignore
+        REQUEST_DURATION = _MRD  # type: ignore
     except Exception:
         try:
-            from hero_quant.metrics import REQUEST_DURATION as _MRD  # type: ignore
-
-            REQUEST_DURATION = _MRD  # type: ignore
+            from hero_quant.metrics import REQUEST_DURATION as _MRD2  # type: ignore
+            REQUEST_DURATION = _MRD2  # type: ignore
         except Exception:
             REQUEST_DURATION = None  # type: ignore
 
@@ -688,31 +705,50 @@ def _check_checkpoint_pg() -> tuple[bool, str]:
         pool = getattr(saver, "pool", None)
         if pool is None:
             return False, "memory"
-        # 实探 SELECT 1，失败则 fail-closed
+        # 实探 SELECT 1（带 2s 超时，避免阻塞 /ready）
         try:
-            if hasattr(pool, "connection"):
-                with pool.connection() as _conn:  # type: ignore
+            import concurrent.futures as _cf
+            def _do_checkpoint_select():
+                if hasattr(pool, "connection"):
                     try:
-                        # 优先直连 execute
-                        _conn.execute("SELECT 1")  # type: ignore
-                    except Exception:
-                        with _conn.cursor() as _cur:  # type: ignore
+                        with pool.connection(timeout=2) as _conn:  # type: ignore[call-arg]
+                            try:
+                                _conn.execute("SELECT 1", timeout=2)  # type: ignore[call-arg]
+                            except TypeError:
+                                with _conn.cursor() as _cur:  # type: ignore
+                                    _cur.execute("SELECT 1")
+                            except Exception:
+                                with _conn.cursor() as _cur:  # type: ignore
+                                    _cur.execute("SELECT 1")
+                    except TypeError:
+                        with pool.connection() as _conn2:  # type: ignore
+                            with _conn2.cursor() as _cur2:  # type: ignore
+                                _cur2.execute("SELECT 1")
+                elif hasattr(pool, "getconn"):
+                    _conn = pool.getconn(timeout=2)  # type: ignore[call-arg]
+                    try:
+                        with _conn.cursor() as _cur:
                             _cur.execute("SELECT 1")
-            elif hasattr(pool, "getconn"):
-                _conn = pool.getconn()  # type: ignore
+                    finally:
+                        try:
+                            pool.putconn(_conn)  # type: ignore
+                        except Exception as _e:
+                            logger.warning("ready.checkpoint_putconn_failed", dsn=_redact_dsn_api(dsn), exc_info=_e)
+                else:
+                    raise RuntimeError("pool has no connection/getconn")
+            # 中文：超时必传，避免无超时阻塞探测
+            with _cf.ThreadPoolExecutor(max_workers=1) as _ex:
+                fut = _ex.submit(_do_checkpoint_select)
                 try:
-                    with _conn.cursor() as _cur:
-                        _cur.execute("SELECT 1")
-                finally:
-                    try:
-                        pool.putconn(_conn)  # type: ignore
-                    except Exception as _e:
-                        logger.warning("ready.checkpoint_putconn_failed", dsn=_redact_dsn_api(dsn), exc_info=_e)
-            else:
-                logger.warning("ready.checkpoint_pool_no_conn", dsn=_redact_dsn_api(dsn))
-                return False, "memory"
+                    fut.result(timeout=2)
+                except _cf.TimeoutError:
+                    logger.warning("ready.checkpoint_select_timeout", dsn=_redact_dsn_api(dsn))
+                    return False, "memory"
         except Exception as _e:
-            logger.warning("ready.checkpoint_select_failed", dsn=_redact_dsn_api(dsn), exc_info=_e)
+            if "TimeoutError" in type(_e).__name__ or "timeout" in str(_e).lower():
+                logger.warning("ready.checkpoint_select_timeout", dsn=_redact_dsn_api(dsn), exc_info=_e)
+            else:
+                logger.warning("ready.checkpoint_select_failed", dsn=_redact_dsn_api(dsn), exc_info=_e)
             return False, "memory"
         return True, "pg"
     except Exception as _e:
@@ -752,30 +788,50 @@ def _check_billing_pg() -> tuple[bool, str]:
         pool = getattr(svc, "_pool", None)
         if pool is None:
             return False, "memory"
-        # 实探 SELECT 1
+        # 实探 SELECT 1（带 2s 超时，避免阻塞 /ready）
         try:
-            if hasattr(pool, "connection"):
-                with pool.connection() as _conn:  # type: ignore
+            import concurrent.futures as _cf2
+            def _do_billing_select():
+                if hasattr(pool, "connection"):
                     try:
-                        _conn.execute("SELECT 1")  # type: ignore
-                    except Exception:
-                        with _conn.cursor() as _c:  # type: ignore
-                            _c.execute("SELECT 1")
-            elif hasattr(pool, "getconn"):
-                _c2 = pool.getconn()  # type: ignore
+                        with pool.connection(timeout=2) as _conn:  # type: ignore[call-arg]
+                            try:
+                                _conn.execute("SELECT 1", timeout=2)  # type: ignore[call-arg]
+                            except TypeError:
+                                with _conn.cursor() as _c:  # type: ignore
+                                    _c.execute("SELECT 1")
+                            except Exception:
+                                with _conn.cursor() as _c:  # type: ignore
+                                    _c.execute("SELECT 1")
+                    except TypeError:
+                        with pool.connection() as _conn2:  # type: ignore
+                            with _conn2.cursor() as _c2:  # type: ignore
+                                _c2.execute("SELECT 1")
+                elif hasattr(pool, "getconn"):
+                    _c2 = pool.getconn(timeout=2)  # type: ignore[call-arg]
+                    try:
+                        with _c2.cursor() as _cur:
+                            _cur.execute("SELECT 1")
+                    finally:
+                        try:
+                            pool.putconn(_c2)  # type: ignore
+                        except Exception as _e:
+                            logger.warning("ready.billing_putconn_failed", dsn=_redact_dsn_api(dsn or ""), exc_info=_e)
+                else:
+                    raise RuntimeError("pool has no connection/getconn")
+            # 中文：超时必传，避免无超时阻塞探测
+            with _cf2.ThreadPoolExecutor(max_workers=1) as _ex2:
+                fut = _ex2.submit(_do_billing_select)
                 try:
-                    with _c2.cursor() as _cur:
-                        _cur.execute("SELECT 1")
-                finally:
-                    try:
-                        pool.putconn(_c2)  # type: ignore
-                    except Exception as _e:
-                        logger.warning("ready.billing_putconn_failed", dsn=_redact_dsn_api(dsn or ""), exc_info=_e)
-            else:
-                logger.warning("ready.billing_pool_no_conn", dsn=_redact_dsn_api(dsn or ""))
-                return False, "memory"
+                    fut.result(timeout=2)
+                except _cf2.TimeoutError:
+                    logger.warning("ready.billing_select_timeout", dsn=_redact_dsn_api(dsn or ""))
+                    return False, "memory"
         except Exception as _e:
-            logger.warning("ready.billing_select_failed", dsn=_redact_dsn_api(dsn or ""), exc_info=_e)
+            if "TimeoutError" in type(_e).__name__ or "timeout" in str(_e).lower():
+                logger.warning("ready.billing_select_timeout", dsn=_redact_dsn_api(dsn or ""), exc_info=_e)
+            else:
+                logger.warning("ready.billing_select_failed", dsn=_redact_dsn_api(dsn or ""), exc_info=_e)
             return False, "memory"
         return True, "pg"
     except Exception as _e:
@@ -870,10 +926,11 @@ def metrics():
 
 
 @app.get("/v1/query")
-async def query(request: Request, q: str = "", use_graph: bool = False, replay_path: str | None = None, trace_dir: str | None = None, wall_time_budget: float | None = None, background_tasks: BackgroundTasks = BackgroundTasks([])):  # type: ignore[assignment]
-    # 可变默认防御：每请求新建独立实例
-    background_tasks = BackgroundTasks()
+async def query(request: Request, q: str = "", use_graph: bool = False, replay_path: str | None = None, trace_dir: str | None = None, wall_time_budget: float | None = None, background_tasks: BackgroundTasks | None = None):
     """同步查询：组装 AgentLoop 并返回 LoopResult 聚合 JSON。"""
+    # 修复：可变默认改为 None，注入的 BackgroundTasks 不被丢弃
+    if background_tasks is None:
+        background_tasks = BackgroundTasks()
     _limited = _check_rate_limit(request, "query", 20, 60)
     if _limited is not None:
         return _limited
@@ -1054,7 +1111,9 @@ async def query(request: Request, q: str = "", use_graph: bool = False, replay_p
             logger.debug("telemetry.wall_time_start_failed", error=str(_e))
         try:
             res = await asyncio.to_thread(loop.run, q)
-        except Exception:
+        except RuntimeError as _e:
+            # 窄化：仅基础设施/线程池不可用时同步重试；业务异常不重试避免重复副作用
+            logger.warning("query.thread_fallback", error=str(_e))
             res = loop.run(q)
         try:
             from hero_quant.metrics import observe_wall_time as _observe_wt2
@@ -1121,9 +1180,10 @@ def query_ticket(request: Request):
 
 
 @app.get("/v1/query/stream")
-async def query_stream(request: Request, q: str = "", ticket: str | None = None, use_graph: bool = False, replay_path: str | None = None, trace_dir: str | None = None, wall_time_budget: float | None = None, background_tasks: BackgroundTasks = BackgroundTasks([])):  # type: ignore[assignment]
-    background_tasks = BackgroundTasks()
+async def query_stream(request: Request, q: str = "", ticket: str | None = None, use_graph: bool = False, replay_path: str | None = None, trace_dir: str | None = None, wall_time_budget: float | None = None, background_tasks: BackgroundTasks | None = None):
     """SSE 查询流：真实 AgentLoop 驱动，产出 tool 轨迹 + 流式 delta + [DONE]。"""
+    if background_tasks is None:
+        background_tasks = BackgroundTasks()
     _limited = _check_rate_limit(request, "stream", 10, 60)
     if _limited is not None:
         return _limited
@@ -1305,8 +1365,8 @@ async def query_stream(request: Request, q: str = "", ticket: str | None = None,
             # Run synchronous AgentLoop in thread pool to avoid blocking event loop (was starving concurrent SSE + /live)
             try:
                 res = await asyncio.to_thread(loop.run, q)
-            except Exception as _e:
-                # fallback: direct call if to_thread unavailable
+            except RuntimeError as _e:
+                # 窄化：仅 to_thread/线程池异常才同步重试
                 logger.warning("loop.thread_fallback", error=str(_e))
                 res = loop.run(q)
             try:
@@ -1558,14 +1618,9 @@ def _get_backtest_bundle():
     """获取回测产物（metrics、持仓、tearsheet、CSV）：L1 内存 → L2 Redis → 计算。
 
     计算段用 threading.Lock 本地互斥 + 可选 Redis SET NX 防多 worker 雷群（fakeredis 下兼容 fail-open）。
-    失败返回静态兜底。"""
+    失败返回静态兜底。原子性：L1 首检在锁内完成。"""
     global _backtest_cache
-    if _backtest_cache:
-        return _backtest_cache
-    cached = _read_backtest_bundle_cache()
-    if cached is not None:
-        _backtest_cache = cached
-        return _backtest_cache
+    # 中文：原子性修复——所有 L1/L2 检查均在单锁内，避免 check-then-act 撕裂
     with _backtest_cache_lock:
         if _backtest_cache:
             return _backtest_cache
@@ -1575,16 +1630,22 @@ def _get_backtest_bundle():
             return _backtest_cache
         # 可选 Redis 分布式锁防多 worker 雷群（拿不到则 fail-open 继续算；fakeredis 下兼容）。
         _have_dlock = False
+        _dlock_token = None
+        _rc = None
         try:
             from hero_quant.infra.redis import get_redis_sync
+            import uuid as _uuid
 
             _rc = get_redis_sync()
             if _rc is not None:
                 try:
-                    if _rc.set(_BACKTEST_BUNDLE_LOCK_KEY, "1", nx=True, ex=30):
+                    _dlock_token = _uuid.uuid4().hex
+                    if _rc.set(_BACKTEST_BUNDLE_LOCK_KEY, _dlock_token, nx=True, ex=30):
                         _have_dlock = True
                 except Exception as _e:
                     logger.debug(f"backtest.bundle_dlock_failed error={_e}")
+                    _have_dlock = False
+                    _dlock_token = None
         except Exception as _e:
             logger.debug(f"backtest.bundle_dlock_failed error={_e}")
         try:
@@ -1597,9 +1658,21 @@ def _get_backtest_bundle():
             _write_backtest_bundle_cache(bundle)
             return _backtest_cache
         finally:
-            if _have_dlock:
+            if _have_dlock and _rc is not None and _dlock_token is not None:
                 try:
-                    _rc.delete(_BACKTEST_BUNDLE_LOCK_KEY)  # type: ignore[union-attr]
+                    # 中文：token + Lua 原子释放，避免过期后误删他人锁
+                    try:
+                        _rc.eval("if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end", 1, _BACKTEST_BUNDLE_LOCK_KEY, _dlock_token)  # type: ignore[attr-defined]
+                    except Exception:
+                        # 回退：GET+DEL 非原子但带 token 校验
+                        try:
+                            cur = _rc.get(_BACKTEST_BUNDLE_LOCK_KEY)
+                            # 兼容 bytes/str
+                            cur_s = cur.decode() if isinstance(cur, bytes) else cur
+                            if cur_s == _dlock_token:
+                                _rc.delete(_BACKTEST_BUNDLE_LOCK_KEY)  # type: ignore[union-attr]
+                        except Exception as _e2:
+                            logger.debug(f"backtest.bundle_dlock_release_failed error={_e2}")
                 except Exception as _e:
                     logger.debug(f"backtest.bundle_dlock_release_failed error={_e}")
 

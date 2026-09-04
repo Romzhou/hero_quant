@@ -11,6 +11,8 @@ import logging
 
 from fastapi import HTTPException, Request
 
+from hero_quant.infra.redis import RateLimiter  # 顶层导入，避免每请求函数内导入
+
 logger = logging.getLogger(__name__)
 
 CHAT_MAX = 10
@@ -31,7 +33,8 @@ def limit_key(request: Request) -> str:
     """限流 key：优先已认证 user_id，否则回退客户端 IP。"""
     user = getattr(getattr(request, "state", None), "current_user", None)
     uid = getattr(user, "id", None) if user is not None else None
-    if uid:
+    # 显式 is not None 判定：0 为合法 id，不得当匿名
+    if uid is not None and uid != "":
         return f"user:{uid}"
     try:
         ip = getattr(getattr(request, "client", None), "host", None) or "unknown"
@@ -45,13 +48,14 @@ limiter = _SlowLimiter(key_func=limit_key) if SLOWAPI_AVAILABLE and _SlowLimiter
 
 
 async def _check(request: Request, quota: int, endpoint: str) -> bool:
-    from hero_quant.infra.redis import RateLimiter
-
+    """按 endpoint 隔离 bucket；Redis 故障 fail-closed 抛 503。"""
     try:
-        ok = await RateLimiter().try_acquire(limit_key(request), quota, WINDOW_SECONDS)
+        # 三档隔离：key 包含 endpoint 前缀，避免 chat/tool/session 共用同一桶
+        ok = await RateLimiter().try_acquire(f"{endpoint}:{limit_key(request)}", quota, WINDOW_SECONDS)
     except Exception as e:
-        logger.debug("ratelimiter.check_failed endpoint=%s error=%s", endpoint, str(e))
-        return True
+        # fail-closed：限流后端故障时不放行，避免在最需限流时失守
+        logger.warning("ratelimiter.check_failed endpoint=%s error=%s", endpoint, str(e))
+        raise HTTPException(status_code=503, detail="Rate limiter unavailable") from e
     if not ok:
         raise HTTPException(status_code=429, detail=f"Too many {endpoint} requests")
     return True

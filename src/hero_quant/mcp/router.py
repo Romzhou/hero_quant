@@ -46,12 +46,14 @@ def _get_router_circuit():
     """获取路由熔断器，失败返回 None。"""
     global _ROUTER_CIRCUIT
     if _ROUTER_CIRCUIT is None:
-        try:
-            from hero_quant.telemetry.circuit import CircuitBreaker
+        with _LIMITER_LOCK:
+            if _ROUTER_CIRCUIT is None:
+                try:
+                    from hero_quant.telemetry.circuit import CircuitBreaker
 
-            _ROUTER_CIRCUIT = CircuitBreaker(failure_threshold=0.5, window=60, open_duration=30)
-        except Exception:
-            _ROUTER_CIRCUIT = None  # type: ignore
+                    _ROUTER_CIRCUIT = CircuitBreaker(failure_threshold=0.5, window=60, open_duration=30)
+                except Exception:
+                    _ROUTER_CIRCUIT = None  # type: ignore
     return _ROUTER_CIRCUIT
 
 
@@ -59,13 +61,15 @@ def _get_rate_limiter():
     """获取双桶限流器，默认大容量以避免误限流；测试可注入小容量实例。"""
     global _ROUTER_RATE_LIMITER
     if _ROUTER_RATE_LIMITER is None:
-        try:
-            from hero_quant.telemetry.circuit import DualBucketRateLimiter
+        with _LIMITER_LOCK:
+            if _ROUTER_RATE_LIMITER is None:
+                try:
+                    from hero_quant.telemetry.circuit import DualBucketRateLimiter
 
-            # 默认大容量，不限流，测试可注入小容量 limiter
-            _ROUTER_RATE_LIMITER = DualBucketRateLimiter(capacity=1000, refill_per_sec=500, burst_capacity=1000)
-        except Exception:
-            _ROUTER_RATE_LIMITER = None  # type: ignore
+                    # 默认大容量，不限流，测试可注入小容量 limiter
+                    _ROUTER_RATE_LIMITER = DualBucketRateLimiter(capacity=1000, refill_per_sec=500, burst_capacity=1000)
+                except Exception:
+                    _ROUTER_RATE_LIMITER = None  # type: ignore
     return _ROUTER_RATE_LIMITER
 
 
@@ -187,56 +191,60 @@ def _ensure_corpus() -> None:
         fp = _hashlib.sha256("|".join(fp_parts).encode()).hexdigest()
     except Exception:
         fp = str(len(TOOL_REGISTRY))
+    # 中文：全量在锁内构建，避免指纹检查后释放锁导致的 torn snapshot
     with _CORPUS_LOCK:
         if fp == _last_registry_fingerprint and _N != 0:
             return
         size = len(TOOL_REGISTRY)
-    corpus: List[List[str]] = []
-    doc_tokens: Dict[str, List[str]] = {}
-    for name, spec in TOOL_REGISTRY.items():
-        desc = getattr(spec, "description", "") or ""
-        toks = _tokenize(desc)
-        doc_tokens[name] = toks
-        corpus.append(toks)
-    N = len(corpus)
-    if N == 0:
-        _IDF = {}
-        _AVG_DL = 0.0
-        _N = 0
-        _DOC_TOKENS = {}
+        corpus: List[List[str]] = []
+        doc_tokens: Dict[str, List[str]] = {}
+        for name, spec in TOOL_REGISTRY.items():
+            desc = getattr(spec, "description", "") or ""
+            toks = _tokenize(desc)
+            doc_tokens[name] = toks
+            corpus.append(toks)
+        N = len(corpus)
+        if N == 0:
+            _IDF = {}
+            _AVG_DL = 0.0
+            _N = 0
+            _DOC_TOKENS = {}
+            _last_registry_size = size
+            _avg_dl = _AVG_DL
+            _idf = _IDF
+            return
+        avg_dl = sum(len(d) for d in corpus) / N if N else 0.0
+        # 统计文档频率 df
+        df: Counter = Counter()
+        for doc in corpus:
+            for term in set(doc):
+                df[term] += 1
+        # IDF = log((N - n +0.5)/(n+0.5)+1)
+        idf: Dict[str, float] = {}
+        for term, freq in df.items():
+            idf[term] = math.log((N - freq + 0.5) / (freq + 0.5) + 1)
+        _IDF = idf
+        _AVG_DL = avg_dl
+        _N = N
+        _DOC_TOKENS = doc_tokens
         _last_registry_size = size
+        _last_registry_fingerprint = fp
         _avg_dl = _AVG_DL
         _idf = _IDF
-        return
-    avg_dl = sum(len(d) for d in corpus) / N if N else 0.0
-    # 统计文档频率 df
-    df: Counter = Counter()
-    for doc in corpus:
-        for term in set(doc):
-            df[term] += 1
-    # IDF = log((N - n +0.5)/(n+0.5)+1)
-    idf: Dict[str, float] = {}
-    for term, freq in df.items():
-        idf[term] = math.log((N - freq + 0.5) / (freq + 0.5) + 1)
-    _IDF = idf
-    _AVG_DL = avg_dl
-    _N = N
-    _DOC_TOKENS = doc_tokens
-    _last_registry_size = size
-    _last_registry_fingerprint = fp
-    _avg_dl = _AVG_DL
-    _idf = _IDF
 
 
 def _score_tool(query_tokens: List[str], query_lower: str, tool_name: str, description: str) -> float:
     """对单个工具计算 BM25 分数；空文档或未知词返回 0.0，保留旧签名兼容测试。"""
     # query_lower 保留以兼容历史签名（不参与额外加权）
     _ensure_corpus()
-    # 优先使用缓存的分词，否则对传入描述分词
-    doc_tokens = _DOC_TOKENS.get(tool_name)
+    # 中文：读 _DOC_TOKENS 时持锁避免与写 torn 竞态
+    with _CORPUS_LOCK:
+        doc_tokens = _DOC_TOKENS.get(tool_name)
+        _avg = _AVG_DL
+        _idf_local = dict(_IDF)
     if doc_tokens is None:
         doc_tokens = _tokenize(description or "")
-    if not doc_tokens or _AVG_DL <= 0:
+    if not doc_tokens or _avg <= 0:
         return 0.0
     dl = len(doc_tokens)
     tf_map = Counter(doc_tokens)
@@ -246,14 +254,14 @@ def _score_tool(query_tokens: List[str], query_lower: str, tool_name: str, descr
         if term in seen:
             continue
         seen.add(term)
-        idf = _IDF.get(term, 0.0)
+        idf = _idf_local.get(term, 0.0)
         if idf <= 0:
             continue
         tf = tf_map.get(term, 0)
         if tf == 0:
             continue
         numerator = tf * (_BM25_K1 + 1)
-        denominator = tf + _BM25_K1 * (1 - _BM25_B + _BM25_B * dl / _AVG_DL)
+        denominator = tf + _BM25_K1 * (1 - _BM25_B + _BM25_B * dl / _avg)
         score += idf * numerator / denominator
     return score
 
@@ -308,13 +316,15 @@ def _vector_score_for_tool(query_vec, tool_name: str, description: str) -> float
         return 0.0
     # 缓存描述向量
     cache_key = f"{tool_name}:{description or ''}"
+    # 中文：锁内仅取值，cosine 在锁外计算，避免持锁做向量运算
+    dvec = None
     try:
         with _DESC_VEC_LOCK:
-            if cache_key in _DESC_VEC_CACHE:
-                dvec = _DESC_VEC_CACHE[cache_key]
-                return _cosine(query_vec, dvec)
+            dvec = _DESC_VEC_CACHE.get(cache_key)
     except Exception:
-        pass
+        dvec = None
+    if dvec is not None:
+        return _cosine(query_vec, dvec)
     try:
         from hero_quant.agent.embed import embed  # type: ignore
 
@@ -332,7 +342,8 @@ def _vector_score_for_tool(query_vec, tool_name: str, description: str) -> float
         except Exception:
             pass
         return _cosine(query_vec, dvec)
-    except (ImportError, ValueError, TypeError) as e:
+    except Exception as e:
+        # 中文：窄化捕获改为宽捕获，保证向量失败回退 BM25
         logger.warning("vector embed failed for %s: %s", tool_name, e)
         return 0.0
 
@@ -426,13 +437,22 @@ def route(query: str, k: int = 5) -> List[str]:
         return []
     # 双桶限流预检（仅计数，不阻塞召回）
     _try_acquire_or_record()
-    # 熔断检查：OPEN 时直接返回 curated 前 k，避免 BM25 耗时
+    # 熔断检查：OPEN 时短路返回，但仍需保证 compute_factor 不变量
     try:
         circ = _get_router_circuit()
         if circ is not None and not circ.allow():
-            # 熔断时短路返回 curated 前 k，保证可用性
+            # 中文：熔断 OPEN 时也保证含 momentum/factor 的查询中 compute_factor 在首位
             curated = CURATED_TOOLS if isinstance(CURATED_TOOLS, list) and len(CURATED_TOOLS) else sorted(TOOL_REGISTRY.keys())
-            return [n for n in curated if n in TOOL_REGISTRY][:k]
+            base = [n for n in curated if n in TOOL_REGISTRY][:k]
+            ql = (query or "").lower()
+            if ("momentum" in ql or "factor" in ql) and "compute_factor" in TOOL_REGISTRY:
+                if "compute_factor" not in base:
+                    base = ["compute_factor"] + [x for x in base if x != "compute_factor"]
+                    base = base[:k]
+                elif base[0] != "compute_factor":
+                    base = ["compute_factor"] + [x for x in base if x != "compute_factor"]
+                    base = base[:k]
+            return base
     except Exception as _exc:
         logger.debug("silent handled: offline-safe: mcp router fallback", exc_info=_exc)  # intentional: offline-safe: mcp router fallback
         pass  # intentional offline-safe: mcp router fallback
