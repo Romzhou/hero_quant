@@ -31,10 +31,10 @@ class AKShareLoader:
         try:
             s = datetime.strptime(start, "%Y-%m-%d")
             e = datetime.strptime(end, "%Y-%m-%d")
-        except Exception as exc:
+        except (ValueError, TypeError) as exc:
             raise DataValidationError(f"invalid date format start={start!r} end={end!r}: {exc}") from exc
         if e < s:
-            e = s
+            raise DataValidationError(f"invalid range: end {end!r} before start {start!r} (fail-closed)")
         dates: list[str] = []
         opens: list[float] = []
         highs: list[float] = []
@@ -53,14 +53,10 @@ class AKShareLoader:
             cur += timedelta(days=1)
             idx += 1
             if idx > 500:
-                break
-        if not dates:
-            dates = [start]
-            opens = [1500.0]
-            highs = [1510.0]
-            lows = [1490.0]
-            closes = [1500.0]
-            volumes = [100.0]
+                # 合成历史静默截断会误导调用方；超过 500 天直接 fail-closed
+                raise DataValidationError(
+                    f"synthetic range too large: start={start!r} end={end!r} exceeds 500 rows (fail-closed)"
+                )
         df = pd.DataFrame(
             {
                 "open": opens,
@@ -94,13 +90,15 @@ class AKShareLoader:
                 if need.capitalize() in df_ak.columns:
                     df[need] = df_ak[need.capitalize()]
                 else:
-                     return None
+                    return None
         if "date" in df.columns:
             try:
-                df["date"] = pd.to_datetime(df["date"])
+                df["date"] = pd.to_datetime(df["date"], errors="raise")
                 df = df.set_index("date")
-            except Exception:
-                pass
+            except (ValueError, TypeError, pd.errors.OutOfBoundsDatetime) as e:
+                # 窄化捕获，禁止裸 except pass 静默错位
+                logger.warning("akshare date parse failed: %s", e, exc_info=True)
+                raise DataValidationError(f"akshare invalid date index: {e}") from e
         # 成交量归一：移除 >100000/100 heuristic，禁止静默填补；缺失则 fail-closed
         if "volume" in df.columns:
             vol = pd.to_numeric(df["volume"], errors="coerce")
@@ -126,7 +124,8 @@ class AKShareLoader:
             import akshare  # noqa: F401
 
             ak_ok = True
-        except Exception:
+        except (ImportError, ModuleNotFoundError) as e:
+            logger.warning("akshare not installed health check: %s", e, exc_info=True)
             ak_ok = False
         return {"status": "ok", "source": self.name, "akshare_available": ak_ok, "unit": self.unit, "markets": self.markets}
 
@@ -142,13 +141,16 @@ class AKShareLoader:
                 raise DataValidationError(f"ambiguous legacy argument order: start={start!r} end={end!r} interval={interval!r}")
         if interval not in _intervals:
             raise DataValidationError(f"invalid interval {interval!r}, expected one of {sorted(_intervals)}")
+        # akshare 日线 loader 仅支持日线及以上；intraday 必须 fail-closed 而非静默返回日线
+        if interval in ("1m", "5m", "15m", "30m", "1h"):
+            raise DataValidationError(f"unsupported interval for daily loader: {interval!r} (akshare only supports daily)")
 
         try:
             from hero_quant.config.settings import Settings
 
             mode = Settings().data_mode
-        except Exception as e:
-            logger.warning("settings load failed for %s: %s", symbol, e, exc_info=e)
+        except (ImportError, AttributeError, ValueError, TypeError, OSError, RuntimeError) as e:
+            logger.warning("settings load failed for %s: %s", symbol, e, exc_info=True)
             import os
 
             mode = os.environ.get("HERO_DATA_MODE", "live")
@@ -164,7 +166,7 @@ class AKShareLoader:
         try:
             import akshare as ak  # type: ignore
         except ImportError as e:
-            logger.warning("akshare not installed for %s: %s", symbol, e, exc_info=e)
+            logger.warning("akshare not installed for %s: %s", symbol, e, exc_info=True)
             raise ImportError("pip install hero-quant[ashare] - akshare not installed") from e
 
         try:
@@ -176,7 +178,7 @@ class AKShareLoader:
                 # ensure 8 digits
                 datetime.strptime(start_n, "%Y%m%d")
                 datetime.strptime(end_n, "%Y%m%d")
-            except Exception as e:
+            except (ValueError, TypeError) as e:
                 raise DataValidationError(f"invalid date format start={start!r} end={end!r}: {e}") from e
             df_ak = None
             # primary: stock_zh_a_hist (retry with different adjust param to handle API variants)
@@ -185,11 +187,11 @@ class AKShareLoader:
             except TypeError:
                 try:
                     df_ak = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=start_n, end_date=end_n, adjust="")
-                except Exception as e:
-                    logger.warning("akshare stock_zh_a_hist failed for %s: %s", symbol, e, exc_info=e)
+                except (ValueError, TypeError, RuntimeError) as e:
+                    logger.warning("akshare stock_zh_a_hist failed for %s: %s", symbol, e, exc_info=True)
                     df_ak = None
-            except Exception as e:
-                logger.warning("akshare stock_zh_a_hist failed for %s: %s", symbol, e, exc_info=e)
+            except (ValueError, TypeError, RuntimeError) as e:
+                logger.warning("akshare stock_zh_a_hist failed for %s: %s", symbol, e, exc_info=True)
                 df_ak = None
             normalized = self._normalize_akshare(df_ak) if df_ak is not None else None
             if normalized is not None and len(normalized) > 0:
@@ -198,10 +200,10 @@ class AKShareLoader:
         except DataValidationError:
             raise
         except ValueError as e:
-            logger.warning("akshare parse failed for %s: %s", symbol, e, exc_info=e)
+            logger.warning("akshare parse failed for %s: %s", symbol, e, exc_info=True)
             raise RuntimeError(f"akshare fetch failed for {symbol}: {e}") from e
         except ImportError:
             raise
-        except Exception as e:
-            logger.warning("akshare error for %s: %s", symbol, e, exc_info=e)
+        except (RuntimeError, OSError) as e:
+            logger.warning("akshare error for %s: %s", symbol, e, exc_info=True)
             raise RuntimeError(f"akshare fetch failed for {symbol}: {e}") from e

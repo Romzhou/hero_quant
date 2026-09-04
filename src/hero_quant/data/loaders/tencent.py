@@ -22,18 +22,6 @@ class DataValidationError(ValueError):
     """Loader validation error for unparseable dates/inputs."""
 
 
-def _coerce_float(val, default):
-    """Preserve 0.0; only fallback when None or empty/whitespace string."""
-    if val is None:
-        return float(default)
-    if isinstance(val, str) and val.strip() == "":
-        return float(default)
-    try:
-        return float(val)
-    except Exception:
-        return float(default)
-
-
 class TencentLoader:
     """腾讯 CN 行情 Loader（board_lots）。"""
 
@@ -47,10 +35,10 @@ class TencentLoader:
         try:
             s = datetime.strptime(start, "%Y-%m-%d")
             e = datetime.strptime(end, "%Y-%m-%d")
-        except Exception as exc:
+        except (ValueError, TypeError) as exc:
             raise DataValidationError(f"invalid date format start={start!r} end={end!r}: {exc}") from exc
         if e < s:
-            e = s
+            raise DataValidationError(f"invalid range: end {end!r} before start {start!r} (fail-closed)")
         bars = []
         cur = s
         idx = 0
@@ -67,9 +55,9 @@ class TencentLoader:
             cur += timedelta(days=1)
             idx += 1
             if idx > 500:
-                break
-        if not bars:
-            bars.append({"date": start, "open": 1500.0, "close": 1500.0, "high": 1510, "low": 1490, "volume": 100})
+                raise DataValidationError(
+                    f"synthetic range too large: start={start!r} end={end!r} exceeds 500 rows (fail-closed)"
+                )
         return bars
 
     def _rate_limit(self):
@@ -78,9 +66,8 @@ class TencentLoader:
             try:
                 from hero_quant.config.settings import Settings
                 mode = Settings().data_mode
-            except Exception as e:
-                import logging as _lg
-                _lg.getLogger(__name__).warning("settings load failed in _rate_limit: %s", e, exc_info=e)
+            except (ImportError, AttributeError, ValueError, TypeError, OSError, RuntimeError) as e:
+                logger.warning("settings load failed in _rate_limit: %s", e, exc_info=True)
                 import os
                 mode = os.environ.get("HERO_DATA_MODE", "live")
             if isinstance(mode, str):
@@ -90,9 +77,8 @@ class TencentLoader:
             if mode == "synthetic":
                 return
             time.sleep(1)
-        except Exception as e:
-            import logging as _lg2
-            _lg2.getLogger(__name__).warning("_rate_limit error: %s", e, exc_info=e)
+        except (OSError, ValueError, RuntimeError, TypeError) as e:
+            logger.warning("_rate_limit error: %s", e, exc_info=True)
 
     @cache("market:bars", expire=60)
     def get_bars(self, symbol, start, end, interval="1d"):
@@ -105,13 +91,15 @@ class TencentLoader:
                 raise DataValidationError(f"ambiguous legacy argument order: start={start!r} end={end!r} interval={interval!r}")
         if interval not in _intervals:
             raise DataValidationError(f"invalid interval {interval!r}, expected one of {sorted(_intervals)}")
+        # 腾讯 loader 仅支持日线，intraday 必须 fail-closed
+        if interval not in ("1d", "1D"):
+            raise DataValidationError(f"tencent loader only supports daily bars, got {interval!r}")
 
         try:
             from hero_quant.config.settings import Settings
             mode = Settings().data_mode
-        except Exception as e:
-            import logging as _lg3
-            _lg3.getLogger(__name__).warning("settings load failed in get_bars: %s", e, exc_info=e)
+        except (ImportError, AttributeError, ValueError, TypeError, OSError, RuntimeError) as e:
+            logger.warning("settings load failed in get_bars: %s", e, exc_info=True)
             import os
             mode = os.environ.get("HERO_DATA_MODE", "live")
         if isinstance(mode, str):
@@ -132,7 +120,7 @@ class TencentLoader:
                 tencent_symbol = code
             # Force https and sanitize symbol to prevent injection (MITM protection)
             tencent_symbol = urllib.parse.quote(tencent_symbol, safe="")
-            url = f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={tencent_symbol},day,,,{320},qfq"
+            url = f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={tencent_symbol},day,{start},{end},{320},qfq"
             with urllib.request.urlopen(url, timeout=2) as resp:
                 raw = resp.read()
                 text = raw.decode("utf-8", errors="ignore") if isinstance(raw, (bytes, bytearray)) else str(raw)
@@ -160,7 +148,10 @@ class TencentLoader:
                                     if field == "date":
                                         _field_vals[field] = str(raw_v)
                                     else:
-                                        v = float(raw_v)
+                                        try:
+                                            v = float(raw_v)
+                                        except (ValueError, TypeError) as e:
+                                            raise DataValidationError(f"tencent bar field {field!r} invalid {raw_v!r}: {e}") from e
                                         if not math.isfinite(v) or (field in ("close", "open", "high", "low") and v <= 0) or (field == "volume" and v < 0):
                                             raise DataValidationError(f"tencent bar field {field!r} invalid {raw_v!r}: non-finite or out-of-range ({v})")
                                         _field_vals[field] = v
@@ -178,9 +169,11 @@ class TencentLoader:
                                         raise DataValidationError(f"tencent bar missing required field {k!r}: {item!r}")
                                     if k != "date":
                                         try:
-                                            float(item[k])
-                                        except Exception as e:
+                                            v = float(item[k])
+                                        except (ValueError, TypeError) as e:
                                             raise DataValidationError(f"tencent bar field {k!r} invalid {item[k]!r}: {e}") from e
+                                        if not math.isfinite(v) or (k in ("close", "open", "high", "low") and v <= 0) or (k == "volume" and v < 0):
+                                            raise DataValidationError(f"tencent bar field {k!r} invalid {item[k]!r}: non-finite or out-of-range ({v})")
                                 bars.append({
                                     "date": str(item.get("date", "")),
                                     "open": float(item.get("open")),
@@ -190,13 +183,22 @@ class TencentLoader:
                                     "volume": float(item.get("volume")),
                                 })
                         if len(bars) > 0:
+                            # 必须裁到 [start,end]，不静默返回全量 320 根
+                            try:
+                                s_dt = datetime.strptime(start, "%Y-%m-%d")
+                                e_dt = datetime.strptime(end, "%Y-%m-%d")
+                            except (ValueError, TypeError) as e:
+                                raise DataValidationError(f"invalid date format start={start!r} end={end!r}: {e}") from e
+                            bars = [b for b in bars if s_dt.strftime("%Y-%m-%d") <= b["date"][:10] <= e_dt.strftime("%Y-%m-%d")]
+                            if len(bars) == 0:
+                                raise ValueError("no bars in requested window after clipping")
                             return bars
                 raise ValueError("no bars parsed")
         except DataValidationError:
             raise
         except ValueError as e:
-            logger.warning("tencent parse failed for %s: %s", symbol, e, exc_info=e)
+            logger.warning("tencent parse failed for %s: %s", symbol, e, exc_info=True)
             raise RuntimeError(f"tencent fetch failed for {symbol}: {e}") from e
-        except Exception as e:
-            logger.warning("tencent network error for %s: %s", symbol, e, exc_info=e)
+        except (RuntimeError, OSError, json.JSONDecodeError) as e:
+            logger.warning("tencent network error for %s: %s", symbol, e, exc_info=True)
             raise RuntimeError(f"tencent fetch failed for {symbol}: {e}") from e

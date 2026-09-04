@@ -46,10 +46,10 @@ class CCXTLoader:
         try:
             s = datetime.strptime(start, "%Y-%m-%d")
             e = datetime.strptime(end, "%Y-%m-%d")
-        except Exception as exc:
+        except (ValueError, TypeError) as exc:
             raise DataValidationError(f"invalid date format start={start!r} end={end!r}: {exc}") from exc
         if e < s:
-            e = s
+            raise DataValidationError(f"invalid range: end {end!r} before start {start!r} (fail-closed)")
         dates: list[str] = []
         opens: list[float] = []
         highs: list[float] = []
@@ -68,14 +68,9 @@ class CCXTLoader:
             cur += timedelta(days=1)
             idx += 1
             if idx > 500:
-                break
-        if not dates:
-            dates = [start]
-            opens = [1500.0]
-            highs = [1510.0]
-            lows = [1490.0]
-            closes = [1500.0]
-            volumes = [100.0]
+                raise DataValidationError(
+                    f"synthetic range too large: start={start!r} end={end!r} exceeds 500 rows (fail-closed)"
+                )
         df = pd.DataFrame(
             {
                 "open": opens,
@@ -95,7 +90,8 @@ class CCXTLoader:
             import ccxt  # noqa: F401
 
             ccxt_ok = True
-        except Exception:
+        except (ImportError, ModuleNotFoundError) as e:
+            logger.warning("ccxt not installed health check: %s", e, exc_info=True)
             ccxt_ok = False
         return {
             "status": "ok",
@@ -112,7 +108,7 @@ class CCXTLoader:
 
             mode = Settings().data_mode
         except (KeyError, AttributeError, ImportError, ValueError) as e:
-            logger.warning("settings load failed for %s: %s", symbol, e, exc_info=e)
+            logger.warning("settings load failed for %s: %s", symbol, e, exc_info=True)
             import os
 
             mode = os.environ.get("HERO_DATA_MODE", "live")
@@ -125,21 +121,20 @@ class CCXTLoader:
         if mode == "synthetic":
             return self._synthetic_df(symbol, start, end)
 
-
         try:
             import ccxt  # type: ignore
         except ImportError as e:
-            logger.warning("ccxt not installed for %s: %s", symbol, e, exc_info=e)
+            logger.warning("ccxt not installed for %s: %s", symbol, e, exc_info=True)
             raise ImportError("pip install hero-quant[crypto] - ccxt not installed") from e
 
         timeframe = _TIMEFRAME_MAP.get(interval, interval)
         try:
             s_dt = datetime.strptime(start, "%Y-%m-%d")
             e_dt = datetime.strptime(end, "%Y-%m-%d")
-        except Exception as e:
+        except (ValueError, TypeError) as e:
             raise DataValidationError(f"invalid date format start={start!r} end={end!r}: {e}") from e
         if e_dt < s_dt:
-            e_dt = s_dt
+            raise DataValidationError(f"invalid range: end {end!r} before start {start!r} (fail-closed)")
         # fix naive timestamp() to aware UTC
         from datetime import timezone
         s_dt_aware = s_dt.replace(tzinfo=timezone.utc)
@@ -154,9 +149,13 @@ class CCXTLoader:
             if requested > 1500:
                 logger.warning("ccxt limit truncated: requested %s truncated to %s for %s timeframe=%s days=%s (pagination required)", requested, limit, symbol, timeframe, days)
         else:
-            # daily/weekly/monthly: daily count, not intraday
-            if timeframe in ("1d", "1w", "1M"):
+            # 日线/周线/月线：按实际周期估算，避免用 days 高估周/月（原死逻辑双分支同值）
+            if timeframe == "1d":
                 requested = days + 5
+            elif timeframe == "1w":
+                requested = (days // 7) + 5
+            elif timeframe == "1M":
+                requested = (days // 30) + 5
             else:
                 requested = days + 5
             limit = min(1500, max(requested, 5))
@@ -181,7 +180,8 @@ class CCXTLoader:
                 try:
                     last_ts = chunk[-1][0]
                     fetch_since = int(last_ts) + 1
-                except Exception:
+                except (ValueError, TypeError, IndexError) as e:
+                    logger.warning("ccxt last_ts parse failed for %s: %s", symbol, e, exc_info=True)
                     break
                 remaining -= len(chunk)
                 if len(ohlcv) >= requested:
@@ -198,8 +198,8 @@ class CCXTLoader:
                     ts, o, h, lo, c, v = candle[:6]
                     idx.append(pd.to_datetime(ts, unit="ms"))
                     rows.append((float(o), float(h), float(lo), float(c), float(v)))
-                except Exception as e:
-                    logger.warning("ccxt candle parse skip for %s: %s", symbol, e, exc_info=e)
+                except (ValueError, TypeError, IndexError) as e:
+                    logger.warning("ccxt candle parse skip for %s: %s", symbol, e, exc_info=True)
                     continue
             if not rows:
                 raise ValueError("no rows parsed")
@@ -207,14 +207,25 @@ class CCXTLoader:
             df = df[["open", "high", "low", "close", "volume"]]
             if len(df) == 0:
                 raise ValueError("empty df")
+            # 必须裁到 [start,end] 并尊重 interval；避免 over-fetch 外溢
+            df = df.sort_index()
+            df = df[~df.index.duplicated(keep="first")]
+            try:
+                s_ts = pd.to_datetime(s_dt)
+                e_ts = pd.to_datetime(e_dt) + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1)
+                df = df[(df.index >= s_ts) & (df.index <= e_ts)]
+            except (ValueError, TypeError, AttributeError) as e:
+                logger.warning("ccxt clip to window failed for %s: %s", symbol, e, exc_info=True)
+                # 保底按位置截断
+                df = df.iloc[:days]
             return df
         except DataValidationError:
             raise
         except ValueError as e:
-            logger.warning("ccxt parse failed for %s: %s", symbol, e, exc_info=e)
+            logger.warning("ccxt parse failed for %s: %s", symbol, e, exc_info=True)
             raise RuntimeError(f"ccxt fetch failed for {symbol}: {e}") from e
         except ImportError:
             raise
-        except Exception as e:
-            logger.warning("ccxt error for %s: %s", symbol, e, exc_info=e)
+        except (RuntimeError, OSError) as e:
+            logger.warning("ccxt error for %s: %s", symbol, e, exc_info=True)
             raise RuntimeError(f"ccxt fetch failed for {symbol}: {e}") from e

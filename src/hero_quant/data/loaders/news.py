@@ -7,7 +7,6 @@
 
 from __future__ import annotations
 
-import copy
 import logging
 
 import pandas as pd
@@ -24,7 +23,7 @@ __all__ = [
     "news_disclosure",
 ]
 
-# 候选发布时间字段（按优先级）
+# 候选发布时间字段（按优先级）；移除 `date` 避免与交易日标签混淆导致伪造 PIT
 _PUBLISH_KEYS = (
     "publish_time",
     "published_at",
@@ -34,16 +33,6 @@ _PUBLISH_KEYS = (
     "timestamp",
     "datetime",
     "time",
-    "date",
-)
-
-# 快照字段候选（记录级）
-_SNAPSHOT_KEYS = (
-    "snapshot_date",
-    "snapshot_time",
-    "available_at",
-    "avail_at",
-    "snapshot",
 )
 
 
@@ -89,7 +78,8 @@ def _normalize_date_str(value) -> str | None:
         return s[:10] if s else None
     try:
         return ts.strftime("%Y-%m-%d")
-    except Exception:
+    except (ValueError, TypeError):
+        logger.warning("news _normalize_date_str strftime failed for %r", value, exc_info=True)
         return str(value).strip()[:10]
 
 
@@ -100,6 +90,17 @@ def _extract_trade_date(record: dict) -> str | None:
             if v:
                 return v
     return None
+
+
+def _is_aware(ts: pd.Timestamp) -> bool:
+    """模块级 helper：判断 Timestamp 是否为带时区；避免逐行重建函数对象。"""
+    try:
+        tz = getattr(ts, "tz", None)
+        if tz is not None:
+            return True
+    except (AttributeError, TypeError, ValueError):
+        logger.debug("news _is_aware tz check failed for %r", ts, exc_info=True)
+    return getattr(ts, "tzinfo", None) is not None
 
 
 def _resolve_snapshot_for_record(
@@ -185,10 +186,7 @@ def load_news(
                 dropped_mismatch += 1
                 continue
 
-        # 拷贝避免污染
-        new_rec = copy.copy(rec)
-        # 也可深拷贝浅层值无需 deepcopy
-        # 但确保 pit 字段写入新对象
+        # 拷贝避免污染（浅拷贝即可）
         new_rec = dict(rec)
 
         pub_ts = _extract_publish_time(rec)
@@ -205,16 +203,6 @@ def load_news(
                 new_rec["pit_status"] = "unavailable"
         else:
             try:
-                # timezone handling: mixed naive/aware is incomparable -> honest unavailable
-                def _is_aware(ts: pd.Timestamp) -> bool:
-                    try:
-                        tz = getattr(ts, "tz", None)
-                        if tz is not None:
-                            return True
-                    except Exception:
-                        pass
-                    return getattr(ts, "tzinfo", None) is not None
-
                 pub_aware = _is_aware(pub_ts)
                 snap_aware = _is_aware(snap_ts)
                 if pub_aware != snap_aware:
@@ -225,7 +213,8 @@ def load_news(
                     try:
                         pub_cmp = pub_ts.tz_convert("UTC")
                         snap_cmp = snap_ts.tz_convert("UTC")
-                    except Exception:
+                    except (TypeError, ValueError, AttributeError) as e:
+                        logger.warning("news tz_convert fallback for %r vs %r: %s", pub_ts, snap_ts, e, exc_info=True)
                         # fallback: pandas can compare aware with different tz natively
                         pub_cmp = pub_ts
                         snap_cmp = snap_ts
@@ -276,10 +265,11 @@ def _disclosure_text(records: list[dict] | None) -> str:
         return "non-PIT source/unavailable - no verified news snapshot (PIT unavailable)"
 
     total = len(records)
-    pit_true = sum(1 for r in records if r.get("pit") is True)
+    # 窄化：仅对 dict 记录统计，避免字符串 in 误判
+    pit_true = sum(1 for r in records if isinstance(r, dict) and r.get("pit") is True)
     pit_false = total - pit_true
     # 若含 unknown/unavailable 统计
-    unknown = sum(1 for r in records if r.get("pit_status") in ("unknown", "unavailable", "missing"))
+    unknown = sum(1 for r in records if isinstance(r, dict) and r.get("pit_status") in ("unknown", "unavailable", "missing"))
     verified = pit_true
 
     if pit_false == total:
@@ -304,8 +294,8 @@ def get_disclosure(records: list[dict] | None = None, **kwargs) -> str:
                 break
         else:
             records = []
-    # 若记录未含 pit 字段，诚实视为 unavailable
-    if records and not any("pit" in r for r in records):
+    # 若记录未含 pit 字段，诚实视为 unavailable；窄化 isinstance 避免字符串 in 误判
+    if records and not any(isinstance(r, dict) and "pit" in r for r in records):
         return "non-PIT source/unavailable - PIT status not verified"
     return _disclosure_text(records)
 

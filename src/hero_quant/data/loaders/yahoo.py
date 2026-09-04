@@ -36,7 +36,8 @@ class YahooLoader:
         try:
             from hero_quant.config.settings import Settings as _YSettings
             _ymode = (_YSettings().data_mode or "").strip().lower()
-        except Exception:
+        except (ImportError, AttributeError, ValueError, TypeError, OSError, RuntimeError) as e:
+            logger.warning("settings load failed for %s: %s", symbol, e, exc_info=True)
             _ymode = ""
         if _ymode == "synthetic":
             logger.warning("yahoo synthetic mode active for %s %s->%s", symbol, start, end)
@@ -51,7 +52,7 @@ class YahooLoader:
                     _bars.append({"date": cur.strftime("%Y-%m-%d"), "open": 1500.0+idx, "close": 1500.5+idx, "high": 1510+idx, "low": 1490+idx, "volume": 100.0})
                     cur += timedelta(days=1)
                     idx += 1
-            except Exception as e:
+            except (ValueError, TypeError) as e:
                 raise DataValidationError(f"yahoo synthetic date parse failed: {e}") from e
             from hero_quant.data.registry import Provenance as _YProv
             return _bars, _YProv(source="synthetic", unit=self.unit, symbol=symbol, extra={"synthetic": True, "real_source": "yahoo"})
@@ -63,7 +64,13 @@ class YahooLoader:
             raise ImportError("pip install hero-quant[us]") from e
 
         # Network/parsing errors must NOT be reclassified as ImportError — preserve original type
-        ticker_symbol = symbol.split(".")[0] if "." in symbol else symbol
+        # 仅剥离 `.US` 市场后缀，BRK.B 等含点品种应转为 Yahoo 的 BRK-B 形式
+        if symbol.endswith(".US"):
+            ticker_symbol = symbol[:-3]
+        elif "." in symbol:
+            ticker_symbol = symbol.replace(".", "-")
+        else:
+            ticker_symbol = symbol
         df = None
         try:
             df = yf.download(ticker_symbol, start=start, end=end, interval=interval, progress=False, auto_adjust=False, timeout=5)
@@ -77,11 +84,11 @@ class YahooLoader:
                 raise
             except TypeError:
                 raise
-            except Exception as e:
-                logger.warning("yfinance download failed for %s: %s, trying history", ticker_symbol, e)
+            except (RuntimeError, OSError, ValueError) as e:
+                logger.warning("yfinance download failed for %s: %s, trying history", ticker_symbol, e, exc_info=True)
                 df = None
-        except Exception as e:
-            logger.warning("yfinance download failed for %s: %s, trying history", ticker_symbol, e)
+        except (RuntimeError, OSError, ValueError) as e:
+            logger.warning("yfinance download failed for %s: %s, trying history", ticker_symbol, e, exc_info=True)
             df = None
 
         if df is None or len(df) == 0:
@@ -90,39 +97,49 @@ class YahooLoader:
                 df = ticker.history(start=start, end=end, interval=interval, auto_adjust=False)
             except DataValidationError:
                 raise
-            except Exception:
+            except (RuntimeError, OSError, ValueError) as e:
+                logger.warning("yfinance history failed for %s: %s", ticker_symbol, e, exc_info=True)
                 df = None
 
         if df is None or len(df) == 0:
             raise ValueError("no data from yahoo")
 
+        # helper 提升至循环外，避免逐 bar 重建
+        def _get_required(row, key_options, field_name):
+            for k in key_options:
+                if k in row:
+                    v = row[k]
+                    try:
+                        fv = float(v)
+                    except (ValueError, TypeError) as e:
+                        raise DataValidationError(f"yahoo {field_name} invalid {v!r}: {e}") from e
+                    if field_name in ("close", "open", "high", "low") and (fv != fv or fv <= 0):
+                        raise DataValidationError(f"yahoo {field_name} non-positive/NaN {fv!r}")
+                    if field_name == "volume" and (fv != fv or fv < 0):
+                        raise DataValidationError(f"yahoo volume NaN/negative {fv!r}")
+                    return fv
+            raise DataValidationError(f"yahoo missing required field {field_name} options {key_options} in row {row.to_dict() if hasattr(row,'to_dict') else row}")
+
         bars = []
         for idx, row in df.iterrows():
+            # 日内保留时间，日线仅保留日期，避免 distinct intraday bars 坍缩
             try:
-                date_str = idx.strftime("%Y-%m-%d") if hasattr(idx, "strftime") else str(idx).split(" ")[0]
-            except Exception:
+                if hasattr(idx, "strftime"):
+                    if interval in ("1m", "5m", "15m", "30m", "1h"):
+                        date_str = idx.strftime("%Y-%m-%d %H:%M")
+                    else:
+                        date_str = idx.strftime("%Y-%m-%d")
+                else:
+                    date_str = str(idx)
+            except (ValueError, TypeError, AttributeError) as e:
+                logger.warning("yahoo date_str fallback for %s: %s", symbol, e, exc_info=True)
                 date_str = str(idx)
 
-            def _get_required(key_options, field_name):
-                for k in key_options:
-                    if k in row:
-                        v = row[k]
-                        try:
-                            fv = float(v)
-                        except Exception as e:
-                            raise DataValidationError(f"yahoo {field_name} invalid {v!r}: {e}") from e
-                        if field_name in ("close", "open", "high", "low") and (fv != fv or fv <= 0):
-                            raise DataValidationError(f"yahoo {field_name} non-positive/NaN {fv!r}")
-                        if field_name == "volume" and (fv != fv or fv < 0):
-                            raise DataValidationError(f"yahoo volume NaN/negative {fv!r}")
-                        return fv
-                raise DataValidationError(f"yahoo missing required field {field_name} options {key_options} in row {row.to_dict() if hasattr(row,'to_dict') else row}")
-
-            close = _get_required(["Close", "close"], "close")
-            high = _get_required(["High", "high"], "high")
-            low = _get_required(["Low", "low"], "low")
-            open_ = _get_required(["Open", "open"], "open")
-            volume = _get_required(["Volume", "volume"], "volume")
+            close = _get_required(row, ["Close", "close"], "close")
+            high = _get_required(row, ["High", "high"], "high")
+            low = _get_required(row, ["Low", "low"], "low")
+            open_ = _get_required(row, ["Open", "open"], "open")
+            volume = _get_required(row, ["Volume", "volume"], "volume")
             bars.append({
                 "date": date_str,
                 "close": close,
