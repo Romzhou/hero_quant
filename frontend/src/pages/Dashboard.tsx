@@ -1,8 +1,8 @@
 /**
  * Dashboard 看板页
  * - 职责：聚合展示资产/收益/年化/回撤等核心指标与四域快捷入口、最近活动
- * - 数据流：拉取 /v1/backtest/metrics.json 真实指标，失败回退静态占位；骨架屏过渡
- * - 演示入口：顶部琥珀渐变 CTA 一键演示，写入 chat store 并跳转 /backtest
+ * - 数据流：拉取 API_METRICS 真实指标，失败回退静态占位并通过 isMock 区分；骨架屏过渡
+ * - 演示入口：顶部琥珀渐变 CTA 一键演示，写入 chat store 并通过 router state 跳转 /backtest
  */
 import { useEffect, useState } from "react"
 import { useNavigate, Link } from "react-router-dom"
@@ -10,7 +10,14 @@ import { useChatStore } from "../store/chat"
 
 type Metrics = { annual_return?: number; sharpe?: number; max_drawdown?: number; turnover?: number; total_equity?: number }
 
-const FALLBACK: Metrics = { annual_return: 0.184, sharpe: 1.62, max_drawdown: -0.032, turnover: 0.42 }
+// 占位回退值，仅在 isMock=true 时展示，配合徽标避免与真实数据混淆
+export const FALLBACK: Metrics = { annual_return: 0.184, sharpe: 1.62, max_drawdown: -0.032, turnover: 0.42 }
+
+// 抽取硬编码：API 路径集中管理，避免分散字符串导致 base-path 变更遗漏
+export const API_METRICS = "/v1/backtest/metrics.json"
+
+// 抽取硬编码：演示查询常量，Hero 文案与 handleDemo 共用，避免文案/逻辑漂移
+export const DEMO_QUERY = "回测 600519.SH 近一月等权"
 
 function isFiniteNumber(v: unknown): v is number {
   return typeof v === "number" && Number.isFinite(v)
@@ -22,9 +29,17 @@ function fmtFixed(v: unknown, fallback: number, digits = 2): string {
   return isFiniteNumber(v) ? (v as number).toFixed(digits) : fallback.toFixed(digits)
 }
 
+// 抽取重复 cast：统一数字选取，处理 total_equity/totalEquity 别名
+function pickNumber(obj: Record<string, unknown>, key: string, fallback?: number): number | undefined {
+  const v = obj[key]
+  return isFiniteNumber(v) ? (v as number) : fallback
+}
+
 export default function Dashboard() {
   const navigate = useNavigate()
-  const [metrics, setMetrics] = useState<Metrics>(FALLBACK)
+  // isMock 区分：初始为占位态，成功后置 false，失败保持 true，避免 FALLBACK 被误读为真实数据
+  const [metrics, setMetrics] = useState<Metrics | null>(null)
+  const [isMock, setIsMock] = useState(true)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [reloadKey, setReloadKey] = useState(0)
@@ -36,17 +51,21 @@ export default function Dashboard() {
       setError(null)
       setLoading(true)
       try {
-        const r = await fetch("/v1/backtest/metrics.json", { cache: "no-store", signal } as RequestInit)
+        const r = await fetch(API_METRICS, { cache: "no-store", signal } as RequestInit)
         if (!r.ok) throw new Error(String(r.status))
         const j = await r.json()
         if (!signal.aborted && j && typeof j === "object") {
-          setMetrics({
-            annual_return: isFiniteNumber((j as Record<string, unknown>).annual_return) ? (j as Record<string, unknown>).annual_return as number : FALLBACK.annual_return,
-            sharpe: isFiniteNumber((j as Record<string, unknown>).sharpe) ? (j as Record<string, unknown>).sharpe as number : FALLBACK.sharpe,
-            max_drawdown: isFiniteNumber((j as Record<string, unknown>).max_drawdown) ? (j as Record<string, unknown>).max_drawdown as number : FALLBACK.max_drawdown,
-            turnover: isFiniteNumber((j as Record<string, unknown>).turnover) ? (j as Record<string, unknown>).turnover as number : FALLBACK.turnover,
-            total_equity: isFiniteNumber((j as Record<string, unknown>).total_equity) ? (j as Record<string, unknown>).total_equity as number : (isFiniteNumber((j as Record<string, unknown>).totalEquity) ? (j as Record<string, unknown>).totalEquity as number : undefined),
-          })
+          const obj = j as Record<string, unknown>
+          // 统一通过 pickNumber 选取，避免逐字段重复 cast 带来的扩展错误
+          const parsed: Metrics = {
+            annual_return: pickNumber(obj, "annual_return", FALLBACK.annual_return),
+            sharpe: pickNumber(obj, "sharpe", FALLBACK.sharpe),
+            max_drawdown: pickNumber(obj, "max_drawdown", FALLBACK.max_drawdown),
+            turnover: pickNumber(obj, "turnover", FALLBACK.turnover),
+            total_equity: pickNumber(obj, "total_equity", pickNumber(obj, "totalEquity")),
+          }
+          setMetrics(parsed)
+          setIsMock(false)
         }
       } catch (e) {
         if (signal.aborted) return
@@ -54,6 +73,9 @@ export default function Dashboard() {
         const msg = e instanceof Error ? e.message : String(e)
         console.error("[Dashboard] metrics fetch failed:", msg)
         setError(msg)
+        // 失败回退占位，但保持 isMock=true 以便徽标与卡片可区分
+        setMetrics(FALLBACK)
+        setIsMock(true)
       } finally {
         if (!signal.aborted) setLoading(false)
       }
@@ -63,19 +85,30 @@ export default function Dashboard() {
   }, [reloadKey])
 
   const handleDemo = () => {
-    const q = "回测 600519.SH 近一月等权"
-    useChatStore.getState().setInput(q)
-    navigate("/backtest")
+    // 脆弱点修复：同时写入 store 并通过 router state 传递，Chat 侧以 state.prefill 为可信来源，store 为增强
+    useChatStore.getState().setInput(DEMO_QUERY)
+    navigate("/backtest", { state: { prefill: DEMO_QUERY } })
   }
 
-  const totalEquityDisplay = loading ? "…" : (isFiniteNumber(metrics.total_equity) ? `¥ ${metrics.total_equity.toLocaleString("zh-CN")}` : "—")
-  type Card = { k: string; v: string; sub: string; accent: boolean; isEquity?: boolean }
+  // 展示用有效指标：未加载到真实数据时使用 FALLBACK 占位，但 isMock 徽标会明确标识
+  const displayMetrics: Metrics = metrics ?? FALLBACK
+  const totalEquityDisplay = loading ? "…" : (isFiniteNumber(displayMetrics.total_equity) ? `¥ ${displayMetrics.total_equity.toLocaleString("zh-CN")}` : "—")
+  // 移除死字段 accent：原 Card.accent 未被渲染消费，保留会误导后续样式扩展
+  type Card = { k: string; v: string; sub: string; isEquity?: boolean }
   const cards: Card[] = [
-    { k: "总资产", v: totalEquityDisplay, sub: "含现金", accent: false, isEquity: true },
-    { k: "年化", v: loading ? "…" : fmtPct(metrics.annual_return, FALLBACK.annual_return!), sub: `sharpe ${fmtFixed(metrics.sharpe, FALLBACK.sharpe!)}`, accent: true },
-    { k: "最大回撤", v: loading ? "…" : fmtPct(metrics.max_drawdown, FALLBACK.max_drawdown!), sub: "近30日", accent: false },
-    { k: "换手率", v: loading ? "…" : fmtFixed(metrics.turnover, FALLBACK.turnover!, 2), sub: "turnover", accent: false },
+    { k: "总资产", v: totalEquityDisplay, sub: "含现金", isEquity: true },
+    { k: "年化", v: loading ? "…" : fmtPct(displayMetrics.annual_return, FALLBACK.annual_return!), sub: `sharpe ${fmtFixed(displayMetrics.sharpe, FALLBACK.sharpe!)}` },
+    { k: "最大回撤", v: loading ? "…" : fmtPct(displayMetrics.max_drawdown, FALLBACK.max_drawdown!), sub: "近30日" },
+    { k: "换手率", v: loading ? "…" : fmtFixed(displayMetrics.turnover, FALLBACK.turnover!, 2), sub: "turnover" },
   ]
+
+  // 徽标 fail-closed 语义：加载中/占位数据/数据就绪 三态，避免无条件“数据就绪”误导
+  const badgeText = loading ? "加载中" : isMock ? "占位数据" : "数据就绪"
+  const badgeClass = loading
+    ? "border-slate-400/20 bg-slate-400/10 text-slate-300"
+    : isMock
+      ? "border-amber-400/20 bg-amber-400/10 text-amber-300"
+      : "border-emerald-400/20 bg-emerald-400/10 text-emerald-300"
 
   return (
     <div className="mx-auto max-w-7xl px-6 py-6">
@@ -88,7 +121,7 @@ export default function Dashboard() {
                 <span className="h-1.5 w-1.5 rounded-full bg-white animate-pulse" /> DEMO READY · 30秒跑通
               </div>
               <h2 className="mt-2 font-display text-lg font-bold leading-tight text-white md:text-xl">一键演示：从自然语言到真回测</h2>
-              <p className="mt-1 text-sm leading-5 text-white/85">预填 <span className="rounded bg-white/20 px-1.5 py-0.5 font-mono text-xs">回测 600519.SH 近一月等权</span> · 点击后跳转对话页，SSE 流式返回 tool 轨迹与净值</p>
+              <p className="mt-1 text-sm leading-5 text-white/85">预填 <span className="rounded bg-white/20 px-1.5 py-0.5 font-mono text-xs">{DEMO_QUERY}</span> · 点击后跳转对话页，SSE 流式返回 tool 轨迹与净值</p>
               <p className="mt-1 hidden text-xs text-white/70 md:block">真实链路：registry → tencent/yahoo → engine → positions.csv / metrics.json</p>
             </div>
             <div className="flex shrink-0 flex-col gap-2">
@@ -106,7 +139,7 @@ export default function Dashboard() {
           <h1 className="font-display text-xl font-semibold text-mist">Dashboard · 总览</h1>
           <p className="mt-1 text-sm text-slate-400">今日概览 · 资产 · 收益 · 风控 · 活动</p>
         </div>
-        <span className="rounded-full border border-emerald-400/20 bg-emerald-400/10 px-3 py-1 text-xs font-medium text-emerald-300">数据就绪</span>
+        <span className={"rounded-full border px-3 py-1 text-xs font-medium " + badgeClass}>{badgeText}</span>
       </div>
 
       {error && !loading && (
@@ -145,7 +178,7 @@ export default function Dashboard() {
             <div key={c.k} style={{ animationDelay: `${i * 80}ms` }} className="group rounded-2xl border border-white/10 bg-white/[0.04] p-4 backdrop-blur transition hover:bg-white/[0.06] hover:border-white/15 hover:shadow-lg hover:-translate-y-0.5 animate-[fadeIn_0.5s_ease_both]">
               <div className="text-[11px] tracking-[0.14em] text-slate-400">{c.k}</div>
               <div className="mt-1 font-display text-xl font-semibold text-mist group-hover:text-white transition">
-                {c.isEquity && !isFiniteNumber(metrics.total_equity) ? "—" : c.v}
+                {c.isEquity && !isFiniteNumber(displayMetrics.total_equity) ? "—" : c.v}
               </div>
               <div className="font-mono text-[11px] text-slate-500">{c.sub}</div>
             </div>
@@ -171,7 +204,7 @@ export default function Dashboard() {
           <ul className="mt-3 space-y-2 text-xs">
             <li>
               <Link to="/research" className="flex justify-between rounded-xl bg-ink-900/60 border border-white/5 px-3 py-2 hover:border-amber-500/20 hover:bg-amber-500/5 transition">
-                <span className="text-slate-400">回测完成</span><span className="text-mist">600519.SH 等权 · {fmtPct(metrics.annual_return, FALLBACK.annual_return!)} 年化 → 研究 ↗</span>
+                <span className="text-slate-400">回测完成</span><span className="text-mist">600519.SH 等权 · {fmtPct(displayMetrics.annual_return, FALLBACK.annual_return!)} 年化 → 研究 ↗</span>
               </Link>
             </li>
             <li>
