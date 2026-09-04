@@ -77,9 +77,8 @@ def validate_loader(loader: Any) -> None:
             if src is not None and isinstance(src, str) and src.strip() and src.lower() not in VALID_SOURCES:
                 raise ValueError(f"loader.source {src!r} must be in VALID_SOURCES {VALID_SOURCES}")
     else:
-        # legacy loader without name: allow but log
-        import logging
-        logging.getLogger(__name__).warning("loader missing name attribute, assuming synthetic for legacy compat: %r", loader.__class__.__name__)
+        # 中文：缺 name 直接 fail-closed，禁止 warn+continue 放行
+        raise ValueError("loader missing attribute: name (must be in VALID_SOURCES, fail-closed)")
     # markets
     if not hasattr(loader, "markets"):
         raise ValueError("loader missing attribute: markets")
@@ -128,10 +127,9 @@ def validate_loader(loader: Any) -> None:
     except Exception as e:
         raise TypeError(f"loader.get_bars interval default check failed: {e}") from e
 
-    # health: optional for legacy loaders (backward compat); if present must be callable
-    if hasattr(loader, "health") and not callable(getattr(loader, "health")):
-        raise ValueError("loader.health must be callable if defined")
-    # Note: health missing is allowed for legacy loaders (Tencent/Yahoo); new loaders should implement health per contract.
+    # 中文：health 为 SourceTrait 必需，与 Protocol 一致（fail-closed）
+    if not hasattr(loader, "health") or not callable(getattr(loader, "health")):
+        raise ValueError("loader missing callable: health (required by SourceTrait)")
 
 
 def _check_dataframe_contract(df: pd.DataFrame) -> None:
@@ -162,18 +160,37 @@ def _check_dataframe_contract(df: pd.DataFrame) -> None:
 
 
 def _check_list_contract(bars: list) -> None:
-    """Internal: validate list[dict] contract."""
+    """Internal: validate list[dict] contract — 中文：校验 OHLCV + date/sort/dedup。"""
     if not bars:
         return
     required = {"open", "high", "low", "close", "volume"}
+    prev_ts = None
+    seen: set = set()
     for i, b in enumerate(bars):
         if not isinstance(b, dict):
             raise ValueError(f"bars[{i}] must be dict, got {type(b).__name__}")
         missing = required - set(b.keys())
-        # allow alternative: close may be required, but we strictly require all
         if missing:
-            # also accept 'date' variant but still require OHLCV
             raise ValueError(f"bars[{i}] missing required keys {missing}, got {list(b.keys())}")
+        # 中文：date/trade_date 必需，且需排序与去重
+        if "date" not in b and "trade_date" not in b:
+            raise ValueError(f"bars[{i}] missing required date/trade_date, got {list(b.keys())}")
+        # 解析日期用于排序/去重校验
+        raw_date = b.get("date", b.get("trade_date"))
+        try:
+            import pandas as pd
+            ts = pd.to_datetime(raw_date)
+            # 去 tz，保证 tz-naive 语义
+            if getattr(ts, "tz", None) is not None:
+                ts = ts.tz_convert(None) if hasattr(ts, "tz_convert") else ts
+        except Exception as e:
+            raise ValueError(f"bars[{i}] invalid date {raw_date!r}: {e}") from e
+        if ts in seen:
+            raise ValueError(f"bars[{i}] duplicated date {raw_date!r}")
+        seen.add(ts)
+        if prev_ts is not None and ts < prev_ts:
+            raise ValueError(f"bars not sorted ascending at index {i}: {raw_date!r} < prev")
+        prev_ts = ts
 
 
 def assert_bars_contract(bars: Union[pd.DataFrame, list[dict], tuple]) -> None:

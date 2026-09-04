@@ -140,18 +140,15 @@ class MarketDataRegistry:
             self._loaders.append(loader)
 
     def _detect_market(self, symbol: str) -> str:
-        """按后缀推断市场：.SH/.SZ→CN，.US→US，其余取后缀或 UNKNOWN。"""
+        """按后缀推断市场：.SH/.SZ→CN，.US→US，其余取后缀或 UNKNOWN。 中文：单路径避免死分支。"""
         upper = symbol.upper()
         if upper.endswith(".SH") or upper.endswith(".SZ"):
             return "CN"
         if upper.endswith(".US"):
             return "US"
         if "." in symbol:
+            # 中文：已由 upper 分支覆盖 .SH/.SZ/.US，此处仅处理其他后缀
             suffix = symbol.split(".")[-1].upper()
-            if suffix in ("SH", "SZ"):
-                return "CN"
-            if suffix == "US":
-                return "US"
             return suffix
         return "UNKNOWN"
 
@@ -297,28 +294,27 @@ class MarketDataRegistry:
         else:
             return getattr(loader, "source", getattr(loader, "name", cls_name))
 
+    def _cross_source_check_bars(self, symbol: str, bars_a, bars_b) -> None:
+        """显式双 bars 对比口径 — 中文：避免与 prov 嗅探重载混淆。"""
+        if self._bars_empty(bars_a) or self._bars_empty(bars_b):
+            return
+        ref_close = self._first_close(bars_a)
+        other_close = self._first_close(bars_b)
+        if ref_close not in (None, 0) and other_close not in (None, 0):
+            diff = abs(ref_close - other_close) / abs(ref_close)
+            if diff > 0.01:
+                raise CrossSourceError(
+                    f"cross-source 1% check failed for {symbol}: {ref_close:.2f} vs {other_close:.2f} diff={diff*100:.2f}%"
+                )
+
     def _cross_source_check(self, symbol: str, bars, prov=None, interval="1d", start=None, end=None) -> None:
         """跨源 1% 一致性校验，超阈值阻断。
 
-        双模式：1) 传入两组 bars 直接对比首根收盘价；2) 遍历已注册 loader
-        拉取对照数据并对比，偏差 >1% 抛 CrossSourceError。
+        单一签名：bars 为待校验数据，prov 为 Provenance（必传时校验 provenance），
+        不再以 hasattr(prov,'source') 嗅探区分 bars/Provenance（窄化调用）。
+        如需直接对比两组 bars，请调用 _cross_source_check_bars。
         """
-        # 模式一：直接对比两组 bars（prov 实为第二组 bars）
-        if prov is not None and not hasattr(prov, "source"):
-            is_bars_like = hasattr(prov, "iloc") or isinstance(prov, (list, tuple))
-            if is_bars_like:
-                other_bars = prov
-                if self._bars_empty(bars) or self._bars_empty(other_bars):
-                    return
-                ref_close = self._first_close(bars)
-                other_close = self._first_close(other_bars)
-                if ref_close not in (None, 0) and other_close not in (None, 0):
-                    diff = abs(ref_close - other_close) / abs(ref_close)
-                    if diff > 0.01:
-                        raise CrossSourceError(
-                            f"cross-source 1% check failed for {symbol}: {ref_close:.2f} vs {other_close:.2f} diff={diff*100:.2f}%"
-                        )
-                return
+        # 中文：不再嗅探 prov 是否为 bars；调用方需显式使用 _cross_source_check_bars
         with self._loaders_lock:
             _loader_cnt = len(self._loaders)
         if _loader_cnt < 2 or self._bars_empty(bars):
@@ -369,8 +365,8 @@ class MarketDataRegistry:
                     raise CrossSourceError(
                         f"cross-source synthetic mix rejected for {symbol}: {current_source} vs {other_source} (use synthetic-aware prov to opt-in)"
                     )
+                # 中文：opt-in 仅放行混合标记，仍需执行后续 1% 对比，禁止直接 continue 跳过校验
                 logger.warning("cross_source synthetic mix allowed via opt-in for %s: %s vs %s", symbol, current_source, other_source)
-                continue
             try:
                 other_close = self._first_close(other_bars)
                 if ref_close not in (None, 0) and other_close not in (None, 0):
@@ -399,12 +395,15 @@ class MarketDataRegistry:
         last_error = None
         for loader in loaders_snapshot:
             markets = getattr(loader, "markets", [])
-            # 按 markets 过滤：loader 不支持该市场则跳过，避免无效请求
+            # 中文：按 markets 过滤；空 markets 表示通用 loader 不跳过，避免 UNKNOWN 市场误报为缺依赖
             if markets and market not in markets:
-                last_error = ImportError(f"pip install hero-quant[us] or [ashare] for {symbol}: no loader available for market {market}")
+                last_error = ImportError(f"pip install hero-quant[us] or [ashare] for {symbol}: no loader available for market {market} (unsupported market {market})")
                 continue
             try:
                 result = loader.get_bars(symbol, start, end, interval)
+            except CrossSourceError:
+                # 中文：完整性异常立即阻断，禁止被大 except 当作 best-effort 跳过
+                raise
             except Exception as e:
                 logger.warning("loader %s failed for %s: %s", loader.__class__.__name__, symbol, e, exc_info=e)
                 # 保留可操作的 pip 安装提示，便于用户补依赖
@@ -456,10 +455,12 @@ class MarketDataRegistry:
                 # non-critical validation warnings are best-effort: log and continue (do not abort primary fetch)
                 logger.warning("cross_source check error for %s: %s", symbol, e, exc_info=e)
             return bars, prov
-        # 全部 loader 失败，透出最后的可操作错误
+        # 全部 loader 失败，透出最后的可操作错误 — 中文：保留异常链
         if isinstance(last_error, ImportError) and "pip install" in str(last_error):
             msg = str(last_error)
             if "pip install hero-quant[us] or [ashare]" not in msg and "pip install hero-quant[us]" in msg:
                 raise ImportError(f"pip install hero-quant[us] or [ashare] - {msg}") from last_error
             raise last_error
+        if last_error is not None:
+            raise ImportError(f"pip install hero-quant[us] or [ashare] for {symbol}: no loader available for market {market}") from last_error
         raise ImportError(f"pip install hero-quant[us] or [ashare] for {symbol}: no loader available for market {market}")

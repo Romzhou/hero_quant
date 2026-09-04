@@ -82,6 +82,7 @@ def load_positions_csv(path: str | Path) -> Dict[str, float]:
         for row in reader:
             sym = str(row.get(sym_key, "")).strip()
             if not sym:
+                logger.warning("load_positions_csv skip blank-symbol row %r", row)
                 continue
             qty_raw = row.get(qty_key, 0)
             qty = _normalize_qty(qty_raw)
@@ -94,10 +95,11 @@ def _shadow_qty_from_trade(trade: Dict[str, Any]) -> tuple[str, float]:
     """从单笔影子交易提取 (symbol, signed_qty)，卖出记为负以保留净持仓语义。"""
     sym = str(trade.get("symbol", trade.get("instrument", trade.get("code", "")))).strip()
     if not sym:
+        logger.warning("shadow trade missing symbol, skipped: %r", trade)
         return "", 0.0
     qty = trade.get("qty", trade.get("quantity", trade.get("amount", 0)))
     q = _normalize_qty(qty)
-    side = str(trade.get("side", "buy")).lower()
+    side = str(trade.get("side", "buy")).strip().lower()
     if side in ("sell", "short", "ask"):
         # 卖出以负数计入净持仓，便于与券商净持仓直接比对
         q = -abs(q)
@@ -209,8 +211,8 @@ def aggregate_shadow(
                         e = json.loads(line)
                     except (json.JSONDecodeError, ValueError) as exc:
                         logger.warning("aggregate_shadow malformed json line %r: %s", line[:200], exc)
-                        # 避免静默丢数据：记录后继续，但上层 daily_reconciliation 会校验 ledger verify
-                        continue
+                        # 中文：坏 JSONL 直接 fail-closed 抛错，避免静默丢数据后误算零差额
+                        raise ValueError(f"malformed ledger line: {line[:200]!r}") from exc
                     rec = e.get("record", {}) if isinstance(e, dict) else {}
                     # P2: 统一去重口径 —— same_file 与 same_ledger 均视为同源，已由 journal 计数则跳过，避免按分支分别 continue 导致一支漏判而双计
                     if same_file and rec.get("action") == "shadow_record":
@@ -394,15 +396,16 @@ def daily_reconciliation(
             logger.warning("observe_wall_time failed: %s", exc)
     if result is None:
         raise RuntimeError("daily_reconciliation: missing result")
-    # optional ledger verify
+    # optional ledger verify — 中文：失败置 False 并 warning，避免与 skip 混淆
     verified = None
     try:
         from hero_quant.governance.ledger import Ledger
 
         ledger = Ledger(Path(ledger_path))
         verified = ledger.verify()
-    except Exception:
-        verified = None
+    except Exception as exc:
+        logger.warning("ledger verify failed for %s: %s", ledger_path, exc, exc_info=exc)
+        verified = False
 
     report: Dict[str, Any] = {
         "date": date,

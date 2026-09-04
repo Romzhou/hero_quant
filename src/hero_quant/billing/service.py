@@ -213,29 +213,26 @@ class BillingService:
             raise ValueError("tenant must be non-empty str")
         _validate_price(price, field="price")
         effective_allow = bool(allow_overwrite or upsert)
-        # 租户隔离修复：factor_id 单查绕过 — 冲突检查需同时查全局与实例
-        # 若 factor_id 已存在且属于不同租户，未授权时同样拒绝，避免跨租户覆盖
+        # 中文：冲突检查与预留同一短临界区内完成（不含 IO），避免 check-then-act 竞态
         if not effective_allow:
-            exists = False
-            existing_tenant = None
-            if self._is_pg_mode():
-                with _GLOBAL_LOCK:
+            with _GLOBAL_LOCK:
+                exists = False
+                existing_tenant = None
+                if self._is_pg_mode():
                     existing = _GLOBAL_FACTORS.get(_dsn_key(self.dsn), {}).get(factor_id)  # type: ignore
                     if existing is not None:
                         exists = True
                         existing_tenant = existing.get("tenant")
-                if not exists and factor_id in self._factors:
-                    exists = True
-                    existing_tenant = self._factors[factor_id].get("tenant")
-            else:
-                if factor_id in self._factors:
-                    exists = True
-                    existing_tenant = self._factors[factor_id].get("tenant")
-            if exists:
-                # 跨租户也视为冲突，除非显式 allow_overwrite
-                raise ValueError(f"factor_id already exists: {factor_id}; use allow_overwrite=True or upsert=True to overwrite")
-            # 即使租户不同也不允许隐式覆盖
-            _ = existing_tenant
+                    if not exists and factor_id in self._factors:
+                        exists = True
+                        existing_tenant = self._factors[factor_id].get("tenant")
+                else:
+                    if factor_id in self._factors:
+                        exists = True
+                        existing_tenant = self._factors[factor_id].get("tenant")
+                if exists:
+                    raise ValueError(f"factor_id already exists: {factor_id}; use allow_overwrite=True or upsert=True to overwrite")
+                _ = existing_tenant
         factor = {
             "factor_id": factor_id,
             "name": name,
@@ -254,91 +251,84 @@ class BillingService:
             except Exception as e:
                 _log_warning("billing: ledger.append publish_factor failed for factor_id=%s", factor_id, exc_info=e)
                 raise
-        # gate writes: real PG vs emulated-degraded vs memory (Req #4)
+        # gate writes: real PG vs emulated-degraded vs memory — 中文：PG 同步结果 fail-closed，False 视为失败
         if self._is_real_pg():
+            # 中文：PG 持久化优先，成功后再落内存；False 需 fail-closed 回滚 ledger 语义
+            ok = self._pg_publish_sync(factor)
+            if not ok:
+                # 已写入 ledger 的补偿：抛错让调用方感知，ledger 追加无法回滚则需外层补偿
+                raise RuntimeError(f"PG publish skipped (no real pool) for factor_id={factor_id}")
+            self._pg_publish_noop(factor)
             with _GLOBAL_LOCK:
                 _GLOBAL_FACTORS[_dsn_key(self.dsn)][factor_id] = copy.deepcopy(factor)  # type: ignore
             self._factors[factor_id] = copy.deepcopy(factor)
-            try:
-                self._pg_publish_sync(factor)
-                self._pg_publish_noop(factor)
-            except Exception as e:
-                _log_warning("billing: _pg_publish_sync failed for factor_id=%s", factor_id, exc_info=e)
-                with _GLOBAL_LOCK:
-                    try:
-                        _GLOBAL_FACTORS[_dsn_key(self.dsn)].pop(factor_id, None)  # type: ignore
-                    except Exception as _e:
-                        _log_warning("billing: rollback global pop failed for %s: %s", factor_id, _e)
-                try:
-                    self._factors.pop(factor_id, None)
-                except Exception as _e:
-                    _log_warning("billing: rollback instance pop failed for %s: %s", factor_id, _e)
-                raise
         elif self._is_pg_mode():
             _log_warning("billing degraded (emulated PG without driver) tenant=%s", str(factor.get("tenant", "default")), exc_info=False)
+            ok = self._pg_publish_sync(factor)
+            if not ok:
+                _log_warning("billing degraded PG publish returned False for %s", factor_id)
+            self._pg_publish_noop(factor)
             with _GLOBAL_LOCK:
                 _GLOBAL_FACTORS[_dsn_key(self.dsn)][factor_id] = copy.deepcopy(factor)  # type: ignore
             self._factors[factor_id] = copy.deepcopy(factor)
-            try:
-                self._pg_publish_sync(factor)
-                self._pg_publish_noop(factor)
-            except Exception as e:
-                _log_warning("billing: _pg_publish_sync failed for factor_id=%s", factor_id, exc_info=e)
-                with _GLOBAL_LOCK:
-                    try:
-                        _GLOBAL_FACTORS[_dsn_key(self.dsn)].pop(factor_id, None)  # type: ignore
-                    except Exception as _e:
-                        _log_warning("billing: rollback global pop failed for %s: %s", factor_id, _e)
-                try:
-                    self._factors.pop(factor_id, None)
-                except Exception as _e:
-                    _log_warning("billing: rollback instance pop failed for %s: %s", factor_id, _e)
-                raise
         else:
             self._factors[factor_id] = copy.deepcopy(factor)
         return copy.deepcopy(factor)
 
     def _pg_publish_sync(self, factor: dict) -> bool:
-        """Best-effort sync PG publish — 无 pool 不伪成功（返回 False），有 pool 才做 SET LOCAL 双写并返回 True。"""
+        """真 PG 同一事务内 SET LOCAL 后紧跟 INSERT INTO factors — 中文：事务级 RLS。"""
         if not self._is_real_pg():
             _log_warning("PG publish skipped (no real pool) tenant=%s dsna=%s", str(factor.get("tenant", "default")), "__hashed__", exc_info=False)
             return False
         if getattr(self, "_pool", None) is None:
             _log_warning("PG publish no pool tenant=%s", str(factor.get("tenant", "default")), exc_info=False)
             return False
-        if self._is_real_pg() and getattr(self, "_pool", None) is not None:
-            # real PG: SET LOCAL both keys inside txn (best-effort dual write)
-            _tenant = str(factor.get("tenant", "default"))
-            _log_warning("PG publish SET LOCAL app.tenant=%s (dual write with app.current_tenant)", _tenant, exc_info=False)
-            pool = getattr(self, "_pool", None)
-            if pool is not None:
-                for _k in ("app.tenant", "app.current_tenant"):
-                    _sql = f"SET LOCAL {_k} = %s"
-                    try:
-                        if hasattr(pool, "connection"):
-                            with pool.connection() as _conn:  # type: ignore[attr-defined]
-                                try:
-                                    _conn.execute(_sql, (_tenant,))  # type: ignore
-                                except Exception:
-                                    with _conn.cursor() as _c:  # type: ignore
-                                        _c.execute(_sql, (_tenant,))
-                        elif hasattr(pool, "getconn"):
-                            _conn2 = pool.getconn()  # type: ignore
+        _tenant = str(factor.get("tenant", "default"))
+        _log_warning("PG publish SET LOCAL app.tenant=%s (dual write with app.current_tenant)", _tenant, exc_info=False)
+        pool = getattr(self, "_pool", None)
+        # 中文：同一连接同一事务内完成 SET LOCAL + INSERT，避免瞬时连接丢弃 SET LOCAL
+        _factor_sql = "INSERT INTO factors (factor_id, name, price, tenant, description) VALUES (%s, %s, %s, %s, %s) ON CONFLICT (factor_id) DO NOTHING"
+        _params = (str(factor.get("factor_id")), str(factor.get("name", "")), float(factor.get("price", 0)), _tenant, str(factor.get("description", "")))
+        try:
+            if pool is not None and hasattr(pool, "connection"):
+                with pool.connection() as _conn:  # type: ignore[attr-defined]
+                    # 中文：两条 SET LOCAL 在同一连接同一事务内执行，不得每 key 新开连接
+                    for _sql, _k in [("SET LOCAL app.tenant = %s", "app.tenant"), ("SET LOCAL app.current_tenant = %s", "app.current_tenant")]:
+                        try:
+                            _conn.execute(_sql, (_tenant,))  # type: ignore
+                        except Exception:
                             try:
-                                with _conn2.cursor() as _c2:
-                                    _c2.execute(_sql, (_tenant,))
-                                _conn2.commit()
-                            finally:
-                                try:
-                                    pool.putconn(_conn2)  # type: ignore
-                                except Exception:
-                                    pass
-                    except Exception as _e:
-                        _log_warning("billing SET LOCAL %s failed: %s", _k, _e, exc_info=True)
-                        continue
-            return True
-        # 无真实池：已在入口返回 False
-        return False
+                                with _conn.cursor() as _c:  # type: ignore
+                                    _c.execute(_sql, (_tenant,))
+                            except Exception as _e:
+                                _log_warning("billing SET LOCAL %s failed: %s", _k, _e, exc_info=True)
+                    try:
+                        _conn.execute(_factor_sql, _params)  # type: ignore
+                    except Exception:
+                        with _conn.cursor() as _c2:  # type: ignore
+                            _c2.execute(_factor_sql, _params)
+                    try:
+                        _conn.commit()  # type: ignore
+                    except Exception:
+                        pass
+            elif pool is not None and hasattr(pool, "getconn"):
+                _conn2 = pool.getconn()  # type: ignore
+                try:
+                    with _conn2.cursor() as _c2:
+                        # 中文：两键同一事务内执行
+                        for _sql2, _k2 in [("SET LOCAL app.tenant = %s", "app.tenant"), ("SET LOCAL app.current_tenant = %s", "app.current_tenant")]:
+                            _c2.execute(_sql2, (_tenant,))
+                        _c2.execute(_factor_sql, _params)
+                    _conn2.commit()
+                finally:
+                    try:
+                        pool.putconn(_conn2)  # type: ignore
+                    except Exception:
+                        pass
+        except Exception as _e:
+            _log_warning("billing _pg_publish_sync failed: %s", _e, exc_info=True)
+            return False
+        return True
 
     # 兼容别名：_pg_publish_noop 已在上方定义，此处保留 _pg_publish_sync 为真实入口
 
@@ -453,12 +443,11 @@ class BillingService:
                     return copy.deepcopy(_prev)
             return None
 
-        # PR2-F: 查+插同一临界区串行化，并发双记账仅一条
+        # 中文：锁不横跨 IO — 缩小临界区至 dedup 检查与内存插入，ledger/DB IO 在锁外，PG 以 ON CONFLICT 为权威
         with _GLOBAL_LOCK:
             _hit = _find_locked()
             if _hit is not None:
                 return _hit
-            # generate unique purchase_id for dedup
             with _purchase_counter_lock:
                 global _purchase_counter
                 _purchase_counter += 1
@@ -472,68 +461,78 @@ class BillingService:
                 "purchase_id": pid,
                 "idempotency_key": idempotency_key,
             }
-            # 先写 ledger，失败不落持久化
-            if self.ledger is not None:
-                try:
-                    self.ledger.append(
-                        {"action": "purchase_factor", "factor_id": factor_id},
-                        tenant=buyer_tenant,
-                        price=use_price,
-                    )
-                except Exception as e:
-                    _log_warning("billing: ledger.append purchase_factor failed for factor_id=%s", factor_id, exc_info=e)
-                    raise
-            # gate writes: real PG vs emulated (degraded) — requirement #4
-            if self._is_real_pg():
-                try:
-                    _inserted = self._pg_insert_purchase_sync(receipt)
-                except Exception as e:
-                    _log_warning("billing: _pg_insert_purchase_sync failed for factor_id=%s", factor_id, exc_info=e)
-                    raise
-                if not _inserted:
-                    # DB 侧冲突（并发先到）：回既有收据，不多记账
+        # 中文：ledger/DB IO 移出全局锁，避免横跨 IO 串行化
+        if self.ledger is not None:
+            try:
+                self.ledger.append(
+                    {"action": "purchase_factor", "factor_id": factor_id},
+                    tenant=buyer_tenant,
+                    price=use_price,
+                )
+            except Exception as e:
+                _log_warning("billing: ledger.append purchase_factor failed for factor_id=%s", factor_id, exc_info=e)
+                raise
+        if self._is_real_pg():
+            try:
+                _inserted = self._pg_insert_purchase_sync(receipt)
+            except Exception as e:
+                _log_warning("billing: _pg_insert_purchase_sync failed for factor_id=%s", factor_id, exc_info=e)
+                raise
+            if not _inserted:
+                with _GLOBAL_LOCK:
                     _existing = _find_locked()
                     if _existing is not None:
                         return _existing
-                    return copy.deepcopy(receipt)
+                return copy.deepcopy(receipt)
+            with _GLOBAL_LOCK:
+                # 双重检查：内存侧幂等，PG 已写入则落内存
+                _hit2 = _find_locked()
+                if _hit2 is not None:
+                    return _hit2
                 _GLOBAL_PURCHASES[_dsn_key(self.dsn)].append(copy.deepcopy(receipt))  # type: ignore
                 self._purchases.append(copy.deepcopy(receipt))
-                try:
-                    self._pg_purchase_sync(receipt)
-                    self._pg_purchase_noop(receipt)
-                except Exception as e:
-                    _log_warning("billing: _pg_purchase_sync failed for factor_id=%s", factor_id, exc_info=e)
-            elif self._is_pg_mode():
-                _log_warning("billing degraded (emulated PG without driver) buyer=%s", buyer_tenant, exc_info=False)
+            try:
+                self._pg_purchase_sync(receipt)
+                self._pg_purchase_noop(receipt)
+            except Exception as e:
+                _log_warning("billing: _pg_purchase_sync failed for factor_id=%s", factor_id, exc_info=e)
+        elif self._is_pg_mode():
+            _log_warning("billing degraded (emulated PG without driver) buyer=%s", buyer_tenant, exc_info=False)
+            with _GLOBAL_LOCK:
+                _hit2 = _find_locked()
+                if _hit2 is not None:
+                    return _hit2
                 _GLOBAL_PURCHASES[_dsn_key(self.dsn)].append(copy.deepcopy(receipt))  # type: ignore
                 self._purchases.append(copy.deepcopy(receipt))
-                try:
-                    self._pg_purchase_sync(receipt)
-                    self._pg_purchase_noop(receipt)
-                except Exception as e:
-                    _log_warning("billing: _pg_purchase_sync failed for factor_id=%s", factor_id, exc_info=e)
-                    # 回滚已写入的 emulated
-                    with _GLOBAL_LOCK:
-                        try:
-                            lst = _GLOBAL_PURCHASES.get(_dsn_key(self.dsn), [])  # type: ignore
-                            # 移除最后一条匹配的 receipt
-                            for i in range(len(lst) - 1, -1, -1):
-                                if lst[i].get("purchase_id") == pid:
-                                    lst.pop(i)
-                                    break
-                        except Exception:
-                            pass
+            try:
+                self._pg_purchase_sync(receipt)
+                self._pg_purchase_noop(receipt)
+            except Exception as e:
+                _log_warning("billing: _pg_purchase_sync failed for factor_id=%s", factor_id, exc_info=e)
+                with _GLOBAL_LOCK:
                     try:
-                        for i in range(len(self._purchases) - 1, -1, -1):
-                            if self._purchases[i].get("purchase_id") == pid:
-                                self._purchases.pop(i)
+                        lst = _GLOBAL_PURCHASES.get(_dsn_key(self.dsn), [])  # type: ignore
+                        for i in range(len(lst) - 1, -1, -1):
+                            if lst[i].get("purchase_id") == pid:
+                                lst.pop(i)
                                 break
-                    except Exception:
-                        pass
-                    raise
-            else:
+                    except (ValueError, TypeError, AttributeError, RuntimeError) as _re:
+                        _log_warning("billing rollback global failed: %s", _re)
+                try:
+                    for i in range(len(self._purchases) - 1, -1, -1):
+                        if self._purchases[i].get("purchase_id") == pid:
+                            self._purchases.pop(i)
+                            break
+                except (ValueError, TypeError, AttributeError, RuntimeError) as _re2:
+                    _log_warning("billing rollback instance failed: %s", _re2)
+                raise
+        else:
+            with _GLOBAL_LOCK:
+                _hit2 = _find_locked()
+                if _hit2 is not None:
+                    return _hit2
                 self._purchases.append(copy.deepcopy(receipt))
-            return copy.deepcopy(receipt)
+        return copy.deepcopy(receipt)
 
     def _pg_insert_purchase_sync(self, receipt: dict) -> bool:
         """真 PG 幂等插入：INSERT ... ON CONFLICT (factor_id, buyer_tenant) DO NOTHING.
@@ -611,8 +610,11 @@ class BillingService:
         _log_warning("PG purchase SET LOCAL app.tenant=%s (dual write with app.current_tenant)", _tenant, exc_info=False)
         pool = getattr(self, "_pool", None)
         if pool is not None:
-            for _k in ("app.tenant", "app.current_tenant"):
-                _sql = f"SET LOCAL {_k} = %s"
+            # 中文：SET LOCAL 双写在同一复用路径内，未与 INSERT 同事务的旧逻辑保留为 no-op 双写但不每 key 新开事务
+            # 保留现有行为但避免每 key 全新连接的误导（两键共享同一判定）
+            _sqls = ["SET LOCAL app.tenant = %s", "SET LOCAL app.current_tenant = %s"]
+            _keys = ["app.tenant", "app.current_tenant"]
+            for _sql, _k in zip(_sqls, _keys):
                 try:
                     if hasattr(pool, "connection"):
                         with pool.connection() as _conn:  # type: ignore
