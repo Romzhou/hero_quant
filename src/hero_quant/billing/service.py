@@ -69,9 +69,17 @@ CREATE TABLE IF NOT EXISTS purchases (
   buyer_tenant text NOT NULL,
   tenant text NOT NULL,
   price double precision NOT NULL,
-  created_at timestamptz DEFAULT now()
+  idempotency_key text,
+  created_at timestamptz DEFAULT now(),
+  UNIQUE (factor_id, buyer_tenant)
 );
 """
+# PR2-F: 真 PG 幂等写入 —— 幂等键 (factor_id, buyer_tenant)，冲突直接丢弃并取既有行。
+_PURCHASE_INSERT_SQL = (
+    "INSERT INTO purchases (factor_id, buyer_tenant, tenant, price, idempotency_key) "
+    "VALUES (%s, %s, %s, %s, %s) "
+    "ON CONFLICT (factor_id, buyer_tenant) DO NOTHING RETURNING id"
+)
 # NOTE: DDL_FACTORS/DDL_PURCHASES are gated — only executed when real PG pool is available.
 # When running in emulated PG mode (no real pool), PG persistence not implemented, using emulated store.
 
@@ -396,8 +404,11 @@ class BillingService:
     ) -> dict:
         """购买因子，生成购买收据并可选同步 ledger。先写 ledger 再落持久化，避免半提交。
 
-        idempotency_key: 幂等键，若提供则重复调用返回同一收据，不重复计费。
-            未提供时仍生成内部 purchase_id 保证唯一。
+        幂等键为 (factor_id, buyer_tenant)：未提供显式 idempotency_key 时，
+        同一 (factor_id, buyer_tenant) 重复调用返回同一收据，不重复计费
+        （并发下串行化保证仅一条记录；真 PG 另有 UNIQUE + ON CONFLICT DO NOTHING）。
+        idempotency_key: 若提供则在 (factor,buyer) 基础上进一步按该键判重，
+            重复调用返回同一收据。
         """
         if not isinstance(buyer_tenant, str) or not buyer_tenant.strip():
             raise ValueError("buyer_tenant must be non-empty str")
@@ -420,85 +431,176 @@ class BillingService:
             idempotency_key = kwargs.get("idempotency_key") or kwargs.get("idem_key")  # alias
         if isinstance(idempotency_key, str):
             idempotency_key = idempotency_key.strip() or None
-        # check existing purchases for same idempotency_key — return prior receipt without duplicate charge
-        if idempotency_key is not None:
-            # search both stores
-            candidates: list[dict] = []
+
+        def _match(prev: dict) -> bool:
+            if prev.get("factor_id") != factor_id or prev.get("buyer_tenant") != buyer_tenant:
+                return False
+            if idempotency_key is not None:
+                return prev.get("idempotency_key") == idempotency_key
+            # PR2-F 默认幂等键 (factor_id, buyer_tenant)
+            return True
+
+        def _find_locked() -> dict | None:
+            """调用方须已持有 _GLOBAL_LOCK；查实时存储（非拷贝）防 TOCTOU。"""
             if self._is_pg_mode():
-                with _GLOBAL_LOCK:
-                    candidates = list(_GLOBAL_PURCHASES.get(_dsn_key(self.dsn), []) or [])  # type: ignore
-            else:
-                candidates = list(self._purchases)
-            for _prev in candidates:
-                if _prev.get("idempotency_key") == idempotency_key and _prev.get("factor_id") == factor_id and _prev.get("buyer_tenant") == buyer_tenant:
+                store = _GLOBAL_PURCHASES.get(_dsn_key(self.dsn), []) or []
+                for _prev in store:
+                    if _match(_prev):
+                        return copy.deepcopy(_prev)
+                return None
+            for _prev in self._purchases:
+                if _match(_prev):
                     return copy.deepcopy(_prev)
-        # generate unique purchase_id for dedup
-        with _purchase_counter_lock:
-            global _purchase_counter
-            _purchase_counter += 1
-            pid = f"{factor_id}:{buyer_tenant}:{_purchase_counter}:{uuid.uuid4().hex[:8]}"
-        receipt = {
-            "factor_id": factor_id,
-            "buyer_tenant": buyer_tenant,
-            "tenant": buyer_tenant,
-            "price": use_price,
-            "action": "purchase_factor",
-            "purchase_id": pid,
-            "idempotency_key": idempotency_key,
-        }
-        # 先写 ledger，失败不落持久化
-        if self.ledger is not None:
-            try:
-                self.ledger.append(
-                    {"action": "purchase_factor", "factor_id": factor_id},
-                    tenant=buyer_tenant,
-                    price=use_price,
-                )
-            except Exception as e:
-                _log_warning("billing: ledger.append purchase_factor failed for factor_id=%s", factor_id, exc_info=e)
-                raise
-        # gate writes: real PG vs emulated (degraded) — requirement #4
-        if self._is_real_pg():
-            with _GLOBAL_LOCK:
+            return None
+
+        # PR2-F: 查+插同一临界区串行化，并发双记账仅一条
+        with _GLOBAL_LOCK:
+            _hit = _find_locked()
+            if _hit is not None:
+                return _hit
+            # generate unique purchase_id for dedup
+            with _purchase_counter_lock:
+                global _purchase_counter
+                _purchase_counter += 1
+                pid = f"{factor_id}:{buyer_tenant}:{_purchase_counter}:{uuid.uuid4().hex[:8]}"
+            receipt = {
+                "factor_id": factor_id,
+                "buyer_tenant": buyer_tenant,
+                "tenant": buyer_tenant,
+                "price": use_price,
+                "action": "purchase_factor",
+                "purchase_id": pid,
+                "idempotency_key": idempotency_key,
+            }
+            # 先写 ledger，失败不落持久化
+            if self.ledger is not None:
+                try:
+                    self.ledger.append(
+                        {"action": "purchase_factor", "factor_id": factor_id},
+                        tenant=buyer_tenant,
+                        price=use_price,
+                    )
+                except Exception as e:
+                    _log_warning("billing: ledger.append purchase_factor failed for factor_id=%s", factor_id, exc_info=e)
+                    raise
+            # gate writes: real PG vs emulated (degraded) — requirement #4
+            if self._is_real_pg():
+                try:
+                    _inserted = self._pg_insert_purchase_sync(receipt)
+                except Exception as e:
+                    _log_warning("billing: _pg_insert_purchase_sync failed for factor_id=%s", factor_id, exc_info=e)
+                    raise
+                if not _inserted:
+                    # DB 侧冲突（并发先到）：回既有收据，不多记账
+                    _existing = _find_locked()
+                    if _existing is not None:
+                        return _existing
+                    return copy.deepcopy(receipt)
                 _GLOBAL_PURCHASES[_dsn_key(self.dsn)].append(copy.deepcopy(receipt))  # type: ignore
-            self._purchases.append(copy.deepcopy(receipt))
-            try:
-                self._pg_purchase_sync(receipt)
-                self._pg_purchase_noop(receipt)
-            except Exception as e:
-                _log_warning("billing: _pg_purchase_sync failed for factor_id=%s", factor_id, exc_info=e)
-        elif self._is_pg_mode():
-            _log_warning("billing degraded (emulated PG without driver) buyer=%s", buyer_tenant, exc_info=False)
-            with _GLOBAL_LOCK:
+                self._purchases.append(copy.deepcopy(receipt))
+                try:
+                    self._pg_purchase_sync(receipt)
+                    self._pg_purchase_noop(receipt)
+                except Exception as e:
+                    _log_warning("billing: _pg_purchase_sync failed for factor_id=%s", factor_id, exc_info=e)
+            elif self._is_pg_mode():
+                _log_warning("billing degraded (emulated PG without driver) buyer=%s", buyer_tenant, exc_info=False)
                 _GLOBAL_PURCHASES[_dsn_key(self.dsn)].append(copy.deepcopy(receipt))  # type: ignore
-            self._purchases.append(copy.deepcopy(receipt))
-            try:
-                self._pg_purchase_sync(receipt)
-                self._pg_purchase_noop(receipt)
-            except Exception as e:
-                _log_warning("billing: _pg_purchase_sync failed for factor_id=%s", factor_id, exc_info=e)
-                # 回滚已写入的 emulated
-                with _GLOBAL_LOCK:
+                self._purchases.append(copy.deepcopy(receipt))
+                try:
+                    self._pg_purchase_sync(receipt)
+                    self._pg_purchase_noop(receipt)
+                except Exception as e:
+                    _log_warning("billing: _pg_purchase_sync failed for factor_id=%s", factor_id, exc_info=e)
+                    # 回滚已写入的 emulated
+                    with _GLOBAL_LOCK:
+                        try:
+                            lst = _GLOBAL_PURCHASES.get(_dsn_key(self.dsn), [])  # type: ignore
+                            # 移除最后一条匹配的 receipt
+                            for i in range(len(lst) - 1, -1, -1):
+                                if lst[i].get("purchase_id") == pid:
+                                    lst.pop(i)
+                                    break
+                        except Exception:
+                            pass
                     try:
-                        lst = _GLOBAL_PURCHASES.get(_dsn_key(self.dsn), [])  # type: ignore
-                        # 移除最后一条匹配的 receipt
-                        for i in range(len(lst) - 1, -1, -1):
-                            if lst[i].get("purchase_id") == pid:
-                                lst.pop(i)
+                        for i in range(len(self._purchases) - 1, -1, -1):
+                            if self._purchases[i].get("purchase_id") == pid:
+                                self._purchases.pop(i)
                                 break
                     except Exception:
                         pass
+                    raise
+            else:
+                self._purchases.append(copy.deepcopy(receipt))
+            return copy.deepcopy(receipt)
+
+    def _pg_insert_purchase_sync(self, receipt: dict) -> bool:
+        """真 PG 幂等插入：INSERT ... ON CONFLICT (factor_id, buyer_tenant) DO NOTHING.
+
+        返回 True=本次插入新行；False=冲突已存在（调用方回既有收据）。
+        无 pool 时返回 True 由调用方走内存分支（不伪装成 DB 冲突）。
+        """
+        pool = getattr(self, "_pool", None)
+        if not self._is_real_pg() or pool is None:
+            return True
+        _tenant = str(receipt.get("buyer_tenant") or receipt.get("tenant") or "default")
+        _params = (
+            str(receipt.get("factor_id")),
+            _tenant,
+            _tenant,
+            float(receipt.get("price", 0.0)),
+            receipt.get("idempotency_key"),
+        )
+
+        def _run(conn) -> bool:
+            try:
+                conn.execute("SET LOCAL app.tenant = %s", (_tenant,))
+            except Exception:
                 try:
-                    for i in range(len(self._purchases) - 1, -1, -1):
-                        if self._purchases[i].get("purchase_id") == pid:
-                            self._purchases.pop(i)
-                            break
+                    with conn.cursor() as _c:  # type: ignore
+                        _c.execute("SET LOCAL app.tenant = %s", (_tenant,))
+                except Exception as _e:
+                    _log_warning("billing SET LOCAL app.tenant failed: %s", _e, exc_info=True)
+            try:
+                conn.execute("SET LOCAL app.current_tenant = %s", (_tenant,))
+            except Exception:
+                try:
+                    with conn.cursor() as _c2:  # type: ignore
+                        _c2.execute("SET LOCAL app.current_tenant = %s", (_tenant,))
+                except Exception as _e:
+                    _log_warning("billing SET LOCAL app.current_tenant failed: %s", _e, exc_info=True)
+            try:
+                _cur = conn.execute(_PURCHASE_INSERT_SQL, _params)  # type: ignore
+                try:
+                    _row = _cur.fetchone()
+                except Exception:
+                    with conn.cursor() as _c3:  # type: ignore
+                        _c3.execute(_PURCHASE_INSERT_SQL, _params)
+                        _row = _c3.fetchone()
+            except Exception:
+                with conn.cursor() as _c4:  # type: ignore
+                    _c4.execute(_PURCHASE_INSERT_SQL, _params)
+                    _row = _c4.fetchone()
+            try:
+                conn.commit()  # type: ignore
+            except Exception:
+                pass
+            return _row is not None
+
+        if hasattr(pool, "connection"):
+            with pool.connection() as _conn:  # type: ignore[attr-defined]
+                return _run(_conn)
+        if hasattr(pool, "getconn"):
+            _conn2 = pool.getconn()  # type: ignore
+            try:
+                return _run(_conn2)
+            finally:
+                try:
+                    pool.putconn(_conn2)  # type: ignore
                 except Exception:
                     pass
-                raise
-        else:
-            self._purchases.append(copy.deepcopy(receipt))
-        return copy.deepcopy(receipt)
+        return True
 
     def _pg_purchase_sync(self, receipt: dict) -> bool:
         """无 pool 不伪成功（返回 False），有 pool 才做 SET LOCAL 双写并返回 True。"""

@@ -389,13 +389,14 @@ def router_hybrid_scores(query: str, candidates: List[str]) -> Dict[str, float]:
             if vscore > 1:
                 vscore = 1.0
             vec_raw[name] = vscore
-    # 统一通过 rank_fusion 融合，若失败则回退旧公式
+    # 统一通过 rank_fusion.fuse 融合（PR2-F：与 store 同一入口 RRF k=60 + 0.5/0.5），若失败则回退旧公式
     try:
-        from hero_quant.memory.rank_fusion import rank_fusion as _rank_fusion
+        from hero_quant.memory.rank_fusion import RRF_K as _RRF_K
+        from hero_quant.memory.rank_fusion import fuse as _rank_fusion
 
         bm25_tuples = [(n, float(bm25_raw.get(n, 0.0))) for n in candidates]
         vec_tuples = [(n, float(vec_raw.get(n, 0.0))) for n in candidates] if qvec is not None else []
-        fused = _rank_fusion(bm25_tuples, vec_tuples, k=60)
+        fused = _rank_fusion(bm25_tuples, vec_tuples, k=_RRF_K)
         out = {k: v for k, v in fused}
         # rank_fusion 可能未包含全部 candidates（若无 vec），补齐
         for n in candidates:
@@ -461,9 +462,10 @@ def route(query: str, k: int = 5) -> List[str]:
         qvec = None
     scored: List[tuple[float, str]] = []
     if qvec is not None:
-        # 统一融合 via rank_fusion (0.5*RRF + 0.5*cosine)
+        # 统一融合 via rank_fusion.fuse (0.5*RRF + 0.5*cosine) —— 与 store 同一入口
         try:
-            from hero_quant.memory.rank_fusion import rank_fusion as _rank_fusion
+            from hero_quant.memory.rank_fusion import RRF_K as _RRF_K2
+            from hero_quant.memory.rank_fusion import fuse as _rank_fusion
 
             bm25_raw2: Dict[str, float] = {}
             for name in candidates:
@@ -482,7 +484,7 @@ def route(query: str, k: int = 5) -> List[str]:
                 vec_raw2[name] = vscore
             bm25_tuples = [(n, float(bm25_raw2.get(n, 0.0))) for n in candidates]
             vec_tuples = [(n, float(vec_raw2.get(n, 0.0))) for n in candidates]
-            fused = _rank_fusion(bm25_tuples, vec_tuples, k=60)
+            fused = _rank_fusion(bm25_tuples, vec_tuples, k=_RRF_K2)
             # fused is list[(name, hybrid)] sorted desc
             fused_map = {k: v for k, v in fused}
             for name in candidates:

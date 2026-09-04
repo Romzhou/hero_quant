@@ -77,6 +77,23 @@ _ALIAS_MAP = {
     "risk": "risk",
 }
 
+# Phase 1: 5 投研角色与工具绑定（过滤 TOOL_REGISTRY）
+_ROLE_TOOL_MAP: dict[str, list[str]] = {
+    "market": ["get_market_data", "get_bars_range", "list_markets", "compute_indicator", "compute_sharpe", "compute_drawdown", "compute_correlation"],
+    "news": ["search_symbols", "search_symbol"],
+    "fundamentals": ["get_ticker_info", "get_fundamentals"],
+    "factor": ["compute_factor", "screen_factors", "compute_indicator"],
+    "risk": ["validate_backtest", "get_backtest_metrics", "compute_drawdown", "compute_correlation"],
+}
+
+_ROLE_PROMPTS: dict[str, str] = {
+    "market": "You are Market Analyst. Use get_market_data/get_bars_range/compute_indicator to analyze price/volume/trend. Cite Ground Truth prices.",
+    "news": "You are News/Sentiment Analyst. Use search_symbols and memory recall to gather sentiment/news context. Summarize catalysts.",
+    "fundamentals": "You are Fundamentals Analyst. Use get_ticker_info/get_fundamentals to assess valuation and earnings. Note placeholders if data empty.",
+    "factor": "You are Factor Analyst. Use compute_factor/screen_factors/compute_indicator to evaluate momentum and signals.",
+    "risk": "You are Risk Analyst. Use validate_backtest/get_backtest_metrics/compute_drawdown to check PIT, 1% cross-source, drawdown and compliance.",
+}
+
 
 def _resolve_targets_from_text(text: str) -> List[str]:
     """从自由文本推断需扇出的分析师目标."""
@@ -109,11 +126,23 @@ def _normalize_selected(selected: List[str] | None) -> List[str]:
     return norm
 
 
+def _get_role_tools(name: str) -> list[str]:
+    """Return tool names for a role; empty list means no special tools."""
+    return _ROLE_TOOL_MAP.get(name, [])
+
+
+def _get_role_prompt(name: str) -> str:
+    return _ROLE_PROMPTS.get(name, f"You are {name} analyst. Provide concise analysis.")
+
+
 def _leaf_subagent(name: str):
-    """创建叶分析师节点，占位实现 create_agent 叶语义。"""
+    """创建叶分析师节点 — Phase 1: 绑定角色 Prompt 与工具子集，复用 skill 的审计/脱敏/截断范式。
+
+    仍保持 BudgetBreaker 熔断与 delegation_depth 预算，新增 per-agent 工具绑定与角色提示，
+    输出通过 State add reducer 聚合，供 verify 节点综合。
+    """
 
     def _run(state: State) -> Dict[str, Any]:
-        # Defensive copy: avoid mutable shared state mutation
         try:
             depth = int(state.get("delegation_depth", 0))
         except (ValueError, TypeError, AttributeError) as exc:
@@ -123,27 +152,45 @@ def _leaf_subagent(name: str):
             return {
                 "messages": [{"role": "assistant", "content": f"{name}: delegation budget exceeded"}],
                 "subagent_outputs": [{"agent": name, "status": "budget_exceeded"}],
+                "agent_traces": [{"agent": name, "status": "budget_exceeded"}],
             }
-        # 成本熔断占位：按固定成本探询是否需降级（依赖 BudgetBreaker 内部 _lock，避免外层 threading.Lock 阻塞 async 事件循环）
         if _breaker is not None:
             try:
-                # 优先原子 check_and_add，若无则用 should_fallback — BudgetBreaker 内部已线程安全
                 if hasattr(_breaker, "check_and_add"):
                     if _breaker.check_and_add(0.1):
                         return {
                             "messages": [{"role": "assistant", "content": f"{name}: budget fallback"}],
                             "subagent_outputs": [{"agent": name, "status": "fallback"}],
+                            "agent_traces": [{"agent": name, "status": "fallback"}],
                         }
                 elif _breaker.should_fallback(cost=0.1):
                     return {
                         "messages": [{"role": "assistant", "content": f"{name}: budget fallback"}],
                         "subagent_outputs": [{"agent": name, "status": "fallback"}],
+                        "agent_traces": [{"agent": name, "status": "fallback"}],
                     }
             except Exception as exc:
                 logging.getLogger(__name__).warning("BudgetBreaker check failed for %s: %s", name, exc, exc_info=True)
+
+        # Role-specific prompt and tool binding (Phase 1)
+        role_prompt = _get_role_prompt(name)
+        tool_names = _get_role_tools(name)
+        # Build tool context for audit/trace — actual LLM tool-calling happens in loop._run_graph
+        tool_preview = ""
+        if tool_names:
+            try:
+                from hero_quant.tools.registry import TOOL_REGISTRY
+
+                available = [t for t in tool_names if t in TOOL_REGISTRY]
+                if available:
+                    tool_preview = f" | tools: {', '.join(available)}"
+            except Exception:
+                pass
+        content = f"{name}: research done [{role_prompt[:80]}]{tool_preview}"
         return {
-            "messages": [{"role": "assistant", "content": f"{name}: research done"}],
-            "subagent_outputs": [{"agent": name, "output": f"{name} result"}],
+            "messages": [{"role": "assistant", "content": content}],
+            "subagent_outputs": [{"agent": name, "output": f"{name} result", "role_prompt": role_prompt, "tools": tool_names}],
+            "agent_traces": [{"agent": name, "role": name, "tools": tool_names}],
         }
 
     _run.__name__ = f"leaf_{name}"

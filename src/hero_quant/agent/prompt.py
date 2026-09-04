@@ -30,6 +30,7 @@ TOOL_SKILL_TEMPLATE = """## Tool / Skill
 - Use vector router TopK selection; call at most 5 tools per turn.
 - is_concurrency_safe=True tools may run in parallel pool; write tools run serially.
 - All tool calls are traced via TraceWriter and redacted via redact_payload.
+- REQUIRED tool args: get_market_data/get_ticker_info/get_fundamentals/run_backtest MUST include `symbol` (e.g. "600519.SH"); extract it from the user query — never call them with empty args.
 """
 
 GROUNDING_TEMPLATE = """## Grounding — Evidence Only

@@ -67,10 +67,11 @@ _PG_PREFIXES = ("postgresql://", "postgres://", "postgresql+psycopg://")
 # external store: consider maxsize (e.g. 10k entries) with least-recently-used eviction
 # and periodic expiry sweep. Current TTL sweep occurs lazily in get/list_thread_ids;
 # a background janitor could be added for proactive eviction.
-# TODO(warm-start): on startup warm _PG_SEQ_BY_RUN / _PG_RUN_BY_SEQ / _PG_GLOBAL_* from
-# DB (SELECT tenant, thread, seq, run_text FROM checkpoints WHERE expires_at IS NULL
-# OR expires_at > now()) if real PG pool available, so seq<->run mapping survives
-# process restart without relying on in-memory only state.
+# PR2-D: startup warms _PG_SEQ_BY_RUN / _PG_RUN_BY_SEQ from DB
+# (SELECT tenant, thread, seq, run_text FROM checkpoints WHERE expires_at IS NULL
+# OR expires_at > now()) when a real sync PG pool is available, so seq<->run mapping
+# survives process restart without relying on in-memory only state.
+# No-pool (memory/emulated) path warms nothing and returns 0.
 _PG_GLOBAL_STORE: Dict[str, Dict[str, Any]] = {}
 _PG_GLOBAL_META: Dict[str, Dict[str, Any]] = {}
 _PG_GLOBAL_TS: Dict[str, float] = {}
@@ -78,13 +79,9 @@ _PG_MAXSIZE = 10000  # LRU bound for emulated store; 0 = unbounded (legacy)
 
 # Persist run-string -> seq mapping for deterministic seq and collision disambiguation.
 # Key: f"{tenant}::{thread}::{run}" -> seq ; reverse: f"{tenant}::{thread}::{seq}" -> run
-# NOTE: in-memory only; survives saver restart within same process via emulated store path.
-# TODO(real-PG DDL): add column `run_text TEXT` to checkpoints table or a
-#   dedicated mapping table `checkpoint_seq_map(tenant, thread, seq, run_text)` so that
-#   seq->run reconstruction survives process restart and real PG list_thread_ids can
-#   return original thread_id without fabrication. Until DDL is applied, real-PG
-#   list_thread_ids will best-effort reconstruct via this in-memory map and fall back
-#   to str(seq) with TODO warning.
+# NOTE: real PG persists run_text in checkpoints.run_text (DDL below); the in-memory
+# maps are rebuilt at startup via warm_checkpoint_maps(). The memory-only fallback
+# (pool=None, e.g. fakeredis/emulated branch) still uses str(seq) when no mapping exists.
 _PG_SEQ_BY_RUN: Dict[str, int] = {}
 _PG_RUN_BY_SEQ: Dict[str, str] = {}
 _PG_GLOBAL_LOCK = threading.RLock()
@@ -225,6 +222,138 @@ def _thread_to_keys(thread_id: str) -> tuple[str, str, int]:
         _PG_SEQ_BY_RUN[key_run] = seq
         _PG_RUN_BY_SEQ[f"{tenant}::{wf}::{seq}"] = run
         return tenant, wf, seq
+
+
+def get_run_text(tenant: str, thread: str, seq: int) -> Optional[str]:
+    """查询已暖的 run 原串（thread_id 重建用）；缺失返回 None，调用方回退 str(seq)。"""
+    try:
+        with _PG_GLOBAL_LOCK:
+            return _PG_RUN_BY_SEQ.get(f"{tenant}::{thread}::{int(seq)}")
+    except Exception:
+        return None
+
+
+def _apply_warm_rows(rows: Any) -> int:
+    """将 SELECT 行写入 _PG_SEQ_BY_RUN/_PG_RUN_BY_SEQ，返回恢复条数（run_text 为空的行跳过）。"""
+    count = 0
+    try:
+        with _PG_GLOBAL_LOCK:
+            for r in rows or []:
+                if not isinstance(r, (list, tuple)) or len(r) < 3:
+                    continue
+                tenant_r, thread_r, seq_r = r[0], r[1], r[2]
+                run_text = r[3] if len(r) > 3 and isinstance(r[3], str) and r[3] else None
+                if run_text is None:
+                    continue
+                try:
+                    seq_int = int(seq_r)
+                except Exception:
+                    continue
+                _PG_SEQ_BY_RUN[f"{tenant_r}::{thread_r}::{run_text}"] = seq_int
+                _PG_RUN_BY_SEQ[f"{tenant_r}::{thread_r}::{seq_int}"] = run_text
+                count += 1
+    except Exception as _exc:
+        logger.warning("silent handled: offline-safe: checkpoint warm apply failed", exc_info=_exc)
+    return count
+
+
+def _fetch_warm_rows_sync(pool: Any) -> list:
+    """同步拉取 (tenant, thread, seq, run_text)；无 run_text 列时回退三列查询。"""
+    sql_new = "SELECT tenant, thread, seq, run_text FROM checkpoints WHERE expires_at IS NULL OR expires_at > now()"
+    sql_old = "SELECT tenant, thread, seq FROM checkpoints WHERE expires_at IS NULL OR expires_at > now()"
+    if hasattr(pool, "connection"):
+        with pool.connection() as conn:  # type: ignore
+            try:
+                try:
+                    cur = conn.execute(sql_new)  # type: ignore
+                    return list(cur.fetchall())  # type: ignore
+                except Exception:
+                    with conn.cursor() as cur:  # type: ignore
+                        cur.execute(sql_new)
+                        return list(cur.fetchall())
+            except Exception:
+                pass
+            try:
+                try:
+                    cur = conn.execute(sql_old)  # type: ignore
+                    return list(cur.fetchall())  # type: ignore
+                except Exception:
+                    with conn.cursor() as cur:  # type: ignore
+                        cur.execute(sql_old)
+                        return list(cur.fetchall())
+            except Exception as _exc:
+                logger.warning("silent handled: offline-safe: checkpoint warm legacy query failed", exc_info=_exc)
+                return []
+    elif hasattr(pool, "getconn"):
+        conn = pool.getconn()  # type: ignore
+        try:
+            with conn.cursor() as cur:
+                try:
+                    cur.execute(sql_new)
+                except Exception:
+                    cur.execute(sql_old)
+                return list(cur.fetchall())
+        finally:
+            try:
+                pool.putconn(conn)  # type: ignore
+            except Exception as _exc:
+                logger.warning("silent handled: offline-safe: checkpoint warm putconn failed", exc_info=_exc)
+    return []
+
+
+def warm_checkpoint_maps(saver: Any) -> int:
+    """PR2-D warm-start：真 PG 同步池才 SELECT 暖映射；无池/异步池返回 0。永不抛异常。"""
+    try:
+        is_real = saver._is_real_pg_pool() if callable(getattr(saver, "_is_real_pg_pool", None)) else False
+        if not is_real:
+            return 0
+        try:
+            if bool(saver._pool_is_async()):
+                return 0
+        except Exception:
+            pass
+        pool = getattr(saver, "pool", None)
+        if pool is None:
+            return 0
+        return _apply_warm_rows(_fetch_warm_rows_sync(pool))
+    except Exception as _exc:
+        logger.warning("silent handled: offline-safe: checkpoint warm failed", exc_info=_exc)
+        return 0
+
+
+async def awarm_checkpoint_maps(saver: Any) -> int:
+    """PR2-D warm-start（异步池）：SELECT 暖映射；非异步真池转同步实现。永不抛异常。"""
+    try:
+        is_real = saver._is_real_pg_pool() if callable(getattr(saver, "_is_real_pg_pool", None)) else False
+        if not is_real:
+            return 0
+        try:
+            is_async = bool(saver._pool_is_async())
+        except Exception:
+            is_async = False
+        if not is_async:
+            return warm_checkpoint_maps(saver)
+        pool = getattr(saver, "pool", None)
+        if pool is None:
+            return 0
+        sql_new = "SELECT tenant, thread, seq, run_text FROM checkpoints WHERE expires_at IS NULL OR expires_at > now()"
+        sql_old = "SELECT tenant, thread, seq FROM checkpoints WHERE expires_at IS NULL OR expires_at > now()"
+        rows: Any = []
+        try:
+            async with pool.connection() as conn:  # type: ignore
+                try:
+                    cur = await conn.execute(sql_new)  # type: ignore
+                    rows = await cur.fetchall()  # type: ignore
+                except Exception:
+                    cur = await conn.execute(sql_old)  # type: ignore
+                    rows = await cur.fetchall()  # type: ignore
+        except Exception as _exc:
+            logger.warning("silent handled: offline-safe: checkpoint async warm query failed", exc_info=_exc)
+            return 0
+        return _apply_warm_rows(rows)
+    except Exception as _exc:
+        logger.warning("silent handled: offline-safe: checkpoint async warm failed", exc_info=_exc)
+        return 0
 
 
 def _is_async_pool(pool: Any) -> bool:
@@ -897,36 +1026,26 @@ class AsyncPostgresSaver:
                 return alive
             if self._is_real_pg_pool() and not self._pool_is_async():
                 try:
-                    sql = "SELECT tenant, thread, seq FROM checkpoints WHERE expires_at IS NULL OR expires_at > now()"
-                    rows = []
-                    if hasattr(self.pool, "connection"):
-                        with self.pool.connection() as conn:  # type: ignore
-                            try:
-                                cur = conn.execute(sql)  # type: ignore
-                                rows = cur.fetchall()  # type: ignore
-                            except Exception:
-                                with conn.cursor() as cur:  # type: ignore
-                                    cur.execute(sql)
-                                    rows = cur.fetchall()
+                    rows = _fetch_warm_rows_sync(self.pool)
                     if rows:
-                        # reconstruct thread_id: try reverse map to recover original run string
-                        # TODO(real-PG DDL): persist run_text column; until then use in-memory reverse map.
+                        # reconstruct thread_id: prefer persisted run_text, then warm reverse map.
                         out = []
+                        _apply_warm_rows(rows)
                         for r in rows:
                             if not isinstance(r, (list, tuple)) or len(r) < 3:
                                 continue
                             tenant_r, thread_r, seq_r = r[0], r[1], r[2]
-                            key_seq = f"{tenant_r}::{thread_r}::{seq_r}"
-                            with _PG_GLOBAL_LOCK:
-                                run_str = _PG_RUN_BY_SEQ.get(key_seq)
+                            run_text = r[3] if len(r) > 3 and isinstance(r[3], str) and r[3] else None
+                            run_str = run_text or get_run_text(str(tenant_r), str(thread_r), seq_r)
                             if run_str is not None:
                                 out.append(f"{thread_r}:{run_str}:{tenant_r}")
                             else:
-                                # no mapping: do not fabricate wrong id; fall back to seq string with warning
-                                # This avoids returning "wf:123:tenant" when original was "wf:myrun:tenant"
+                                # memory-only fallback (no real mapping yet): str(seq), never raise.
+                                # This branch only triggers when the row predates run_text persistence
+                                # and no warm mapping exists (e.g. emulated/fakeredis branch).
                                 logger.warning(
                                     "checkpoint list_thread_ids: no run mapping for seq %s (tenant=%s thread=%s); "
-                                    "returning seq as run (may be incorrect). TODO: add run_text column.",
+                                    "returning seq as run (memory-only fallback).",
                                     seq_r, tenant_r, thread_r,
                                 )
                                 out.append(f"{thread_r}:{seq_r}:{tenant_r}")

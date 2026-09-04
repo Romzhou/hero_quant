@@ -78,3 +78,6 @@ class State(TypedDict, total=False):
     pros: Annotated[List[str], _add_list]
     cons: Annotated[List[str], _add_list]
     confidence: Annotated[float, _keep_last]
+    # Phase 1: multi-agent extensions (optional, not required by legacy tests)
+    agent_traces: Annotated[List[Dict[str, Any]], _add_list]
+    risk_report: Annotated[str, _keep_last]

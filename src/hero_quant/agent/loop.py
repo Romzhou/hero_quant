@@ -980,9 +980,50 @@ class AgentLoop:
 
             token_count = estimate_tokens(buffer)
 
-            # 6) 工具调用：只读并发、写入串行
+            # 6) 工具调用：只读并发、写入串行（含 symbol 缺失自动回填，避免 DeepSeek 漏参导致 tool_error 刷屏）
             tool_success_this_iter = False
             if tool_calls_this_iter:
+                # 预解析 goal 中的 symbol 候选，供漏参工具回填（600519.SH / AAPL 等）
+                _fallback_symbols: list[str] = []
+                try:
+                    _fallback_symbols = re.findall(r"\b\d{6}\.(?:SH|SZ|HK)\b|\b[A-Z]{1,5}\b", goal or "")
+                    # 去重保序
+                    _seen = set()
+                    _uniq = []
+                    for _s in _fallback_symbols:
+                        if _s not in _seen:
+                            _seen.add(_s)
+                            _uniq.append(_s)
+                    _fallback_symbols = [s for s in _uniq if not s.isupper() or "." in s or len(s) <= 5]
+                    # 优先带后缀的
+                    _fallback_symbols.sort(key=lambda s: (0 if "." in s else 1, s))
+                except Exception:
+                    _fallback_symbols = []
+
+                def _autofill_symbol_args(tname: str, args: dict) -> dict:
+                    if not isinstance(args, dict):
+                        return args
+                    # 仅对已知需 symbol 的工具回填
+                    if tname not in ("get_market_data", "get_ticker_info", "get_fundamentals", "run_backtest"):
+                        return args
+                    sym = str(args.get("symbol", "")).strip()
+                    if sym:
+                        return args
+                    # 从 goal 回填
+                    if _fallback_symbols:
+                        cand = _fallback_symbols[0]
+                        # 统一 SH 大写
+                        cand = cand.strip()
+                        nxt = dict(args)
+                        nxt["symbol"] = cand
+                        return nxt
+                    # 兜底：回测场景默认 600519.SH
+                    if tname == "run_backtest":
+                        nxt = dict(args)
+                        nxt["symbol"] = "600519.SH"
+                        return nxt
+                    return args
+
                 # 先统一解析全部工具调用，确定并发安全性并脱敏落盘
                 parsed: List[Dict[str, Any]] = []
                 for tc in tool_calls_this_iter:
@@ -1006,6 +1047,11 @@ class AgentLoop:
                         args = {"value": args}
                     if not tool_name:
                         continue
+                    # 漏参回填（在 spec 查找前完成，以便并发安全判定也基于回填后 args）
+                    try:
+                        args = _autofill_symbol_args(tool_name, args if isinstance(args, dict) else {})
+                    except Exception:
+                        pass
                     spec = None
                     try:
                         from hero_quant.tools.registry import TOOL_REGISTRY

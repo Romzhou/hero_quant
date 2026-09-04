@@ -313,6 +313,29 @@ except Exception as _e:
 app = FastAPI(title="hero-quant")
 
 
+def warm_checkpoint_at_startup() -> int:
+    """PR2-D lifespan 启动暖机：SELECT tenant/thread/seq/run_text 恢复 seq<->run 映射。
+
+    无真 PG 池（memory/fakeredis 仿真分支）时返回 0 且不抛异常；永不阻断启动。
+    """
+    try:
+        saver = _get_checkpoint_saver()
+        if saver is None:
+            return 0
+        from hero_quant.checkpoint.postgres import warm_checkpoint_maps as _warm
+
+        n = int(_warm(saver))
+        logger.info("checkpoint.warm_completed", restored=n)
+        return n
+    except Exception as _e:
+        logger.debug("checkpoint.warm_failed", error=str(_e))
+        return 0
+
+
+@app.on_event("startup")
+def _warm_checkpoint_maps_on_startup() -> None:
+    warm_checkpoint_at_startup()
+
 
 def _client_ip(request: Request | None) -> str:
     """提取客户端 IP（限流 key 用），失败回退 testclient/unknown。"""

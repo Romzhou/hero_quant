@@ -38,8 +38,9 @@ _CHAIN_FIELDS = frozenset({"seq", "prev_record_hash", "record_hash"})
 
 _fsync_warned = False
 
-# P2: 追加前 O(n) 全链校验的增量优化缓存 —— 以 path -> (mtime, size, count, tail_hash) 记录上次已校验的尾部，命中且尾连续时可短路全扫
-_tail_verify_cache: dict[str, tuple[float, int, int, str]] = {}  # path_str -> (mtime, size, count, tail_hash)
+# PR2-E: 追加前校验的增量缓存 —— path -> (mtime, size, count, tail_hash, tenants)，tenants 为 {tenant: [count, tail_hash]}；
+# 命中（四元一致 + O(1) 尾自检）跳过全扫，未命中且前缀连续时仅校验新增段 O(k)，否则回落全扫
+_tail_verify_cache: dict[str, tuple[float, int, int, str, dict[str, list]]] = {}
 
 __all__ = [
     "GENESIS_PREV_HASH",
@@ -596,6 +597,96 @@ def verify_export(export: Mapping[str, Any] | str | Path) -> ChainVerificationRe
     return ChainVerificationResult(ok=True, record_count=len(records), first_break=None)
 
 
+def _tenant_tail_snapshot(entries: list[dict[str, Any]]) -> dict[str, list]:
+    """PR2-E: 按文件顺序统计每租户 [count, tail_hash]，作为增量校验的可信锚点。"""
+    tenants: dict[str, list] = {}
+    for e in entries:
+        if "_raw" in e:
+            continue
+        t = e.get("tenant", "default")
+        slot = tenants.get(t)
+        if slot is None:
+            tenants[t] = [1, e.get("record_hash", "")]
+        else:
+            slot[0] += 1
+            slot[1] = e.get("record_hash", "")
+    return tenants
+
+
+def _tail_self_check(entry: dict[str, Any]) -> bool:
+    """PR2-E: O(1) 尾记录自复核 —— 用其自身 prev_hash 重算 record_hash。
+
+    检出同长度篡改尾部 payload + 伪造 mtime/size 回缓存值的场景（此时四元组命中，必须看记录内容本身）。
+    """
+    if "_raw" in entry:
+        return False
+    ts = entry.get("tenant_seq")
+    if ts is None:
+        return False  # 无法定位，回落全扫
+    t = entry.get("tenant", "default")
+    prev = entry.get("prev_hash", "")
+    record = entry.get("record")
+    if record is None:
+        return False
+    new_hex, new_pref, leg_hex, leg_pref = _expected_hashes(ts, prev, record, t, entry.get("price"))
+    if entry.get("record_hash") in (new_hex, new_pref, leg_hex, leg_pref):
+        return True
+    if _is_genesis(prev):
+        alt_prev = _LEGACY_GENESIS if prev == GENESIS_PREV_HASH else GENESIS_PREV_HASH
+        alt_new_hex = _tenant_payload_hash(ts, alt_prev, record, tenant=t, price=entry.get("price"))
+        alt_leg_hex = _tenant_payload_hash_legacy(ts, alt_prev, record)
+        if entry.get("record_hash") in (alt_new_hex, f"sha256:{alt_new_hex}", alt_leg_hex, f"sha256:{alt_leg_hex}"):
+            return True
+    return False
+
+
+def _verify_suffix_incremental(
+    suffix: list[dict[str, Any]],
+    *,
+    start_seq: int,
+    tenant_state: dict[str, list],
+) -> tuple[bool, ChainBreak | None, dict[str, list]]:
+    """PR2-E: 仅校验新增段 O(k)，前缀以后缀起点锚定已校验的 tenant_state（{tenant: [count, tail]}）。
+
+    调用方须保证 suffix 非空、逐条含 tenant_seq 且无 _raw；返回 (ok, break, new_state)。
+    """
+    state = {t: [c, h] for t, (c, h) in tenant_state.items()}
+    for off, entry in enumerate(suffix):
+        gidx = start_seq - 1 + off  # 0-based 全局下标
+        exp_seq = start_seq + off
+        if entry.get("seq") != exp_seq:
+            return False, ChainBreak(gidx, entry.get("seq"), "seq_gap", f"expected seq={exp_seq} found {entry.get('seq')!r}"), state
+        t = entry.get("tenant", "default")
+        slot = state.get(t)
+        if slot is None:
+            exp_ts, prev = 1, GENESIS_PREV_HASH
+        else:
+            exp_ts, prev = slot[0] + 1, slot[1]
+        ts = entry.get("tenant_seq")
+        if ts != exp_ts:
+            return False, ChainBreak(gidx, ts, "seq_gap", f"tenant {t} expected tenant_seq={exp_ts} got {ts!r}"), state
+        ph = entry.get("prev_hash")
+        first_of_tenant = exp_ts == 1
+        if ph != prev and not (first_of_tenant and _is_genesis(ph) and _is_genesis(prev)):
+            return False, ChainBreak(gidx, ts, "prev_hash_mismatch", f"expected {prev!r} got {ph!r}"), state
+        record = entry.get("record")
+        if record is None:
+            return False, ChainBreak(gidx, ts, "missing_chain_fields", "missing record"), state
+        new_hex, new_pref, leg_hex, leg_pref = _expected_hashes(ts, prev, record, t, entry.get("price"))
+        stored = entry.get("record_hash")
+        if stored not in (new_hex, new_pref, leg_hex, leg_pref):
+            if first_of_tenant and _is_genesis(prev) and _is_genesis(ph):
+                alt_prev = _LEGACY_GENESIS if prev == GENESIS_PREV_HASH else GENESIS_PREV_HASH
+                alt_new_hex = _tenant_payload_hash(ts, alt_prev, record, tenant=t, price=entry.get("price"))
+                alt_leg_hex = _tenant_payload_hash_legacy(ts, alt_prev, record)
+                if stored in (alt_new_hex, f"sha256:{alt_new_hex}", alt_leg_hex, f"sha256:{alt_leg_hex}"):
+                    state[t] = [exp_ts, entry.get("record_hash")]
+                    continue
+            return False, ChainBreak(gidx, ts, "record_hash_mismatch", f"stored {stored!r} recomputed {new_hex!r}"), state
+        state[t] = [exp_ts, entry.get("record_hash")]
+    return True, None, state
+
+
 class Ledger:
     """JSONL hash 链账本：追加写、按租户隔离、可全链校验。
 
@@ -784,38 +875,88 @@ class Ledger:
                         entries.append(json.loads(s))
                     except json.JSONDecodeError:
                         entries.append({"_raw": s})
-                # 追加前全链校验，断链则拒绝写入
-                # TODO(P2): O(n) verify before append —— 当前为全量扫描，理想优化为缓存 tail hash 做增量校验；
-                # 已加入 _tail_verify_cache 短路：命中且 mtime/size/count/tail 一致时跳过全扫，后续可扩展为批量增量校验
+                # 追加前校验，断链则拒绝写入 —— PR2-E 批量增量校验：
+                # 1) 缓存命中（count/mtime/size/tail 一致）+ O(1) 尾自检通过 → 跳过全扫；
+                # 2) 未命中但 count 未回退，且缓存锚点 tail 与新增段起点 prev 连续 → 仅校验新增段 O(k)；
+                # 3) 否则（无缓存/收缩/锚点断裂）→ 回落 O(n) 全扫。_tail_verify_cache 语义保留并扩展 tenants 快照。
                 _cache_key = str(self.path)
                 _cached = _tail_verify_cache.get(_cache_key)
-                _use_cache = False
+                _new_tenants: dict[str, list] | None = None
+                if _cached is not None and len(_cached) == 4:
+                    # 兼容旧版 4 元缓存：补算 tenants 快照后升级
+                    _cm0, _cs0, _cc0, _ct0 = _cached
+                    _cached = (_cm0, _cs0, _cc0, _ct0, {})
                 if _cached is not None:
                     try:
                         _cur_mtime = self.path.stat().st_mtime if self.path.exists() else 0.0
                         _cur_size = len(raw_bytes)
-                        _cm, _cs, _cc, _ct = _cached
+                        _cm, _cs, _cc, _ct, _ctenants = _cached
                         _cur_tail = entries[-1].get("record_hash", "") if entries else GENESIS_PREV_HASH
-                        if _cc == len(entries) and _ct == _cur_tail and _cm == _cur_mtime and _cs == _cur_size:
-                            ok, brk = True, None
-                            _use_cache = True
+                        if _cc > 0 and not _ctenants:
+                            # 旧版 4 元缓存无 tenants 快照，无法做可信增量 → 全扫并重建快照
+                            ok, brk = self._verify_entries(entries)
+                        elif _cc == len(entries) and _ct == _cur_tail and _cm == _cur_mtime and _cs == _cur_size:
+                            # 命中后仍做 O(1) 尾自检：防“同长篡改尾 payload + 伪造 mtime”绕过四元组
+                            if not entries or _tail_self_check(entries[-1]):
+                                ok, brk = True, None
+                                _new_tenants = {t: [c, h] for t, (c, h) in _ctenants.items()}
+                            else:
+                                ok, brk = self._verify_entries(entries)
+                        elif _cc <= len(entries) and not any("_raw" in e for e in entries):
+                            # 增量分支：从缓存 count 处切分新增段
+                            _suffix = entries[_cc:]
+                            _anchor_ok = True
+                            if _cc == 0:
+                                _exp_prev_map: dict[str, str] = {}
+                            else:
+                                if len(_suffix) == 0:
+                                    _anchor_ok = False
+                                else:
+                                    _exp_prev_map = {}
+                                    for _e in _suffix:
+                                        _t = _e.get("tenant", "default")
+                                        if _t not in _exp_prev_map:
+                                            _slot = _ctenants.get(_t)
+                                            _exp_prev_map[_t] = _slot[1] if _slot is not None else GENESIS_PREV_HASH
+                                    _first = _suffix[0]
+                                    _ft = _first.get("tenant", "default")
+                                    _fph = _first.get("prev_hash")
+                                    _fprev = _exp_prev_map[_ft]
+                                    _anchor_ok = _fph == _fprev or (
+                                        _ctenants.get(_ft) is None and _is_genesis(_fph) and _is_genesis(_fprev)
+                                    )
+                            if _anchor_ok and _suffix and all(e.get("tenant_seq") is not None and "_raw" not in e for e in _suffix):
+                                # 锚点记录本身 O(1) 自检：确认缓存边界条目未被替换（深层前缀以前次全量/增量校验结论为信任基础；
+                                # 带外篡改的最终兜底仍是 verify()/verify_chain 全扫审计路径）
+                                if _cc > 0 and not _tail_self_check(entries[_cc - 1]):
+                                    ok, brk = self._verify_entries(entries)
+                                else:
+                                    ok, brk, _new_tenants = _verify_suffix_incremental(
+                                        _suffix, start_seq=_cc + 1, tenant_state=_ctenants
+                                    )
+                                    if not ok:
+                                        _new_tenants = None
+                            else:
+                                ok, brk = self._verify_entries(entries)
                         else:
                             ok, brk = self._verify_entries(entries)
+                    except LedgerCorruptionError:
+                        raise
                     except Exception:
                         ok, brk = self._verify_entries(entries)
                 else:
                     ok, brk = self._verify_entries(entries)
-                # 校验通过后更新缓存（无论是否短路，未命中时以本次结果更新）
+                # 校验通过后更新缓存（含 tenants 快照；增量分支复用后缀校验结果，全扫分支重算快照）
                 if ok:
                     try:
                         _n_mtime = self.path.stat().st_mtime if self.path.exists() else 0.0
                         _n_size = len(raw_bytes)
                         _n_tail = entries[-1].get("record_hash", "") if entries else GENESIS_PREV_HASH
-                        _tail_verify_cache[_cache_key] = (_n_mtime, _n_size, len(entries), _n_tail)
+                        if _new_tenants is None:
+                            _new_tenants = _tenant_tail_snapshot(entries)
+                        _tail_verify_cache[_cache_key] = (_n_mtime, _n_size, len(entries), _n_tail, _new_tenants)
                     except Exception:
                         pass
-                if _use_cache:
-                    pass  # 已通过缓存短路，无需额外处理
                 if not ok:
                     assert brk is not None
                     raise LedgerCorruptionError(brk)
@@ -837,10 +978,17 @@ class Ledger:
                     os.fsync(handle.fileno())
                 except OSError as exc:
                     _warn_fsync_failure(exc, self.path)
-                # 追加成功后刷新 tail 缓存，供下次增量短路（记录新计数值与尾 hash）
+                # 追加成功后刷新 tail 缓存，供下次增量短路（记录新计数值、尾 hash 与 tenants 快照）
                 try:
                     # handle 已写入新行，entries 长度为旧长度，追加后 count+1，tail 为新 record_hash
-                    _tail_verify_cache[str(self.path)] = (self.path.stat().st_mtime if self.path.exists() else 0.0, int(self.path.stat().st_size) if self.path.exists() else len(raw_bytes) + len(line), len(entries) + 1, record_hash)
+                    _post_tenants = {t: [c, h] for t, (c, h) in (_new_tenants or {}).items()}
+                    _slot = _post_tenants.get(tenant)
+                    if _slot is None:
+                        _post_tenants[tenant] = [1, record_hash]
+                    else:
+                        _slot[0] += 1
+                        _slot[1] = record_hash
+                    _tail_verify_cache[str(self.path)] = (self.path.stat().st_mtime if self.path.exists() else 0.0, int(self.path.stat().st_size) if self.path.exists() else len(raw_bytes) + len(line), len(entries) + 1, record_hash, _post_tenants)
                 except Exception:
                     pass
                 # 保持 fsync 原子性：文件 fsync 仍在锁内，目录 fsync 移至解锁后

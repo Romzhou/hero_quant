@@ -11,6 +11,11 @@ from __future__ import annotations
 
 from typing import Dict, List, Tuple
 
+# 统一融合常量（PR2-F）：router 与 store 双轨统一于此 —— RRF k=60 + 0.5/0.5 归一语义。
+RRF_K = 60
+W_RRF = 0.5
+W_COS = 0.5
+
 
 def _extract_pairs(cands) -> List[Tuple[str, float]]:
     """Normalize candidates to list of (key, score) tuples."""
@@ -136,8 +141,65 @@ def rank_fusion(bm25_cands, vec_cands, k: int = 60) -> List[Tuple[str, float]]:
         if c_norm > 1:
             c_norm = 1.0
         # uniform 0.5/0.5
-        hybrid[key] = 0.5 * r_norm + 0.5 * c_norm
+        hybrid[key] = W_RRF * r_norm + W_COS * c_norm
 
     # Sort by hybrid desc, tie-breaker lexical for determinism
     ranked = sorted(hybrid.items(), key=lambda x: (-x[1], x[0]))
     return ranked
+
+
+def bm25_from_ordered(bm25_items) -> List[Tuple[str, float]]:
+    """将有序 BM25 候选（dict 含 key / 或 (key, score)）转为融合输入。
+
+    router/store 双轨统一于此：按出现顺序赋递减分，保留召回排序信息。
+    """
+    pairs: List[Tuple[str, float]] = []
+    try:
+        items = list(bm25_items) if bm25_items else []
+    except TypeError:
+        return []
+    n = len(items)
+    for idx, it in enumerate(items):
+        try:
+            if isinstance(it, dict):
+                key = it.get("key")
+                if key is None or (isinstance(key, str) and key == ""):
+                    key = it.get("id", it.get("doc_id"))
+                if key is None or (isinstance(key, str) and key == ""):
+                    continue
+                pairs.append((str(key), float(n - idx)))
+            elif isinstance(it, (list, tuple)) and len(it) >= 2:
+                k = it[0]
+                if k is None or (isinstance(k, str) and k == ""):
+                    continue
+                pairs.append((str(k), float(n - idx)))
+        except (ValueError, TypeError):
+            continue
+    return pairs
+
+
+def vec_from_scored(vec_items) -> List[Tuple[str, float]]:
+    """将向量候选（dict 含 key/score / 或 (key, score)）转为融合输入。
+
+    score 缺失时取 0.0；rank_fusion 内部做 max 归一，调用方无需预归一。
+    """
+    return _extract_pairs(vec_items)
+
+
+def fuse(bm25_cands, vec_cands, k: int = RRF_K) -> List[Tuple[str, float]]:
+    """统一融合入口（PR2-F）：RRF(k=60) + 归一 0.5*RRF + 0.5*cosine。
+
+    router（工具路由）与 store（记忆检索）均经此入口，消除双轨权重。
+    输入形态与 rank_fusion 一致：(key, score) 元组或 dict 列表。
+    dict 形态下 bm25 侧按出现顺序赋分（见 bm25_from_ordered），与历史 store 语义一致。
+    """
+    try:
+        kk = int(k)
+    except (ValueError, TypeError):
+        kk = RRF_K
+    if kk <= 0:
+        kk = RRF_K
+    bm25_pairs = bm25_cands
+    if bm25_cands and isinstance(bm25_cands, (list, tuple)) and bm25_cands and isinstance(bm25_cands[0], dict):
+        bm25_pairs = bm25_from_ordered(bm25_cands)
+    return rank_fusion(bm25_pairs, vec_cands, k=kk)

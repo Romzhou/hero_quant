@@ -1574,26 +1574,38 @@ class MemoryStore:
                 pass
             return _res_decay
 
-        # 统一融合：RRF(k=60) + 归一 0.5*RRF + 0.5*cosine
+        # 统一融合入口（PR2-F）：RRF(k=60) + 归一 0.5*RRF + 0.5*cosine，
+        # 与 router 侧同一 fuse()，消除双轨权重。bm25 适配/count 逻辑收口到 rank_fusion。
         try:
-            from hero_quant.memory.rank_fusion import rank_fusion as _rank_fusion
+            from hero_quant.memory.rank_fusion import RRF_K as _RRF_K
+            from hero_quant.memory.rank_fusion import bm25_from_ordered as _bm25_from_ordered
+            from hero_quant.memory.rank_fusion import fuse as _rank_fuse
+            from hero_quant.memory.rank_fusion import vec_from_scored as _vec_from_scored
         except Exception:
-            _rank_fusion = None  # type: ignore
-        # 构建 rank_fusion 输入：bm25 按出现顺序赋分，vec 用真实 cosine
-        # bm25 候选赋予递减分数以保留排序信息
+            _rank_fuse = None  # type: ignore
+            _RRF_K = 60  # type: ignore
+            _bm25_from_ordered = None  # type: ignore
+            _vec_from_scored = None  # type: ignore
         bm25_tuples: list[tuple[str, float]] = []
-        for idx, it in enumerate(bm25_candidates):
-            bm25_tuples.append((it["key"], float(len(bm25_candidates) - idx)))
+        if _bm25_from_ordered is not None:
+            try:
+                bm25_tuples = _bm25_from_ordered(bm25_candidates)
+            except Exception:
+                bm25_tuples = []
         # vec 候选用 vector_search 已有 score，若无则即时计算 cosine
         vec_tuples: list[tuple[str, float]] = []
         if vector_candidates:
-            for it in vector_candidates:
-                sc = it.get("score", 0.0)
+            if _vec_from_scored is not None:
                 try:
-                    sc_f = float(sc)
+                    vec_tuples = _vec_from_scored(vector_candidates)
                 except Exception:
-                    sc_f = 0.0
-                vec_tuples.append((it["key"], sc_f))
+                    vec_tuples = []
+            else:
+                for it in vector_candidates:
+                    try:
+                        vec_tuples.append((it["key"], float(it.get("score", 0.0))))
+                    except Exception:
+                        vec_tuples.append((it["key"], 0.0))
         else:
             # 回退：为 items 即时计算 cosine 以喂入融合
             try:
@@ -1615,9 +1627,9 @@ class MemoryStore:
                         cos = 1.0
                     vec_tuples.append((it["key"], cos))
 
-        if _rank_fusion is not None and (bm25_tuples or vec_tuples):
+        if _rank_fuse is not None and (bm25_tuples or vec_tuples):
             try:
-                ranked = _rank_fusion(bm25_tuples, vec_tuples, k=60)
+                ranked = _rank_fuse(bm25_tuples, vec_tuples, k=_RRF_K)
                 # ranked is list[(key, hybrid)]
                 # Map back to dict results preserving content
                 out: list[dict] = []
