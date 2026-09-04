@@ -30,12 +30,19 @@ class ApprovalPolicy:
     def __str__(self):
         return self.value
 
+    def __repr__(self):
+        return f"ApprovalPolicy({self.value!r})"
+
+    def __hash__(self):
+        # 与 __str__/__eq__ 一致：按策略值哈希，保证可入 set/dict
+        return hash(self.value)
+
     def __eq__(self, other):
         if isinstance(other, ApprovalPolicy):
             return self.value == other.value
         if isinstance(other, str):
             return self.value == other.lower()
-        return False
+        return NotImplemented
 
 
 def effectiveApprovalPolicy(events: list[dict[str, Any]] | None) -> str:
@@ -73,28 +80,8 @@ def effectiveApprovalPolicy(events: list[dict[str, Any]] | None) -> str:
                 lv = str(val).strip().lower()
                 if lv in ("ask", "never", "auto"):
                     return lv
-            except Exception:
+            except (ValueError, TypeError, AttributeError):
                 continue
-        # 兼容历史事件类型
-        if ev.get("type") in ("approval/asked", "approval/decided") and "policy" in ev:
-            pol = ev["policy"]
-            if isinstance(pol, dict):
-                # heterogeneous dict
-                inner = pol.get("policy") or pol.get("value") or pol.get("mode") or ""
-                pol = inner
-            if isinstance(pol, ApprovalPolicy):
-                return pol.value
-            if isinstance(pol, str):
-                lv = pol.strip().lower()
-                if lv in ("ask", "never", "auto"):
-                    return lv
-            else:
-                try:
-                    lv = str(pol).strip().lower()
-                    if lv in ("ask", "never", "auto"):
-                        return lv
-                except Exception:
-                    pass
     return ApprovalPolicy.ASK
 
 
@@ -106,10 +93,40 @@ def _audit(event: str, **fields):
         pass
 
 
-def requires_approval(policy: str) -> bool:
-    """模块级 helper：判断策略是否需要人审（仅 ask 需审批）。"""
-    p = policy.strip().lower() if isinstance(policy, str) else str(policy).lower()
-    return p == ApprovalPolicy.ASK
+def requires_approval(policy: object) -> bool:
+    """模块级 helper：判断策略是否需要人审（fail-closed：仅 never/auto 放行）。
+
+    未知/None/非法策略一律视为需要审批，避免静默绕过人审。
+    """
+    if isinstance(policy, ApprovalPolicy):
+        return policy.value == ApprovalPolicy.ASK
+    if isinstance(policy, str):
+        p = policy.strip().lower()
+        if p in (ApprovalPolicy.NEVER, ApprovalPolicy.AUTO):
+            return False
+        return True
+    return True
+
+
+class _Decision(dict):
+    """审批决议：dict 形态承载 status，同时兼容旧 `== 'rejected'` 字符串比较。"""
+
+    def __init__(self, status: str, **fields: Any):
+        super().__init__(status=status, **fields)
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, str):
+            return self.get("status") == other.lower()
+        return super().__eq__(other)
+
+    def __ne__(self, other: object) -> bool:
+        eq = self.__eq__(other)
+        if eq is NotImplemented:
+            return eq
+        return not eq
+
+    def __hash__(self) -> int:
+        return dict.__hash__(self)
 
 
 @dataclass
@@ -119,34 +136,42 @@ class ApprovalService:
     mode: str = "ask"
 
     def __post_init__(self):
-        self.mode = self.mode.strip().lower() if isinstance(self.mode, str) else "ask"
-        if self.mode not in ("ask", "never", "auto"):
-            self.mode = "ask"
+        # 非 str mode（如 ApprovalPolicy 实例）按其 value 归一化，不静默丢成 ask
+        if isinstance(self.mode, ApprovalPolicy):
+            raw = self.mode.value
+        elif isinstance(self.mode, str):
+            raw = self.mode.strip().lower()
+        else:
+            try:
+                raw = str(self.mode).strip().lower()
+            except (ValueError, TypeError, AttributeError):
+                raw = "ask"
+        self.mode = raw if raw in ("ask", "never", "auto") else "ask"
 
     def requires_approval(self, tool: str | None = None) -> bool:  # noqa: ARG002
         """实例 helper：当前模式是否需要人审（ask→True，其余 False）。"""
         return self.mode == ApprovalPolicy.ASK
 
-    def request_sync(self, tool: str, reason: str | None = None, **kwargs: Any) -> Any:
-        """同步审批：never 短路 rejected，ask 返回 pending 阻塞，auto 直接 approved。"""
+    def request_sync(self, tool: str, reason: str | None = None, **kwargs: Any) -> _Decision:
+        """同步审批：统一返回含 status 的决议（never→rejected，ask→pending，auto→approved）。"""
         _audit("asked", tool=tool, reason=reason, mode=self.mode)
         if self.mode == ApprovalPolicy.NEVER:
             _audit("decided", tool=tool, outcome="rejected", reason=reason)
-            return "rejected"
+            return _Decision("rejected", tool=tool, reason=reason, mode=self.mode)
         if self.mode == ApprovalPolicy.ASK:
             # P2 blocking: 返回 pending/need_approval 由调用方处理阻塞与超时（300s）
             _audit("asked_pending", tool=tool, reason=reason, timeout=300)
-            return {
-                "status": "pending",
-                "need_approval": True,
-                "timeout": 300,
-                "tool": tool,
-                "reason": reason,
-                "mode": self.mode,
-            }
+            return _Decision(
+                "pending",
+                need_approval=True,
+                timeout=300,
+                tool=tool,
+                reason=reason,
+                mode=self.mode,
+            )
         # auto 直通
         _audit("decided", tool=tool, outcome="approved", reason=reason)
-        return "approved"
+        return _Decision("approved", tool=tool, reason=reason, mode=self.mode)
 
     async def request(self, tool: str, reason: str | None = None, **kwargs: Any) -> Any:
         """异步审批入口，当前委托同步实现。"""
@@ -165,7 +190,4 @@ class ApprovalService:
         # if folded is more permissive than service mode, clamp to service mode
         if folded_rank > mode_rank:
             return self.mode
-        # also explicitly forbid ask->auto escalation via untrusted events
-        if self.mode == ApprovalPolicy.ASK and folded == ApprovalPolicy.AUTO:
-            return ApprovalPolicy.ASK
         return folded

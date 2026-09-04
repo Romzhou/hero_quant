@@ -30,8 +30,8 @@ _SENSITIVE_KEYS = {
     "private_key",
 }
 
-# 键名子串匹配——覆盖命名变体（如 my_secret_key）
-_SENSITIVE_SUBSTRINGS = ("api_key", "apikey", "secret", "password", "token")
+# 键名子串匹配——覆盖命名变体（如 my_secret_key / my_passwd / my_private_key）
+_SENSITIVE_SUBSTRINGS = ("api_key", "apikey", "secret", "password", "passwd", "private", "token")
 
 # 密钥值模式——按 sink 区分严格程度
 _BEARER_RE = re.compile(r"Bearer\s+[A-Za-z0-9\-_\.=~\+/]+=*", re.IGNORECASE)  # HTTP Bearer 头
@@ -48,8 +48,11 @@ _REDACTED = "***"
 _ALLOW_TOKENS = {"input_tokens", "output_tokens", "prompt_tokens", "completion_tokens", "prompttokens", "completiontokens", "generated_tokens"}
 
 
-def _is_sensitive_key(key: str) -> bool:
+def _is_sensitive_key(key: object) -> bool:
     """判断键名是否敏感；计量类 token 键显式放行，避免误杀。"""
+    # 非字符串键（如 int/enum/tuple）直接放行，避免脱敏路径崩溃
+    if not isinstance(key, str):
+        return False
     lk = key.lower()
     if lk in _ALLOW_TOKENS:
         return False
@@ -76,11 +79,8 @@ def _redact_string(value: str, sink: str) -> str:
         m = _LONG_TOKEN_RE.search(value)
         if m:
             tok = m.group(0)
-            # 重复字符（如 x*100）在 ARGUMENTS_SINK 也视为非密钥，避免误杀 trace 用的重复填充内容
-            if tok.isdigit() or all(c in "0123456789abcdefABCDEF" for c in tok):
-                # 纯 hex/数字不脱敏，返回原值（让调用方继续）
-                pass
-            elif len(set(tok)) == 1:
+            # hex 编码密钥很常见，仅单字符重复（如 x*100）视为非密钥放行
+            if len(set(tok)) == 1:
                 pass  # 单字符重复如 x*100，非密钥
             else:
                 return _REDACTED
@@ -92,23 +92,17 @@ def _redact_string(value: str, sink: str) -> str:
         m = _LONG_TOKEN_RE.search(value)
         if m:
             tok = m.group(0)
-            # 纯 hex/纯数字指纹视为非密钥，跳过
-            if tok.isdigit() or all(c in "0123456789abcdefABCDEF" for c in tok):
+            # 纯数字指纹视为非密钥，跳过
+            if tok.isdigit():
                 return value
-            # 简易熵阈值：去重字符数/长度 >0.35 且含大小写混合或符号才视为密钥
+            # 长 token 按长度+熵脱敏：单大小写密钥同样拦截，不再要求大小写混合或符号
             uniq = len(set(tok))
             if uniq / max(1, len(tok)) < 0.35:
                 return value
-            has_mixed = any(c.islower() for c in tok) and any(c.isupper() for c in tok)
-            has_dash = "-" in tok or "_" in tok
-            if not (has_mixed or has_dash):
-                return value
             return _REDACTED
         return value
-    # unknown sink fail-closed: treat as strict
-    if _BEARER_RE.search(value) or _SK_RE.search(value) or _AKIA_RE.search(value) or _JWT_RE.search(value) or _LONG_TOKEN_RE.search(value):
-        return _REDACTED
-    return _REDACTED if value.strip() and len(value) >= 8 else value
+    # 未知 sink 回退 ARGUMENTS_SINK 语义：无模式命中则透传，避免拼写 typo 致过脱敏
+    return _redact_string(value, ARGUMENTS_SINK)
 
 
 def _scan_string(value: str, *, preserve_zero_width: bool = False) -> str:

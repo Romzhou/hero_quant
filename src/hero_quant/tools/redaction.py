@@ -25,7 +25,8 @@ def _maybe_redact(value: Any, sink: str = "result") -> Any:
         logger.warning("redaction module unavailable, dropping payload sink=%s err=%s", sink, e, exc_info=True)
         return "***"
     try:
-        if isinstance(value, (dict, list)):
+        # dict/list/tuple/set/frozenset 统一走脱敏，防止 tuple/set 绕过键级脱敏
+        if isinstance(value, (dict, list, tuple, set, frozenset)):
             return redact_payload(value, sink=sink)
         if isinstance(value, str):
             # 字符串复用 dict 脱敏路径，需包装后解包
@@ -49,7 +50,7 @@ def redact_tool_result(result: Any, limit: int | None = None, sink: str = "resul
     lim = limit if limit is not None else TOOL_RESULT_LIMIT
 
     # 第一步：脱敏（sink-aware）
-    if isinstance(result, (dict, list)):
+    if isinstance(result, (dict, list, tuple, set, frozenset)):
         redacted = _maybe_redact(result, sink=sink)
         # 序列化后统一按字符串预算做截断
         try:

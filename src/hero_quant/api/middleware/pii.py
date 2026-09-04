@@ -22,19 +22,28 @@ except ImportError:
     CRYPTO_AVAILABLE = False
 
 _PII_KEY: Optional[bytes] = None
+# 缺 key 告警只打一次，避免热路径刷屏。
+_WARNED_NO_KEY = False
+_WARNED_NO_CRYPTO = False
 
 
 def _get_key() -> Optional[bytes]:
     """懒加载 PII_ENCRYPTION_KEY，无密钥/无效密钥返回 None。"""
-    global _PII_KEY
+    global _PII_KEY, _WARNED_NO_KEY, _WARNED_NO_CRYPTO
     if _PII_KEY is not None:
         return _PII_KEY
     if not CRYPTO_AVAILABLE:
-        logger.warning("cryptography 未安装，PII 加密不可用")
+        # 缺依赖告警只打一次
+        if not _WARNED_NO_CRYPTO:
+            logger.warning("cryptography 未安装，PII 加密不可用")
+            _WARNED_NO_CRYPTO = True
         return None
     key_str = os.getenv("PII_ENCRYPTION_KEY")
     if not key_str:
-        logger.warning("PII_ENCRYPTION_KEY 未设置，PII 回退掩码/明文标记")
+        # 缺 key 告警只打一次，避免热路径刷屏
+        if not _WARNED_NO_KEY:
+            logger.warning("PII_ENCRYPTION_KEY 未设置，PII 加密拒绝明文落盘")
+            _WARNED_NO_KEY = True
         return None
     try:
         _PII_KEY = key_str.encode()
@@ -46,33 +55,34 @@ def _get_key() -> Optional[bytes]:
 
 
 def pii_encrypt(plaintext: str) -> str:
-    """加密 PII；无密钥时返回 !NOENC! 前缀便于排查。"""
+    """加密 PII；无密钥/加密失败时抛错，拒绝明文落盘（fail-closed）。"""
     if not plaintext:
         return plaintext
     key = _get_key()
     if key is None:
-        return f"!NOENC!{plaintext}"
+        raise RuntimeError("PII_ENCRYPTION_KEY 缺失：拒绝明文持久化 PII")
     try:
         return Fernet(key).encrypt(plaintext.encode()).decode()  # type: ignore[operator]
     except (ValueError, TypeError, OSError) as e:
         logger.error("PII 加密失败: %s", e)
-        return f"!NOENC!{plaintext}"
+        raise RuntimeError("PII 加密失败：拒绝明文落盘") from e
 
 
 def pii_decrypt(ciphertext: str) -> str:
-    """解密 PII；兼容 !NOENC! 历史数据。"""
+    """解密 PII；无密钥/解密失败时抛错，不把密文当明文返回。"""
     if not ciphertext:
         return ciphertext
     if ciphertext.startswith("!NOENC!"):
+        # 历史遗留明文标记：仅剥离标记，不做解密
         return ciphertext[7:]
     key = _get_key()
     if key is None:
-        return ciphertext
+        raise RuntimeError("PII_ENCRYPTION_KEY 缺失：无法解密")
     try:
         return Fernet(key).decrypt(ciphertext.encode()).decode()  # type: ignore[operator]
     except (InvalidToken, ValueError, TypeError) as e:  # type: ignore[misc]
         logger.error("PII 解密失败: %s", e)
-        return ciphertext
+        raise
 
 
 def mask_pii(value: str, mask_char: str = "*", visible_prefix: int = 3, visible_suffix: int = 4) -> str:
@@ -84,20 +94,40 @@ def mask_pii(value: str, mask_char: str = "*", visible_prefix: int = 3, visible_
     return value[:visible_prefix] + mask_char * (len(value) - visible_prefix - visible_suffix) + value[-visible_suffix:]
 
 
-def is_pii_field(field_name: str) -> bool:
-    """判断字段名是否为 PII。"""
-    pii_keywords = {"password", "token", "secret", "phone", "email", "id_card", "idcard", "ssn"}
-    field_lower = (field_name or "").lower()
+def is_pii_field(field_name: object) -> bool:
+    """判断字段名是否为 PII（子串命中即视为敏感；计量类 token 键放行）。"""
+    # 计量键显式放行，避免误杀成本统计
+    allow = {"input_tokens", "output_tokens", "prompt_tokens", "completion_tokens",
+             "prompttokens", "completiontokens", "generated_tokens"}
+    field_lower = str(field_name or "").lower()
+    if field_lower in allow:
+        return False
+    pii_keywords = {
+        "password", "passwd", "token", "secret", "phone", "mobile", "email",
+        "id_card", "idcard", "ssn", "name", "address", "birthday", "bank",
+        "card", "passport", "license", "private",
+    }
     return any(kw in field_lower for kw in pii_keywords)
 
 
-def safe_log_args(args: dict) -> dict:
-    """日志参数脱敏：PII 掩码，非标量记类型名。"""
+def _safe_log_text(value: str) -> str:
+    """日志文本脱敏：截断+去换行，避免日志伪造与膨胀。"""
+    return str(value)[:200].replace("\n", " ").replace("\r", " ")
+
+
+def safe_log_args(args: object) -> dict:
+    """日志参数脱敏：PII 掩码，未知键字符串默认脱敏（fail-closed）。"""
+    if not isinstance(args, dict):
+        return {}
     safe: dict = {}
-    for k, v in (args or {}).items():
+    for k, v in args.items():
         if is_pii_field(k):
             safe[k] = mask_pii(str(v)) if v else None
-        elif isinstance(v, (str, int, float, bool)):
+        elif isinstance(v, str):
+            # 未知键字符串默认不信任：短串截断去换行，长串全掩码
+            text = _safe_log_text(v)
+            safe[k] = text if len(v) <= 32 else mask_pii(text, visible_prefix=0, visible_suffix=0)
+        elif isinstance(v, (int, float, bool)) or v is None:
             safe[k] = v
         else:
             safe[k] = type(v).__name__

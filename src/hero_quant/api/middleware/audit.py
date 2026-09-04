@@ -14,13 +14,23 @@ audit_logger = logging.getLogger("api.audit")
 
 
 def _hash_args(args: dict) -> str:
-    """对参数名+类型做 SHA256（不暴露明文）。"""
+    """对参数名+类型+值摘要做 SHA256（哈希值不暴露明文，值不同则哈希不同）。"""
     try:
-        meta = {k: type(v).__name__ for k, v in (args or {}).items()}
-        raw = str(sorted(meta.items())).encode()
+        items = sorted(
+            (str(k), type(v).__name__, repr(v)[:256]) for k, v in (args or {}).items()
+        )
+        raw = str(items).encode(errors="ignore")
         return hashlib.sha256(raw).hexdigest()[:16]
     except (ValueError, TypeError, AttributeError):
         return "hash_failed"
+
+
+def _safe_error_text(error: object) -> tuple[str, str]:
+    """错误文本脱敏：截断+去换行+hash，原文本只保留摘要用于取证。"""
+    raw = str(error or "")
+    digest = hashlib.sha256(raw.encode(errors="ignore")).hexdigest()[:16]
+    safe = raw[:500].replace("\n", " ").replace("\r", " ")
+    return safe, digest
 
 
 class AuditLogger:
@@ -28,6 +38,8 @@ class AuditLogger:
 
     @staticmethod
     def log_tool_call(user_id: int, tool_name: str, args: dict, success: bool, session_id: int | None = None):
+        # 防御：非 dict 参数不得让审计抛错（审计永不抛，保住主请求）。
+        safe_args = args if isinstance(args, dict) else {}
         audit_logger.info(
             "tool_call",
             extra={
@@ -35,8 +47,8 @@ class AuditLogger:
                 "user_id": user_id,
                 "session_id": session_id,
                 "tool_name": tool_name,
-                "args_hash": _hash_args(args or {}),
-                "args_keys": list((args or {}).keys()),
+                "args_hash": _hash_args(safe_args),
+                "args_keys": list(safe_args.keys()),
                 "success": success,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             },
@@ -44,14 +56,17 @@ class AuditLogger:
 
     @staticmethod
     def log_tool_failure(user_id: int, tool_name: str, error: str, session_id: int | None = None):
+        # 错误原文不进日志：截断+去换行防注入/膨胀，另附 hash 供取证关联。
+        safe_error, error_hash = _safe_error_text(error)
         audit_logger.warning(
             "tool_failure",
             extra={
                 "event": "tool_failure",
                 "user_id": user_id,
                 "session_id": session_id,
-                "tool_name": tool_name,
-                "error": error,
+                "tool_name": str(tool_name)[:128],
+                "error": safe_error,
+                "error_hash": error_hash,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             },
         )
