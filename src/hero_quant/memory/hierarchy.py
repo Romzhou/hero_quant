@@ -50,13 +50,17 @@ class MemoryHierarchy:
 
     def _validate_filename(self, filename: str) -> Path:
         """校验 filename 不含路径穿越字符，返回 Path 对象，非法则抛 ValueError。"""
-        # P2: 增加 ":" 校验，阻断 Windows ADS（Alternate Data Stream）如 "a:stream" 绕过
+        # 中文注释：拒绝空/点文件名，防止路径解析到目录本身
+        if not filename or filename in {".", ".."}:
+            raise ValueError(f"Invalid filename: {filename!r}")
         if "/" in filename or "\\" in filename or ".." in filename or ":" in filename:
             raise ValueError(f"Invalid filename: {filename!r}")
         p = Path(filename)
         if p.is_absolute():
             raise ValueError(f"Invalid filename: {filename!r}")
         if ".." in p.parts:
+            raise ValueError(f"Invalid filename: {filename!r}")
+        if Path(filename).name in ("", ".", ".."):
             raise ValueError(f"Invalid filename: {filename!r}")
         return p
 
@@ -145,6 +149,8 @@ class MemoryHierarchy:
             cat_dir = self._base_dir / category
             if cat_dir.is_dir():
                 for item in cat_dir.iterdir():
+                    if item.name in _SKIP_NAMES:
+                        continue
                     if item.is_file() and item.suffix == ".md":
                         results.append(item)
         results.sort(key=lambda p: p.name)
@@ -157,6 +163,8 @@ class MemoryHierarchy:
         if not cat_dir.is_dir():
             return results
         for item in cat_dir.iterdir():
+            if item.name in _SKIP_NAMES:
+                continue
             if item.is_file() and item.suffix == ".md":
                 results.append(item)
         results.sort(key=lambda p: p.name)
@@ -170,14 +178,21 @@ class MemoryHierarchy:
             if mtype not in cat_data:
                 continue
             cat_data[mtype].count += 1
-            keywords = entry.get("keywords", []) if isinstance(entry, dict) else []
+            # 中文注释：兼容 object 条目且过滤非 string keywords，避免 None/int 导致 lower() 崩溃
+            if isinstance(entry, dict):
+                keywords = entry.get("keywords", [])
+            else:
+                keywords = getattr(entry, "keywords", [])
             if isinstance(keywords, list):
-                cat_data[mtype].keywords.extend(keywords)
+                cat_data[mtype].keywords.extend(k for k in keywords if isinstance(k, str))
         max_keywords = 10
         for summary in cat_data.values():
             seen: Set[str] = set()
             unique: List[str] = []
             for kw in summary.keywords:
+                # 中文注释：守卫非 string 关键词，避免 AttributeError 中断重建
+                if not isinstance(kw, str):
+                    continue
                 kw_lower = kw.lower().strip()
                 if kw_lower and kw_lower not in seen:
                     seen.add(kw_lower)

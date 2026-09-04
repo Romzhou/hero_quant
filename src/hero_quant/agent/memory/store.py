@@ -10,6 +10,7 @@ inject_memory_store(app) 注入 app.state.memory_store。
 from __future__ import annotations
 
 import logging
+import threading
 from collections import OrderedDict
 
 from .buffer import MemoryBuffer
@@ -26,48 +27,69 @@ class MemoryStore:
     def __init__(self, max_sessions: int = MAX_SESSIONS):
         self._buffers: OrderedDict[int, MemoryBuffer] = OrderedDict()
         self._max_sessions = max_sessions
+        # 并发一致性：OrderedDict 复合操作需加锁（C 波锁纪律）
+        self._lock = threading.RLock()
 
     def get_buffer(self, session_id: int, max_turns: int = 20) -> MemoryBuffer:
         """获取或创建记忆缓冲区"""
-        if session_id in self._buffers:
-            self._buffers.move_to_end(session_id)
-            return self._buffers[session_id]
+        with self._lock:
+            if session_id in self._buffers:
+                self._buffers.move_to_end(session_id)
+                return self._buffers[session_id]
 
-        if len(self._buffers) >= self._max_sessions:
-            evicted_id, evicted_buffer = self._buffers.popitem(last=False)
-            if evicted_buffer is not None:
-                evicted_buffer.clear()
-            logger.warning("memory store full, evicted session: %s", evicted_id)
+            if len(self._buffers) >= self._max_sessions:
+                evicted_id, evicted_buffer = self._buffers.popitem(last=False)
+                if evicted_buffer is not None:
+                    evicted_buffer.clear()
+                logger.warning("memory store full, evicted session: %s", evicted_id)
 
-        buffer = MemoryBuffer(max_turns=max_turns)
-        self._buffers[session_id] = buffer
-        return buffer
+            buffer = MemoryBuffer(max_turns=max_turns)
+            self._buffers[session_id] = buffer
+            return buffer
 
     def save_buffer(self, session_id: int, buffer: MemoryBuffer):
-        """保存记忆缓冲区"""
-        self._buffers[session_id] = buffer
-        self._buffers.move_to_end(session_id)
+        """保存记忆缓冲区（受 MAX_SESSIONS 约束）"""
+        with self._lock:
+            # 若为新会话且已满则先淘汰最旧，避免无界增长
+            if session_id not in self._buffers and len(self._buffers) >= self._max_sessions:
+                evicted_id, evicted_buffer = self._buffers.popitem(last=False)
+                if evicted_buffer is not None:
+                    evicted_buffer.clear()
+                logger.warning("memory store full, evicted session: %s", evicted_id)
+            self._buffers[session_id] = buffer
+            try:
+                self._buffers.move_to_end(session_id)
+            except KeyError:
+                # 并发删除竞争下已不在字典，忽略
+                pass
 
     def clear_buffer(self, session_id: int):
         """清除会话记忆"""
-        if session_id in self._buffers:
-            self._buffers[session_id].clear()
+        with self._lock:
+            if session_id in self._buffers:
+                self._buffers[session_id].clear()
 
     def delete_buffer(self, session_id: int):
         """删除缓冲区"""
-        if session_id in self._buffers:
-            buffer = self._buffers.pop(session_id)
-            if buffer is not None:
-                buffer.clear()
+        with self._lock:
+            if session_id in self._buffers:
+                try:
+                    buffer = self._buffers.pop(session_id)
+                except KeyError:
+                    return
+                if buffer is not None:
+                    buffer.clear()
 
     def has_buffer(self, session_id: int) -> bool:
         """检查是否有缓冲"""
-        return session_id in self._buffers
+        with self._lock:
+            return session_id in self._buffers
 
     @property
     def size(self) -> int:
         """当前缓存的会话数"""
-        return len(self._buffers)
+        with self._lock:
+            return len(self._buffers)
 
 
 # 离线兜底实例（生产应在启动时经 inject_memory_store 注入 app.state）

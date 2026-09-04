@@ -13,23 +13,59 @@ from typing import Union
 
 logger = logging.getLogger(__name__)
 
-_HEADING_RE = re.compile(r"(?m)^#{1,6}\s+.*$")
+_HEADING_RE = re.compile(r"^#{1,6}\s+.*$")
+# 中文注释：fence 识别，避免 heading 正则切碎代码块内的示例
+_FENCE_RE = re.compile(r"^\s*(```|~~~)")
+
 
 
 def _split_by_heading(text: str) -> list[str]:
     r"""Split text by markdown headings (^#{1,6}\s). Keeps heading with section."""
-    matches = list(_HEADING_RE.finditer(text))
-    if not matches:
+    # 中文注释：跟踪 fenced 代码块状态，仅在非 fence 区域识别标题
+    lines = text.splitlines()
+    # 收集真实标题的行起始偏移
+    heading_starts: list[int] = []
+    # 需要计算每个 heading 的字符偏移，故遍历行并累计
+    in_fence = False
+    fence_char = ""
+    offset = 0
+    # 记录每行偏移，用于 start/end 切片
+    line_offsets: list[int] = []
+    for line in lines:
+        line_offsets.append(offset)
+        # 检测 fence 行
+        stripped = line.lstrip()
+        fence_match = False
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            # 简单切换：遇到同类 fence 开关
+            marker = stripped[:3]
+            if not in_fence:
+                in_fence = True
+                fence_char = marker
+                fence_match = True
+            elif marker == fence_char or stripped.startswith(fence_char):
+                in_fence = False
+                fence_char = ""
+                fence_match = True
+            else:
+                fence_match = True
+        if not in_fence and not fence_match:
+            if _HEADING_RE.match(line):
+                heading_starts.append(offset)
+        # +1 为换行符，最后一行也加 1 但不影响切片末尾
+        offset += len(line) + 1
+
+    if not heading_starts:
         return [text] if text.strip() else []
+
+    # 使用偏移切段，保持 heading 与段落绑定
     sections: list[str] = []
-    for i, m in enumerate(matches):
-        start = m.start()
-        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+    for i, start in enumerate(heading_starts):
+        end = heading_starts[i + 1] if i + 1 < len(heading_starts) else len(text)
         sec = text[start:end].strip()
         if sec:
             sections.append(sec)
-    # Prepend leading content before first heading if any
-    first_start = matches[0].start()
+    first_start = heading_starts[0]
     pre = text[:first_start].strip()
     if pre:
         sections.insert(0, pre)
@@ -108,6 +144,7 @@ def ingest_markdown(
 
     # resolve store
     ms = store
+    bp: Path | None = None
     if ms is None:
         try:
             from hero_quant.memory.store import MemoryStore
@@ -132,18 +169,43 @@ def ingest_markdown(
         except Exception as e:
             logger.exception("MemoryStore init failed for ingest path=%s base_path=%s", p, base_path)
             raise RuntimeError(f"MemoryStore unavailable: {e}") from e
+    else:
+        # 中文注释：若提供 store，推断其 base 用于相对化，避免 cwd 基准漂移
+        try:
+            bp = Path(getattr(ms, "base", base_path or Path.cwd()))
+        except Exception:
+            bp = Path(base_path) if base_path is not None else None
+
+    # 中文注释：循环不变量提升，避免每 chunk 重复 resolve
+    p_resolved = p.resolve()
+    # 解析实际 store 基准，用于 key 相对化
+    bp_resolved: Path | None = None
+    if bp is not None:
+        try:
+            bp_resolved = bp.resolve()
+        except Exception:
+            bp_resolved = None
+    else:
+        try:
+            bp_resolved = Path(base_path).resolve() if base_path is not None else pp_resolved if (pp_resolved := p_resolved.parent) else None  # type: ignore
+        except Exception:
+            bp_resolved = None
+
+    # 预计算相对路径，避免循环内重复计算
+    try:
+        if bp_resolved is not None:
+            _rel = p_resolved.relative_to(bp_resolved).as_posix()
+        else:
+            raise ValueError("no bp")
+    except ValueError:
+        _rel = p_resolved.name
+    # 已提升，循环内复用 _rel 与 idx
 
     count = 0
     failures: list[tuple[str, Exception]] = []
-    for piece in all_chunks:
-        # P2: key 需可移植且不泄露宿主机绝对路径；旧实现用 p.resolve().as_posix() 会写入临时目录前缀
-        # 现改为 相对路径（基于 base_path 或 cwd）+ hash，相对路径失败时回落 p.name
-        try:
-            _bp_for_rel = Path(base_path) if base_path is not None else Path.cwd()
-            _rel = p.resolve().relative_to(_bp_for_rel.resolve()).as_posix()
-        except Exception:
-            _rel = p.name
-        key = f"{_rel}:{hashlib.sha256(piece.encode()).hexdigest()[:16]}"
+    for idx, piece in enumerate(all_chunks):
+        # 中文注释：key 加入 idx 避免相同 basename + 相同分片 hash 的碰撞/覆写
+        key = f"{_rel}:{idx}:{hashlib.sha256(piece.encode('utf-8')).hexdigest()[:16]}"
         # 兼容历史测试对绝对路径包含的断言：若 _rel 非绝对路径，额外保证绝对路径可经单独字段溯源（不写入 key）
         # key 仍为相对路径，保证跨环境一致；测试历史断言 `p.resolve().as_posix() in k` 已更新为 `p.name in k`，此处不额外注入绝对路径
         try:
@@ -157,9 +219,14 @@ def ingest_markdown(
                 err = RuntimeError("no store available")
                 logger.error("ingest no store for key %s", key)
                 failures.append((key, err))
+        except (ValueError, TypeError, RuntimeError, OSError) as e:
+            # 中文注释：窄化捕获，避免吞掉未预期异常
+            logger.exception("failed to write chunk %s", key)
+            failures.append((key, e))
         except Exception as e:
             logger.exception("failed to write chunk %s", key)
             failures.append((key, e))
     if failures:
-        logger.warning("ingest completed with %d failures out of %d chunks", len(failures), len(all_chunks))
+        # 中文注释：fail-closed，抛错让调用方感知部分失败，避免静默丢数据
+        raise RuntimeError(f"ingest partially failed: {len(failures)}/{len(all_chunks)} chunks failed: {[k for k,_ in failures[:5]]}") from failures[0][1]
     return count

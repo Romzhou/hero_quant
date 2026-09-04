@@ -124,22 +124,15 @@ def rank_fusion(bm25_cands, vec_cands, k: int = 60) -> List[Tuple[str, float]]:
     for key in all_keys:
         r = rrf.get(key, 0.0)
         r_norm = (r / max_rrf) if max_rrf > 0 else 0.0
-        c = cos_map.get(key, 0.0)
-        # P2: 保留负余弦信号，原先 clip 负值到 0 会丢失负相关区分度；
-        # 改为保号归一：先按 max 归一到 [-1,1] 再映射到 [0,1] via (x+1)/2，负值压缩而非截断
-        if max_cos > 0:
-            c_raw = c / max_cos
-            # 限幅到 [-1,1] 再映射，保证 0.5 权重下负样本仍可区分
+        # 中文注释：缺失向量的 key 不赋 0.5 假余弦，避免 BM25-only 白嫖分数
+        if key not in cos_map:
+            c_norm = 0.0
+        elif max_cos > 0:
+            c_raw = cos_map[key] / max_cos
             c_raw = max(-1.0, min(1.0, c_raw))
             c_norm = (c_raw + 1.0) / 2.0
         else:
-            # 全负或零时区分度不足，退化到 0.5 中性，避免全 0 掩盖 RRF
-            # 若存在负值可用 min-max 区分，此处保持 0 以不引入噪声
             c_norm = 0.0
-        if c_norm < 0:
-            c_norm = 0.0
-        if c_norm > 1:
-            c_norm = 1.0
         # uniform 0.5/0.5
         hybrid[key] = W_RRF * r_norm + W_COS * c_norm
 
@@ -164,7 +157,9 @@ def bm25_from_ordered(bm25_items) -> List[Tuple[str, float]]:
             if isinstance(it, dict):
                 key = it.get("key")
                 if key is None or (isinstance(key, str) and key == ""):
-                    key = it.get("id", it.get("doc_id"))
+                    key = it.get("id")
+                if key is None or (isinstance(key, str) and key == ""):
+                    key = it.get("doc_id")
                 if key is None or (isinstance(key, str) and key == ""):
                     continue
                 pairs.append((str(key), float(n - idx)))
@@ -200,6 +195,13 @@ def fuse(bm25_cands, vec_cands, k: int = RRF_K) -> List[Tuple[str, float]]:
     if kk <= 0:
         kk = RRF_K
     bm25_pairs = bm25_cands
-    if bm25_cands and isinstance(bm25_cands, (list, tuple)) and bm25_cands and isinstance(bm25_cands[0], dict):
-        bm25_pairs = bm25_from_ordered(bm25_cands)
+    # 中文注释：完整检测 dict 形态，兼容 generator/混合类型
+    try:
+        peek = list(bm25_cands) if bm25_cands else []
+    except TypeError:
+        peek = []
+    if peek and all(isinstance(x, dict) for x in peek):
+        bm25_pairs = bm25_from_ordered(peek)
+    else:
+        bm25_pairs = bm25_cands
     return rank_fusion(bm25_pairs, vec_cands, k=kk)

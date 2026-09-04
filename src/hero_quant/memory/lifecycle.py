@@ -51,9 +51,16 @@ class MemoryLifecycle:
     DELETE_THRESHOLD = DELETE_THRESHOLD
     MIN_AGE_DAYS = MIN_AGE_DAYS
     MAX_AGE_DAYS = MAX_AGE_DAYS
-    MAX_AGE = MAX_AGE
     MAX_MEMORY_COUNT = MAX_MEMORY_COUNT
     ENABLE_DELETE = ENABLE_DELETE
+
+    @property
+    def MAX_AGE(self) -> int:  # 中文注释：别名属性，避免与 MAX_AGE_DAYS 分叉
+        return int(self.MAX_AGE_DAYS)
+
+    @MAX_AGE.setter
+    def MAX_AGE(self, value: int) -> None:  # 中文注释：setter 回写同一来源
+        self.MAX_AGE_DAYS = int(value)
 
     _EVENT_DELTAS: MappingProxyType[str, float] = MappingProxyType(
         {
@@ -164,12 +171,21 @@ class MemoryLifecycle:
             text = file_path.read_text(encoding="utf-8")
             if text.lstrip().startswith("---"):
                 lines = text.lstrip().splitlines()
-                for line in lines[1:11]:
+                # 中文注释：扩大扫描至 1:51 并遇 closing --- 停止，每字段独立 try 避免单条坏值阻断其余
+                for line in lines[1:51]:
                     stripped = line.lstrip()
+                    if stripped == "---":
+                        break
                     if stripped.startswith("quality_score:"):
-                        qs = float(stripped.split(":", 1)[1].strip())
+                        try:
+                            qs = float(stripped.split(":", 1)[1].strip())
+                        except (TypeError, ValueError):
+                            pass
                     elif stripped.startswith("access_count:"):
-                        ac = int(stripped.split(":", 1)[1].strip())
+                        try:
+                            ac = int(stripped.split(":", 1)[1].strip())
+                        except (TypeError, ValueError):
+                            pass
                     elif stripped.startswith("last_accessed:"):
                         # 兼容 ISO 与时间戳两种写法，支持缩进
                         val = stripped.split(":", 1)[1].strip()
@@ -183,8 +199,6 @@ class MemoryLifecycle:
                                 last = datetime.fromisoformat(iso).timestamp()
                             except Exception:
                                 pass
-                    if stripped == "---":
-                        break
         except Exception as _exc:
             logger.debug("silent handled: offline-safe: lifecycle optional", exc_info=_exc)  # intentional: offline-safe: lifecycle optional
             pass  # intentional offline-safe: lifecycle optional
@@ -214,7 +228,8 @@ class MemoryLifecycle:
                 for _kk, _vv in _stem_lookup.items():
                     _merged.setdefault(_kk, _vv)
                 _meta_lookup = _merged
-        except Exception:
+        except Exception as exc:  # 中文注释：meta-map 构建失败应可观测
+            logger.debug("GC meta-map build failed, falling back to frontmatter: %s", exc)
             _meta_lookup = None
         actions: list[dict] = []
         for file_path in entries:
@@ -284,15 +299,8 @@ class MemoryLifecycle:
                             continue
                         logger.warning("GC archive failed for %s: %s", file_path, exc)
                         return
-                # 归档后保留 SQLite 行，搜索回退仍可见，仅文件态视为已回收
-                try:
-                    from .hierarchy import MemoryHierarchy
-
-                    MemoryHierarchy(self.memory_dir)
-                    # 归档后保留 SQLite 行，搜索回退仍可见，仅文件态视为已回收
-                except Exception as _exc:
-                    logger.debug("silent handled: offline-safe: lifecycle optional", exc_info=_exc)  # intentional: offline-safe: lifecycle optional
-                    pass  # intentional offline-safe: lifecycle optional
+                # 中文注释：归档后保留 SQLite 行，文件态已回收；此处不再做无意义 hierarchy 构造（原空转调用已移除）
+                pass
             elif action == "delete":
                 dest = archive_dir / file_path.name
                 # dest 冲突版本化 dest.stem.{n}.suffix
@@ -340,8 +348,8 @@ class MemoryLifecycle:
         try:
             with open(log_path, "a", encoding="utf-8") as f:
                 f.write("\n".join(lines))
-        except OSError:
-            pass
+        except OSError as exc:
+            logger.warning("GC log append failed for %s: %s", log_path, exc)
 
     @staticmethod
     def _read_compressible(file_path: Path) -> str | None:

@@ -628,35 +628,58 @@ class MemoryStore:
 
     def _safe_filename(self, ns_key: str) -> str:
         """生成文件安全名，规避 Windows 禁用字符与路径穿越。"""
-        # 使用 ``__NS__`` 作为命名空间分隔，避免与内容中 ``__`` 歧义
-        safe = ns_key.replace(":", "__NS__").replace("/", "__NS__").replace("\\", "__NS__")
-        # 阻断 ``..`` 穿越
-        safe = safe.replace("..", "__NS__")
+        # 中文注释：使用 quote 去除碰撞，每个分隔符编码独立且可逆
+        import urllib.parse
+        safe = urllib.parse.quote(ns_key, safe='')
+        # quote 后不再含 :/\ 故无需额外替换，但防循环安全名过长截断不处理
         return f"{safe}.md"
 
     def _safe_prefix(self) -> str | None:
         """返回用于文件过滤的安全前缀。"""
         if self.namespace:
-            # 与 _safe_filename 保持同构替换
-            return self.namespace.replace(":", "__NS__").replace("/", "__NS__").replace("\\", "__NS__") + "__NS__"
+            import urllib.parse
+            # 中文注释：与 _safe_filename 同构，加 %3A 后缀作前缀匹配
+            return urllib.parse.quote(self.namespace, safe='') + "%3A"
         return None
 
     def _safe_prefix_old(self) -> str | None:
-        """旧 ``__`` 前缀，用于向后兼容过滤。"""
+        """旧 ``__``/旧 ``__NS__`` 前缀，用于向后兼容过滤。"""
         if self.namespace:
-            return self.namespace.replace(":", "__").replace("/", "__").replace("\\", "__") + "__"
+            # 保留旧格式兼容，含 __NS__ 与 __
+            return self.namespace.replace(":", "__NS__").replace("/", "__NS__").replace("\\", "__NS__") + "__NS__"
         return None
 
     def _matches_safe_prefix(self, filename: str) -> bool:
-        """兼容新 ``__NS__`` 与旧 ``__`` 前缀的过滤判断；无 namespace 时始终 True。"""
+        """兼容新 quote 与旧 ``__NS__``/``__`` 前缀的过滤判断；无 namespace 时始终 True。"""
         if self.namespace is None:
             return True
+        # 新格式：文件名以 quote(namespace)+%3A 开头
         new_p = self._safe_prefix()
+        if new_p is not None and filename.startswith(new_p):
+            return True
+        # 旧格式兼容
         old_p = self._safe_prefix_old()
-        return (new_p is not None and filename.startswith(new_p)) or (old_p is not None and filename.startswith(old_p))
+        if old_p is not None and filename.startswith(old_p):
+            return True
+        # quote 前缀可能因历史数据为旧格式，也检查旧 __ 前缀
+        legacy = self.namespace.replace(":", "__").replace("/", "__").replace("\\", "__") + "__"
+        if filename.startswith(legacy):
+            return True
+        return False
 
     def _parse_safe_stem(self, stem: str) -> str:
-        """将安全文件名 stem 还原为原始 ns_key，兼容旧 ``__`` 分隔。"""
+        """将安全文件名 stem 还原为原始 ns_key，兼容旧 ``__NS__``/``__`` 分隔。"""
+        # 中文注释：新格式为 quote，旧格式为 __NS__/__
+        import urllib.parse
+        # 如果含 % 则尝试 unquote（新格式）
+        if "%" in stem:
+            try:
+                decoded = urllib.parse.unquote(stem)
+                # 防止误解码旧 __ 文件名中的非 quote 内容，仅当解码后不同时才认为是新格式
+                if decoded != stem:
+                    return decoded
+            except Exception:
+                pass
         if "__NS__" in stem:
             return stem.replace("__NS__", ":")
         # 向后兼容旧文件：``__`` 分隔
@@ -785,38 +808,38 @@ class MemoryStore:
     def _load_vector_for_key(self, key: str):
         """按 key 载入已存向量；维度漂移时视为过期返回 None 触发重算。"""
         try:
-            cur = self._conn.cursor()
-            # 先确认向量列存在，避免旧库报错
-            cur.execute("PRAGMA table_info(notes)")
-            cols = [row[1] for row in cur.fetchall()]
-            if "vector" not in cols:
-                return None
-            cur.execute("SELECT vector FROM notes WHERE key = ? ORDER BY id DESC LIMIT 1", (key,))
-            row = cur.fetchone()
-            if row and row[0]:
-                raw = row[0]
-                if isinstance(raw, str):
+            with self._lock:  # 中文注释：SQLite 共享连接需加锁
+                cur = self._conn.cursor()
+                # 先确认向量列存在，避免旧库报错
+                cur.execute("PRAGMA table_info(notes)")
+                cols = [row[1] for row in cur.fetchall()]
+                if "vector" not in cols:
+                    return None
+                cur.execute("SELECT vector FROM notes WHERE key = ? ORDER BY id DESC LIMIT 1", (key,))
+                row = cur.fetchone()
+                if row and row[0]:
+                    raw = row[0]
+                    if isinstance(raw, str):
+                        try:
+                            parsed = json.loads(raw)
+                        except Exception:
+                            return None
+                    else:
+                        parsed = raw
+                    # 维度漂移校验：以当前 get_vector_dim 为准
                     try:
-                        parsed = json.loads(raw)
-                    except Exception:
-                        return None
-                else:
-                    parsed = raw
-                # 维度漂移校验：以当前 get_vector_dim 为准
-                try:
-                    from hero_quant.agent.embed import get_vector_dim as _gvd
+                        from hero_quant.agent.embed import get_vector_dim as _gvd
 
-                    expected = int(_gvd())
-                    if isinstance(parsed, list) and len(parsed) != expected:
-                        return None
-                except Exception as _exc:
-                    logger.debug("silent handled: offline-safe: memory sidecar/pgvector optional, fallback to local", exc_info=_exc)  # intentional: offline-safe: memory sidecar/pgvector optional, fallback to local
-                    pass  # intentional offline-safe: memory sidecar/pgvector optional, fallback to local
-                return parsed
+                        expected = int(_gvd())
+                        if isinstance(parsed, list) and len(parsed) != expected:
+                            return None
+                    except Exception as _exc:
+                        logger.debug("silent handled: offline-safe: memory sidecar/pgvector optional, fallback to local", exc_info=_exc)  # intentional: offline-safe: memory sidecar/pgvector optional, fallback to local
+                        pass  # intentional offline-safe: memory sidecar/pgvector optional, fallback to local
+                    return parsed
         except Exception:
             return None
         return None
-
     def _ensure_vector_dim(self, vec, content: str):
         """向量为空或维度不匹配时重算，保证与当前 dim 一致。"""
         try:
@@ -938,6 +961,16 @@ class MemoryStore:
         tmp_path = self.base / f".{safe_name}.tmp.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex[:6]}"  # O_EXCL unique tmp via mkstemp semantics
         # 兼容层次路由的子目录结构，确保父目录存在
         file_path.parent.mkdir(parents=True, exist_ok=True)
+        # 中文注释：记录是否已存在旧文件，用于 DB 失败时恢复而非误删
+        _had_prior = file_path.exists()
+        _backup_path = None
+        if _had_prior:
+            _backup_path = file_path.with_suffix(file_path.suffix + ".bak")
+            try:
+                import shutil
+                shutil.copy2(file_path, _backup_path)
+            except Exception:
+                _backup_path = None
         try:
             _oflag = os.O_WRONLY | os.O_CREAT | os.O_EXCL | (os.O_NOFOLLOW if hasattr(os, "O_NOFOLLOW") else 0)
             _fd = os.open(tmp_path, _oflag, 0o600)
@@ -995,55 +1028,56 @@ class MemoryStore:
         except Exception:
             vector_json = None
         try:
-            cur = self._conn.cursor()
-            # 探查向量列是否存在以选择写入路径
-            cur.execute("PRAGMA table_info(notes)")
-            cols = [row[1] for row in cur.fetchall()]
-            has_vector = "vector" in cols
-            if has_vector:
-                cur.execute(
-                    "INSERT INTO notes (key, content, created, vector) VALUES (?, ?, ?, ?)",
-                    (ns_key, content, created, vector_json),
-                )
-            else:
-                cur.execute(
-                    "INSERT INTO notes (key, content, created) VALUES (?, ?, ?)",
-                    (ns_key, content, created),
-                )
-                # 向量列后续出现时可通过更新回填，此处占位
-                if vector_json is not None:
-                    try:
-                        # 预留更新路径，当前无操作
-                        pass
-                    except Exception as _exc:
-                        logger.debug("silent handled: offline-safe: memory sidecar/pgvector optional, fallback to local", exc_info=_exc)  # intentional: offline-safe: memory sidecar/pgvector optional, fallback to local
-                        pass  # intentional offline-safe: memory sidecar/pgvector optional, fallback to local
-            rowid = cur.lastrowid
-            if self._fts_enabled:
-                try:
+            with self._lock:  # 中文注释：SQLite 共享连接需加锁
+                cur = self._conn.cursor()
+                # 探查向量列是否存在以选择写入路径
+                cur.execute("PRAGMA table_info(notes)")
+                cols = [row[1] for row in cur.fetchall()]
+                has_vector = "vector" in cols
+                if has_vector:
                     cur.execute(
-                        "INSERT INTO notes_fts (rowid, content) VALUES (?, ?)",
-                        (rowid, content),
+                        "INSERT INTO notes (key, content, created, vector) VALUES (?, ?, ?, ?)",
+                        (ns_key, content, created, vector_json),
                     )
-                except Exception:
-                    # 回退：不依赖 rowid 的插入
+                else:
+                    cur.execute(
+                        "INSERT INTO notes (key, content, created) VALUES (?, ?, ?)",
+                        (ns_key, content, created),
+                    )
+                    # 向量列后续出现时可通过更新回填，此处占位
+                    if vector_json is not None:
+                        try:
+                            # 预留更新路径，当前无操作
+                            pass
+                        except Exception as _exc:
+                            logger.debug("silent handled: offline-safe: memory sidecar/pgvector optional, fallback to local", exc_info=_exc)  # intentional: offline-safe: memory sidecar/pgvector optional, fallback to local
+                            pass  # intentional offline-safe: memory sidecar/pgvector optional, fallback to local
+                rowid = cur.lastrowid
+                if self._fts_enabled:
                     try:
                         cur.execute(
-                            "INSERT INTO notes_fts (content) VALUES (?)", (content,)
+                            "INSERT INTO notes_fts (rowid, content) VALUES (?, ?)",
+                            (rowid, content),
+                        )
+                    except Exception:
+                        # 回退：不依赖 rowid 的插入
+                        try:
+                            cur.execute(
+                                "INSERT INTO notes_fts (content) VALUES (?)", (content,)
+                            )
+                        except Exception as _exc:
+                            logger.debug("silent handled: offline-safe: memory sidecar/pgvector optional, fallback to local", exc_info=_exc)  # intentional: offline-safe: memory sidecar/pgvector optional, fallback to local
+                            pass  # intentional offline-safe: memory sidecar/pgvector optional, fallback to local
+                if self._bigram_enabled:
+                    try:
+                        cur.execute(
+                            "INSERT INTO notes_fts_bigram (rowid, bigrams) VALUES (?, ?)",
+                            (rowid, _content_bigrams(content)),
                         )
                     except Exception as _exc:
                         logger.debug("silent handled: offline-safe: memory sidecar/pgvector optional, fallback to local", exc_info=_exc)  # intentional: offline-safe: memory sidecar/pgvector optional, fallback to local
                         pass  # intentional offline-safe: memory sidecar/pgvector optional, fallback to local
-            if self._bigram_enabled:
-                try:
-                    cur.execute(
-                        "INSERT INTO notes_fts_bigram (rowid, bigrams) VALUES (?, ?)",
-                        (rowid, _content_bigrams(content)),
-                    )
-                except Exception as _exc:
-                    logger.debug("silent handled: offline-safe: memory sidecar/pgvector optional, fallback to local", exc_info=_exc)  # intentional: offline-safe: memory sidecar/pgvector optional, fallback to local
-                    pass  # intentional offline-safe: memory sidecar/pgvector optional, fallback to local
-            self._conn.commit()
+                self._conn.commit()
             # 侧车同步：尽力而为，失败不影响本地写入事务
             try:
                 if vector_json is not None:
@@ -1067,14 +1101,34 @@ class MemoryStore:
                 pass  # intentional offline-safe: memory sidecar/pgvector optional, fallback to local
         except Exception as _e:
             try:
-                self._conn.rollback()
+                with self._lock:
+                    self._conn.rollback()
             except Exception as _exc:
                 logger.debug("silent handled: offline-safe: memory sidecar/pgvector optional, fallback to local", exc_info=_exc)  # intentional: offline-safe: memory sidecar/pgvector optional, fallback to local
                 pass  # intentional offline-safe: memory sidecar/pgvector optional, fallback to local
-            # atomic double-write failure: clean orphan file or reconcile
+            # ä¸­ææ³¨é：原子双写失败时恢复旧文件或清理孤儿，避免误删旧版本
             try:
-                if file_path.exists():
+                if _had_prior and _backup_path is not None and Path(_backup_path).exists():
+                    try:
+                        import shutil as _sh2
+                        _sh2.copy2(_backup_path, file_path)
+                    except Exception:
+                        try:
+                            import os as _os2
+                            _os2.replace(_backup_path, file_path)
+                        except Exception:
+                            pass
+                    try:
+                        Path(_backup_path).unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                elif not _had_prior and file_path.exists():
                     file_path.unlink()
+                if _backup_path is not None:
+                    try:
+                        Path(_backup_path).unlink(missing_ok=True)
+                    except Exception:
+                        pass
                 logger.warning("write DB failed, cleaned orphan file; reconcile may be needed", exc_info=_e)
             except Exception as _exc:
                 logger.warning("reconcile: failed to clean orphan file", exc_info=_exc)
@@ -1118,50 +1172,51 @@ class MemoryStore:
             pass  # intentional offline-safe: memory sidecar/pgvector optional, fallback to local
 
         try:
-            cur = self._conn.cursor()
-            cur.execute("SELECT id FROM notes WHERE key = ?", (ns_key,))
-            old_rowids = [row[0] for row in cur.fetchall()]
-            for rowid in old_rowids:
-                for table in ("notes_fts", "notes_fts_bigram"):
+            with self._lock:  # 中文注释：SQLite 共享连接需加锁
+                cur = self._conn.cursor()
+                cur.execute("SELECT id FROM notes WHERE key = ?", (ns_key,))
+                old_rowids = [row[0] for row in cur.fetchall()]
+                for rowid in old_rowids:
+                    for table in ("notes_fts", "notes_fts_bigram"):
+                        try:
+                            cur.execute(f"DELETE FROM {table} WHERE rowid = ?", (rowid,))
+                        except Exception as _exc:
+                            logger.debug("silent handled: offline-safe: memory sidecar/pgvector optional, fallback to local", exc_info=_exc)  # intentional: offline-safe: memory sidecar/pgvector optional, fallback to local
+                            pass  # intentional offline-safe: memory sidecar/pgvector optional, fallback to local
+                cur.execute("DELETE FROM notes WHERE key = ?", (ns_key,))
+
+                cur.execute("PRAGMA table_info(notes)")
+                columns = [row[1] for row in cur.fetchall()]
+                if "vector" in columns:
+                    cur.execute(
+                        "INSERT INTO notes (key, content, created, vector) VALUES (?, ?, ?, ?)",
+                        (ns_key, content, datetime.now(timezone.utc).isoformat(), vector_json),
+                    )
+                else:
+                    cur.execute(
+                        "INSERT INTO notes (key, content, created) VALUES (?, ?, ?)",
+                        (ns_key, content, datetime.now(timezone.utc).isoformat()),
+                    )
+                rowid = cur.lastrowid
+                if self._fts_enabled:
                     try:
-                        cur.execute(f"DELETE FROM {table} WHERE rowid = ?", (rowid,))
+                        cur.execute(
+                            "INSERT INTO notes_fts (rowid, content) VALUES (?, ?)",
+                            (rowid, content),
+                        )
                     except Exception as _exc:
                         logger.debug("silent handled: offline-safe: memory sidecar/pgvector optional, fallback to local", exc_info=_exc)  # intentional: offline-safe: memory sidecar/pgvector optional, fallback to local
                         pass  # intentional offline-safe: memory sidecar/pgvector optional, fallback to local
-            cur.execute("DELETE FROM notes WHERE key = ?", (ns_key,))
-
-            cur.execute("PRAGMA table_info(notes)")
-            columns = [row[1] for row in cur.fetchall()]
-            if "vector" in columns:
-                cur.execute(
-                    "INSERT INTO notes (key, content, created, vector) VALUES (?, ?, ?, ?)",
-                    (ns_key, content, datetime.now(timezone.utc).isoformat(), vector_json),
-                )
-            else:
-                cur.execute(
-                    "INSERT INTO notes (key, content, created) VALUES (?, ?, ?)",
-                    (ns_key, content, datetime.now(timezone.utc).isoformat()),
-                )
-            rowid = cur.lastrowid
-            if self._fts_enabled:
-                try:
-                    cur.execute(
-                        "INSERT INTO notes_fts (rowid, content) VALUES (?, ?)",
-                        (rowid, content),
-                    )
-                except Exception as _exc:
-                    logger.debug("silent handled: offline-safe: memory sidecar/pgvector optional, fallback to local", exc_info=_exc)  # intentional: offline-safe: memory sidecar/pgvector optional, fallback to local
-                    pass  # intentional offline-safe: memory sidecar/pgvector optional, fallback to local
-            if self._bigram_enabled:
-                try:
-                    cur.execute(
-                        "INSERT INTO notes_fts_bigram (rowid, bigrams) VALUES (?, ?)",
-                        (rowid, _content_bigrams(content)),
-                    )
-                except Exception as _exc:
-                    logger.debug("silent handled: offline-safe: memory sidecar/pgvector optional, fallback to local", exc_info=_exc)  # intentional: offline-safe: memory sidecar/pgvector optional, fallback to local
-                    pass  # intentional offline-safe: memory sidecar/pgvector optional, fallback to local
-            self._conn.commit()
+                if self._bigram_enabled:
+                    try:
+                        cur.execute(
+                            "INSERT INTO notes_fts_bigram (rowid, bigrams) VALUES (?, ?)",
+                            (rowid, _content_bigrams(content)),
+                        )
+                    except Exception as _exc:
+                        logger.debug("silent handled: offline-safe: memory sidecar/pgvector optional, fallback to local", exc_info=_exc)  # intentional: offline-safe: memory sidecar/pgvector optional, fallback to local
+                        pass  # intentional offline-safe: memory sidecar/pgvector optional, fallback to local
+                self._conn.commit()
         except Exception:
             try:
                 self._conn.rollback()
@@ -1182,19 +1237,17 @@ class MemoryStore:
     def _importance_for(self, item: dict, now: float) -> float:
         """按 Ebbinghaus 14 天衰减计算单条记忆的重要性。"""
         ns_key = item.get("key", "")
-        meta = self._meta.get(ns_key)
+        # 中文注释：加锁读 _meta，避免并发迭代竞态
+        with self._lock:
+            meta_snapshot = dict(self._meta)
+        meta = meta_snapshot.get(ns_key)
         if meta is None:
             # 文件扫描场景下 key 为安全文件名，需反向映射到原始 ns_key
-            for k, v in self._meta.items():
+            for k, v in meta_snapshot.items():
                 if self._safe_filename(k).removesuffix(".md") == ns_key:
                     meta = v
                     break
-            if meta is None:
-                # 兼容带 namespace 前缀的后缀匹配
-                for k, v in self._meta.items():
-                    if ns_key.endswith(k.split(":")[-1]) or k.endswith(ns_key.split(":")[-1]):
-                        meta = v
-                        break
+            # ä¸­ææ³¨é：已移除跨命名空间后缀匹配，避免 nsA:report 继承 nsB:report
         if meta is not None:
             qs = float(meta.get("quality_score", 0.5))
             ac = int(meta.get("access_count", 0))
@@ -1263,40 +1316,41 @@ class MemoryStore:
         # 载入本地候选
         candidates: list[dict] = []
         try:
-            cur = self._conn.cursor()
-            # 探查向量列可用性
-            cur.execute("PRAGMA table_info(notes)")
-            cols = [row[1] for row in cur.fetchall()]
-            has_vector = "vector" in cols
-            if has_vector:
-                cur.execute("SELECT key, content, vector FROM notes")
-                rows = cur.fetchall()
-                for k, c, v in rows:
-                    if prefix is not None and not k.startswith(prefix):
-                        continue
-                    # 解析已存向量
-                    note_vec = None
-                    if v:
-                        try:
-                            note_vec = json.loads(v) if isinstance(v, str) else v
-                        except Exception:
-                            note_vec = None
-                    # 维度漂移时重算，保证与当前 dim 一致
-                    note_vec = self._ensure_vector_dim(note_vec, c)
-                    if note_vec is None:
-                        continue
-                    sim = self._cosine_sim(qvec, note_vec)
-                    candidates.append({"key": k, "content": c, "vector": note_vec, "_score": sim})
-            else:
-                # 无向量列时全量即时计算，兼容旧库
-                cur.execute("SELECT key, content FROM notes")
-                rows = cur.fetchall()
-                for k, c in rows:
-                    if prefix is not None and not k.startswith(prefix):
-                        continue
-                    note_vec = self._embed_text(c)
-                    sim = self._cosine_sim(qvec, note_vec)
-                    candidates.append({"key": k, "content": c, "_score": sim})
+            with self._lock:  # 中文注释：SQLite 共享连接需加锁
+                cur = self._conn.cursor()
+                # 探查向量列可用性
+                cur.execute("PRAGMA table_info(notes)")
+                cols = [row[1] for row in cur.fetchall()]
+                has_vector = "vector" in cols
+                if has_vector:
+                    cur.execute("SELECT key, content, vector FROM notes")
+                    rows = cur.fetchall()
+                    for k, c, v in rows:
+                        if prefix is not None and not k.startswith(prefix):
+                            continue
+                        # 解析已存向量
+                        note_vec = None
+                        if v:
+                            try:
+                                note_vec = json.loads(v) if isinstance(v, str) else v
+                            except Exception:
+                                note_vec = None
+                        # 维度漂移时重算，保证与当前 dim 一致
+                        note_vec = self._ensure_vector_dim(note_vec, c)
+                        if note_vec is None:
+                            continue
+                        sim = self._cosine_sim(qvec, note_vec)
+                        candidates.append({"key": k, "content": c, "vector": note_vec, "_score": sim})
+                else:
+                    # 无向量列时全量即时计算，兼容旧库
+                    cur.execute("SELECT key, content FROM notes")
+                    rows = cur.fetchall()
+                    for k, c in rows:
+                        if prefix is not None and not k.startswith(prefix):
+                            continue
+                        note_vec = self._embed_text(c)
+                        sim = self._cosine_sim(qvec, note_vec)
+                        candidates.append({"key": k, "content": c, "_score": sim})
         except Exception:
             # 数据库异常时回退到文件扫描
             candidates = []
@@ -1411,27 +1465,28 @@ class MemoryStore:
         # 优先走 FTS5 MATCH — FTS MATCH 转义加引号防止语法注入
         if self._fts_enabled:
             try:
-                cur = self._conn.cursor()
-                match_query = f'"{query.replace(chr(34), chr(34) * 2)}"'
-                cur.execute(
-                    "SELECT notes.key, notes.content FROM notes_fts JOIN notes ON notes_fts.rowid = notes.id WHERE notes_fts MATCH ?",
-                    (match_query,),
-                )
-                rows = cur.fetchall()
-                if rows:
-                    result = [{"key": k, "content": c} for k, c in rows]
-                    if prefix is not None:
-                        result = [r for r in result if r["key"].startswith(prefix)]
-                        if not result:
-                            raise sqlite3.OperationalError("no rows for namespace, fallback to LIKE")
-                    seen: dict[str, dict] = {}
-                    deduped: list[dict] = []
-                    for item in result:
-                        if item["content"] not in seen:
-                            seen[item["content"]] = item
-                            deduped.append(item)
-                    if deduped:
-                        return deduped
+                with self._lock:  # 中文注释：SQLite 共享连接需加锁
+                    cur = self._conn.cursor()
+                    match_query = f'"{query.replace(chr(34), chr(34) * 2)}"'
+                    cur.execute(
+                        "SELECT notes.key, notes.content FROM notes_fts JOIN notes ON notes_fts.rowid = notes.id WHERE notes_fts MATCH ?",
+                        (match_query,),
+                    )
+                    rows = cur.fetchall()
+                    if rows:
+                        result = [{"key": k, "content": c} for k, c in rows]
+                        if prefix is not None:
+                            result = [r for r in result if r["key"].startswith(prefix)]
+                            if not result:
+                                raise sqlite3.OperationalError("no rows for namespace, fallback to LIKE")
+                        seen: dict[str, dict] = {}
+                        deduped: list[dict] = []
+                        for item in result:
+                            if item["content"] not in seen:
+                                seen[item["content"]] = item
+                                deduped.append(item)
+                        if deduped:
+                            return deduped
             except sqlite3.OperationalError:
                 pass
             except Exception as _exc:
@@ -1443,47 +1498,48 @@ class MemoryStore:
             return bigram_result
         # 回退到 LIKE 模糊匹配
         try:
-            cur = self._conn.cursor()
-            pattern = f"%{query}%"
-            if prefix is not None:
-                cur.execute(
-                    "SELECT key, content FROM notes WHERE key LIKE ? AND content LIKE ?",
-                    (f"{prefix}%", pattern),
-                )
-            else:
-                cur.execute("SELECT key, content FROM notes WHERE content LIKE ?", (pattern,))
-            rows = cur.fetchall()
-            result = [{"key": k, "content": c} for k, c in rows]
-            if prefix is not None:
-                result = [r for r in result if r["key"].startswith(prefix)]
-            if not result:
-                try:
-                    from .hierarchy import MemoryHierarchy
-
-                    mh = MemoryHierarchy(self.base)
-                    candidates = mh.scan_all()
-                except Exception:
-                    candidates = list(self.base.rglob("*.md"))
-                    candidates = [p for p in candidates if "archive" not in p.parts]
-                for md_file in candidates:
+            with self._lock:  # 中文注释：SQLite 共享连接需加锁
+                cur = self._conn.cursor()
+                pattern = f"%{query}%"
+                if prefix is not None:
+                    cur.execute(
+                        "SELECT key, content FROM notes WHERE key LIKE ? AND content LIKE ?",
+                        (f"{prefix}%", pattern),
+                    )
+                else:
+                    cur.execute("SELECT key, content FROM notes WHERE content LIKE ?", (pattern,))
+                rows = cur.fetchall()
+                result = [{"key": k, "content": c} for k, c in rows]
+                if prefix is not None:
+                    result = [r for r in result if r["key"].startswith(prefix)]
+                if not result:
                     try:
-                        if not self._matches_safe_prefix(md_file.name):
-                            continue
-                        if prefix is not None and not self._parse_safe_stem(md_file.stem).startswith(prefix.rstrip(":")):
+                        from .hierarchy import MemoryHierarchy
+
+                        mh = MemoryHierarchy(self.base)
+                        candidates = mh.scan_all()
+                    except Exception:
+                        candidates = list(self.base.rglob("*.md"))
+                        candidates = [p for p in candidates if "archive" not in p.parts]
+                    for md_file in candidates:
+                        try:
                             if not self._matches_safe_prefix(md_file.name):
                                 continue
-                        txt = md_file.read_text(encoding="utf-8")
-                        if query in txt:
-                            result.append({"key": self._parse_safe_stem(md_file.stem), "content": txt})
-                    except Exception:
-                        continue
-            seen2: dict[str, dict] = {}
-            deduped2: list[dict] = []
-            for item in result:
-                if item["content"] not in seen2:
-                    seen2[item["content"]] = item
-                    deduped2.append(item)
-            return deduped2
+                            if prefix is not None and not self._parse_safe_stem(md_file.stem).startswith(prefix.rstrip(":")):
+                                if not self._matches_safe_prefix(md_file.name):
+                                    continue
+                            txt = md_file.read_text(encoding="utf-8")
+                            if query in txt:
+                                result.append({"key": self._parse_safe_stem(md_file.stem), "content": txt})
+                        except Exception:
+                            continue
+                seen2: dict[str, dict] = {}
+                deduped2: list[dict] = []
+                for item in result:
+                    if item["content"] not in seen2:
+                        seen2[item["content"]] = item
+                        deduped2.append(item)
+                return deduped2
         except Exception:
             return []
 
