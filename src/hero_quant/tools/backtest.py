@@ -110,14 +110,25 @@ def run_backtest(
     - 若 symbol 包含逗号（如 "AAPL,MSFT"），按逗号分割为多标的，为每个标的合成独立价格序列，构造多列 DataFrame 传入引擎以触发多资产路径。
     - 若 weights 长度 >1 但仅有单列价格，则生成多列合成价格作为 fallback，并在日志中警告。
     - 单标的场景保持原有单列 'close' DataFrame 行为以兼容存量调用。
+    - 无真实行情时仍可运行，但返回体必带 provenance{source:"synthetic"} 标记，
+      调用方不得将其误判为真实市场回测。
     """
-    weights = weights or [0.5, 0.5]
+    # 中文：默认权重按 symbol 形态决定——单标的默认 [1.0] 走单资产路径，
+    # 逗号多标的默认等权；禁止单标的被默认 [0.5,0.5] 逼入多资产合成路径
+    if weights is None:
+        if isinstance(symbol, str) and "," in symbol:
+            tickers_default = [s.strip() for s in symbol.split(",") if s.strip()]
+            n_default = len(tickers_default) or 1
+            weights = [1.0 / n_default] * n_default
+        else:
+            weights = [1.0]
     # Narrow try blocks: date_range isolated
     import pandas as pd
 
     bars = _fetch_bars_for_backtest(symbol, start, end, interval=interval)
+    # 中文：不得静默截断——全部 bars 进入引擎，避免长区间回测被压成 50 根而不自知
     closes = []
-    for b in bars[:50] if bars else []:
+    for b in bars if bars else []:
         c = b.get("close")
         if c is None:
             continue
@@ -130,8 +141,13 @@ def run_backtest(
             continue
         closes.append(v)
     if not closes:
-        # 无真实行情时使用锚定起始日的合成价格，保证引擎可运行
+        # 中文：无真实行情时用合成价格兜底保证引擎可运行，但必须显式标记 synthetic，
+        # 调用方靠 provenance 区分演示数字与真实市场回测
+        is_synthetic = True
+        logger.warning("no market bars for %s %s->%s, using synthetic fallback", symbol, start, end)
         closes = [100, 101, 102]
+    else:
+        is_synthetic = False
     # 以起始日为锚点构建 DatetimeIndex — interval aware
     freq_map = {"1d": "D", "1h": "h", "1m": "min", "1w": "W", "1M": "M"}
     freq = freq_map.get(interval or "1d", "D")
@@ -145,11 +161,20 @@ def run_backtest(
     need_multi = len(weights) > 1
     is_comma_symbol = isinstance(symbol, str) and "," in symbol
     prices = None
-    if need_multi and is_comma_symbol:
+    if is_comma_symbol:
         tickers = [s.strip() for s in symbol.split(",") if s.strip()]
-        # 若 tickers 数量与 weights 不一致，严格校验
+        # 中文：数量不一致走 {ok:False} 信封返回，不抛裸 ValueError 破坏工具契约；
+        # 逗号多标的必查（即使 weights 长度为 1，也属 tickers-vs-weights 错位）
         if len(tickers) != len(weights):
-            raise ValueError(f"tickers {len(tickers)} vs weights {len(weights)} mismatch")
+            logger.warning("tickers %d vs weights %d mismatch for %s", len(tickers), len(weights), symbol)
+            return {
+                "equity": [],
+                "metrics": {},
+                "ok": False,
+                "error": f"tickers {len(tickers)} vs weights {len(weights)} mismatch",
+                "engine": engine or "default",
+                "provenance": {"source": "synthetic" if is_synthetic else "market"},
+            }
         # 合成每标的的 close 序列
         price_dict: dict[str, pd.Series] = {}
         for t in tickers:
@@ -182,10 +207,10 @@ def run_backtest(
         res = eng.run(prices, weights=weights, costs=float(costs) if costs is not None else 0.0005, engine=engine or "default")
     except (ValueError, RuntimeError) as e:
         logger.warning("run_backtest engine failed: %s", e, exc_info=True)
-        return {"equity": [], "metrics": {}, "ok": False, "error": str(e), "engine": engine or "default"}
+        return {"equity": [], "metrics": {}, "ok": False, "error": str(e), "engine": engine or "default", "provenance": {"source": "synthetic" if is_synthetic else "market"}}
     except Exception as e:
         logger.warning("run_backtest unexpected failed: %s", e, exc_info=True)
-        return {"equity": [], "metrics": {}, "ok": False, "error": f"{type(e).__name__}: {e}", "engine": engine or "default"}
+        return {"equity": [], "metrics": {}, "ok": False, "error": f"{type(e).__name__}: {e}", "engine": engine or "default", "provenance": {"source": "synthetic" if is_synthetic else "market"}}
 
     eq = res.get("equity")
     if hasattr(eq, "tolist"):
@@ -194,7 +219,9 @@ def run_backtest(
         equity = list(eq.values)  # type: ignore
     else:
         equity = list(eq) if isinstance(eq, (list, tuple)) else []
-    return {"equity": equity, "metrics": res.get("metrics", {}), "ok": True, "engine": engine or "default"}
+    # 中文：provenance 必传——合成兜底标 synthetic，否则标 market
+    provenance = {"source": "synthetic" if is_synthetic else "market"}
+    return {"equity": equity, "metrics": res.get("metrics", {}), "ok": True, "engine": engine or "default", "provenance": provenance}
 
 
 @tool(
@@ -301,7 +328,10 @@ def list_backtest_engines() -> Dict[str, Any]:
     is_concurrency_safe=lambda args: False,
 )
 def optimize_portfolio(symbols: list, method: str = "equal") -> Dict[str, Any]:
-    """投资组合权重优化占位：当前返回等权配置。"""
-    n = len(symbols) if symbols else 1
+    """投资组合权重优化占位：当前返回等权配置；空 symbols 走 {ok:False} 信封。"""
+    # 中文：空组合 fail-closed——返回错位 weights=[1.0] 会破坏 tickers-vs-weights 对齐校验
+    if not symbols:
+        return {"weights": [], "ok": False, "method": method, "error": "symbols is empty"}
+    n = len(symbols)
     w = [1.0 / n] * n
     return {"weights": w, "ok": True, "method": method}

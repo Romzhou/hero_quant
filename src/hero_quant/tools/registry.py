@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Any
 import inspect
@@ -30,23 +31,17 @@ def _assert_schema(schema: Dict[str, Any], path: str = "$") -> None:
         props = schema.get("properties")
         if props is not None and not isinstance(props, dict):
             raise ValueError(f"{path}: properties must be dict")
-        if "additionalProperties" in schema and not isinstance(schema["additionalProperties"], bool):
-            raise ValueError(f"{path}: additionalProperties must be bool")
+        # 中文：additionalProperties 允许 bool 或 schema dict（合法 JSON Schema），否则拒收
+        if "additionalProperties" in schema and not isinstance(schema["additionalProperties"], (bool, dict)):
+            raise ValueError(f"{path}: additionalProperties must be bool or schema dict")
         if "required" in schema:
             if not isinstance(schema["required"], list):
                 raise ValueError(f"{path}: required must be list")
-            # required entries must be strings and exist in properties
+            # 中文：required 条目必须为字符串（类型校验）；存在性不做强制，避免误拒演进中的 schema
             for idx, req in enumerate(schema["required"]):
                 if not isinstance(req, str):
                     raise ValueError(f"{path}.required[{idx}]: must be string")
-                if isinstance(props, dict) and req not in props:
-                    # allow but warn via error: drift to runtime
-                    pass
             # ensure enum/additionalProperties schema etc if present are valid
-        if "required" in schema and isinstance(schema.get("required"), list):
-            for r in schema["required"]:
-                if not isinstance(r, str):
-                    raise ValueError(f"{path}: required entries must be strings")
         if isinstance(props, dict):
             for k, v in props.items():
                 _assert_schema(v, f"{path}.properties.{k}")
@@ -198,8 +193,9 @@ def tool(
             description=description,
             func=func,
             signature=inspect.signature(func),
-            parameters=parameters,
-            output=output_wrapped,
+            # 中文：存调用方 dict 的深拷贝，事后改原 dict 不得漂移已注册合约
+            parameters=copy.deepcopy(parameters),
+            output=copy.deepcopy(output_wrapped),
             is_concurrency_safe=safe_fn,
             timeoutMs=t_ms,
             presentAs=present_as,
@@ -225,7 +221,8 @@ def get_definitions(presentAs: str = "native") -> list[Dict[str, Any]]:
         items = sorted(TOOL_REGISTRY.items())
         defs: list[Dict[str, Any]] = []
         for tool_name, spec in items:
-            params = spec.parameters if spec.parameters is not None else {"type": "object", "properties": {}}
+            # 中文：深拷贝导出，调用方改返回体不得污染注册表共享状态
+            params = copy.deepcopy(spec.parameters) if spec.parameters is not None else {"type": "object", "properties": {}}
             func_def: Dict[str, Any] = {
                 "name": spec.name,
                 "description": spec.description,

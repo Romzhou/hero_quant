@@ -2,8 +2,8 @@
 
 位于 tools 层计算分支，通过 MarketDataRegistry 获取收盘价，优先调用
 Rust quantlib（sma/ema/rsi/bollinger/macd/max_drawdown），缺失时回退至
-pandas 实现；数据不可用时返回 20 点合成序列兜底。全部工具为只读计算，
-并发安全标记为 True。
+pandas 实现；数据不可用时 fail-closed 返回 ok:false（禁止合成序列冒充
+真实值）。全部工具为只读计算，并发安全标记为 True。
 """
 
 from __future__ import annotations
@@ -48,7 +48,7 @@ def _get_shared_registry():
         return _shared_registry
 
 
-def _fetch_closes(symbol: str, start: str = "2026-08-01", end: str = "2026-08-03", allow_synthetic: bool = False):
+def _fetch_closes(symbol: str, start: str = "2026-08-01", end: str = "2026-08-03"):
     """拉取收盘价序列，fail-closed：无有效收盘价时抛错，禁止合成 ok:true。"""
     try:
         reg = _get_shared_registry()
@@ -70,10 +70,11 @@ def _fetch_closes(symbol: str, start: str = "2026-08-01", end: str = "2026-08-03
         if closes:
             return closes
         logger.warning("no valid closes for %s", symbol)
-    except Exception as e:
+        # 中文：窄化捕获——仅包装底层拉取异常，其余逻辑错误直接抛便于 fail-fast
+    except (ImportError, RuntimeError, ValueError, TypeError, OSError, ConnectionError, TimeoutError) as e:
         logger.warning("fetch closes failed for %s: %s", symbol, e, exc_info=True)
         raise RuntimeError(f"no valid closes for {symbol}: {e}") from e
-    raise RuntimeError(f"no valid closes for {symbol} and allow_synthetic={allow_synthetic} (fail-closed)")
+    raise RuntimeError(f"no valid closes for {symbol} (fail-closed)")
 
 
 def _validate_window(window: Any, closes_len: int | None = None) -> int:
@@ -86,8 +87,8 @@ def _validate_window(window: Any, closes_len: int | None = None) -> int:
     if n > 500:
         raise ValueError(f"window must be <=500, got {n}")
     if closes_len is not None and closes_len > 0 and n > closes_len:
-        # cap to len to avoid waste but allow
-        pass
+        # 中文：超窗显式报错，不静默走 NaN 填充路径
+        raise ValueError(f"insufficient_data: window {n} exceeds available bars {closes_len}")
     return n
 
 
@@ -130,21 +131,31 @@ def compute_indicator(
     window: int = 20,
     start: str = "2026-08-01",
     end: str = "2026-08-20",
-    allow_synthetic: bool = False,
 ) -> Dict[str, Any]:
-    """计算技术指标（sma/ema/rsi/bollinger/macd/max_drawdown），quantlib 优先、pandas 兜底。"""
+    """计算技术指标（sma/ema/rsi/bollinger/macd/max_drawdown），quantlib 优先、pandas 兜底。
+
+    数据不足（bars < window）时 fail-closed 返回 {ok:False, error: insufficient...}，
+    前窗 NaN 以 None 透出，禁止填 0.0/50.0 冒充有效值。
+    """
     try:
-        closes = _fetch_closes(symbol, start, end, allow_synthetic=allow_synthetic)
-        s = pd.Series(closes, dtype=float)
         ind = (indicator or "sma").lower().strip()
         if ind not in SUPPORTED_INDICATORS:
             return {"values": [], "ok": False, "error": f"unsupported indicator: {ind}", "symbol": symbol, "indicator": indicator}
         try:
+            # 中文：纯参数先验（不依赖行情），fail-fast；超窗判定待拉取后用真实 bars 复核
+            n = _validate_window(window)
+        except ValueError as ve:
+            return {"values": [], "ok": False, "error": str(ve), "symbol": symbol, "indicator": indicator}
+        closes = _fetch_closes(symbol, start, end)
+        s = pd.Series(closes, dtype=float)
+        try:
+            # 中文：超窗在此直接抛 ValueError（insufficient_data），走下处信封返回，
+            # 不进入 NaN→0.0/50.0 填充路径
             n = _validate_window(window, len(s))
         except ValueError as ve:
             return {"values": [], "ok": False, "error": str(ve), "symbol": symbol, "indicator": indicator}
         # 优先使用 Rust quantlib，避免 Python 重复实现；缺失时走 pandas
-        values: list[float] = []
+        values: list = []
         try:
             from hero_quant.quantlib.indicators import sma, ema, rsi, bollinger, macd
         except (ImportError, ModuleNotFoundError) as e:
@@ -156,13 +167,15 @@ def compute_indicator(
                 res = sma(s, n)
             else:
                 res = s.rolling(n).mean()
-            values = [float(x) if pd.notna(x) else 0.0 for x in res.tolist()]
+            # 中文：前窗 NaN 以 None 透出，禁止填 0.0 冒充有效 SMA
+            values = [float(x) if pd.notna(x) else None for x in res.tolist()]
         elif ind == "ema":
             if ema is not None:
                 res = ema(s, n)
             else:
                 res = s.ewm(span=n, adjust=False).mean()
-            values = [float(x) for x in res.tolist()]
+            # 中文：ema 首值即有效（adjust=False 下首值=首价），仅透出真实 NaN
+            values = [float(x) if pd.notna(x) else None for x in res.tolist()]
         elif ind == "rsi":
             if rsi is not None:
                 res = rsi(s, n if n else 14)
@@ -174,30 +187,33 @@ def compute_indicator(
                 avg_loss = loss.ewm(alpha=1 / n, adjust=False, min_periods=1).mean()
                 rs = avg_gain / avg_loss.replace(0, 1e-9)
                 res = 100 - (100 / (1 + rs))
-                res = res.fillna(50.0)
-            values = [float(x) if pd.notna(x) else 50.0 for x in res.tolist()]
+                # 中文：全平序列等退化情形 res 全 NaN，以 None 透出不填 50.0 伪装中性
+                res = res.where(pd.notna(res), None)
+            values = [float(x) if pd.notna(x) else None for x in res.tolist()]
         elif ind in ("bollinger", "bb", "boll"):
             if bollinger is not None:
                 mid, upper, lower = bollinger(s, n)
-                mid_l = [float(x) if pd.notna(x) else 0.0 for x in mid.tolist()]
-                upper_l = [float(x) if pd.notna(x) else 0.0 for x in upper.tolist()]
-                lower_l = [float(x) if pd.notna(x) else 0.0 for x in lower.tolist()]
+                # 中文：前窗 NaN 以 None 透出，禁止填 0.0 伪装布林带
+                mid_l = [float(x) if pd.notna(x) else None for x in mid.tolist()]
+                upper_l = [float(x) if pd.notna(x) else None for x in upper.tolist()]
+                lower_l = [float(x) if pd.notna(x) else None for x in lower.tolist()]
                 return {"values": mid_l, "upper": upper_l, "lower": lower_l, "ok": True, "symbol": symbol, "indicator": indicator}
             else:
                 mid = s.rolling(n).mean()
                 std = s.rolling(n).std()
                 upper_s = mid + 2 * std
                 lower_s = mid - 2 * std
-                mid_l = [float(x) if pd.notna(x) else 0.0 for x in mid.tolist()]
-                upper_l = [float(x) if pd.notna(x) else 0.0 for x in upper_s.tolist()]
-                lower_l = [float(x) if pd.notna(x) else 0.0 for x in lower_s.tolist()]
+                mid_l = [float(x) if pd.notna(x) else None for x in mid.tolist()]
+                upper_l = [float(x) if pd.notna(x) else None for x in upper_s.tolist()]
+                lower_l = [float(x) if pd.notna(x) else None for x in lower_s.tolist()]
                 return {"values": mid_l, "upper": upper_l, "lower": lower_l, "ok": True, "symbol": symbol, "indicator": indicator}
         elif ind in ("macd",):
             if macd is not None:
                 m_line, sig, hist = macd(s)
-                m_l = [float(x) if pd.notna(x) else 0.0 for x in m_line.tolist()]
-                sig_l = [float(x) if pd.notna(x) else 0.0 for x in sig.tolist()]
-                hist_l = [float(x) if pd.notna(x) else 0.0 for x in hist.tolist()]
+                # 中文：MACD 前段 NaN 以 None 透出，禁止填 0.0 伪装零轴
+                m_l = [float(x) if pd.notna(x) else None for x in m_line.tolist()]
+                sig_l = [float(x) if pd.notna(x) else None for x in sig.tolist()]
+                hist_l = [float(x) if pd.notna(x) else None for x in hist.tolist()]
                 return {"values": m_l, "signal": sig_l, "hist": hist_l, "ok": True, "symbol": symbol, "indicator": indicator}
             else:
                 ef = s.ewm(span=12, adjust=False).mean()
@@ -205,9 +221,9 @@ def compute_indicator(
                 m_line = ef - es
                 sig = m_line.ewm(span=9, adjust=False).mean()
                 hist = m_line - sig
-                m_l = [float(x) if pd.notna(x) else 0.0 for x in m_line.tolist()]
-                sig_l = [float(x) if pd.notna(x) else 0.0 for x in sig.tolist()]
-                hist_l = [float(x) if pd.notna(x) else 0.0 for x in hist.tolist()]
+                m_l = [float(x) if pd.notna(x) else None for x in m_line.tolist()]
+                sig_l = [float(x) if pd.notna(x) else None for x in sig.tolist()]
+                hist_l = [float(x) if pd.notna(x) else None for x in hist.tolist()]
                 return {"values": m_l, "signal": sig_l, "hist": hist_l, "ok": True, "symbol": symbol, "indicator": indicator}
         elif ind in ("max_drawdown", "mdd", "drawdown"):
             try:
@@ -327,8 +343,18 @@ SUPPORTED_FACTORS = {"momentum", "mom"}
     },
     is_concurrency_safe=lambda args: True,
 )
-def compute_factor(factor: str, symbol: str = "600519.SH", window: int = 20) -> Dict[str, Any]:
-    """计算因子值；当前仅实现 momentum（N 日收益率），其余返回空占位。"""
+def compute_factor(
+    factor: str,
+    symbol: str = "600519.SH",
+    window: int = 20,
+    start: str = "2026-08-01",
+    end: str = "2026-08-20",
+) -> Dict[str, Any]:
+    """计算因子值；当前仅实现 momentum（N 日收益率），其余返回空占位。
+
+    动量需要 window+1 根 bars（shift(n) 首 n 个为 NaN 透出）；bars<=window
+    时 fail-closed 返回 {ok:False}，禁止全零 ok:true 冒充。
+    """
     try:
         f = (factor or "").lower().strip()
         if f not in SUPPORTED_FACTORS:
@@ -337,12 +363,16 @@ def compute_factor(factor: str, symbol: str = "600519.SH", window: int = 20) -> 
             n = _validate_window(window)
         except ValueError as ve:
             return {"values": [], "ok": False, "error": str(ve), "factor": factor}
-        closes = _fetch_closes(symbol)
+        closes = _fetch_closes(symbol, start, end)
         s = pd.Series(closes, dtype=float)
         if f in ("momentum", "mom"):
-            # momentum = price / price.shift(n) -1
-            vals = (s / s.shift(n) - 1).fillna(0.0).tolist()
-            return {"values": [float(x) for x in vals], "ok": True, "factor": factor}
+            # 中文：bars<=window 时 shift(n) 全 NaN，直接报 insufficient，不 fillna(0.0) 伪造全零动量
+            if len(s) <= n:
+                return {"values": [], "ok": False, "error": f"insufficient_data: bars {len(s)} <= window {n}", "factor": factor}
+            # momentum = price / price.shift(n) -1；首 n 个 NaN 以 None 透出
+            raw = (s / s.shift(n) - 1).tolist()
+            vals = [float(x) if pd.notna(x) else None for x in raw]
+            return {"values": vals, "ok": True, "factor": factor}
         return {"values": [], "ok": False, "error": f"unsupported factor: {factor}", "factor": factor}
     except Exception as e:
         logger.warning("compute_factor failed for %s: %s", factor, e, exc_info=True)
