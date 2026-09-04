@@ -115,12 +115,8 @@ def compute_record_hash(
     seq: int, prev_record_hash: str, payload: Mapping[str, Any], *, tenant: str = "default", price: float | None = None
 ) -> str:
     """计算全局链参考 hash（seq+prev+payload 的 canonical JSON），与租户业务链 hash 算法区分。"""
-    # 新写入一律走全字段 envelope（含 tenant/price 默认值），保持跨租户一致；校验时仍双试兼容历史
-    if price is not None or tenant != "default":
-        hex_part = _tenant_payload_hash(seq, prev_record_hash, payload, tenant=tenant, price=price)
-    else:
-        # 默认租户也走 envelope，避免旧式 legacy 分叉；校验双试保证历史兼容
-        hex_part = _tenant_payload_hash(seq, prev_record_hash, payload, tenant=tenant, price=price)
+    # 中文：新写入一律走全字段 envelope（含 tenant/price 默认值），单路径无分支
+    hex_part = _tenant_payload_hash(seq, prev_record_hash, payload, tenant=tenant, price=price)
     return f"sha256:{hex_part}"
 
 
@@ -192,6 +188,11 @@ def _lock_exclusive(handle: BinaryIO) -> None:
             lock_len = size if size > 0 else 1
             # Windows 锁全文件（从 0 开始锁整个范围）
             msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, lock_len)
+            # 中文：记住加锁长度，解锁必须用同一区域（文件在锁内变大后重算会 mismatch）
+            try:
+                handle._ledger_lock_len = lock_len  # type: ignore[attr-defined]
+            except Exception:
+                pass
         except OSError as exc:
             logger.warning("ledger lock failed on %s (%s)", handle, exc)
             raise
@@ -215,6 +216,10 @@ def _lock_shared(handle: BinaryIO) -> None:
             handle.seek(0)
             lock_len = size if size > 0 else 1
             msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, lock_len)
+            try:
+                handle._ledger_lock_len = lock_len  # type: ignore[attr-defined]
+            except Exception:
+                pass
         except OSError as exc:
             logger.warning("ledger shared lock failed on %s (%s)", handle, exc)
             raise
@@ -231,11 +236,20 @@ def _unlock(handle: BinaryIO) -> None:
         return
     if msvcrt is not None:  # pragma: no cover
         try:
-            handle.seek(0, os.SEEK_END)
-            size = handle.tell()
-            handle.seek(0)
-            if size > 0:
-                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, size)
+            # 中文：优先用加锁时记录的长度；回退重算（只读路径未改文件时一致）
+            lock_len = getattr(handle, "_ledger_lock_len", None)
+            if lock_len is None:
+                handle.seek(0, os.SEEK_END)
+                size = handle.tell()
+                handle.seek(0)
+                lock_len = size if size > 0 else 1
+            else:
+                try:
+                    handle.seek(0)
+                except Exception:
+                    pass
+            if lock_len > 0:
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, lock_len)
             else:
                 # 空文件解锁 1 字节，与加锁对应
                 try:
@@ -285,27 +299,8 @@ def rotate_if_needed(path: Path, max_bytes: int = DEFAULT_ROTATE_BYTES, *, fsync
         raise ValueError(f"max_bytes must be positive, got {max_bytes}")
     if not path.exists() or path.stat().st_size < max_bytes:
         return None
-    # 轮转前校验，避免固化已损坏历史 — 加共享锁防 TOCTOU，锁失败则中止轮转（fail-closed）
+    # 轮转前校验，避免固化已损坏历史 — 在排他锁内 verify，消除预检与归档间 TOCTOU
     tmp = Ledger(path)
-    if path.exists():
-        try:
-            with open(path, "rb") as h:
-                _lock_shared(h)
-                try:
-                    pass
-                finally:
-                    try:
-                        _unlock(h)
-                    except Exception:
-                        pass
-        except Exception as e:
-            raise LedgerCorruptionError(ChainBreak(0, None, "lock_failed", f"rotate lock_shared failed: {e}")) from e
-    if not tmp.verify():
-        entries = tmp._read_all()
-        for idx, e in enumerate(entries):
-            if "_raw" in e:
-                raise LedgerCorruptionError(ChainBreak(idx, None, "malformed_json", str(e.get("_raw"))))
-        raise LedgerCorruptionError(ChainBreak(0, None, "prev_hash_mismatch", "ledger corrupted, cannot rotate"))
     # 轮转：先校验，再用文件锁保护读-校验-归档临界区；Windows 上 rename 需在锁释放并关闭句柄后执行
     archive = None
     _locked_h = None
@@ -316,8 +311,45 @@ def rotate_if_needed(path: Path, max_bytes: int = DEFAULT_ROTATE_BYTES, *, fsync
         try:
             _lock_exclusive(_locked_h)
             _locked = True
-        except Exception:
-            pass
+        except Exception as exc:
+            # 中文：独占锁失败必须 fail-closed，不可无锁裸奔（TOCTOU/分叉）
+            try:
+                _locked_h.close()
+            except Exception:
+                pass
+            _locked_h = None
+            raise LedgerCorruptionError(ChainBreak(0, None, "lock_failed", f"rotate lock_exclusive failed: {exc}")) from exc
+        # 中文：verify 收拢进排他锁后、rename 前，消除空临界区 TOCTOU。
+        # Windows msvcrt 是强制锁：锁区内另开句柄读写会被系统拒绝，
+        # 故复用已加锁句柄读（同 append 路径），不用 tmp.verify() 另开句柄。
+        _locked_h.seek(0)
+        _rot_raw = _locked_h.read()
+        try:
+            _rot_text = _rot_raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise LedgerCorruptionError(ChainBreak(0, None, "malformed_json", f"decode_error: {exc}")) from exc
+        _rot_entries: list[dict[str, Any]] = []
+        for _line in _rot_text.splitlines():
+            _s = _line.strip()
+            if not _s:
+                continue
+            try:
+                _rot_entries.append(json.loads(_s))
+            except json.JSONDecodeError:
+                _rot_entries.append({"_raw": _s})
+        _rot_ok, _rot_brk = tmp._verify_entries(_rot_entries)
+        if not _rot_ok:
+            for _idx, _e in enumerate(_rot_entries):
+                if "_raw" in _e:
+                    raise LedgerCorruptionError(ChainBreak(_idx, None, "malformed_json", str(_e.get("_raw"))))
+            raise LedgerCorruptionError(
+                ChainBreak(
+                    _rot_brk.index if _rot_brk else 0,
+                    _rot_brk.seq if _rot_brk else None,
+                    _rot_brk.reason if _rot_brk else "prev_hash_mismatch",
+                    _rot_brk.detail if _rot_brk else "ledger corrupted, cannot rotate",
+                )
+            )
         try:
             try:
                 if path.stat().st_size < max_bytes:
@@ -550,6 +582,8 @@ def verify_export(export: Mapping[str, Any] | str | Path) -> ChainVerificationRe
     else:
         data = export
     records = list(data.get("records", []))
+    # 中文：全局位置索引（enumerate），不用 list.index（重复记录错位）
+    pos_by_id = {id(r): i for i, r in enumerate(records)}
     envelope = {"format": data.get("format", EXPORT_FORMAT), "source_path": data.get("source_path", ""), "records": records}
     expected = f"sha256:{_sha256_hex(_canonical_json(envelope))}"
     if expected != data.get("export_hash"):
@@ -558,7 +592,7 @@ def verify_export(export: Mapping[str, Any] | str | Path) -> ChainVerificationRe
     groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for r in records:
         if "_raw" in r:
-            return ChainVerificationResult(ok=False, record_count=len(records), first_break=ChainBreak(index=records.index(r), seq=None, reason="malformed_json", detail=str(r.get("_raw"))))
+            return ChainVerificationResult(ok=False, record_count=len(records), first_break=ChainBreak(index=pos_by_id.get(id(r), 0), seq=None, reason="malformed_json", detail=str(r.get("_raw"))))
         groups[r.get("tenant", "default")].append(r)
     for t, grp in groups.items():
         grp_sorted = sorted(grp, key=lambda x: x.get("tenant_seq", x.get("seq", 0)))
@@ -706,8 +740,12 @@ class Ledger:
                 logger.warning("silent handled: governance: ledger fsync/lock best-effort, durability degraded but not silent", exc_info=_exc)  # intentional: governance: ledger fsync/lock best-effort, durability degraded but not silent
                 pass  # intentional governance: ledger fsync/lock best-effort, durability degraded but not silent
 
-    def _read_all(self):
-        """逐行读取 JSONL，errors='strict' 且 NUL 视为 corruption — 加共享锁防 TOCTOU。"""
+    def _read_all(self, *, lock: bool = True):
+        """逐行读取 JSONL，errors='strict' 且 NUL 视为 corruption — 加共享锁防 TOCTOU。
+
+        lock=False 跳过加锁，仅供外层已持排他锁的调用方（如 rotate 内 verify）使用，
+        避免 Windows msvcrt 同进程嵌套加锁自死锁。
+        """
         if not self.path.exists():
             return []
         entries = []
@@ -715,15 +753,18 @@ class Ledger:
         raw: bytes | None = None
         try:
             with open(self.path, "rb") as h:
-                try:
-                    _lock_shared(h)
-                    h.seek(0)
-                    raw = h.read()
-                finally:
+                if lock:
                     try:
-                        _unlock(h)
-                    except Exception:
-                        pass
+                        _lock_shared(h)
+                        h.seek(0)
+                        raw = h.read()
+                    finally:
+                        try:
+                            _unlock(h)
+                        except Exception:
+                            pass
+                else:
+                    raw = h.read()
             text = raw.decode("utf-8")  # strict  # type: ignore[union-attr]
         except FileNotFoundError:
             return []
@@ -767,12 +808,15 @@ class Ledger:
         """O(n) 全链校验：全局 seq 连续 + 每租户 prev_hash/record_hash 链。增量优化：按租户分组后顺序校验，尾部缓存（_tail_verify_cache）可用于下次增量校验。"""
         for e in entries:
             if "_raw" in e:
-                idx = entries.index(e)
+                # 中文：用全局下标（enumerate），不用 list.index（O(n²)+重复行错位）
+                idx = next(i for i, x in enumerate(entries) if x is e)
                 return False, ChainBreak(idx, None, "malformed_json", str(e.get("_raw")))
         # 全局 seq 单调连续校验
         for idx, entry in enumerate(entries, start=1):
             if entry.get("seq") != idx:
                 return False, ChainBreak(idx-1, entry.get("seq"), "seq_gap", f"expected seq={idx} found {entry.get('seq')!r}")
+        # 中文：全局下标索引，供租户分组校验映射回全局位置
+        pos_by_id = {id(e): i for i, e in enumerate(entries)}
         groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for e in entries:
             groups[e.get("tenant", "default")].append(e)
@@ -783,17 +827,19 @@ class Ledger:
                 group_sorted = sorted(group, key=lambda x: x.get("tenant_seq", 0))
             prev = GENESIS_PREV_HASH
             for idx, entry in enumerate(group_sorted, start=1):
+                # 中文：断裂上报全局下标（pos_by_id），不用租户内序号
+                gidx = pos_by_id.get(id(entry), idx - 1)
                 ts = entry.get("tenant_seq")
                 eff = ts if ts is not None else idx
                 if ts is not None and ts != idx:
-                    return False, ChainBreak(idx-1, ts, "seq_gap", f"tenant {t} expected tenant_seq={idx} got {ts!r}")
+                    return False, ChainBreak(gidx, ts, "seq_gap", f"tenant {t} expected tenant_seq={idx} got {ts!r}")
                 ph = entry.get("prev_hash")
                 # 首条允许 GENESIS 与 legacy 0*64 等价
                 if ph != prev and not (_is_genesis(ph) and _is_genesis(prev) and idx == 1):
-                    return False, ChainBreak(idx-1, eff, "prev_hash_mismatch", f"expected {prev!r} got {ph!r}")
+                    return False, ChainBreak(gidx, eff, "prev_hash_mismatch", f"expected {prev!r} got {ph!r}")
                 record = entry.get("record")
                 if record is None:
-                    return False, ChainBreak(idx-1, eff, "missing_chain_fields", "missing record")
+                    return False, ChainBreak(gidx, eff, "missing_chain_fields", "missing record")
                 # 哈希校验：优先全字段（tenant/price），回退旧式以兼容存量
                 tenant_v = entry.get("tenant", "default")
                 price_v = entry.get("price")
@@ -810,7 +856,7 @@ class Ledger:
                         if stored in (alt_new_hex, alt_new_pref, alt_leg_hex, alt_leg_pref):
                             prev = entry.get("record_hash")
                             continue
-                    return False, ChainBreak(idx-1, eff, "record_hash_mismatch", f"stored {stored!r} recomputed {new_hex!r}")
+                    return False, ChainBreak(gidx, eff, "record_hash_mismatch", f"stored {stored!r} recomputed {new_hex!r}")
                 prev = entry.get("record_hash")
         return True, None
 
@@ -875,28 +921,30 @@ class Ledger:
                         entries.append(json.loads(s))
                     except json.JSONDecodeError:
                         entries.append({"_raw": s})
-                # 追加前校验，断链则拒绝写入 —— PR2-E 批量增量校验：
-                # 1) 缓存命中（count/mtime/size/tail 一致）+ O(1) 尾自检通过 → 跳过全扫；
+                # 追加前校验，断链则拒绝写入 —— PR2-E 批量增量校验（A2b 加固版）：
+                # 1) 缓存命中（count/tail/内容hash一致）+ O(1) 尾自检通过 → 跳过全扫；
+                #    短路条件用 sha256(raw_bytes) 内容哈希，不用 mtime/size（外部可伪造）；
                 # 2) 未命中但 count 未回退，且缓存锚点 tail 与新增段起点 prev 连续 → 仅校验新增段 O(k)；
-                # 3) 否则（无缓存/收缩/锚点断裂）→ 回落 O(n) 全扫。_tail_verify_cache 语义保留并扩展 tenants 快照。
+                # 3) 否则（无缓存/收缩/锚点断裂/内容hash不符）→ 回落 O(n) 全扫。
                 _cache_key = str(self.path)
                 _cached = _tail_verify_cache.get(_cache_key)
                 _new_tenants: dict[str, list] | None = None
                 if _cached is not None and len(_cached) == 4:
-                    # 兼容旧版 4 元缓存：补算 tenants 快照后升级
-                    _cm0, _cs0, _cc0, _ct0 = _cached
-                    _cached = (_cm0, _cs0, _cc0, _ct0, {})
+                    # 兼容旧版 4 元缓存：无内容哈希，不可信 → 视为未命中（全扫重建）
+                    _cached = None
+                if _cached is not None and len(_cached) == 5 and not isinstance(_cached[0], str):
+                    # 兼容 5 元旧缓存（mtime,size,count,tail,tenants）：无内容哈希 → 未命中
+                    _cached = None
                 if _cached is not None:
                     try:
-                        _cur_mtime = self.path.stat().st_mtime if self.path.exists() else 0.0
-                        _cur_size = len(raw_bytes)
-                        _cm, _cs, _cc, _ct, _ctenants = _cached
+                        import hashlib as _hl
+
+                        _cur_content = _hl.sha256(raw_bytes).hexdigest()
+                        _ch, _cc, _ct, _ctenants = _cached[0], _cached[2], _cached[3], _cached[4]
                         _cur_tail = entries[-1].get("record_hash", "") if entries else GENESIS_PREV_HASH
-                        if _cc > 0 and not _ctenants:
-                            # 旧版 4 元缓存无 tenants 快照，无法做可信增量 → 全扫并重建快照
-                            ok, brk = self._verify_entries(entries)
-                        elif _cc == len(entries) and _ct == _cur_tail and _cm == _cur_mtime and _cs == _cur_size:
-                            # 命中后仍做 O(1) 尾自检：防“同长篡改尾 payload + 伪造 mtime”绕过四元组
+                        if _cc == len(entries) and _ct == _cur_tail and _ch == _cur_content:
+                            # 中文：内容哈希一致证明文件逐字节未变，短路可信；
+                            # 仍做 O(1) 尾自检防缓存本身被污染
                             if not entries or _tail_self_check(entries[-1]):
                                 ok, brk = True, None
                                 _new_tenants = {t: [c, h] for t, (c, h) in _ctenants.items()}
@@ -946,15 +994,18 @@ class Ledger:
                         ok, brk = self._verify_entries(entries)
                 else:
                     ok, brk = self._verify_entries(entries)
-                # 校验通过后更新缓存（含 tenants 快照；增量分支复用后缀校验结果，全扫分支重算快照）
+                # 校验通过后更新缓存（内容哈希, size, count, tail, tenants 快照；
+                # 增量分支复用后缀校验结果，全扫分支重算快照）
                 if ok:
                     try:
-                        _n_mtime = self.path.stat().st_mtime if self.path.exists() else 0.0
+                        import hashlib as _hl2
+
+                        _n_content = _hl2.sha256(raw_bytes).hexdigest()
                         _n_size = len(raw_bytes)
                         _n_tail = entries[-1].get("record_hash", "") if entries else GENESIS_PREV_HASH
                         if _new_tenants is None:
                             _new_tenants = _tenant_tail_snapshot(entries)
-                        _tail_verify_cache[_cache_key] = (_n_mtime, _n_size, len(entries), _n_tail, _new_tenants)
+                        _tail_verify_cache[_cache_key] = (_n_content, _n_size, len(entries), _n_tail, _new_tenants)
                     except Exception:
                         pass
                 if not ok:
@@ -978,8 +1029,10 @@ class Ledger:
                     os.fsync(handle.fileno())
                 except OSError as exc:
                     _warn_fsync_failure(exc, self.path)
-                # 追加成功后刷新 tail 缓存，供下次增量短路（记录新计数值、尾 hash 与 tenants 快照）
+                # 追加成功后刷新 tail 缓存，供下次增量短路（记录内容哈希、新计数值、尾 hash 与 tenants 快照）
                 try:
+                    import hashlib as _hl3
+
                     # handle 已写入新行，entries 长度为旧长度，追加后 count+1，tail 为新 record_hash
                     _post_tenants = {t: [c, h] for t, (c, h) in (_new_tenants or {}).items()}
                     _slot = _post_tenants.get(tenant)
@@ -988,7 +1041,9 @@ class Ledger:
                     else:
                         _slot[0] += 1
                         _slot[1] = record_hash
-                    _tail_verify_cache[str(self.path)] = (self.path.stat().st_mtime if self.path.exists() else 0.0, int(self.path.stat().st_size) if self.path.exists() else len(raw_bytes) + len(line), len(entries) + 1, record_hash, _post_tenants)
+                    handle.seek(0)
+                    _post_content = _hl3.sha256(handle.read()).hexdigest()
+                    _tail_verify_cache[str(self.path)] = (_post_content, len(raw_bytes) + len(line), len(entries) + 1, record_hash, _post_tenants)
                 except Exception:
                     pass
                 # 保持 fsync 原子性：文件 fsync 仍在锁内，目录 fsync 移至解锁后
@@ -1055,9 +1110,12 @@ class Ledger:
         import copy
         return copy.deepcopy(obj)
 
-    def verify(self, tenant: str | None = None) -> bool:
-        """校验链完整性；指定 tenant 时仅校验该租户子链。共享锁读防 TOCTOU。"""
-        entries = self._read_all()
+    def verify(self, tenant: str | None = None, *, lock: bool = True) -> bool:
+        """校验链完整性；指定 tenant 时仅校验该租户子链。共享锁读防 TOCTOU。
+
+        lock=False 跳过读锁，仅供外层已持排他锁时使用（rotate 内 verify）。
+        """
+        entries = self._read_all(lock=lock)
         for e in entries:
             if "_raw" in e:
                 return False

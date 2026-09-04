@@ -233,6 +233,7 @@ class DedupStore:
     def _pg_setup_sync(self) -> None:
         if not self._is_pg or self.pool is None or _is_async_pool(self.pool):
             return
+        # 中文：RLS/DDL 是租户隔离根基，失败必须 loud（fail-closed），不可吞
         try:
             if hasattr(self.pool, "connection"):
                 with self.pool.connection() as conn:  # type: ignore
@@ -244,45 +245,36 @@ class DedupStore:
                     try:
                         conn.execute(DDL_TOOL_CALL_PG)  # type: ignore
                     except Exception:
-                        try:
-                            with conn.cursor() as cur:  # type: ignore
-                                cur.execute(DDL_TOOL_CALL_PG)
-                        except Exception:
-                            pass
+                        with conn.cursor() as cur:  # type: ignore
+                            cur.execute(DDL_TOOL_CALL_PG)
                     # DB-level RLS true policy
                     try:
                         conn.execute(DDL_RLS_PG)  # type: ignore
                     except Exception:
-                        try:
-                            with conn.cursor() as cur:  # type: ignore
-                                cur.execute(DDL_RLS_PG)
-                        except Exception:
-                            pass
+                        with conn.cursor() as cur:  # type: ignore
+                            cur.execute(DDL_RLS_PG)
                     try:
                         conn.commit()  # type: ignore
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        logger.warning("dedup DDL commit failed: %s", exc, exc_info=True)
+                        raise
             elif hasattr(self.pool, "getconn"):
                 conn = self.pool.getconn()  # type: ignore
                 try:
                     with conn.cursor() as cur:
                         cur.execute(DDL_DEDUP_PG)
-                        try:
-                            cur.execute(DDL_TOOL_CALL_PG)
-                        except Exception:
-                            pass
-                        try:
-                            cur.execute(DDL_RLS_PG)
-                        except Exception:
-                            pass
+                        cur.execute(DDL_TOOL_CALL_PG)
+                        cur.execute(DDL_RLS_PG)
                     conn.commit()
                 finally:
                     try:
                         self.pool.putconn(conn)  # type: ignore
-                    except Exception:
-                        pass
-        except Exception:
-            pass
+                    except Exception as exc:
+                        logger.warning("dedup putconn failed: %s", exc, exc_info=True)
+        except Exception as exc:
+            # 中文：隔离根基失败必须 loud，不可吞（fail-closed）
+            logger.warning("dedup PG setup failed: %s", exc, exc_info=True)
+            raise
 
     async def _pg_setup_async(self) -> None:
         if not self._is_pg or self.pool is None:
@@ -584,7 +576,17 @@ class DedupStore:
         if not self._is_pg or self.pool is None or _is_async_pool(self.pool):
             return False
         try:
-            result_json = json.dumps(result, ensure_ascii=False) if result is not None and not isinstance(result, str) else result
+            # 中文：纯 str 结果必须编码为 JSON 字符串再 ::jsonb，否则 PG 报 invalid input syntax
+            if result is not None and isinstance(result, str):
+                try:
+                    json.loads(result)
+                    result_json = result
+                except (ValueError, TypeError):
+                    result_json = json.dumps(result, ensure_ascii=False)
+            elif result is not None:
+                result_json = json.dumps(result, ensure_ascii=False)
+            else:
+                result_json = None
             error_str = str(error) if error is not None else None
             sql = """
                 UPDATE dedup SET status=%s, result=%s::jsonb, updated_at=now() WHERE key=%s
@@ -603,7 +605,9 @@ class DedupStore:
                         rc = getattr(cur, "rowcount", 0)
                         if rc == 0:
                             # upsert fallback trying to get tool from mem or unknown
-                            tool = self._mem.get(key, {}).get("tool", "unknown")
+                            # 中文：读 _mem 必须持锁（与写路径对称）
+                            with self._lock:
+                                tool = self._mem.get(key, {}).get("tool", "unknown")
                             conn.execute(sql_insert, (key, tool, status, result_json))  # type: ignore
                         # also update alias table best-effort
                         try:
@@ -615,7 +619,8 @@ class DedupStore:
                             cur2.execute(sql, (status, result_json, key))
                             rc = getattr(cur2, "rowcount", 0)
                             if rc == 0:
-                                tool = self._mem.get(key, {}).get("tool", "unknown")
+                                with self._lock:
+                                    tool = self._mem.get(key, {}).get("tool", "unknown")
                                 cur2.execute(sql_insert, (key, tool, status, result_json))
                     try:
                         conn.commit()  # type: ignore
@@ -629,7 +634,8 @@ class DedupStore:
                         cur.execute(sql, (status, result_json, key))
                         rc = getattr(cur, "rowcount", 0)
                         if rc == 0:
-                            tool = self._mem.get(key, {}).get("tool", "unknown")
+                            with self._lock:
+                                tool = self._mem.get(key, {}).get("tool", "unknown")
                             cur.execute(sql_insert, (key, tool, status, result_json))
                     conn.commit()
                 finally:
@@ -687,14 +693,13 @@ class DedupStore:
                     try:
                         con.execute("BEGIN IMMEDIATE")
                     except Exception as e:
-                        # 不再静默吞掉：记录并在 busy 时回退重试，避免并发丢失
-                        logger.debug("dedup BEGIN IMMEDIATE failed: %s", e)
-                        # 若已在事务中则继续，否则抛出以便回退到内存路径
+                        # 中文：BEGIN 失败意味着无事务保护，不可无原子性继续（fail-closed）
+                        logger.warning("dedup BEGIN IMMEDIATE failed: %s", e, exc_info=True)
                         try:
-                            con.execute("ROLLBACK")
-                            con.execute("BEGIN IMMEDIATE")
-                        except Exception as e2:
-                            logger.warning("dedup BEGIN IMMEDIATE retry failed: %s", e2)
+                            con.close()
+                        except Exception:
+                            pass
+                        raise
                     # TTL-aware: delete expired row first within same txn
                     if self.ttl_seconds > 0:
                         try:
@@ -935,18 +940,18 @@ class DedupStore:
             _dedup_observe("wait_for", _start, _status)
 
     async def wait_for_async(self, key: str, timeout: float = 5.0) -> dict[str, Any] | None:
-        """异步轮询等待终态 — 使用 await asyncio.sleep 避免阻塞事件循环。"""
+        """异步轮询等待终态 — 经 to_thread 卸载同步 get，避免阻塞事件循环。"""
         _start = time.monotonic()
         _status = "success"
         try:
             deadline = time.monotonic() + timeout
             while time.monotonic() < deadline:
-                # get 是同步但无 IO 阻塞，仍可直接调用
-                rec = self.get(key)
+                # 中文：get 内部含锁与 SQLite IO，必须经 to_thread 卸载，不可直调阻塞 loop
+                rec = await asyncio.to_thread(self.get, key)
                 if rec is not None and rec.get("status") in ("SUCCESS", "FAILED"):
                     return rec
                 await asyncio.sleep(0.05)
-            return self.get(key)
+            return await asyncio.to_thread(self.get, key)
         except Exception:
             _status = "error"
             raise
