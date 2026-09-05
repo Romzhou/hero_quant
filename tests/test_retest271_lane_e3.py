@@ -546,3 +546,20 @@ def test_e3_presentation_multiline_description_commented():
     for ln in lines[1:]:
         assert ln.startswith("#"), f"uncommented overflow line: {ln!r}"
     assert "line two" in out and "line four" in out
+
+
+def test_e3_llm_stream_no_timeout_backend_single_execution():
+    """[bug·high] stream_chat to a no-timeout backend must execute the RPC exactly once."""
+    from hero_quant.llm.client import LLMClient
+
+    calls = []
+
+    class NoTimeoutStream:
+        def stream_chat(self, prompt):
+            calls.append(1)
+            yield "ok"
+
+    c = LLMClient(NoTimeoutStream(), timeout=7, max_retries=0)
+    chunks = list(c.stream_chat("hi"))
+    assert chunks == ["ok"]
+    assert len(calls) == 1, f"non-idempotent stream RPC must execute once, got {len(calls)}"

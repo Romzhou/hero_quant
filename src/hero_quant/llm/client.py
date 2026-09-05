@@ -68,32 +68,36 @@ class LLMClient:
         self.usage = None
         self.last_usage = None
 
+    @staticmethod
+    def _call_with_optional_timeout(fn, prompt: str, t: int | None):
+        """Single-execution call with timeout iff the callee signature supports it.
+
+        中文：先签名探测再单次调用，非幂等 RPC 绝不重发。探测称支持但调用仍
+        except TypeError（签名撒谎的 C 扩展等极端情形）时直接带因透出，不再
+        回退重调。
+        """
+        if not LLMClient._accepts_timeout(fn):
+            # 中文：后端不支持 timeout 形参时直接用无超时调用（签名已探测，不再试探重发）
+            return fn(prompt)  # type: ignore[call-arg]
+        try:
+            return fn(prompt, timeout=t)  # type: ignore[call-arg]
+        except TypeError as e:
+            raise TypeError(
+                f"{getattr(fn, '__name__', fn)!r} rejected timeout kwarg despite signature probe; "
+                "not retrying to avoid double-executing non-idempotent RPC"
+            ) from e
+
     def _stream_with_chat(self, prompt: str, t: int | None):
         """Internal: yield from underlying chat, handling both stream_chat and LangChain stream conventions."""
         # Priority 1: legacy stream_chat (custom adapters)
         fn = getattr(self._chat, "stream_chat", None)
         if callable(fn):
-            if self._accepts_timeout(fn):
-                gen = fn(prompt, timeout=t)  # type: ignore[call-arg]
-            else:
-                try:
-                    gen = fn(prompt, timeout=t)  # type: ignore[call-arg]
-                except TypeError:
-                    # 中文：后端不支持 timeout 形参时回退为无超时调用（已尝试透传，降级可接受）
-                    gen = fn(prompt)  # type: ignore[call-arg]
-            yield from gen
+            yield from self._call_with_optional_timeout(fn, prompt, t)
             return
         # Priority 2: LangChain Runnable .stream(prompt) -> yields content chunks
         fn = getattr(self._chat, "stream", None)
         if callable(fn):
-            if self._accepts_timeout(fn):
-                iterator = fn(prompt, timeout=t)  # type: ignore[call-arg]
-            else:
-                try:
-                    iterator = fn(prompt, timeout=t)  # type: ignore[call-arg]
-                except TypeError:
-                    # 中文：后端不支持 timeout 形参时回退为无超时调用（已尝试透传，降级可接受）
-                    iterator = fn(prompt)  # type: ignore[call-arg]
+            iterator = self._call_with_optional_timeout(fn, prompt, t)
             for chunk in iterator:  # type: ignore[call-arg]
                 # Normalize LangChain AIMessageChunk to text dict for loop compatibility
                 if isinstance(chunk, str):
@@ -117,14 +121,7 @@ class LLMClient:
         # Priority 3: .invoke fallback streamed as single chunk
         fn = getattr(self._chat, "invoke", None)
         if callable(fn):
-            if self._accepts_timeout(fn):
-                res = fn(prompt, timeout=t)  # type: ignore[call-arg]
-            else:
-                try:
-                    res = fn(prompt, timeout=t)  # type: ignore[call-arg]
-                except TypeError:
-                    # 中文：后端不支持 timeout 形参时回退为无超时调用（已尝试透传，降级可接受）
-                    res = fn(prompt)  # type: ignore[call-arg]
+            res = self._call_with_optional_timeout(fn, prompt, t)
             text = getattr(res, "content", None) if not isinstance(res, str) else res
             if text is None:
                 text = str(res)
