@@ -4,9 +4,9 @@
 供 lifespan 经 inject_agent_container 注入 app.state.agent。
 架构位置：agent 层容器（因 agent/graph.py 已为文件存在，落位为
 agent/container.py 以避包/文件冲突）。
-关键设计：模块级 _init_lock/_graph_lock 保懒加载；init_graph 幂等；
+关键设计：实例级 _lock 保懒加载双检（跨容器不串行）；init_graph 幂等；
 checkpointer 复用 HERO_CHECKPOINT_DSN 经 checkpoint.postgres.get_saver
-（memory:// 兜底离线可用，永不阻断初始化）。
+（memory:// 兜底离线可用但显式 warning，永不阻断初始化）。
 """
 
 from __future__ import annotations
@@ -19,10 +19,6 @@ from typing import Any, List, Optional
 from pydantic import BaseModel, ConfigDict
 
 logger = logging.getLogger(__name__)
-
-# 中文：sync 初始化需用 threading.Lock，asyncio.Lock 不能在 sync 场景下 await
-_init_lock = threading.Lock()
-_graph_lock = threading.Lock()
 
 
 class AgentState(BaseModel):
@@ -56,7 +52,7 @@ class AgentState(BaseModel):
 
 
 def _build_agent_graph(checkpointer: Any = None):
-    """构建最小 think->respond 图；checkpointer 兼容则挂载，否则裸编译。"""
+    """构建最小 think->respond 图；checkpointer 兼容则挂载，否则裸编译（显式 warning）。"""
     from langgraph.graph import END, StateGraph
 
     def _think(state: AgentState) -> dict:
@@ -76,7 +72,7 @@ def _build_agent_graph(checkpointer: Any = None):
         try:
             return graph.compile(checkpointer=checkpointer)
         except Exception as exc:
-            logger.debug("graph compile with checkpointer failed, fallback bare: %s", exc)
+            logger.warning("graph compile with checkpointer failed, fallback bare graph (non-durable): %s", exc)
     return graph.compile()
 
 
@@ -87,50 +83,72 @@ class AgentContainer:
         self.llm: Optional[Any] = None
         self.graph: Optional[Any] = None
         self.checkpointer: Optional[Any] = None
+        # 中文：sync 初始化需用 threading 锁，asyncio.Lock 不能在 sync 场景下 await；
+        # 实例级锁保护实例级状态，避免模块全局锁串行化无关容器；
+        # RLock 允许 init_graph 持锁调用 init_checkpointer（同实例嵌套加锁）
+        self._lock = threading.RLock()
 
     def init_llm(self, llm: Optional[Any] = None) -> Optional[Any]:
         """初始化 LLM（显式注入优先，否则经 LLMFactory 离线友好创建）。"""
         if llm is not None:
-            self.llm = llm
-            return self.llm
+            with self._lock:
+                self.llm = llm
+                return self.llm
+        # 双检：无锁 fast-path + 持锁复检，避免并发下重复 LLMFactory().create()
         if self.llm is not None:
             return self.llm
-        try:
-            from hero_quant.llm.factory import LLMFactory
+        with self._lock:
+            if self.llm is not None:
+                return self.llm
+            try:
+                from hero_quant.llm.factory import LLMFactory
 
-            self.llm = LLMFactory().create()
-        except Exception as exc:
-            logger.warning("agent llm init failed, keep None: %s", exc)
-            self.llm = None
-        return self.llm
+                self.llm = LLMFactory().create()
+            except Exception as exc:
+                logger.warning("agent llm init failed, keep None: %s", exc)
+                self.llm = None
+            return self.llm
 
     def init_checkpointer(self, dsn: Optional[str] = None) -> Optional[Any]:
-        """复用 HERO_CHECKPOINT_DSN 的 PG 持久；失败回退 None 永不抛异常。"""
+        """复用 HERO_CHECKPOINT_DSN 的 PG 持久；失败回退 None 永不抛异常。
+
+        缺 DSN 时回退 memory://default（离线可用）但显式 warning，PG/import/
+        编译失败同样 warning（脱敏后），避免生产静默跑无持久模式。
+        """
         if self.checkpointer is not None:
             return self.checkpointer
-        eff = (dsn or os.environ.get("HERO_CHECKPOINT_DSN", "") or "").strip() or "memory://default"
-        try:
-            from hero_quant.checkpoint.postgres import get_saver
+        with self._lock:
+            if self.checkpointer is not None:
+                return self.checkpointer
+            raw = (dsn or os.environ.get("HERO_CHECKPOINT_DSN", "") or "").strip()
+            if not raw:
+                logger.warning("HERO_CHECKPOINT_DSN missing, falling back to memory://default (ephemeral, non-durable)")
+                eff = "memory://default"
+            else:
+                eff = raw
+            try:
+                from hero_quant.checkpoint.postgres import get_saver
 
-            self.checkpointer = get_saver(eff)
-        except Exception as exc:
-            logger.debug("agent checkpointer init failed: %s", exc)
-            self.checkpointer = None
-        return self.checkpointer
+                self.checkpointer = get_saver(eff)
+                if eff.startswith("memory://"):
+                    logger.warning("agent checkpointer using ephemeral memory:// fallback (non-durable)")
+            except Exception as exc:
+                logger.warning("agent checkpointer init failed, durability degraded (dsn=%s): %s",
+                               ("memory://default" if eff.startswith("memory://") else "pg"), exc)
+                self.checkpointer = None
+            return self.checkpointer
 
     def init_graph(self) -> Any:
         """初始化 Agent Graph（幂等：重复调用返回同一编译产物）。"""
         if self.graph is not None:
             return self.graph
-        # 中文：双检锁保证并发下仅编译一次
-        with _graph_lock:
+        # 中文：实例级双检锁保证并发下仅编译一次，不串行化无关容器
+        with self._lock:
             if self.graph is not None:
                 return self.graph
-            try:
-                self.init_checkpointer()
-            except Exception as exc:
-                # 中文：窄化捕获并记录，避免静默丢错
-                logger.warning("agent checkpointer init failed, using bare graph: %s", exc)
+            self.init_checkpointer()
+            if self.checkpointer is None:
+                logger.warning("agent checkpointer unavailable, using bare graph (non-durable)")
             self.graph = _build_agent_graph(self.checkpointer)
             logger.info("agent graph compiled")
             return self.graph
@@ -143,4 +161,4 @@ def inject_agent_container(app, container: AgentContainer | None = None) -> Agen
     return bound
 
 
-__all__ = ["AgentContainer", "AgentState", "_graph_lock", "_init_lock", "inject_agent_container"]
+__all__ = ["AgentContainer", "AgentState", "inject_agent_container"]

@@ -217,8 +217,39 @@ class AgentLoop:
         if _allow_root is None:
             _allow_root = kwargs.pop("allow_replay_root", None)
         def _resolve_allow_dir() -> Path:
+            # 安全：allow_root 仅接受受信部署配置，拒绝 "/"、"~" 及项目根外路径；
+            # 显式 allow_root 若不可信则回退默认 replays 目录，绝不混入用户输入。
             if _allow_root is not None:
-                return Path(_allow_root).resolve()
+                try:
+                    cand = Path(_allow_root).resolve()
+                    # 拒绝文件系统根与用户家目录等过宽根
+                    if cand == cand.anchor or str(cand) == str(Path.home().resolve()):
+                        logging.getLogger(__name__).warning(
+                            "allow_root %r too broad, falling back to default replays dir", _allow_root)
+                    else:
+                        proj = Path.cwd().resolve()
+                        try:
+                            cand.relative_to(proj)
+                            return cand
+                        except Exception:
+                            pass
+                        # 允许系统临时目录（回放件场景）与 replays 同名目录
+                        try:
+                            import tempfile as _tf
+                            tmp = Path(_tf.gettempdir()).resolve()
+                            try:
+                                cand.relative_to(tmp)
+                                return cand
+                            except Exception:
+                                pass
+                        except Exception:
+                            pass
+                        if cand.name == "replays":
+                            return cand
+                        logging.getLogger(__name__).warning(
+                            "allow_root %r outside trusted roots, falling back to default replays dir", _allow_root)
+                except Exception as exc:
+                    logging.getLogger(__name__).warning("allow_root resolve failed for %r: %s", _allow_root, exc, exc_info=True)
             cand = Path("replays").resolve()
             try:
                 if cand.exists():
@@ -834,9 +865,11 @@ class AgentLoop:
             # 5) 累积流式增量、更新 token 计数并收集工具调用
             tool_calls_this_iter: List[Dict[str, Any]] = []
             _chunk_error: Optional[Exception] = None
-            # 中文：记录本轮起始长度，重试时回滚避免重复拼 partial
+            # 中文：记录本轮起始长度/用量，重试时回滚避免重复拼 partial 与 double-bill
             _iter_start_len = len(buffer)
             _iter_start_token_count = token_count
+            _iter_start_usage_in = _llm_usage_input
+            _iter_start_usage_out = _llm_usage_output
             try:
                 for chunk in stream:  # type: ignore[union-attr]
                     # chunk 可能是 dict/str/对象，需分别处理
@@ -960,12 +993,28 @@ class AgentLoop:
                     except Exception:
                         should = False
                 if should:
-                    # 中文：回滚本轮已追加的 partial，避免重试重复拼
+                    # 中文：回滚本轮本地累计（buffer/token/usage），避免重试重复拼/double-bill。
+                    # 用量语义（fail-visible）：失败 attempt 的 tokens 虽真实消耗且已由
+                    # record_usage 计入 breaker，但 BudgetBreaker 无 refund API（归属他 lane，
+                    # 不得跨文件改签名），故 breaker 侧保留该次计费；本地累计回滚使后续
+                    # estimated/should_fallback 与可见输出一致，trace 记录此口径。
                     try:
                         buffer = buffer[:_iter_start_len]
                         token_count = _iter_start_token_count
                     except Exception:
                         pass
+                    _failed_in = _llm_usage_input - _iter_start_usage_in
+                    _failed_out = _llm_usage_output - _iter_start_usage_out
+                    _llm_usage_input = _iter_start_usage_in
+                    _llm_usage_output = _iter_start_usage_out
+                    if (_failed_in or _failed_out) and trace_writer is not None:
+                        try:
+                            trace_writer.append({"type": "usage_rollback", "iteration": iterations,
+                                                 "reverted_input": _failed_in, "reverted_output": _failed_out,
+                                                 "breaker_adjusted": False,
+                                                 "note": "failed-attempt usage rolled back locally; breaker retains charge (no refund API)"})
+                        except Exception:
+                            pass
                     try:
                         if retry_policy is not None:
                             retry_policy.sleep(iterations)
@@ -1252,12 +1301,24 @@ class AgentLoop:
                                 else:
                                     res, err = fut.result()
                             except concurrent.futures.TimeoutError as e:
-                                # 中文：超时转为 tool_error，非阻塞收集
-                                res, err = f"tool_error: timeout after {t_ms}ms", e
+                                # 中文：超时转为 tool_error，非阻塞收集。
+                                # 注意 ThreadPoolExecutor 无法中止已运行线程：fut.cancel()
+                                # 仅取消尚未开始的任务，已运行 worker 会继续执行（abandoned）。
+                                # 故此处显式标记 abandoned 并记录 deadline，供审计追踪；
+                                # 需真取消请让 spec.func 支持协作式 timeout/deadline 或改用进程隔离。
+                                res, err = f"tool_error: timeout after {t_ms}ms (abandoned, worker not cancellable)", e
                                 try:
-                                    fut.cancel()
+                                    fut.cancel()  # only cancels pending, never a running thread
                                 except Exception:
                                     pass
+                                if trace_writer is not None:
+                                    try:
+                                        trace_writer.append({"type": "tool_timeout", "iteration": iterations,
+                                                             "tool": item["tool_name"], "timeout_ms": t_ms,
+                                                             "abandoned": True,
+                                                             "note": "cooperative deadline only; running thread cannot be cancelled"})
+                                    except Exception:
+                                        pass
                             except (KeyboardInterrupt, SystemExit, GeneratorExit):
                                 raise
                             except Exception as e:
@@ -1456,26 +1517,20 @@ class AgentLoop:
                                 _pi = float(_os2.environ.get("HERO_LLM_PRICE_IN", "0.15") or "0.15")
                                 _po = float(_os2.environ.get("HERO_LLM_PRICE_OUT", "0.60") or "0.60")
                                 estimated = _llm_usage_input * _pi / 1_000_000 + _llm_usage_output * _po / 1_000_000
-                        except Exception:
-                            import os as _os3
-
-                            try:
-                                _pi = float(_os3.environ.get("HERO_LLM_PRICE_IN", "0.15") or "0.15")
-                            except Exception:
-                                _pi = 0.15
-                            try:
-                                _po = float(_os3.environ.get("HERO_LLM_PRICE_OUT", "0.60") or "0.60")
-                            except Exception:
-                                _po = 0.60
-                            estimated = _llm_usage_input * _pi / 1_000_000 + _llm_usage_output * _po / 1_000_000
+                        except Exception as exc:
+                            # 定价/estimate 失败必须 fail-visible 并 fail-closed，
+                            # 不得静默回退旧公式继续循环
+                            logging.getLogger(__name__).warning("budget estimate_cost failed: %s", exc, exc_info=True)
+                            raise
                         # 真实 usage 已通过 record_usage 累计，直接以累计状态判定，避免重复计算
                         try:
                             if hasattr(self.budget_breaker, "should_fallback"):
                                 _should_fallback = bool(self.budget_breaker.should_fallback(cost=0))
                             else:
                                 _should_fallback = False
-                        except Exception:
-                            _should_fallback = False
+                        except Exception as exc:
+                            logging.getLogger(__name__).warning("budget should_fallback failed: %s", exc, exc_info=True)
+                            raise
                     else:
                         estimated = token_count / 10000.0 + iterations * 0.05
                         try:
@@ -1483,8 +1538,9 @@ class AgentLoop:
                                 _should_fallback = bool(self.budget_breaker.should_fallback(cost=estimated))
                             else:
                                 _should_fallback = False
-                        except Exception:
-                            _should_fallback = False
+                        except Exception as exc:
+                            logging.getLogger(__name__).warning("budget should_fallback failed: %s", exc, exc_info=True)
+                            raise
                     if _should_fallback:
                             reason = "budget_fallback"
                             terminated = True
@@ -1494,8 +1550,18 @@ class AgentLoop:
                                 except Exception:
                                     pass
                             break
-                except Exception:
-                    pass
+                except Exception as exc:
+                    # 预算计算失败必须 fail-visible：记录 warning 并 fail-closed 熔断，
+                    # 避免未知成本下继续循环（fail-open 会绕过 budget_fallback）。
+                    logging.getLogger(__name__).warning("budget check failed: %s", exc, exc_info=True)
+                    if trace_writer is not None:
+                        try:
+                            trace_writer.append({"type": "budget_error", "iteration": iterations, "error": str(exc)})
+                        except Exception:
+                            pass
+                    reason = "budget_fallback"
+                    terminated = True
+                    break
 
             # 迭代末尾再检 token 上限（工具输出/压缩后可能膨胀） token_limit*4
             if self.token_limit is not None and estimate_tokens(buffer) >= int(self.token_limit):

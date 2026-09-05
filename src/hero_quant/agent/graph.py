@@ -10,13 +10,10 @@
 
 from __future__ import annotations
 
-import copy
 import logging
 import threading
 import warnings
 from typing import Dict, Any, List
-
-_threading_ref = threading.Lock
 
 try:
     from langgraph.graph import StateGraph, START, END
@@ -46,8 +43,15 @@ except ImportError as e:  # pragma: no cover - narrow
 # 委派深度上限，防无限递归
 MAX_DELEGATION_DEPTH = 5
 
-# 全局成本熔断器（滑动窗口）占位；线程安全由 BudgetBreaker 内部 _lock 提供，无需外层锁
+# 全局成本熔断器（滑动窗口）占位；线程安全由 BudgetBreaker 内部 _lock 提供，无需外层锁。
+# 注意：_breaker 为遗留模块级默认，仅在未显式注入 breaker 时兜底使用；
+# 跨请求复用会污染预算（daily_limit 耗尽后影响无关请求），故 _leaf_subagent 支持
+# per-request 注入（breaker 参数 / RunnableConfig），长期应经 config 透传。
 _breaker = None
+# 遗留全局 _breaker 兜底路径的串行化锁：单次 check_and_add 本身已由
+# BudgetBreaker 内部 _lock 保证原子，此锁仅串行化“选用全局默认”这一回退决策，
+# 避免高并发扇出下对共享全局的复合竞态；per-request 注入优先。
+_legacy_budget_lock = threading.Lock()
 try:
     if BudgetBreaker is not None:
         _breaker = BudgetBreaker(daily_limit=5.0)
@@ -116,7 +120,9 @@ def _normalize_selected(selected: List[str] | None) -> List[str]:
     norm: List[str] = []
     for s in selected:
         key = s.strip().lower()
-        canon = _ALIAS_MAP.get(key, key)
+        canon = _ALIAS_MAP.get(key)
+        if canon is None:
+            raise ValueError(f"unknown analyst role: {s!r}")
         if canon not in norm:
             norm.append(canon)
     return norm
@@ -131,11 +137,21 @@ def _get_role_prompt(name: str) -> str:
     return _ROLE_PROMPTS.get(name, f"You are {name} analyst. Provide concise analysis.")
 
 
-def _leaf_subagent(name: str):
+def _check_breaker(active) -> bool:
+    """单次熔断判定：优先原子 check_and_add，回退 should_fallback 查询。"""
+    if hasattr(active, "check_and_add"):
+        return bool(active.check_and_add(0.1))
+    return bool(active.should_fallback(cost=0.1))
+
+
+def _leaf_subagent(name: str, breaker=None, config=None):
     """创建叶分析师节点 — Phase 1: 绑定角色 Prompt 与工具子集，复用 skill 的审计/脱敏/截断范式。
 
     仍保持 BudgetBreaker 熔断与 delegation_depth 预算，新增 per-agent 工具绑定与角色提示，
     输出通过 State add reducer 聚合，供 verify 节点综合。
+
+    breaker 注入优先级：显式 breaker 参数 > config["breaker"]（RunnableConfig 透传）
+    > 模块级 _breaker 遗留默认。显式注入可避免跨请求共享熔断器导致的预算污染。
     """
 
     def _run(state: State) -> Dict[str, Any]:
@@ -150,16 +166,22 @@ def _leaf_subagent(name: str):
                 "subagent_outputs": [{"agent": name, "status": "budget_exceeded"}],
                 "agent_traces": [{"agent": name, "status": "budget_exceeded"}],
             }
-        if _breaker is not None:
+        _active_breaker = breaker
+        if _active_breaker is None and isinstance(config, dict):
+            _active_breaker = config.get("breaker")
+        _using_legacy_global = False
+        if _active_breaker is None:
+            _active_breaker = _breaker
+            _using_legacy_global = True
+        if _active_breaker is not None:
             try:
-                if hasattr(_breaker, "check_and_add"):
-                    if _breaker.check_and_add(0.1):
-                        return {
-                            "messages": [{"role": "assistant", "content": f"{name}: budget fallback"}],
-                            "subagent_outputs": [{"agent": name, "status": "fallback"}],
-                            "agent_traces": [{"agent": name, "status": "fallback"}],
-                        }
-                elif _breaker.should_fallback(cost=0.1):
+                if _using_legacy_global:
+                    # 遗留全局兜底：串行化回退决策；注入式 breaker 走无锁原子路径
+                    with _legacy_budget_lock:
+                        _fallback = _check_breaker(_active_breaker)
+                else:
+                    _fallback = _check_breaker(_active_breaker)
+                if _fallback:
                     return {
                         "messages": [{"role": "assistant", "content": f"{name}: budget fallback"}],
                         "subagent_outputs": [{"agent": name, "status": "fallback"}],
@@ -178,6 +200,9 @@ def _leaf_subagent(name: str):
                 from hero_quant.tools.registry import TOOL_REGISTRY
 
                 available = [t for t in tool_names if t in TOOL_REGISTRY]
+                # audit 一致性：preview 与上报均使用 TOOL_REGISTRY 过滤后的可用工具，
+                # 避免下游审计看到实际不存在的工具
+                tool_names = available
                 if available:
                     tool_preview = f" | tools: {', '.join(available)}"
             except Exception as exc:
@@ -224,10 +249,16 @@ def plan_node(state: State):
     msgs = state.get("messages", [])
     last = ""
     try:
-        if msgs and isinstance(msgs[-1], dict):
-            last = msgs[-1].get("content", "") or ""
-        elif msgs:
-            last = str(msgs[-1])
+        if msgs:
+            m = msgs[-1]
+            if isinstance(m, dict):
+                last = m.get("content", "") or ""
+            elif hasattr(m, "content"):
+                # LangChain BaseMessage：取 .content，避免 str(msg) 的 repr 污染路由
+                c = m.content
+                last = c if isinstance(c, str) else (str(c) if c is not None else "")
+            else:
+                last = str(m)
     except (IndexError, AttributeError, TypeError, ValueError) as exc:
         logging.getLogger(__name__).warning("plan_node message extract failed: %s", exc, exc_info=True)
         last = ""
@@ -244,14 +275,21 @@ def plan_node(state: State):
             "plan": plan_text,
             "delegation_depth": depth + 1,
         }
+    # 最小扇出载荷：仅透传新分支必需的 messages 切片 + plan + delegation_depth，
+    # 避免全量 **state deepcopy（O(targets*state_size) 且快照 stale reducer 列表）。
+    fanout_kwargs: Dict[str, Any] = {
+        "messages": [msgs[-1]] if msgs else [],
+        "plan": plan_text,
+        "delegation_depth": depth + 1,
+    }
     return Cmd(
         update={
             "messages": [{"role": "assistant", "content": "plan done"}],
             "plan": plan_text,
             "delegation_depth": depth + 1,
         },
-        # deepcopy per Send to avoid shallow-copy sharing; retains **state spread for audit
-        goto=[Snd(t, {**copy.deepcopy(state), "delegation_depth": depth + 1}) for t in targets],  # **state via deepcopy
+        # 每个 Send 独立浅拷贝，避免浅拷贝共享同一 dict
+        goto=[Snd(t, dict(fanout_kwargs)) for t in targets],
     )
 
 
@@ -365,10 +403,15 @@ def build_research_graph(selected: List[str] | None = None):
         msgs = state.get("messages", [])
         last = ""
         try:
-            if msgs and isinstance(msgs[-1], dict):
-                last = msgs[-1].get("content", "") or ""
-            elif msgs:
-                last = str(msgs[-1])
+            if msgs:
+                m = msgs[-1]
+                if isinstance(m, dict):
+                    last = m.get("content", "") or ""
+                elif hasattr(m, "content"):
+                    c = m.content
+                    last = c if isinstance(c, str) else (str(c) if c is not None else "")
+                else:
+                    last = str(m)
         except (IndexError, AttributeError, TypeError, ValueError) as exc:
             logging.getLogger(__name__).warning("_plan message extract failed: %s", exc, exc_info=True)
             last = ""
@@ -380,13 +423,19 @@ def build_research_graph(selected: List[str] | None = None):
                 "plan": plan_text,
                 "delegation_depth": depth + 1,
             }
+        # 最小扇出载荷（同 plan_node）：仅 messages 切片 + plan + delegation_depth
+        _fanout: Dict[str, Any] = {
+            "messages": [msgs[-1]] if msgs else [],
+            "plan": plan_text,
+            "delegation_depth": depth + 1,
+        }
         return Cmd(
             update={
                 "messages": [{"role": "assistant", "content": "plan done"}],
                 "plan": plan_text,
                 "delegation_depth": depth + 1,
             },
-            goto=[Snd(t, {**copy.deepcopy(state), "delegation_depth": depth + 1}) for t in targets],  # **state via deepcopy
+            goto=[Snd(t, dict(_fanout)) for t in targets],
         )
 
     _plan.__name__ = "plan"
