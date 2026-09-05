@@ -80,13 +80,21 @@ def _cached_getaddrinfo(host: str) -> list:
         if hit is not None and now - hit[0] < _DNS_CACHE_TTL_SECONDS and hit[1] is resolver:
             return hit[2]
     # 中文：工作线程 + result(timeout) 界定 DNS 等待；超时按 gaierror 处理（fail-closed）。
-    with _fut.ThreadPoolExecutor(max_workers=1) as _ex:
+    # 不用 with（退出时 shutdown(wait=True) 会等卡死的 worker，超时失效）；手动
+    # shutdown(wait=False, cancel_futures=True) 让超时真正生效。
+    _ex = _fut.ThreadPoolExecutor(max_workers=1)
+    try:
         try:
             infos = _ex.submit(resolver, host, None, _socket.AF_UNSPEC, _socket.SOCK_STREAM).result(
                 timeout=_DNS_TIMEOUT_SECONDS
             )
         except _fut.TimeoutError as e:
             raise _socket.gaierror(f"DNS resolution timed out after {_DNS_TIMEOUT_SECONDS}s: {host}") from e
+    finally:
+        try:
+            _ex.shutdown(wait=False, cancel_futures=True)
+        except (OSError, ValueError, RuntimeError):
+            pass
     with _DNS_CACHE_LOCK:
         _DNS_CACHE[host.lower()] = (now, resolver, infos)
         if len(_DNS_CACHE) > 1024:
