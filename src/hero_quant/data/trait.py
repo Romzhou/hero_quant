@@ -176,15 +176,16 @@ def _check_list_contract(bars: list) -> None:
         if "date" not in b and "trade_date" not in b:
             raise ValueError(f"bars[{i}] missing required date/trade_date, got {list(b.keys())}")
         # 解析日期用于排序/去重校验
-        raw_date = b.get("date", b.get("trade_date"))
+        raw_date = b.get("date") if b.get("date") is not None else b.get("trade_date")
         try:
             import pandas as pd
             ts = pd.to_datetime(raw_date)
-            # 去 tz，保证 tz-naive 语义
-            if getattr(ts, "tz", None) is not None:
-                ts = ts.tz_convert(None) if hasattr(ts, "tz_convert") else ts
         except Exception as e:
             raise ValueError(f"bars[{i}] invalid date {raw_date!r}: {e}") from e
+        if ts is None or pd.isna(ts):
+            raise ValueError(f"bars[{i}] invalid date {raw_date!r}")
+        if getattr(ts, "tz", None) is not None:
+            raise ValueError(f"bars[{i}] index/date must be tz-naive UTC, got tz={ts.tz!r}")
         if ts in seen:
             raise ValueError(f"bars[{i}] duplicated date {raw_date!r}")
         seen.add(ts)
@@ -209,10 +210,11 @@ def assert_bars_contract(bars: Union[pd.DataFrame, list[dict], tuple]) -> None:
     if bars is None:
         raise ValueError("bars is None, expected DataFrame or list")
     # DataFrame branch
-    if hasattr(bars, "columns") and hasattr(bars, "index"):
-        # duck-type DataFrame
-        _check_dataframe_contract(bars)  # type: ignore[arg-type]
+    if isinstance(bars, pd.DataFrame):
+        _check_dataframe_contract(bars)
         return
+    if hasattr(bars, "columns") and hasattr(bars, "index"):
+        raise ValueError(f"bars must be DataFrame or list[dict], got {type(bars).__name__}")
     # list branch
     if isinstance(bars, list):
         _check_list_contract(bars)

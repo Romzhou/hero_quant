@@ -614,3 +614,62 @@ def test_d1_yahoo_inf_rejected(monkeypatch):
     loader = _yahoo_loader(monkeypatch, "live")
     with pytest.raises(DataValidationError):
         loader.get_bars("AAPL.US", "2025-01-01", "2025-01-05")
+
+
+# ---------------- trait.py (3 items: 2 high + 1 medium) + sources.py (1 medium) ----------------
+
+def test_d1_trait_none_date_falls_back_or_rejects():
+    """High: {"date": None, "trade_date": valid} must use fallback; all-None must raise."""
+    from hero_quant.data.trait import assert_bars_contract
+
+    good = [
+        {"date": None, "trade_date": "2025-01-01", "open": 1, "high": 2, "low": 0.5, "close": 1.5, "volume": 10},
+        {"date": "2025-01-02", "open": 1, "high": 2, "low": 0.5, "close": 1.5, "volume": 10},
+    ]
+    assert_bars_contract(good)  # fallback works
+    bad = [
+        {"date": None, "open": 1, "high": 2, "low": 0.5, "close": 1.5, "volume": 10},
+    ]
+    with pytest.raises(ValueError):
+        assert_bars_contract(bad)
+
+
+def test_d1_trait_tz_aware_list_rejected():
+    """High: tz-aware list dates must raise (tz-naive UTC contract), not strip."""
+    from hero_quant.data.trait import assert_bars_contract
+
+    bars = [
+        {"date": "2025-01-01 09:00:00+08:00", "open": 1, "high": 2, "low": 0.5, "close": 1.5, "volume": 10},
+    ]
+    with pytest.raises(ValueError, match="tz-naive"):
+        assert_bars_contract(bars)
+
+
+def test_d1_trait_duck_dataframe_valueerror():
+    """Medium: duck-typed DataFrame (columns+index attrs) must raise ValueError, not AttributeError."""
+    from hero_quant.data.trait import assert_bars_contract
+
+    class _Duck:
+        columns = ["open", "high", "low", "close", "volume"]
+        index = [1, 2, 3]
+
+    with pytest.raises(ValueError):
+        assert_bars_contract(_Duck())
+
+
+def test_d1_sources_allowlist_immutable():
+    """Medium: VALID_SOURCES must be an immutable tuple (Final)."""
+    from typing import Final  # noqa: F401  (contract marker)
+    import hero_quant.data.sources as smod
+
+    vs = smod.VALID_SOURCES
+    assert isinstance(vs, tuple)
+    with pytest.raises(AttributeError):
+        vs.append("evil")  # type: ignore[attr-defined]
+    assert "tencent" in vs and len(vs) == 16
+    # single-source identity preserved across re-exports
+    from hero_quant.data import VALID_SOURCES as pkg_vs
+    from hero_quant.data.registry import VALID_SOURCES as reg_vs
+    from hero_quant.data.trait import VALID_SOURCES as trait_vs
+
+    assert list(pkg_vs) == list(reg_vs) == list(trait_vs) == list(vs)
