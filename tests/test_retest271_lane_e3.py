@@ -384,3 +384,115 @@ def test_e3_otel_provider_build_race_no_leak():
                       "opentelemetry.exporter.otlp.proto.http._log_exporter"):
                 sys.modules.pop(m, None)
         otel_mod.shutdown_otel()
+
+
+# ============================================================================
+# tools/registry.py — 4 items
+# ============================================================================
+
+def test_e3_registry_truthy_concurrency_rejected():
+    """[bug·high] Non-bool/non-callable is_concurrency_safe must fail fast, not coerce truthy."""
+    import pytest
+
+    from hero_quant.tools.registry import TOOL_REGISTRY, tool
+
+    with pytest.raises(ValueError):
+        @tool(name="e3_bad_safe_xyz", description="bad safe", is_concurrency_safe="false")
+        def _f():
+            pass
+
+    assert "e3_bad_safe_xyz" not in TOOL_REGISTRY
+    # bool/callable still fine
+    @tool(name="e3_good_safe_xyz", description="good safe", is_concurrency_safe=True)
+    def _g():
+        pass
+
+    assert TOOL_REGISTRY.pop("e3_good_safe_xyz").is_concurrency_safe({}) is True
+
+
+def test_e3_registry_timeoutms_strict():
+    """[bug·medium] timeoutMs must reject bool and non-integral floats (no silent coercion)."""
+    import pytest
+
+    from hero_quant.tools.registry import TOOL_REGISTRY, tool
+
+    with pytest.raises(ValueError):
+        @tool(name="e3_bool_timeout_xyz", description="bad", timeoutMs=True)
+        def _f():
+            pass
+
+    with pytest.raises(ValueError):
+        @tool(name="e3_float_timeout_xyz", description="bad", timeoutMs=1.9)
+        def _g():
+            pass
+
+    # integral float and int-convertible str still accepted
+    @tool(name="e3_ok_timeout_xyz", description="ok", timeoutMs=5.0)
+    def _h():
+        pass
+
+    assert TOOL_REGISTRY.pop("e3_ok_timeout_xyz").timeoutMs == 5
+    assert "e3_bool_timeout_xyz" not in TOOL_REGISTRY
+    assert "e3_float_timeout_xyz" not in TOOL_REGISTRY
+
+
+def test_e3_registry_explicit_plus_alias_conflict():
+    """[bug·medium] Explicit timeoutMs + timeout_ms alias must raise conflicting-alias error."""
+    import pytest
+
+    from hero_quant.tools.registry import TOOL_REGISTRY, tool
+
+    with pytest.raises(ValueError, match="conflicting timeout aliases"):
+        @tool(name="e3_conflict_xyz", description="bad", timeoutMs=100, timeout_ms=200)
+        def _f():
+            pass
+
+    assert "e3_conflict_xyz" not in TOOL_REGISTRY
+
+
+def test_e3_registry_wrapped_output_exact_shape():
+    """[bug·medium] Only exact {schema, render} counts as wrapped; validated at use time."""
+    import pytest
+
+    from hero_quant.tools.registry import TOOL_REGISTRY, tool
+
+    raw_schema_with_those_keys = {
+        "type": "object",
+        "properties": {
+            "schema": {"type": "string"},
+            "render": {"type": "string"},
+        },
+    }
+    # raw schema that happens to use schema/render keys must be treated as a
+    # whole raw schema (wrapped once more), NOT unwrapped as {"schema", "render"} form
+    @tool(name="e3_raw_schema_xyz", description="raw", output=raw_schema_with_those_keys)
+    def _f():
+        pass
+
+    stored = TOOL_REGISTRY.pop("e3_raw_schema_xyz").output
+    assert stored == {"schema": raw_schema_with_those_keys, "render": None}, stored
+
+    # exact wrapped shape still supported and kept as-is
+    @tool(
+        name="e3_wrapped_xyz",
+        description="wrapped",
+        output={"schema": {"type": "object", "properties": {}}, "render": None},
+    )
+    def _g():
+        pass
+
+    stored2 = TOOL_REGISTRY.pop("e3_wrapped_xyz").output
+    assert stored2 == {"schema": {"type": "object", "properties": {}}, "render": None}
+
+    # TOCTOU: mutating the dict between tool(...) call and decorator application
+    # must not bypass fail-fast validation
+    evil = {"type": "object", "properties": {}}
+    factory = tool(name="e3_toctou_xyz", description="toctou", output=evil)
+    evil.clear()
+    evil["type"] = "not-a-real-type"
+    with pytest.raises(ValueError):
+        @factory
+        def _h():
+            pass
+
+    assert "e3_toctou_xyz" not in TOOL_REGISTRY

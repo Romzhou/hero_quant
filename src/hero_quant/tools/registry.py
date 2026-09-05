@@ -73,8 +73,8 @@ def _normalize_concurrency_safe(fn: Callable | bool | None) -> Callable[[Dict[st
     if isinstance(fn, bool):
         val = fn
         return lambda args, v=val: v
-    # fallback: truthy
-    return lambda args: bool(fn)
+    # 中文：非 bool/非 callable（如字符串 "false"）一律 fail-fast，禁止 truthy 隐式标记安全
+    raise ValueError(f"is_concurrency_safe must be bool/Callable/None, got {fn!r}")
 
 
 @dataclass
@@ -118,6 +118,9 @@ def tool(
         timeout_aliases.append("timeoutms")
     if "timeout" in kwargs:
         timeout_aliases.append("timeout")
+    # 中文：显式 timeoutMs + 任一别名同属冲突（此前仅统计 kwargs 别名，显式参数被漏检）
+    if timeoutMs is not None and timeout_aliases:
+        raise ValueError(f"conflicting timeout aliases: ['timeoutMs', {timeout_aliases}]")
     if len(timeout_aliases) > 1:
         raise ValueError(f"conflicting timeout aliases: {timeout_aliases}")
     if timeoutMs is None:
@@ -129,9 +132,14 @@ def tool(
             timeoutMs = kwargs.pop("timeout")
     if is_concurrency_safe is None and "concurrency_safe" in kwargs:
         is_concurrency_safe = kwargs.pop("concurrency_safe")
+    # 中文：显式 is_concurrency_safe + 别名 concurrency_safe 同属冲突（与 timeout 别名同规则）
+    if "concurrency_safe" in kwargs:
+        raise ValueError("conflicting concurrency_safe aliases: ['is_concurrency_safe', 'concurrency_safe']")
 
     # presentAs handling — pop early for unknown-kwargs detection
     present_as_raw = "native"
+    if "presentAs" in kwargs and "present_as" in kwargs:
+        raise ValueError("conflicting presentAs aliases: ['presentAs', 'present_as']")
     if "presentAs" in kwargs:
         present_as_raw = kwargs.pop("presentAs")
     elif "present_as" in kwargs:
@@ -152,12 +160,6 @@ def tool(
     # 注册期即校验 Schema， fail-fast 避免运行时合约漂移
     if parameters is not None:
         assertSupportedJsonSchema(parameters)
-    if output is not None:
-        # validate after unwrapping decision — support wrapped form
-        if isinstance(output, dict) and "schema" in output and "render" in output:
-            assertSupportedJsonSchema(output["schema"])
-        else:
-            assertSupportedJsonSchema(output)
 
     def decorator(func: Callable) -> Callable:
         with _REGISTRY_LOCK:
@@ -165,26 +167,46 @@ def tool(
                 raise ValueError(f"tool name '{name}' already registered")
         if not description:
             raise ValueError("description must be non-empty")
-
-        safe_fn = _normalize_concurrency_safe(is_concurrency_safe)
-
-        # 输出 Schema 统一包为 {schema, render}，便于后续扩展渲染层
+        # 中文：对深拷贝后的输出合约做使用时校验（防 tool(...) 与 dec(func) 之间被篡改）；
+        # 仅精确 {"schema", "render"} 视为 wrapped 形态（validate output["schema"] when wrapped），
+        # 避免原始 schema 误判。
         if output is not None:
-            if isinstance(output, dict) and "schema" in output and "render" in output:
-                output_wrapped: Dict[str, Any] | None = output
+            output_snapshot = copy.deepcopy(output)
+            if isinstance(output_snapshot, dict) and set(output_snapshot) == {"schema", "render"}:
+                assertSupportedJsonSchema(output_snapshot["schema"])
+                output_wrapped: Dict[str, Any] | None = output_snapshot
             else:
-                output_wrapped = {"schema": output, "render": None}
+                assertSupportedJsonSchema(output_snapshot)
+                output_wrapped = {"schema": output_snapshot, "render": None}
         else:
             output_wrapped = None
+
+        safe_fn = _normalize_concurrency_safe(is_concurrency_safe)
 
         present_as = present_as_raw
 
         t_ms = None
         if timeoutMs is not None:
-            try:
+            # 中文：bool 是 int 子类（True==1），必须先拒收；float 仅接受整数值，禁止截断
+            if isinstance(timeoutMs, bool):
+                raise ValueError(f"timeoutMs must be int, got {timeoutMs!r}")
+            if isinstance(timeoutMs, float):
+                if not timeoutMs.is_integer():
+                    raise ValueError(f"timeoutMs must be integer, got {timeoutMs!r}")
                 t_ms = int(timeoutMs)
-            except (TypeError, ValueError) as e:
-                raise ValueError(f"timeoutMs must be int-convertible, got {timeoutMs!r}") from e
+            else:
+                try:
+                    t_ms = int(timeoutMs)
+                except (TypeError, ValueError) as e:
+                    raise ValueError(f"timeoutMs must be int-convertible, got {timeoutMs!r}") from e
+                if isinstance(timeoutMs, str) and str(t_ms) != timeoutMs.strip():
+                    # "5.0"/" 5 " 等非纯整数字符串：int() 截断/容错会掩盖误配，显式拒绝
+                    try:
+                        _f = float(timeoutMs.strip())
+                    except (TypeError, ValueError):
+                        _f = None
+                    if _f is None or not float(_f).is_integer() or int(_f) != t_ms:
+                        raise ValueError(f"timeoutMs must be integer, got {timeoutMs!r}")
             if t_ms < 0:
                 raise ValueError("timeoutMs must be >=0")
 
