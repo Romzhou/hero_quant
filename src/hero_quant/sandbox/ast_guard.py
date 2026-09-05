@@ -10,7 +10,6 @@ from __future__ import annotations
 import ast
 import logging
 import re
-import threading
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -185,9 +184,12 @@ ALLOWED_ROOTS: set[str] = set(_STATIC_ROOTS)
 
 
 def reload_allowed_roots() -> set[str]:
-    """按需将 pyproject 动态 roots 合并进 ALLOWED_ROOTS 并返回拷贝（幂等，原地更新）。
+    """刷新动态 roots 缓存并同步审计镜像 ALLOWED_ROOTS，返回其拷贝（幂等，原地更新）。
 
     先失效 _DYNAMIC_ROOTS 缓存再重载，否则 reload 只是重新合并 stale 快照。
+    注意裁决唯一真相源：check_import_allowlist() 只认 _get_allowed_roots()
+    （静态+扩展）；ALLOWED_ROOTS 是供审计/测试观察的镜像，reload 不同步
+    裁决——pyproject 新增依赖永不自动放行（fail-closed）。
     """
     global _DYNAMIC_ROOTS
     _DYNAMIC_ROOTS = _load_pyproject_roots()  # invalidate cache
@@ -272,6 +274,11 @@ BANNED_METHOD_NAMES = {
     "to_hdf",
     # pickle/序列化加载（RCE 面）
     "unsafe_load",
+    "load",
+    "loads",
+    "dump",
+    # 文件打开（实例形态 p.open()；模块形态 open() 另由 BANNED_CALL_NAMES 覆盖）
+    "open",
     # 网络外联（httpx.Client 实例 / yfinance.Ticker / ccxt / requests 等）
     "get",
     "post",
@@ -354,8 +361,9 @@ BANNED_ATTRS = {
 def _is_banned_subscript(node: ast.Subscript) -> bool:
     """检测 Subscript 索引为危险 dunder 常量字符串（如 obj['__class__']）。
 
-    纵深：banned 根上的任意字符串下标调用（如 os["system"]）同样不可验证，
-    一并拒绝；普通容器下标不受影响。
+    纵深：banned 根上的字符串下标（如 os["system"]）不可验证，一并拒绝。
+    非调用下标的数据访问（如 bar['open'] OHLC 取值）不受影响——真正的下标
+    调用（obj[...]()）另由 Call-Subscript 分支 fail-closed 拒绝。
     """
     slc = node.slice
     if isinstance(slc, ast.Constant) and isinstance(slc.value, str) and slc.value in BANNED_DUNDER_ATTRS:
@@ -363,8 +371,6 @@ def _is_banned_subscript(node: ast.Subscript) -> bool:
     if isinstance(slc, ast.Constant) and isinstance(slc.value, str):
         root = _get_root_name(node.value)
         if root is not None and root in BANNED_IMPORT_ROOTS:
-            return True
-        if slc.value in BANNED_CALL_NAMES or slc.value in BANNED_METHOD_NAMES:
             return True
     return False
 
@@ -503,6 +509,11 @@ def check_import_allowlist(code: str) -> bool:
             if isinstance(func, ast.Name) and func.id in alias_map:
                 effective = alias_map.get(func.id, func.id)
                 if effective in BANNED_IMPORT_ROOTS:
+                    return False
+                # from-import 危险属性直接调用：`from pandas import read_pickle` 后
+                # 裸 `read_pickle(...)` 无 Attribute 形态，按 (模块, 属性) 对拒绝；
+                # 非对内名字（如 from pandas import DataFrame）不受影响。
+                if (effective, func.id) in BANNED_ATTRS:
                     return False
             if isinstance(func, ast.Attribute):
                 if _is_banned_attribute(func, alias_map):

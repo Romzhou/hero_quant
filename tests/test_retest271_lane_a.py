@@ -79,6 +79,24 @@ def test_laneA_astguard_sync_two_sided(monkeypatch):
     assert any(p.startswith("stale:") for p in problems)
 
 
+def test_laneA_astguard_from_import_bare_call_blocked():
+    """Rescan: `from pandas import read_pickle` + bare call must not evade the guard."""
+    from hero_quant.sandbox.ast_guard import check_import_allowlist as chk
+
+    assert chk("from pandas import read_pickle\nread_pickle('/tmp/x')") is False
+    assert chk("from joblib import load\nload('/tmp/x')") is False
+    # benign from-imports still pass (no call, or non-banned attr)
+    assert chk("from pandas import DataFrame\nx = DataFrame({'a': [1]})") is True
+
+
+def test_laneA_astguard_data_subscript_and_query_allowed():
+    """Rescan: OHLC data access d['open'] and df.query() must not be over-blocked."""
+    from hero_quant.sandbox.ast_guard import check_import_allowlist as chk
+
+    assert chk("import pandas as pd\ndf = pd.DataFrame({'a': [1]})\nq = df.query('a > 0')") is True
+    assert chk("bar = {'open': 1.0}\nx = bar['open']") is True
+
+
 # ── policy.py (4 items: 2 high + 2 medium) ──────────────────────────────
 
 
