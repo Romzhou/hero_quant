@@ -186,30 +186,32 @@ def _ensure_corpus() -> None:
         import hero_quant.mcp.server  # noqa: F401
     except ImportError as _exc:
         logger.warning("mcp server import failed for corpus: %s", _exc)
-    # 计算内容指纹（名称+描述）：注册表快照持 _REGISTRY_LOCK，避免并发注册 torn
+    # 计算内容指纹（名称+描述）：单次注册表快照同时用于指纹与语料构建，
+    # 避免两次快照间的并发注册导致 torn（fingerprint 与 IDF 描述不同内容）
     try:
         import hashlib as _hashlib
 
         from hero_quant.tools.registry import _REGISTRY_LOCK
 
         with _REGISTRY_LOCK:
-            items = sorted(TOOL_REGISTRY.items(), key=lambda kv: kv[0])
-            fp_parts = [f"{n}:{getattr(s, 'description', '') or ''}" for n, s in items]
+            reg_items = sorted(TOOL_REGISTRY.items(), key=lambda kv: kv[0])
+            fp_parts = [f"{n}:{getattr(s, 'description', '') or ''}" for n, s in reg_items]
         fp = _hashlib.sha256("|".join(fp_parts).encode()).hexdigest()
     except Exception:
-        fp = str(len(TOOL_REGISTRY))
-    # 中文：全量在锁内构建，避免指纹检查后释放锁导致的 torn snapshot；
-    # 注册表迭代另持 _REGISTRY_LOCK 快照，避免并发注册 RuntimeError
+        reg_items = []
+        fp = None  # 指纹不可用时强制重建；len-only 回退会漏掉纯描述变更
+    # 中文：全量在锁内构建，避免指纹检查后释放锁导致的 torn snapshot
     with _CORPUS_LOCK:
-        if fp == _last_registry_fingerprint and _N != 0:
+        if fp is not None and fp == _last_registry_fingerprint and _N != 0:
             return
-        try:
-            from hero_quant.tools.registry import _REGISTRY_LOCK as _REG_LOCK
+        if not reg_items:
+            try:
+                from hero_quant.tools.registry import _REGISTRY_LOCK as _REG_LOCK
 
-            with _REG_LOCK:
+                with _REG_LOCK:
+                    reg_items = list(TOOL_REGISTRY.items())
+            except Exception:
                 reg_items = list(TOOL_REGISTRY.items())
-        except Exception:
-            reg_items = list(TOOL_REGISTRY.items())
         size = len(reg_items)
         corpus: List[List[str]] = []
         doc_tokens: Dict[str, List[str]] = {}
@@ -267,7 +269,9 @@ def _bm25_for_candidates(query_tokens: List[str], query_lower: str, candidates: 
         desc = getattr(spec, "description", "") if spec else ""
         try:
             out[name] = _score_tool(query_tokens, query_lower, name, desc, _snapshot=snap)
-        except TypeError:
+        except TypeError as e:
+            if "_snapshot" not in str(e):
+                raise
             # 4 参替换（无 _snapshot 形参）时回退旧签名
             out[name] = _score_tool(query_tokens, query_lower, name, desc)
     return out
@@ -462,7 +466,7 @@ def router_hybrid_scores(query: str, candidates: List[str]) -> Dict[str, float]:
                 max_bm25 = max(bm25_raw.values()) if bm25_raw else 1.0
                 out[n] = (bm25_raw.get(n, 0.0) / max_bm25) if max_bm25 > 0 else 0.0
         return out
-    except (ValueError, TypeError, AttributeError) as e:
+    except (ValueError, TypeError, AttributeError, ImportError) as e:
         logger.warning("router rank_fusion failed, falling back to BM25: %s", e)
         # 回退：归一化 BM25，含向量时与 cosine 均分（避免旧 0.6/0.4 偏置）
         max_bm25 = max(bm25_raw.values()) if bm25_raw else 1.0
@@ -519,11 +523,11 @@ def route(query: str, k: int = 5) -> List[str]:
         candidates = candidates + extra
     query_lower = (query or "").lower()
     query_tokens = _tokenize(query_lower)
-    # 向量混合重排（尽力而为，异常回退纯 BM25）
+    # 向量混合重排（尽力而为，异常回退纯 BM25；嵌入用原始 query，与 hybrid_scores 一致）
     qvec = None
     try:
         if _is_router_vector_enabled():
-            qvec = _get_query_embedding(query_lower)
+            qvec = _get_query_embedding(query)
     except Exception:
         qvec = None
     scored: List[tuple[float, str]] = []
@@ -574,7 +578,7 @@ def route(query: str, k: int = 5) -> List[str]:
                 except Exception as _exc:
                     logger.debug("silent handled: router rerank fallback", exc_info=_exc)
                     pass
-        except (ValueError, TypeError, AttributeError) as e:
+        except (ValueError, TypeError, AttributeError, ImportError) as e:
             logger.warning("router rank_fusion failed, falling back to BM25: %s", e)
             # 回退：归一化 BM25 与 cosine 均分，避免旧 0.6/0.4 权重
             bm25_raw: Dict[str, float] = _bm25_for_candidates(query_tokens, query_lower, candidates, _route_snap)
