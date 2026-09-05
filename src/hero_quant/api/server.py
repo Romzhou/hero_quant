@@ -12,6 +12,7 @@ from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_
 import structlog
 import structlog.contextvars
 import hashlib
+import re
 import time
 import uuid
 import logging
@@ -22,6 +23,9 @@ import asyncio
 import threading
 import tempfile
 import itertools
+
+# X-Request-ID 安全字母表（模块级预编译，热路径中间件复用；与 trace._clean_trace_id 兼容的子集）。
+_REQUEST_ID_RE = re.compile(r"[A-Za-z0-9_.~-]+\Z")
 
 from fastapi import BackgroundTasks, HTTPException
 
@@ -532,10 +536,8 @@ async def add_request_id_and_otel(request: Request, call_next):
     wall_start = time.monotonic()
     # 透传或生成 X-Request-ID：仅接受安全字母表 + 长度上限，否则回退 uuid4
     # （防日志注入/CRLF/响应头拆分；与 trace._clean_trace_id 兼容的子集）。
-    import re as _re
-
     _raw_rid = request.headers.get("X-Request-ID", "")
-    if _raw_rid and len(_raw_rid) <= 128 and _re.fullmatch(r"[A-Za-z0-9_.~-]+", _raw_rid):
+    if _raw_rid and len(_raw_rid) <= 128 and _REQUEST_ID_RE.fullmatch(_raw_rid):
         request_id = _raw_rid
     else:
         request_id = str(uuid.uuid4())
