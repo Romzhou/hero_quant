@@ -193,10 +193,13 @@ class MemoryLifecycle:
                             last = float(val)
                         except ValueError:
                             try:
-                                from datetime import datetime
+                                from datetime import datetime, timezone
 
                                 iso = val.replace("Z", "+00:00")
-                                last = datetime.fromisoformat(iso).timestamp()
+                                dt = datetime.fromisoformat(iso)
+                                if dt.tzinfo is None:
+                                    dt = dt.replace(tzinfo=timezone.utc)
+                                last = dt.timestamp()
                             except Exception:
                                 pass
         except Exception as _exc:
@@ -232,7 +235,32 @@ class MemoryLifecycle:
             logger.debug("GC meta-map build failed, falling back to frontmatter: %s", exc)
             _meta_lookup = None
         actions: list[dict] = []
+        # capacity enforcement: entries beyond MAX_MEMORY_COUNT are archived
+        # oldest-first by mtime, even if above importance thresholds
+        overflow_handled: set[Path] = set()
+        if len(entries) > self.MAX_MEMORY_COUNT:
+            overflow = len(entries) - self.MAX_MEMORY_COUNT
+            by_age: list[tuple[float, Path]] = []
+            for file_path in entries:
+                try:
+                    by_age.append((file_path.stat().st_mtime, file_path))
+                except OSError:
+                    continue
+            by_age.sort(key=lambda t: t[0])
+            for _, file_path in by_age[:overflow]:
+                record = {
+                    "name": file_path.stem,
+                    "action": "archive",
+                    "importance": 0.0,
+                    "reason": f"count {len(entries)} > MAX_MEMORY_COUNT {self.MAX_MEMORY_COUNT}, oldest-first overflow",
+                }
+                actions.append(record)
+                overflow_handled.add(file_path)
+                if not dry_run:
+                    self._execute_gc_action(file_path, "archive")
         for file_path in entries:
+            if file_path in overflow_handled:
+                continue
             try:
                 # 以文件 mtime 作为年龄代理
                 mtime = file_path.stat().st_mtime
@@ -270,8 +298,12 @@ class MemoryLifecycle:
 
     def _execute_gc_action(self, file_path: Path, action: str) -> None:
         """执行单条 GC 动作：归档或删除。"""
-        archive_dir = self.memory_dir / "archive"
-        archive_dir.mkdir(exist_ok=True)
+        try:
+            archive_dir = self.memory_dir / "archive"
+            archive_dir.mkdir(exist_ok=True)
+        except OSError as exc:
+            logger.warning("GC archive mkdir failed for %s: %s", file_path, exc)
+            return
         try:
             if action == "archive":
                 dest = archive_dir / file_path.name
@@ -302,33 +334,9 @@ class MemoryLifecycle:
                 # 中文注释：归档后保留 SQLite 行，文件态已回收；此处不再做无意义 hierarchy 构造（原空转调用已移除）
                 pass
             elif action == "delete":
-                dest = archive_dir / file_path.name
-                # dest 冲突版本化 dest.stem.{n}.suffix
-                if dest.exists():
-                    base_stem = dest.stem
-                    suffix = dest.suffix
-                    counter = 1
-                    while dest.exists():
-                        dest = archive_dir / f"{base_stem}.{counter}{suffix}"
-                        counter += 1
-                # 备份写 tmp+rename 原子，读/写包 try 失败 logger.warning+return 不 unlink
-                tmp = dest.with_name(dest.name + ".tmp")
-                try:
-                    content = file_path.read_text(encoding="utf-8")
-                except (OSError, UnicodeError, IOError) as exc:
-                    logger.warning("GC delete backup read failed for %s: %s", file_path, exc)
-                    return
-                try:
-                    tmp.write_text(content, encoding="utf-8")
-                    tmp.rename(dest)
-                except (OSError, IOError) as exc:
-                    logger.warning("GC delete backup write failed for %s -> %s: %s", file_path, dest, exc)
-                    try:
-                        if tmp.exists():
-                            tmp.unlink()
-                    except OSError:
-                        pass
-                    return
+                # true delete: unlink without archiving (delete must purge,
+                # not retain a copy under archive/); callers needing retention
+                # should use the explicit "archive" action instead.
                 try:
                     file_path.unlink()
                 except (OSError, IOError) as exc:
@@ -429,25 +437,27 @@ class MemoryLifecycle:
             if file_path.parent.name in {"archive", "daily", "digest"}:
                 continue
             try:
-                age_days = (now - file_path.stat().st_mtime) / 86400.0
+                mtime = file_path.stat().st_mtime
             except OSError:
                 continue
+            age_days = (now - mtime) / 86400.0
             if age_days < self.MIN_AGE_DAYS or self._read_compressible(file_path) is None:
                 continue
             stage = "digest" if age_days >= self.MAX_AGE else "daily"
-            period = time.strftime("%Y-%m" if stage == "digest" else "%Y-%m-%d", time.gmtime(file_path.stat().st_mtime))
+            period = time.strftime("%Y-%m" if stage == "digest" else "%Y-%m-%d", time.gmtime(mtime))
             groups.setdefault((stage, period), []).append(file_path)
 
         daily_dir = self.memory_dir / "daily"
         if daily_dir.is_dir():
             for file_path in sorted(daily_dir.glob("*.md")):
                 try:
-                    age_days = (now - file_path.stat().st_mtime) / 86400.0
+                    mtime = file_path.stat().st_mtime
                 except OSError:
                     continue
+                age_days = (now - mtime) / 86400.0
                 if age_days < self.MAX_AGE or self._read_compressible(file_path) is None:
                     continue
-                period = time.strftime("%Y-%m", time.gmtime(file_path.stat().st_mtime))
+                period = time.strftime("%Y-%m", time.gmtime(mtime))
                 groups.setdefault(("digest", period), []).append(file_path)
 
         return [(stage, period, sources) for (stage, period), sources in sorted(groups.items())]
@@ -522,10 +532,39 @@ class MemoryLifecycle:
 
     # 预留接口：与上游事件体系对齐
     def reinforce(self, name: str, event: str, source: str = "system") -> bool:
-        """按事件增量强化记忆，未实现时返回 False。"""
+        """按事件增量强化记忆：累积会话内 delta（封顶 _MAX_SESSION_DELTA）并回写 quality_score。"""
         if event not in self._EVENT_DELTAS:
             return False
-        return False
+        delta = float(self._EVENT_DELTAS[event])
+        current = float(self._session_deltas.get(name, 0.0))
+        capped = max(-self._MAX_SESSION_DELTA, min(self._MAX_SESSION_DELTA, current + delta))
+        # only the increment actually applied to the capped total flows through
+        applied = capped - current
+        self._session_deltas[name] = capped
+        try:
+            meta_dict = getattr(self._memory, "_meta", None)
+            if isinstance(meta_dict, dict):
+                entry = meta_dict.get(name)
+                if not isinstance(entry, dict):
+                    try:
+                        safe = self._memory._safe_filename(name)  # type: ignore
+                    except Exception:
+                        safe = f"{name}.md"
+                    entry = meta_dict.get(safe)
+                if isinstance(entry, dict):
+                    try:
+                        q = float(entry.get("quality_score", 0.5))
+                    except (TypeError, ValueError):
+                        q = 0.5
+                    entry["quality_score"] = min(1.0, max(0.0, q + applied))
+                    entry["last_accessed"] = time.time()
+                    try:
+                        entry["access_count"] = int(entry.get("access_count", 0)) + 1
+                    except (TypeError, ValueError):
+                        entry["access_count"] = 1
+        except Exception as exc:
+            logger.debug("reinforce meta writeback failed for %s: %s", name, exc)
+        return True
 
     def track_access(self, entry) -> None:
         """记录访问，当前为占位实现。"""

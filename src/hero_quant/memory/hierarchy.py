@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import os
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -53,7 +54,7 @@ class MemoryHierarchy:
         # 中文注释：拒绝空/点文件名，防止路径解析到目录本身
         if not filename or filename in {".", ".."}:
             raise ValueError(f"Invalid filename: {filename!r}")
-        if "/" in filename or "\\" in filename or ".." in filename or ":" in filename:
+        if "/" in filename or "\\" in filename or ":" in filename:
             raise ValueError(f"Invalid filename: {filename!r}")
         p = Path(filename)
         if p.is_absolute():
@@ -101,8 +102,8 @@ class MemoryHierarchy:
     def recover_extensionless_entries(self) -> List[Path]:
         """修复无后缀的历史条目，符合 frontmatter 的补为 .md。"""
         recovered: List[Path] = []
-        for category in CATEGORIES:
-            cat_dir = self._base_dir / category
+        dirs_to_scan = [self._base_dir] + [self._base_dir / c for c in CATEGORIES]
+        for cat_dir in dirs_to_scan:
             if not cat_dir.is_dir():
                 continue
             for item in sorted(cat_dir.iterdir()):
@@ -116,11 +117,27 @@ class MemoryHierarchy:
                     continue
                 try:
                     with item.open("r", encoding="utf-8") as f:
-                        head = f.read(512).lstrip("\ufeff").lstrip()
-                except OSError as e:
+                        # read up to 64 lines / 8KB: enough for real frontmatter,
+                        # bounded against huge files; require closing delimiter
+                        chunks: list[str] = []
+                        total = 0
+                        for _ in range(64):
+                            line = f.readline(4096)
+                            if not line:
+                                break
+                            chunks.append(line)
+                            total += len(line)
+                            if total >= 8192:
+                                break
+                        head = "".join(chunks).lstrip("\ufeff").lstrip()
+                except (OSError, UnicodeDecodeError) as e:
                     logger.warning("recover failed for %s: %s", item, e)
                     continue
                 if not head.startswith("---"):
+                    continue
+                # require closing frontmatter delimiter before renaming
+                lines = head.splitlines()
+                if not any(line.strip() in ("---", "...") for line in lines[1:]):
                     continue
                 try:
                     item.rename(target)
@@ -173,9 +190,18 @@ class MemoryHierarchy:
     def rebuild_index(self, entries: list) -> None:
         """按条目重建 ``.hierarchy.yaml`` 轻量索引。"""
         cat_data: Dict[str, CategorySummary] = {cat: CategorySummary() for cat in CATEGORIES}
+        base_fallback = CategorySummary()
         for entry in entries:
             mtype = entry.get("memory_type", "") if isinstance(entry, dict) else getattr(entry, "memory_type", "")
             if mtype not in cat_data:
+                # track base-dir fallback explicitly so index matches scan_all()
+                base_fallback.count += 1
+                if isinstance(entry, dict):
+                    keywords = entry.get("keywords", [])
+                else:
+                    keywords = getattr(entry, "keywords", [])
+                if isinstance(keywords, list):
+                    base_fallback.keywords.extend(k for k in keywords if isinstance(k, str))
                 continue
             cat_data[mtype].count += 1
             # 中文注释：兼容 object 条目且过滤非 string keywords，避免 None/int 导致 lower() 崩溃
@@ -186,7 +212,7 @@ class MemoryHierarchy:
             if isinstance(keywords, list):
                 cat_data[mtype].keywords.extend(k for k in keywords if isinstance(k, str))
         max_keywords = 10
-        for summary in cat_data.values():
+        for summary in list(cat_data.values()) + [base_fallback]:
             seen: Set[str] = set()
             unique: List[str] = []
             for kw in summary.keywords:
@@ -202,17 +228,38 @@ class MemoryHierarchy:
         data: Dict[str, object] = {
             "rebuilt_at": rebuilt_at,
             "categories": {cat: {"count": cat_data[cat].count, "keywords": cat_data[cat].keywords} for cat in CATEGORIES},
+            "base_fallback": {"count": base_fallback.count, "keywords": base_fallback.keywords},
         }
         self._base_dir.mkdir(parents=True, exist_ok=True)
-        tmp_path = self._index_path.with_suffix(".tmp")
-        # use tmp in same dir for atomicity; yaml.safe_dump ensures proper quoting/escaping
-        tmp_path.write_text(yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8")
+        # unique tmp in same dir: no cross-rebuild race, no stale fixed-name file
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=".hierarchy.", suffix=".tmp", dir=str(self._base_dir)
+        )
+        os.close(fd)
+        tmp_path = Path(tmp_name)
         try:
-            with open(tmp_path, "rb") as _f:
-                os.fsync(_f.fileno())
-        except OSError as _e:
-            logger.warning("hierarchy index fsync file failed: %s", _e)
-        tmp_path.replace(self._index_path)
+            try:
+                tmp_path.write_text(yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8")
+            except OSError as e:
+                logger.warning("hierarchy index write tmp failed: %s", e)
+                try:
+                    if tmp_path.exists():
+                        tmp_path.unlink()
+                except OSError:
+                    pass
+                raise
+            try:
+                with open(tmp_path, "rb") as _f:
+                    os.fsync(_f.fileno())
+            except OSError as _e:
+                logger.warning("hierarchy index fsync file failed: %s", _e)
+            tmp_path.replace(self._index_path)
+        finally:
+            try:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            except OSError:
+                pass
         # fsync directory to durably persist rename
         try:
             flags = os.O_RDONLY
@@ -248,7 +295,14 @@ class MemoryHierarchy:
                     if isinstance(entry, dict):
                         kws = entry.get("keywords", [])
                         if isinstance(kws, list):
-                            result[cat] = [str(k).strip() for k in kws if str(k).strip()]
+                            # normalize like rebuild_index: lowercase, drop non-str
+                            # and null-like strings (YAML `None` parses as "None")
+                            result[cat] = [
+                                k.strip().lower()
+                                for k in kws
+                                if isinstance(k, str) and k.strip()
+                                and k.strip().lower() not in ("none", "null", "~")
+                            ]
                         else:
                             result[cat] = []
                     else:
@@ -274,7 +328,12 @@ class MemoryHierarchy:
                 bracket_end = stripped.find("]")
                 if bracket_start != -1 and bracket_end != -1:
                     inner = stripped[bracket_start + 1 : bracket_end]
-                    keywords = [k.strip() for k in inner.split(",") if k.strip()]
+                    # same normalization as YAML path: lowercase, drop null-likes
+                    keywords = [
+                        k.strip().lower()
+                        for k in inner.split(",")
+                        if k.strip() and k.strip().lower() not in ("none", "null", "~")
+                    ]
                     result[current_cat] = keywords
                 else:
                     # block 样式已由 yaml 解析处理，此处忽略
@@ -292,9 +351,10 @@ class MemoryHierarchy:
         if not index_keywords:
             return self.scan_all()
         scored: List[tuple] = []
+        norm_tokens = {str(t).strip().lower() for t in query_tokens if isinstance(t, str) and str(t).strip()}
         for cat in CATEGORIES:
             cat_kws = set(index_keywords.get(cat, []))
-            overlap = len(query_tokens & cat_kws)
+            overlap = len(norm_tokens & cat_kws)
             scored.append((overlap, cat))
         scored.sort(key=lambda x: x[0], reverse=True)
         filtered_cats = [cat for score, cat in scored if score > 0]
@@ -308,6 +368,15 @@ class MemoryHierarchy:
         for cat in filtered_cats:
             for p in self.scan_category(cat):
                 if p not in seen:
+                    results.append(p)
+                    seen.add(p)
+        # also include base-dir fallback *.md: unknown-type memories live in base
+        # and must not be silently dropped from the filtered scope
+        if self._base_dir.is_dir():
+            for p in sorted(self._base_dir.iterdir()):
+                if p.name in _SKIP_NAMES:
+                    continue
+                if p.is_file() and p.suffix == ".md" and p not in seen:
                     results.append(p)
                     seen.add(p)
         return results

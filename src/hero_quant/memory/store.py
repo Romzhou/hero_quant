@@ -518,6 +518,11 @@ class MemoryStore:
         self._vector_cache: dict[tuple, tuple[float, list[dict]]] = {}
         self._vector_cache_ttl: float = 30.0
 
+    def _ensure_open(self) -> None:
+        """Fail-fast guard: close() poisons _conn; surface ValueError, not AttributeError."""
+        if getattr(self, "_conn", None) is None:
+            raise ValueError("MemoryStore is closed")
+
     def _cache_get(self, cache: dict, key: tuple, ttl: float) -> list[dict] | None:
         try:
             with self._lock:
@@ -548,14 +553,43 @@ class MemoryStore:
         except Exception:
             pass
 
-    def clear_retrieval_cache(self) -> None:
-        """清空检索缓存（测试/写入后失效）。"""
+    def clear_retrieval_cache(self, *, include_redis_l2: bool = False) -> None:
+        """清空检索缓存（测试/写入后失效）。
+
+        默认仅清 L1 进程内缓存；写入路径经 ``_invalidate_search_caches``
+        透传 ``include_redis_l2=True``，同步失效 Redis L2
+        ``hero:cache:memory:search:{ns}:*``，保证新写入对其它进程可见。
+        """
         try:
             with self._lock:
                 self._retrieval_cache.clear()
                 self._vector_cache.clear()
         except Exception:
             pass
+        if include_redis_l2:
+            self._invalidate_redis_search_cache()
+
+    def _invalidate_redis_search_cache(self) -> None:
+        """Invalidate Redis L2 hero:cache:memory:search:{ns}:* (best-effort)."""
+        try:
+            from hero_quant.infra.redis import get_redis_sync as _get_rsync
+            _r = _get_rsync()
+            if _r is not None:
+                _prefix = f"hero:cache:memory:search:{self.namespace or 'default'}:"
+                try:
+                    for _k in _r.scan_iter(f"{_prefix}*"):
+                        try:
+                            _r.delete(_k)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _invalidate_search_caches(self) -> None:
+        """Write-path invalidation: L1 in-process + Redis L2 search entries."""
+        self.clear_retrieval_cache(include_redis_l2=True)
 
     def close(self) -> None:
         """Idempotent close - release sqlite handle, safe for Windows tmp_path cleanup."""
@@ -768,6 +802,121 @@ class MemoryStore:
         except Exception:
             self._bigram_enabled = False
         self._conn.commit()
+        # startup reconcile: re-index files missing from notes (crash between
+        # file os.replace and DB INSERT left unindexed orphans)
+        try:
+            self._reconcile_orphan_files()
+        except Exception as _exc:
+            logger.debug("startup reconcile failed: %s", _exc)
+
+    def _reconcile_orphan_files(self) -> int:
+        """Scan base/**/*.md vs notes keys, re-index missing files. Returns count."""
+        count = 0
+        try:
+            with self._lock:
+                cur = self._conn.cursor()
+                cur.execute("SELECT key FROM notes")
+                known = {row[0] for row in cur.fetchall()}
+        except Exception:
+            return 0
+        try:
+            from datetime import datetime as _dt, timezone as _tz
+            files: list = []
+            if self.base.is_dir():
+                for p in self.base.rglob("*.md"):
+                    if "archive" in p.parts:
+                        continue
+                    if p.name in {"MEMORY.md", ".hierarchy.yaml", "gc.log"}:
+                        continue
+                    files.append(p)
+            for fp in files:
+                # candidate keys: safe-stem decode AND base-relative path forms,
+                # so hierarchy/category layouts and external-style keys both match
+                candidates: set[str] = set()
+                try:
+                    candidates.add(self._parse_safe_stem(fp.stem))
+                except Exception:
+                    pass
+                try:
+                    rel = fp.relative_to(self.base).as_posix()
+                    candidates.add(rel)
+                    if rel.endswith(".md"):
+                        candidates.add(rel[:-3])
+                    # hierarchy category file: also try "cat/stem.md" form
+                    if len(fp.relative_to(self.base).parts) == 2:
+                        candidates.add(rel)
+                except Exception:
+                    pass
+                if self.namespace:
+                    candidates |= {f"{self.namespace}:{c}" for c in list(candidates)}
+                if not candidates:
+                    continue
+                if candidates & known:
+                    continue
+                try:
+                    content = fp.read_text(encoding="utf-8")
+                except Exception:
+                    continue
+                if not content.strip():
+                    continue
+                created = _dt.now(_tz.utc).isoformat()
+                try:
+                    with self._lock:
+                        cur = self._conn.cursor()
+                        cur.execute("PRAGMA table_info(notes)")
+                        cols = [row[1] for row in cur.fetchall()]
+                        # prefer the base-relative path key (matches index_external
+                        # conventions like "daily/2026-08-22.md"); fall back to stem
+                        try:
+                            key = fp.relative_to(self.base).as_posix()
+                        except Exception:
+                            key = sorted(candidates)[0]
+                        if self.namespace and not key.startswith(f"{self.namespace}:"):
+                            key = f"{self.namespace}:{key}"
+                        if "vector" in cols:
+                            try:
+                                vec = self._embed_text(content)
+                                vj = json.dumps(vec) if vec is not None else None
+                            except Exception:
+                                vj = None
+                            cur.execute(
+                                "INSERT INTO notes (key, content, created, vector) VALUES (?, ?, ?, ?)",
+                                (key, content, created, vj),
+                            )
+                        else:
+                            cur.execute(
+                                "INSERT INTO notes (key, content, created) VALUES (?, ?, ?)",
+                                (key, content, created),
+                            )
+                        rowid = cur.lastrowid
+                        if self._fts_enabled:
+                            try:
+                                cur.execute("INSERT INTO notes_fts (rowid, content) VALUES (?, ?)", (rowid, content))
+                            except Exception:
+                                pass
+                        if self._bigram_enabled:
+                            try:
+                                cur.execute(
+                                    "INSERT INTO notes_fts_bigram (rowid, bigrams) VALUES (?, ?)",
+                                    (rowid, _content_bigrams(content)),
+                                )
+                            except Exception:
+                                pass
+                        self._conn.commit()
+                        known.add(key)
+                        count += 1
+                except Exception:
+                    try:
+                        with self._lock:
+                            self._conn.rollback()
+                    except Exception:
+                        pass
+                    continue
+        except Exception:
+            pass
+        if count:
+            logger.info("reconciled %d orphan files into index", count)
+        return count
 
     def _embed_text(self, text: str):
         """对文本做 embedding，延迟导入以避免循环依赖。"""
@@ -807,6 +956,7 @@ class MemoryStore:
 
     def _load_vector_for_key(self, key: str):
         """按 key 载入已存向量；维度漂移时视为过期返回 None 触发重算。"""
+        self._ensure_open()
         try:
             with self._lock:  # 中文注释：SQLite 共享连接需加锁
                 cur = self._conn.cursor()
@@ -904,6 +1054,7 @@ class MemoryStore:
 
     def write(self, key: str, content: str, memory_type: str | None = None) -> None:
         """写入一条记忆：经去重、落盘、建索引并同步向量侧车。"""
+        self._ensure_open()
         # P2: missing validation - fail-visible for empty key/content
         if not isinstance(key, str) or not key.strip():
             logger.warning("MemoryStore.write rejected empty key %r", key)
@@ -927,8 +1078,13 @@ class MemoryStore:
                 # keep newest 2048
                 self._recent_hashes = dict(sorted_items[-2048:])
                 logger.debug("recent_hashes capped to 2048, evicted %d", len(sorted_items) - 2048)
-            if content_hash in self._recent_hashes or full_hash in self._recent_hashes:
+            if full_hash in self._recent_hashes:
+                # same (ns_key, content) re-write within window: suppress duplicate
+                logger.info("dedup hit ns_key=%s content_hash=%s", ns_key, content_hash)
                 return
+            if content_hash in self._recent_hashes:
+                # cross-key identical content: log but do NOT drop (distinct keys must persist)
+                logger.info("dedup cross-key hit ns_key=%s content_hash=%s", ns_key, content_hash)
             self._recent_hashes[content_hash] = now
             self._recent_hashes[full_hash] = now
             # re-check cap after insert
@@ -1030,6 +1186,22 @@ class MemoryStore:
         try:
             with self._lock:  # 中文注释：SQLite 共享连接需加锁
                 cur = self._conn.cursor()
+                # overwrite parity: file os.replace overwrote any prior content,
+                # so DELETE prior rows for ns_key before INSERT (else stale
+                # duplicates accumulate and search returns outdated versions)
+                try:
+                    cur.execute("SELECT id FROM notes WHERE key = ?", (ns_key,))
+                    _old_rowids = [row[0] for row in cur.fetchall()]
+                    for _rid in _old_rowids:
+                        for _table in ("notes_fts", "notes_fts_bigram"):
+                            try:
+                                cur.execute(f"DELETE FROM {_table} WHERE rowid = ?", (_rid,))
+                            except Exception:
+                                pass
+                    if _old_rowids:
+                        cur.execute("DELETE FROM notes WHERE key = ?", (ns_key,))
+                except Exception:
+                    pass
                 # 探查向量列是否存在以选择写入路径
                 cur.execute("PRAGMA table_info(notes)")
                 cols = [row[1] for row in cur.fetchall()]
@@ -1133,6 +1305,9 @@ class MemoryStore:
             except Exception as _exc:
                 logger.warning("reconcile: failed to clean orphan file", exc_info=_exc)
                 pass
+            # fail-visible: DB index missing while file committed (or restored)
+            # must not report success — caller would assume the note is searchable
+            raise RuntimeError(f"MemoryStore.write DB failed for key {ns_key!r}: {_e}") from _e
         # 初始化 Ebbinghaus 元数据：内存态，无需 DDL
         with self._lock:
             if ns_key not in self._meta:
@@ -1150,12 +1325,13 @@ class MemoryStore:
                 logger.debug("meta capped to 4096, evicted %d", len(sorted_meta) - 4096)
         # 写入后失效检索缓存，保证新笔记立即可召回
         try:
-            self.clear_retrieval_cache()
+            self._invalidate_search_caches()
         except Exception:
             pass
 
     def index_external(self, key: str, content: str) -> None:
         """索引已由外部文件持久化的内容，不重复写入记忆文件。"""
+        self._ensure_open()
         now = time.time()
         ns_key = self._ns_key(key)
         vector = None
@@ -1230,7 +1406,7 @@ class MemoryStore:
         if ns_key not in self._meta:
             self._meta[ns_key] = {"quality_score": 0.5, "access_count": 0, "last_accessed": now}
         try:
-            self.clear_retrieval_cache()
+            self._invalidate_search_caches()
         except Exception:
             pass
 
@@ -1278,6 +1454,7 @@ class MemoryStore:
 
         优先走 pgvector 侧车，失败回退到本地向量列或即时计算；全程按 namespace 隔离。
         """
+        self._ensure_open()
         if not query:
             return []
         # TTL 缓存（Wave6）：命中则直接返回，避免重复 embedding/cosine
@@ -1431,14 +1608,15 @@ class MemoryStore:
         # Quote each token so punctuation in user input cannot become FTS syntax.
         match_query = " ".join(f'"{token.replace(chr(34), chr(34) * 2)}"' for token in tokens)
         try:
-            cur = self._conn.cursor()
-            cur.execute(
-                "SELECT notes.key, notes.content "
-                "FROM notes_fts_bigram JOIN notes ON notes_fts_bigram.rowid = notes.id "
-                "WHERE notes_fts_bigram MATCH ?",
-                (match_query,),
-            )
-            rows = cur.fetchall()
+            with self._lock:  # match _search_bm25_raw/vector_search locking discipline
+                cur = self._conn.cursor()
+                cur.execute(
+                    "SELECT notes.key, notes.content "
+                    "FROM notes_fts_bigram JOIN notes ON notes_fts_bigram.rowid = notes.id "
+                    "WHERE notes_fts_bigram MATCH ?",
+                    (match_query,),
+                )
+                rows = cur.fetchall()
             prefix = self._ns_prefix()
             result = [{"key": key, "content": content} for key, content in rows]
             if prefix is not None:

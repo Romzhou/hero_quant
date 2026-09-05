@@ -14,7 +14,7 @@ from typing import Union
 logger = logging.getLogger(__name__)
 
 _HEADING_RE = re.compile(r"^#{1,6}\s+.*$")
-# 中文注释：fence 识别，避免 heading 正则切碎代码块内的示例
+# fence detection uses _FENCE_RE below so heading splits skip fenced code blocks
 _FENCE_RE = re.compile(r"^\s*(```|~~~)")
 
 
@@ -22,38 +22,33 @@ _FENCE_RE = re.compile(r"^\s*(```|~~~)")
 def _split_by_heading(text: str) -> list[str]:
     r"""Split text by markdown headings (^#{1,6}\s). Keeps heading with section."""
     # 中文注释：跟踪 fenced 代码块状态，仅在非 fence 区域识别标题
-    lines = text.splitlines()
+    # use splitlines(keepends=True) so offsets account for \r\n width (CRLF-safe)
+    lines = text.splitlines(keepends=True)
     # 收集真实标题的行起始偏移
     heading_starts: list[int] = []
     # 需要计算每个 heading 的字符偏移，故遍历行并累计
     in_fence = False
     fence_char = ""
     offset = 0
-    # 记录每行偏移，用于 start/end 切片
-    line_offsets: list[int] = []
-    for line in lines:
-        line_offsets.append(offset)
+    for raw_line in lines:
+        line = raw_line.rstrip("\r\n")
+        line_len = len(raw_line)
         # 检测 fence 行
         stripped = line.lstrip()
-        fence_match = False
-        if stripped.startswith("```") or stripped.startswith("~~~"):
+        fence_match = bool(_FENCE_RE.match(line))
+        if fence_match:
             # 简单切换：遇到同类 fence 开关
             marker = stripped[:3]
             if not in_fence:
                 in_fence = True
                 fence_char = marker
-                fence_match = True
             elif marker == fence_char or stripped.startswith(fence_char):
                 in_fence = False
                 fence_char = ""
-                fence_match = True
-            else:
-                fence_match = True
         if not in_fence and not fence_match:
             if _HEADING_RE.match(line):
                 heading_starts.append(offset)
-        # +1 为换行符，最后一行也加 1 但不影响切片末尾
-        offset += len(line) + 1
+        offset += line_len
 
     if not heading_starts:
         return [text] if text.strip() else []
@@ -161,7 +156,8 @@ def ingest_markdown(
                         _bp = Path(_md) / "memory" if Path(_md).name != "memory" else Path(_md)
                     else:
                         _bp = Path("data/memory")
-                except Exception:
+                except Exception as e:
+                    logger.warning("get_settings/memory_dir failed, falling back to data/memory: %s", e)
                     _bp = Path("data/memory")
             bp = Path(_bp)
             # allow caller to pass directory; ensure exists
@@ -198,7 +194,9 @@ def ingest_markdown(
         else:
             raise ValueError("no bp")
     except ValueError:
-        _rel = p_resolved.name
+        # Disambiguate files outside store base: basename + path hash avoids same-name collision.
+        _path_hash = hashlib.sha256(str(p_resolved).encode("utf-8")).hexdigest()[:12]
+        _rel = f"_external/{_path_hash}_{p_resolved.name}"
     # 已提升，循环内复用 _rel 与 idx
 
     count = 0
