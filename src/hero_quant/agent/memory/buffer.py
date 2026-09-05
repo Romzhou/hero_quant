@@ -43,10 +43,12 @@ class MemoryBuffer:
         at_cap = len(self._messages) >= self._capacity
         self._messages.append(msg)
         if at_cap:
-            # 溢出导致 head 被自动顶掉后，可能残留孤儿 assistant/tool 消息；
-            # 逐出直到 head 为 user（至少保留 1 条）。
-            while len(self._messages) > 1 and self._messages[0].role != "user":
-                self._messages.popleft()
+            self._align_head()
+
+    def _align_head(self):
+        """逐出头部孤儿 assistant/tool 消息直到 head 为 user 或为空。"""
+        while self._messages and self._messages[0].role != "user":
+            self._messages.popleft()
 
     def add_user_message(self, content: str):
         """添加用户消息"""
@@ -88,13 +90,25 @@ class MemoryBuffer:
         staged_system: list = []
         staged: list = []
         for m in value:
+            if isinstance(m, dict):
+                try:
+                    m = Message(m["role"], m["content"])
+                except (KeyError, TypeError) as e:
+                    raise ValueError(f"invalid message entry: {m!r}") from e
+            if not isinstance(m, Message):
+                raise ValueError(f"invalid message entry: {m!r}")
             (staged_system if m.role == "system" else staged).append(m)
         if len(staged) > self.max_turns * 2:
             raise ValueError(f"messages exceed capacity: {len(staged)} > {self.max_turns * 2}")
+        if len(staged_system) > (self._system_messages.maxlen or 0):
+            raise ValueError(
+                f"system messages exceed capacity: {len(staged_system)} > {self._system_messages.maxlen}"
+            )
         self._system_messages.clear()
         self._messages.clear()
         self._system_messages.extend(staged_system)
         self._messages.extend(staged)
+        self._align_head()
 
     def clear(self):
         """清空记忆"""
@@ -117,14 +131,22 @@ class MemoryBuffer:
             raise ValueError("invalid buffer data: messages is None")
         if not isinstance(msgs, list):
             raise ValueError(f"invalid buffer data: messages must be list, got {type(msgs).__name__}")
+        staged_system: list = []
+        staged: list = []
         for m in msgs:
             try:
                 role, content = m["role"], m["content"]
             except (KeyError, TypeError) as e:
                 raise ValueError(f"invalid message entry: {m!r}") from e
             msg = Message(role, content)
-            if msg.role == "system":
-                buffer._system_messages.append(msg)
-            else:
-                buffer._messages.append(msg)
+            (staged_system if msg.role == "system" else staged).append(msg)
+        if len(staged) > buffer._capacity:
+            raise ValueError(f"messages exceed capacity: {len(staged)} > {buffer._capacity}")
+        if len(staged_system) > (buffer._system_messages.maxlen or 0):
+            raise ValueError(
+                f"system messages exceed capacity: {len(staged_system)} > {buffer._system_messages.maxlen}"
+            )
+        buffer._system_messages.extend(staged_system)
+        buffer._messages.extend(staged)
+        buffer._align_head()
         return buffer
