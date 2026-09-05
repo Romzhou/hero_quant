@@ -21,10 +21,12 @@ def _deduplicate_preserve_order(items: list[str]) -> list[str]:
 
 def canonical_path(p: str) -> str:
     """返回路径的真实规范路径（解析符号链接），失败即抛 ValueError（不做 realpath 回退）。"""
+    if not isinstance(p, str):
+        raise ValueError(f"path resolve failed for {p!r}: expected str")
     try:
         # strict=True：悬空符号链接视为失败，fail-closed
         return str(Path(p).resolve(strict=True))
-    except (OSError, ValueError, RuntimeError) as e:
+    except (OSError, ValueError, RuntimeError, TypeError) as e:
         raise ValueError(f"path resolve failed for {p!r}: {e}") from e
 
 
@@ -49,10 +51,20 @@ def resolve_policy(mode: str, workspace_root: str | None = None) -> dict:
             raise ValueError("workspace_root required for workspace-write mode")
 
     if mode == "workspace-write":
+        # 显式拒绝文件系统根作为工作区（`/` 或驱动器根如 `D:\`）：否则约束模式
+        # 静默升级为全盘可写。既检查原始输入也检查归一化结果（Windows 下 `/`
+        # 归一化为驱动器根，纯 `"/"` 字面比对够不着）。
+        _raw_ws = workspace_root.strip() if isinstance(workspace_root, str) else workspace_root
+        ws = policy.get("workspaceRoot")
+        if _raw_ws in ("/", "\\") or (isinstance(ws, str) and Path(ws).parent == Path(ws)):
+            raise ValueError(
+                "workspace_root must not be a filesystem root for workspace-write; "
+                "use danger-full-access explicitly"
+            )
         # /tmp 解析失败即 fail-closed，不用字面量回退
         tmp_canonical = canonical_path("/tmp")
         roots = _deduplicate_preserve_order(
-            [r for r in [policy.get("workspaceRoot"), tmp_canonical] if r]
+            [r for r in [ws, tmp_canonical] if r]
         )
         policy["writableRoots"] = roots
         policy["enforcement"] = "full"
@@ -104,9 +116,16 @@ def is_path_writable(path: str, policy: dict) -> bool:
         return False
     cp_norm = os.path.normcase(cp)
     for r in policy.get("writableRoots", []):
+        if not isinstance(r, str) or not r:
+            continue
         if r == "/":
-            return True  # danger-full-access 全盘可写
-        r_norm = os.path.normcase(r)
+            if policy.get("mode") == "danger-full-access":
+                return True  # danger-full-access 全盘可写
+            continue
+        try:
+            r_norm = os.path.normcase(r)
+        except (TypeError, ValueError):
+            continue
         try:
             common = os.path.commonpath([cp_norm, r_norm])
         except ValueError:

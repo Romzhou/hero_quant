@@ -77,3 +77,50 @@ def test_laneA_astguard_sync_two_sided(monkeypatch):
     ok, problems = ag.is_allowlist_synced_with_pyproject()
     assert ok is False
     assert any(p.startswith("stale:") for p in problems)
+
+
+# ── policy.py (4 items: 2 high + 2 medium) ──────────────────────────────
+
+
+def test_laneA_policy_workspace_root_slash_rejected():
+    """High: workspace-write with workspace_root='/' must not escalate to full-disk write."""
+    import pytest
+
+    from hero_quant.sandbox.policy import resolve_policy
+
+    with pytest.raises(ValueError):
+        resolve_policy(mode="workspace-write", workspace_root="/")
+
+
+def test_laneA_policy_slash_root_gated_on_danger_mode():
+    """High: writableRoots ['/'] grants all-path writes only in danger-full-access."""
+    from hero_quant.sandbox.policy import is_path_writable
+
+    assert is_path_writable("/etc/passwd", {"mode": "read-only", "writableRoots": ["/"]}) is False
+    assert (
+        is_path_writable("/etc/passwd", {"mode": "workspace-write", "writableRoots": ["/"]}) is False
+    )
+    assert (
+        is_path_writable("/etc/passwd", {"mode": "danger-full-access", "writableRoots": ["/"]})
+        is True
+    )
+
+
+def test_laneA_policy_malformed_roots_fail_closed():
+    """Medium: non-string writableRoots entries must be skipped, not raise."""
+    from hero_quant.sandbox.policy import is_path_writable
+
+    pol = {"mode": "workspace-write", "writableRoots": [None, 123, b"/tmp", "/tmp"]}
+    assert is_path_writable("/etc/passwd", pol) is False
+
+
+def test_laneA_policy_canonical_non_str_valueerror():
+    """Medium: canonical_path contract is ValueError-only; non-str must not leak TypeError."""
+    import pytest
+
+    from hero_quant.sandbox.policy import canonical_path
+
+    with pytest.raises(ValueError):
+        canonical_path(None)
+    with pytest.raises(ValueError):
+        canonical_path(123)
