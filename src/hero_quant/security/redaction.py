@@ -46,8 +46,9 @@ _REDACTED = "***"
 
 # LLM 计量键不应脱敏，避免影响 VCR 回放与成本统计
 _ALLOW_TOKENS = {"input_tokens", "output_tokens", "prompt_tokens", "completion_tokens", "prompttokens", "completiontokens", "generated_tokens",
-                 # 中文：子串匹配会误杀计量/模型配置键（token_count/total_tokens/tokenizer/token_usage/private_notes），显式放行
-                 "token_count", "total_tokens", "token_usage", "tokenizer", "private_notes"}
+                 # 中文：子串匹配会误杀计量/模型配置键（token_count/total_tokens/tokenizer/token_usage），显式放行；
+                 # 自由文本键（如 private_notes）不得放行——仍走键级脱敏，防嵌套密钥经放行外泄
+                 "token_count", "total_tokens", "token_usage", "tokenizer"}
 
 
 def _is_sensitive_key(key: object) -> bool:
@@ -102,7 +103,8 @@ def _redact_string(value: str, sink: str) -> str:
                 continue
             return _REDACTED
         return value
-    # 未知 sink 回退 ARGUMENTS_SINK 语义：无模式命中则透传，避免拼写 typo 致过脱敏
+    # 未知 sink 回退 ARGUMENTS_SINK 语义（最严格，fail-closed）：无模式命中亦按 ARGUMENTS 规则处理，
+    # 拼写 typo 不得导致放宽脱敏（宁可过脱敏，不可欠脱敏）
     return _redact_string(value, ARGUMENTS_SINK)
 
 
