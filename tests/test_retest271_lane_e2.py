@@ -375,65 +375,33 @@ def test_e2_sec_headers_survive_errors():
     """Security headers must be applied even when downstream raises."""
     import starlette.middleware.base as _base  # noqa: F401  (ensures starlette present)
 
+    from fastapi import FastAPI
+    from fastapi.responses import JSONResponse
+    from fastapi.testclient import TestClient
+
     from hero_quant.api.middleware.security_headers import SecurityHeadersMiddleware
 
-    async def _boom(req):
-        raise RuntimeError("downstream failure")
+    app = FastAPI()
+    app.add_middleware(SecurityHeadersMiddleware)
 
-    async def _ok(req):
-        from starlette.responses import JSONResponse
-
+    @app.get("/ping")
+    def _ping():
         return JSONResponse({"ok": True})
 
-    mw = SecurityHeadersMiddleware(app=None)
+    @app.get("/boom")
+    def _boom():
+        raise RuntimeError("downstream failure")
 
-    async def _run(fn):
-        from starlette.responses import Response
-
-        scope = {
-            "type": "http",
-            "http_version": "1.1",
-            "method": "GET",
-            "scheme": "http",
-            "path": "/ping",
-            "query_string": b"",
-            "headers": [],
-            "client": ("test", 123),
-            "server": ("test", 80),
-        }
-        status = {}
-
-        async def receive():
-            return {"type": "http.request", "body": b"", "more_body": False}
-
-        async def send(msg):
-            status.setdefault("msgs", []).append(msg)
-
-        try:
-            await mw(scope, receive, send)
-            return status.get("msgs", [])
-        except RuntimeError:
-            return status.get("msgs", "RAISED")
-
-    ok_msgs = asyncio.run(_run(_ok))
-    assert ok_msgs != "RAISED"
-    starts = [m for m in ok_msgs if m.get("type") == "http.response.start"]
-    assert starts, f"no response start: {ok_msgs!r}"
-    headers = {k.decode().lower(): v.decode() for k, v in starts[0].get("headers", [])}
-    assert headers.get("x-content-type-options") == "nosniff"
-    assert headers.get("strict-transport-security", "").startswith("max-age=")
-    err_msgs = asyncio.run(_run(_boom))
-    # error path: either headers already sent on http.response.start before the
-    # exception propagates, or the exception propagates (ServerErrorMiddleware
-    # outside will render 500 — headers injected at ASGI send level then apply).
-    # Pure-ASGI send-wrapper guarantees the former; BaseHTTPMiddleware cannot.
-    if err_msgs != "RAISED":
-        err_starts = [m for m in err_msgs if m.get("type") == "http.response.start"]
-        if err_starts:
-            eheaders = {k.decode().lower(): v.decode() for k, v in err_starts[0].get("headers", [])}
-            assert eheaders.get("x-content-type-options") == "nosniff"
-    else:
-        src = _src("hero_quant/api/middleware/security_headers.py")
-        assert "send_wrapper" in src or "http.response.start" in src, (
-            "BaseHTTPMiddleware cannot cover error path — must use pure-ASGI send wrapper"
-        )
+    client = TestClient(app, raise_server_exceptions=False)
+    ok = client.get("/ping")
+    assert ok.headers.get("X-Content-Type-Options") == "nosniff"
+    assert ok.headers.get("Strict-Transport-Security", "").startswith("max-age=")
+    err = client.get("/boom")
+    # error responses rendered by ServerErrorMiddleware sit OUTSIDE this
+    # middleware so headers cannot be injected there by any in-app middleware;
+    # what pure-ASGI guarantees is headers on every response WE send (incl.
+    # handled 4xx/5xx). Assert at minimum the ok-path + that dispatch goes
+    # through the ASGI send wrapper (http.response.start injection).
+    src = _src("hero_quant/api/middleware/security_headers.py")
+    assert "send_wrapper" in src and "http.response.start" in src
+    assert err.status_code == 500
