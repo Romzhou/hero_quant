@@ -590,3 +590,12 @@ def test_e3_redaction_circular_fail_closed():
     d = {"k": "v"}
     d["self"] = d
     assert redact_tool_result(d, sink="result") == "***"
+
+
+def test_e3_presentation_name_newline_safe():
+    """[bug·medium] Name containing newlines must not break comment structure."""
+    from hero_quant.tools.presentation import present_as_code
+
+    out = present_as_code({"name": "a\nb", "description": "d"})
+    for ln in out.splitlines():
+        assert ln.startswith("#"), f"uncommented line from name: {ln!r}"

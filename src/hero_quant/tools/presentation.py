@@ -44,10 +44,13 @@ def present_as_code(spec: Any) -> str:
     if not name:
         raise ValueError(f"tool spec missing required 'name': {spec!r}")
     description = _get_field(spec, "description", "")
+    # 中文：name 同样逐行注释化（防 name 含换行破坏注释结构，与 description 同规则）
+    name_lines = str(name).splitlines() or [""]
+    name_commented = "\n".join(f"# Tool: {line}" if line.strip() else "# Tool:" for line in name_lines)
     # 中文：多行 description 逐行加 # 前缀，避免后续行成为未注释文本
     desc_lines = str(description).splitlines() or [""]
     commented = "\n".join(f"# {line}" if line.strip() else "#" for line in desc_lines)
-    return f"# Tool: {name}\n{commented}\n"
+    return f"{name_commented}\n{commented}\n"
 
 
 def present(spec: Any, presentAs: str = "native") -> Any:
