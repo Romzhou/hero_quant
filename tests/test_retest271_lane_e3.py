@@ -118,3 +118,99 @@ def test_e3_security_collision_retry_checks_second_set():
         assert sec_mod.consume_ticket(t) is True
     finally:
         sec_mod._get_redis_for_ticket = orig
+
+
+# ============================================================================
+# llm/client.py — 4 items
+# ============================================================================
+
+def test_e3_llm_no_double_rpc_on_internal_typeerror():
+    """[bug·high] Internal TypeError must NOT trigger timeout-fallback re-execution."""
+    from hero_quant.llm.client import LLMClient
+
+    calls = []
+
+    class BuggyBackend:
+        def invoke(self, prompt, timeout=None):
+            calls.append(1)
+            if len(calls) == 1:
+                raise TypeError("internal bug: bad prompt type")
+            return "second-call-result"
+
+    c = LLMClient(BuggyBackend(), timeout=5, max_retries=0)
+    try:
+        c.invoke("hi")
+        raised = None
+    except TypeError as e:
+        raised = e
+    assert raised is not None and "internal bug" in str(raised)
+    assert len(calls) == 1, f"non-idempotent RPC must execute exactly once, got {len(calls)}"
+
+
+def test_e3_llm_invoke_preserves_tool_calls():
+    """[bug·high] invoke-via-stream_chat fallback must not silently drop tool_calls."""
+    from hero_quant.llm.client import LLMClient
+
+    class ToolBackend:
+        def stream_chat(self, prompt, timeout=None):
+            yield {"type": "text", "text": "thinking "}
+            yield {"type": "tool_call", "tool_calls": [{"name": "get_bars", "arguments": {}}], "text": ""}
+
+    c = LLMClient(ToolBackend(), timeout=5, max_retries=0)
+    result = c.invoke("any")
+    # text concatenation preserved (d3_07 compat)
+    assert "thinking" in result
+    # tool_calls must be retrievable, not silently discarded
+    assert getattr(c, "last_tool_calls", None) == [{"name": "get_bars", "arguments": {}}]
+
+
+def test_e3_llm_usage_reset_each_call():
+    """[bug·medium] Usage must reset at start of each call (no stale attribution)."""
+    from hero_quant.llm.client import LLMClient
+
+    class WithUsage:
+        usage = {"prompt_tokens": 10, "completion_tokens": 5}
+
+        def stream_chat(self, p, timeout=None):
+            yield "done"
+
+    class NoUsage:
+        def stream_chat(self, p, timeout=None):
+            yield "done"
+
+    c = LLMClient(WithUsage(), timeout=5, max_retries=0)
+    list(c.stream_chat("first"))
+    assert c.usage == {"prompt_tokens": 10, "completion_tokens": 5}
+    # rebind to a backend with no usage: stale counts must NOT linger
+    c._chat = NoUsage()
+    list(c.stream_chat("second"))
+    assert c.usage is None and c.last_usage is None
+
+
+def test_e3_llm_langchain_fallback_forwards_timeout():
+    """[bug·medium] stream_chat LangChain .stream/.invoke fallbacks must forward timeout."""
+    from hero_quant.llm.client import LLMClient
+
+    seen = {}
+
+    class LangChainLike:
+        def stream(self, prompt, timeout=None):
+            seen["stream_t"] = timeout
+            yield "chunk"
+
+        def invoke(self, prompt, timeout=None):
+            seen["invoke_t"] = timeout
+            return "invoked"
+
+    c = LLMClient(LangChainLike(), timeout=9, max_retries=0)
+    chunks = list(c.stream_chat("hi"))
+    assert chunks and seen.get("stream_t") == 9, f"stream fallback must get timeout=9, got {seen}"
+
+    class InvokeOnly:
+        def invoke(self, prompt, timeout=None):
+            seen["direct_t"] = timeout
+            return "ok"
+
+    c2 = LLMClient(InvokeOnly(), timeout=11, max_retries=0)
+    assert c2.invoke("hi") == "ok"
+    assert seen.get("direct_t") == 11, f"invoke must get timeout=11, got {seen}"
