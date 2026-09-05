@@ -193,3 +193,396 @@ def test_lanee_redis_publish_sync_caps_stream():
     assert "maxlen" in src or "xtrim" in src.lower(), (
         "publish_sync uses bare xadd without maxlen/xtrim cap"
     )
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Lane E1 · ws.py repro tests (detail log src__hero_quant__api__ws_py.log)
+# ══════════════════════════════════════════════════════════════════════
+import json as _lanee_json
+import logging as _lanee_logging
+from types import SimpleNamespace as _lanee_SNS
+
+
+def _lanee_reset_async_redis():
+    import hero_quant.infra.redis as rmod
+
+    rmod.clear_redis_instance()
+    fake = fakeredis_async.FakeRedis(decode_responses=True)
+    rmod.set_redis_instance(fake)
+    return rmod, fake
+
+
+def _lanee_clear_ws():
+    from hero_quant.api import ws as wsmod
+
+    wsmod.manager._connections.clear()
+    wsmod.heartbeat._last_active.clear()
+    hb = wsmod.heartbeat
+    if hasattr(hb, "_server_keepalives"):
+        hb._server_keepalives.clear()
+    return wsmod
+
+
+class _lanee_FakeWS:
+    """Minimal WS double: scripted receive_json (dict / 'timeout' / 'disconnect')."""
+
+    def __init__(self, recv_script=()):
+        self.sent = []
+        self.closed = None
+        self._script = list(recv_script)
+
+    async def accept(self):
+        pass
+
+    async def send_json(self, data):
+        self.sent.append(data)
+
+    async def close(self, *a, **kw):
+        self.closed = (a, kw)
+
+    async def receive_json(self):
+        from fastapi import WebSocketDisconnect
+
+        if not self._script:
+            raise WebSocketDisconnect()
+        act = self._script.pop(0)
+        if act == "timeout":
+            raise asyncio.TimeoutError()
+        if act == "disconnect":
+            raise WebSocketDisconnect()
+        return act
+
+
+async def _lanee_run_consumer_briefly(wsmod, stop_after=0.8):
+    """Run run_trace_consumer until shortly after first read settles."""
+    stop = asyncio.Event()
+
+    async def _stopper():
+        await asyncio.sleep(stop_after)
+        stop.set()
+
+    await asyncio.gather(wsmod.run_trace_consumer(stop), _stopper())
+
+
+# ── ws.py high 1: duplicate / missed fan-out ──
+
+
+def test_lanee_ws_publish_tags_origin():
+    """broadcast publishes Stream entry tagged with origin == INSTANCE_ID so the
+    originator's own consumer can suppress the echo (no duplicate delivery)."""
+    rmod, fake = _lanee_reset_async_redis()
+    wsmod = _lanee_clear_ws()
+    try:
+        from hero_quant.api.ws import TRACE_STREAM, broadcast_trace_event
+
+        async def _run():
+            await broadcast_trace_event({"type": "delta", "delta": "origin-probe"})
+            entries = await fake.xread({TRACE_STREAM: "0"}, count=10)
+            assert entries, "stream entry missing"
+            fields = [f for _, msgs in entries for _, f in msgs]
+            assert any(
+                f.get("origin") == wsmod.INSTANCE_ID for f in fields
+            ), f"publish untagged: no origin==INSTANCE_ID in {fields}"
+
+        asyncio.run(_run())
+    finally:
+        rmod.clear_redis_instance()
+        wsmod.manager._connections.clear()
+
+
+def test_lanee_ws_consumer_skips_own_origin_no_duplicate():
+    """Single worker end-to-end: broadcast delivers locally once; the worker's
+    own consumer must NOT re-deliver its own Stream entry (exactly-once)."""
+    rmod, fake = _lanee_reset_async_redis()
+    wsmod = _lanee_clear_ws()
+    ch = "trace:lanee-dedup"
+    ws = _lanee_FakeWS()
+    try:
+        from hero_quant.api.ws import broadcast_trace_event
+
+        async def _run():
+            await wsmod.manager.connect(ch, ws)
+            await broadcast_trace_event({"type": "delta", "delta": "dup-probe"})
+            assert ws.sent.count({"type": "delta", "delta": "dup-probe"}) == 1
+            await _lanee_run_consumer_briefly(wsmod)
+            assert ws.sent.count({"type": "delta", "delta": "dup-probe"}) == 1, (
+                f"duplicate delivery: consumer re-forwarded own entry: {ws.sent}"
+            )
+
+        asyncio.run(_run())
+    finally:
+        asyncio.run(wsmod.manager.disconnect(ch, ws))
+        rmod.clear_redis_instance()
+        wsmod.manager._connections.clear()
+
+
+def test_lanee_ws_consumer_delivers_foreign_origin():
+    """Guard against over-suppression: entries from OTHER workers must still be
+    forwarded locally by this worker's consumer."""
+    rmod, fake = _lanee_reset_async_redis()
+    wsmod = _lanee_clear_ws()
+    ch = "trace:lanee-foreign"
+    ws = _lanee_FakeWS()
+    try:
+        from hero_quant.api.ws import TRACE_STREAM
+
+        event = {"type": "delta", "delta": "foreign-probe"}
+
+        async def _run():
+            await wsmod.manager.connect(ch, ws)
+            await fake.xadd(
+                TRACE_STREAM,
+                {
+                    "channel": ch,
+                    "origin": "some-other-worker",
+                    "data": _lanee_json.dumps(event),
+                },
+            )
+            await _lanee_run_consumer_briefly(wsmod)
+            assert event in ws.sent, "foreign-origin entry was wrongly suppressed"
+
+        asyncio.run(_run())
+    finally:
+        asyncio.run(wsmod.manager.disconnect(ch, ws))
+        rmod.clear_redis_instance()
+        wsmod.manager._connections.clear()
+
+
+def test_lanee_ws_consumer_group_is_per_worker():
+    """run_trace_consumer must read via a per-worker group (INSTANCE_ID-scoped)
+    so every worker receives every entry — a single shared group delivers each
+    entry to exactly one worker (broadcast misses)."""
+    import hero_quant.api.ws as wsmod
+
+    group = wsmod._trace_consumer_group()
+    assert wsmod.INSTANCE_ID in group and group != wsmod.TRACE_GROUP, (
+        f"consumer group not per-worker: {group!r}"
+    )
+    src = inspect.getsource(wsmod.run_trace_consumer)
+    assert "_trace_consumer_group" in src, (
+        "run_trace_consumer still uses one shared TRACE_GROUP for all workers"
+    )
+
+
+# ── ws.py high 2: user isolation dropped in sync path ──
+
+
+def test_lanee_ws_sync_broadcast_routes_user():
+    """broadcast_trace_event_sync(event, user=...) must fan out ONLY to that
+    user's channel — never full-broadcast (cross-user leak)."""
+    rmod, fake = _lanee_reset_async_redis()
+    wsmod = _lanee_clear_ws()
+    from hero_quant.api.ws import resolve_user_channel
+
+    ch_u1 = resolve_user_channel("lanee-u1", None)
+    ch_u2 = resolve_user_channel("lanee-u2", None)
+    ws1, ws2 = _lanee_FakeWS(), _lanee_FakeWS()
+    event = {"type": "delta", "delta": "user-scoped-probe"}
+
+    async def _run():
+        await wsmod.manager.connect(ch_u1, ws1)
+        await wsmod.manager.connect(ch_u2, ws2)
+        wsmod.broadcast_trace_event_sync(event, user="lanee-u1")
+        await asyncio.sleep(0.5)
+        assert event in ws1.sent, "user-scoped event never reached its owner"
+        assert event not in ws2.sent, "CROSS-USER LEAK: u2 received u1's event"
+
+    try:
+        asyncio.run(_run())
+    finally:
+        asyncio.run(wsmod.manager.disconnect(ch_u1, ws1))
+        asyncio.run(wsmod.manager.disconnect(ch_u2, ws2))
+        rmod.clear_redis_instance()
+        wsmod.manager._connections.clear()
+
+
+def test_lanee_ws_sync_broadcast_legacy_no_user():
+    """Guard: sync broadcast without user keeps legacy full-broadcast (Monitor
+    compat; single-arg call shape used by existing call sites)."""
+    rmod, fake = _lanee_reset_async_redis()
+    wsmod = _lanee_clear_ws()
+    ws1, ws2 = _lanee_FakeWS(), _lanee_FakeWS()
+    event = {"type": "delta", "delta": "legacy-probe"}
+
+    async def _run():
+        await wsmod.manager.connect("trace:lanee-leg-a", ws1)
+        await wsmod.manager.connect("trace:lanee-leg-b", ws2)
+        wsmod.broadcast_trace_event_sync(event)
+        await asyncio.sleep(0.5)
+        assert event in ws1.sent and event in ws2.sent
+
+    try:
+        asyncio.run(_run())
+    finally:
+        asyncio.run(wsmod.manager.disconnect("trace:lanee-leg-a", ws1))
+        asyncio.run(wsmod.manager.disconnect("trace:lanee-leg-b", ws2))
+        rmod.clear_redis_instance()
+        wsmod.manager._connections.clear()
+
+
+# ── ws.py medium 1: heartbeat eviction races WSManager lock ──
+
+
+def test_lanee_ws_eviction_holds_manager_lock():
+    """_check_loop must pop connections under WSManager lock (connect /
+    disconnect mutate the same dict under the lock; lock-free get+pop can
+    evict a just-added reconnect)."""
+    import hero_quant.api.ws as wsmod
+
+    src = inspect.getsource(wsmod.HeartbeatMonitor._check_loop)
+    assert "manager._lock" in src or "self._lock" in src, (
+        "_check_loop still reads/pops manager._connections without the lock"
+    )
+
+
+def test_lanee_ws_eviction_closes_expired():
+    """Guard (behavioral): an expired channel is evicted and its sockets are
+    closed with heartbeat-timeout code 4002."""
+    rmod, fake = _lanee_reset_async_redis()
+    wsmod = _lanee_clear_ws()
+    from datetime import timedelta
+
+    ch = "trace:lanee-expire"
+    ws = _lanee_FakeWS()
+
+    async def _run():
+        await wsmod.manager.connect(ch, ws)
+        wsmod.heartbeat.record(ch)
+        wsmod.heartbeat._last_active[ch] -= timedelta(seconds=120)
+        wsmod.heartbeat.CHECK_INTERVAL = 0.05
+        task = asyncio.create_task(wsmod.heartbeat._check_loop())
+        await asyncio.sleep(0.3)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        assert ws.closed is not None, "expired connection was not closed"
+        args, kwargs = ws.closed
+        assert args == (4002,) or kwargs.get("code") == 4002, (
+            f"wrong close code for heartbeat timeout: {ws.closed!r}"
+        )
+        assert ch not in wsmod.manager._connections
+
+    try:
+        asyncio.run(_run())
+    finally:
+        try:
+            del wsmod.heartbeat.CHECK_INTERVAL
+        except AttributeError:
+            pass
+        rmod.clear_redis_instance()
+        wsmod.manager._connections.clear()
+        wsmod.heartbeat._last_active.clear()
+
+
+# ── ws.py medium 2: ack-on-failure loses messages ──
+
+
+def test_lanee_ws_consumer_no_ack_on_forward_failure(monkeypatch):
+    """Transient local-send failure must NOT be acked (entry stays pending for
+    redelivery); ack belongs only after successful forward."""
+    rmod, fake = _lanee_reset_async_redis()
+    wsmod = _lanee_clear_ws()
+    from hero_quant.api.ws import TRACE_STREAM
+    from hero_quant.infra.redis import RedisStream
+
+    acked = []
+    orig_ack = RedisStream.ack
+
+    async def _spy_ack(self, stream, group, *ids):
+        acked.extend(ids)
+        return await orig_ack(self, stream, group, *ids)
+
+    monkeypatch.setattr(RedisStream, "ack", _spy_ack)
+
+    async def _boom(channel, data):
+        raise RuntimeError("lanee-transient-send-failure")
+
+    monkeypatch.setattr(wsmod.manager, "send_to", _boom)
+    monkeypatch.setattr(wsmod.manager, "broadcast", _boom)
+
+    async def _run():
+        await fake.xadd(
+            TRACE_STREAM,
+            {"channel": "trace", "data": _lanee_json.dumps({"type": "ping"})},
+        )
+        await _lanee_run_consumer_briefly(wsmod)
+        assert acked == [], f"failed forward was acked (message lost): {acked}"
+
+    try:
+        asyncio.run(_run())
+    finally:
+        rmod.clear_redis_instance()
+        wsmod.manager._connections.clear()
+
+
+def test_lanee_ws_consumer_no_ack_on_poison(monkeypatch):
+    """Poison payload (unparseable JSON) must NOT be acked away silently."""
+    rmod, fake = _lanee_reset_async_redis()
+    wsmod = _lanee_clear_ws()
+    from hero_quant.api.ws import TRACE_STREAM
+    from hero_quant.infra.redis import RedisStream
+
+    acked = []
+    orig_ack = RedisStream.ack
+
+    async def _spy_ack(self, stream, group, *ids):
+        acked.extend(ids)
+        return await orig_ack(self, stream, group, *ids)
+
+    monkeypatch.setattr(RedisStream, "ack", _spy_ack)
+
+    async def _run():
+        await fake.xadd(TRACE_STREAM, {"channel": "trace", "data": "not-json-poison"})
+        await _lanee_run_consumer_briefly(wsmod)
+        assert acked == [], f"poison payload was acked (silently dropped): {acked}"
+
+    try:
+        asyncio.run(_run())
+    finally:
+        rmod.clear_redis_instance()
+        wsmod.manager._connections.clear()
+
+
+# ── ws.py medium 3: server-driven pong defeats heartbeat timeout ──
+
+
+def test_lanee_ws_server_pong_renewal_bounded():
+    """Server keepalive pongs must NOT renew liveness unboundedly: after a
+    bounded number of consecutive server pongs with zero client traffic, the
+    channel must become evictable so dead peers eventually expire."""
+    rmod, fake = _lanee_reset_async_redis()
+    wsmod = _lanee_clear_ws()
+    orig_ct = wsmod.consume_ticket
+    wsmod.consume_ticket = lambda t: True
+    orig_record = wsmod.heartbeat.record
+    calls = {"n": 0}
+
+    def _spy(ch):
+        calls["n"] += 1
+        return orig_record(ch)
+
+    wsmod.heartbeat.record = _spy
+    try:
+        bound = getattr(wsmod.heartbeat, "MAX_SERVER_KEEPALIVES", 0)
+
+        async def _run():
+            ws = _lanee_FakeWS(recv_script=["timeout"] * 6 + ["disconnect"])
+            await wsmod.ws_trace(ws, ticket="t", user="")
+            pongs = [m for m in ws.sent if m.get("type") == "pong"]
+            assert len(pongs) == 6, f"keepalive pongs must still be sent: {ws.sent}"
+            assert calls["n"] <= 1 + bound, (
+                f"server pongs renew liveness forever: record called {calls['n']}x "
+                f"for 6 timeouts with no client traffic (bound={bound})"
+            )
+
+        asyncio.run(_run())
+    finally:
+        wsmod.consume_ticket = orig_ct
+        wsmod.heartbeat.record = orig_record
+        rmod.clear_redis_instance()
+        wsmod.manager._connections.clear()
+        wsmod.heartbeat._last_active.clear()
+        if hasattr(wsmod.heartbeat, "_server_keepalives"):
+            wsmod.heartbeat._server_keepalives.clear()
