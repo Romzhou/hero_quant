@@ -19,6 +19,27 @@ REF_PATTERN = re.compile(r"^(?:\$\{(?P<braced>[^}]+)\}$|\$(?P<var2>[A-Za-z_][A-Z
 _GENERIC_REF = re.compile(r"\$\{([^}]+)\}")
 
 
+def _looks_like_path(ref: str) -> bool:
+    """纯字面值 vs 文件路径意图判定：仅显式路径形态才做文件探测。
+
+    中文：短字面值恰好与 CWD 下 0600 文件同名即被劫持为文件内容（CWD 相关
+    惊喜语义），或撞上非 0600 文件抛 PermissionError（DoS）。要求显式意图：
+    含分隔符/显式 ./~/../ 前缀/绝对路径/prefixed file:，否则直接回落原值。
+    """
+    if ref.startswith("file:"):
+        return True
+    if ref.startswith(("./", "../", ".\\", "..\\", "~/", "~\\")):
+        return True
+    if "/" in ref or "\\" in ref:
+        return True
+    try:
+        if Path(ref).is_absolute():
+            return True
+    except (ValueError, OSError, RuntimeError):
+        return False
+    return False
+
+
 def _check_fd_0600(fd: int, path: Path) -> None:
     """fd 版 0600 检查（open 后 fstat，无 TOCTOU）。供 _read_credential_file 复用。
 
@@ -33,32 +54,10 @@ def _check_fd_0600(fd: int, path: Path) -> None:
         raise PermissionError(f"credential file {path} permissions {oct(mode)} not 0600")
 
 
-def _check_0600(path: Path, *, strict: bool = True) -> None:
-    """检查文件权限是否为 0600，非 0600 时告警（防多用户可读导致泄露）。
-
-    strict=True 默认强制隔离；strict=False 保持历史 warn-only 兼容。
-    仅捕获 OSError/FileNotFoundError，不吞噬其它异常，避免隐藏 Windows ACL 等错误。
-    """
-    try:
-        st = os.stat(path)
-        mode = st.st_mode & 0o777
-        if mode != 0o600:
-            msg = f"credential file {path} permissions {oct(mode)} not 0600"
-            if strict:
-                raise PermissionError(msg)
-            warnings.warn(msg, UserWarning, stacklevel=3)
-    except FileNotFoundError:
-        return
-    except OSError as e:
-        if strict:
-            raise ValueError(f"cannot stat credential file {path}: {e}") from e
-        warnings.warn(f"cannot stat {path}: {e}", UserWarning, stacklevel=3)
-        return
-
-
 def _read_credential_file(path: Path) -> str:
     """读取凭据文件：原子 O_NOFOLLOW 打开防 TOCTOU，每次调用均重读以支持热重载。"""
     # symlink validation before open — ensure target inside allowed dir (parent)
+    target: Path | None = None
     try:
         if path.is_symlink():
             try:
@@ -74,6 +73,10 @@ def _read_credential_file(path: Path) -> str:
                     raise PermissionError(f"credential symlink target outside allowed dir: {path} -> {target}")
             except PermissionError:
                 raise
+            except FileNotFoundError:
+                # 中文：悬空 symlink 的 ENOENT 是“缺失”而非“无权限”，直透以便调用方
+                # 区分 fail-closed（权限）与回落/缺失（未找到），不误包为 PermissionError
+                raise
             except OSError as e:
                 raise PermissionError(f"credential symlink validation failed for {path}: {e}") from e
     except PermissionError:
@@ -82,10 +85,16 @@ def _read_credential_file(path: Path) -> str:
         # is_symlink/resolve failed
         raise PermissionError(f"credential symlink check failed for {path}: {e}") from e
     flags = os.O_RDONLY
-    if hasattr(os, "O_NOFOLLOW"):
+    # 中文：已校验的 parent 内 symlink 走 target 打开（不带 O_NOFOLLOW，避免
+    # allow 分支被一刀切 ELOOP 堵死）；其余路径仍 O_NOFOLLOW 防 TOCTOU 跟随。
+    nofollow_ok = hasattr(os, "O_NOFOLLOW") and target is None
+    if nofollow_ok:
         flags |= os.O_NOFOLLOW  # type: ignore[attr-defined]
     try:
-        fd = os.open(path, flags)
+        fd = os.open(target if target is not None else path, flags)
+    except PermissionError:
+        # 中文：EACCES 等系统权限错误直透，不得收敛为 ValueError（权限 vs 缺失语义调用方需区分）
+        raise
     except OSError as e:
         # ELOOP indicates symlink when O_NOFOLLOW set
         raise ValueError(f"cannot open credential file {path}: {e}") from e
@@ -155,6 +164,10 @@ def resolve(ref: str) -> str:
             if kind == "env":
                 raise ValueError(f"credential ref not found (shadow fail-loud): {ref}")
             # 对 ref:/credential:/${} / $VAR 允许文件回落，但不展开 env vars 防注入
+            # 中文：与纯字面值同理，无路径意图的裸名（如 MY_VAR）不得做 CWD 相对探测，
+            # 否则 CWD 下同名 0600 文件劫持解析；直接 fail-loud（凭据引用语义）。
+            if not _looks_like_path(var):
+                raise ValueError(f"credential ref not found (shadow fail-loud): {ref}")
             p = Path(var)
             # 仅用字面路径，不做 expandvars/expanduser，避免 $HOME 注入任意文件读取
             cand = p
@@ -187,15 +200,21 @@ def resolve(ref: str) -> str:
 
         return _GENERIC_REF.sub(_repl, ref)
 
-    # 无模式的纯值：若指向已存在文件则按凭据文件读取（支持热重载）— 原子 O_NOFOLLOW
-    # 中文：纯值探测只对像路径的短字符串做（<=512 且无换行/NUL），否则直接回落原值，防无意义 IO 与意外语义
-    if len(ref) <= 512 and "\n" not in ref and "\r" not in ref and "\x00" not in ref:
-        p_plain = Path(ref)
-        # 仅当路径看起来像文件路径时尝试原子读取；不存在则回落为原值
+    # 无模式的纯值：仅显式路径意图才做文件探测（支持热重载）— 原子 O_NOFOLLOW
+    # 中文：纯值探测只对像路径的短字符串做（<=512 且无换行/NUL 且 _looks_like_path），
+    # 否则直接回落原值，防 CWD 碰撞劫持与意外 DoS（PermissionError 不再误抛给字面值）
+    if len(ref) <= 512 and "\n" not in ref and "\r" not in ref and "\x00" not in ref and _looks_like_path(ref):
+        # 中文：file: 前缀表路径意图，剥离后再做 Path 解析（否则按字面文件名探测恒 miss，intent 即死代码）
+        plain = ref[len("file:"):] if ref.startswith("file:") else ref
+        p_plain = Path(plain)
+        # 仅当路径看起来像文件路径时尝试原子读取；不存在/权限不对均回落原值
+        # （纯字面值语义：PermissionError 亦回落，不误抛 DoS；REF 分支仍 fail-loud）。
+        # 权限失败回落时必须告警（loud fallback），避免把 "./secret" 这类字面值
+        # 静默当成凭据使用而掩盖误配置。
         try:
             return _read_credential_file(p_plain)
-        except PermissionError:
-            raise
+        except PermissionError as e:
+            warnings.warn(f"credential file {p_plain} unreadable ({e}), using literal value", UserWarning, stacklevel=2)
         except (FileNotFoundError, ValueError, OSError):
             pass
 
@@ -209,6 +228,18 @@ def write_credential_file(path: str | Path, content: str) -> Path:
     p = Path(path)
     try:
         p.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        # 中文：exist_ok=True 时已存在目录的 mode 不会被改（且新建受 umask 遮蔽），
+        # 必须 stat 后显式 chmod 0700，否则宽松父目录包住 0600 秘钥（枚举/替换）。
+        # 失败必须 loud（fail-closed），成功且已是 0700 则不再多余 chmod。
+        # 中文：内层 chmod 失败抛 PermissionError（OSError 子类），必须先直透，
+        # 不得被外层 mkdir-failed 重包误报根因。
+        try:
+            if p.parent.exists() and (os.stat(p.parent).st_mode & 0o077) != 0:
+                os.chmod(p.parent, 0o700)
+        except PermissionError:
+            raise
+        except OSError as e:
+            raise PermissionError(f"chmod 0700 failed for credential dir {p.parent}: {e}") from e
     except TypeError:
         p.parent.mkdir(parents=True, exist_ok=True)
         try:
@@ -217,6 +248,10 @@ def write_credential_file(path: str | Path, content: str) -> Path:
         except Exception as e:
             # 中文：目录权限失败必须 loud，不可吞（fail-closed）
             raise PermissionError(f"chmod 0700 failed for credential dir {p.parent}: {e}") from e
+    except PermissionError:
+        # 中文：内层 chmod 0700 的 PermissionError（OSError 子类）直透，
+        # 不得被外层 mkdir-failed 重包误报根因
+        raise
     except OSError as e:
         raise PermissionError(f"mkdir failed for credential dir {p.parent}: {e}") from e
     # use atomic temp with random suffix in same dir, mode 0o600, no world-readable window
