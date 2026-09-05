@@ -71,22 +71,65 @@ try:
         """
 
         async def dispatch(self, request: Request, call_next):
-            raw = request.headers.get("x-request-id") or request.headers.get("x-trace-id")
-            rid = _clean_trace_id(raw) or uuid.uuid4().hex[:16]
+            # 各自独立校验：非法 x-request-id 不得吞掉合法 x-trace-id 回退。
+            rid = (
+                _clean_trace_id(request.headers.get("x-request-id"))
+                or _clean_trace_id(request.headers.get("x-trace-id"))
+                or uuid.uuid4().hex[:16]
+            )
             t1 = _trace_id_var.set(rid)
             t2 = _request_id_var.set(rid)
+            # BaseHTTPMiddleware 在部分 Starlette 版本下行用拷贝/分离 context 运行，
+            # 此处 set() 后 endpoint 侧经同 context 调 call_next 可见；后台任务如需
+            # ID 须由调用方显式透传 rid（见 server.py query/query_stream）。
             try:
                 response: Response = await call_next(request)
                 response.headers["X-Request-ID"] = rid
                 response.headers["X-Trace-Id"] = rid
                 return response
             finally:
-                # token 复位：异常也不泄漏到复用 task/测试/后台任务
+                # token 复位：异常也不泄漏到复用 task/测试/后台任务。
+                # 注意：Starlette 在响应 BackgroundTasks 执行前即跑 finally，
+                # 后台任务如需 ID 须由调用方显式透传 rid（见 server.py query/query_stream）。
+                _trace_id_var.reset(t1)
+                _request_id_var.reset(t2)
+
+        async def dispatch_with_context_propagated(self, request: Request, call_next):
+            """显式上下文透传变体：供后台任务需要 ID 时调用方使用。"""
+            rid = (
+                _clean_trace_id(request.headers.get("x-request-id"))
+                or _clean_trace_id(request.headers.get("x-trace-id"))
+                or uuid.uuid4().hex[:16]
+            )
+            import contextvars as _cv
+
+            t1 = _trace_id_var.set(rid)
+            t2 = _request_id_var.set(rid)
+            ctx = _cv.copy_context()
+            try:
+                response: Response = await ctx.run(call_next, request)
+                response.headers["X-Request-ID"] = rid
+                response.headers["X-Trace-Id"] = rid
+                return response
+            finally:
                 _trace_id_var.reset(t1)
                 _request_id_var.reset(t2)
 
 except ImportError:  # pragma: no cover - 无 starlette 时跳过
-    TraceIdMiddleware = None  # type: ignore[assignment]
+    class TraceIdMiddleware:  # type: ignore[no-redef]
+        """Fail-fast stub：无 starlette 时实例化即抛，避免 add_middleware(None) 迷惑报错."""
+
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError("TraceIdMiddleware requires starlette")
+
+
+def _pure_asgi_trace_middleware_note() -> str:
+    """长期方向：纯 ASGI 中间件替代 BaseHTTPMiddleware（request 级 ContextVar 更稳）。
+
+    保持 BaseHTTPMiddleware 兼容（现有单测/挂载均依赖 TraceIdMiddleware 类），
+    此处以文档+显式透传缓解；若未来迁移，按 detail log 建议用 scope/send 包装实现。
+    """
+    return "prefer pure-ASGI middleware for request-scoped ContextVars; propagate rid explicitly to background tasks"
 
 
 __all__ = [
