@@ -496,3 +496,37 @@ def test_e3_registry_wrapped_output_exact_shape():
             pass
 
     assert "e3_toctou_xyz" not in TOOL_REGISTRY
+
+
+# ============================================================================
+# tools/redaction.py — 2 items
+# ============================================================================
+
+def test_e3_redaction_set_json_not_repr():
+    """[bug·medium] set/frozenset results must serialize as JSON arrays, not Python repr."""
+    import json
+
+    from hero_quant.tools.redaction import redact_tool_result
+
+    s = redact_tool_result({3, 1, 2}, sink="result")
+    assert s == "[1, 2, 3]", s
+    parsed = json.loads(s)
+    assert sorted(parsed) == [1, 2, 3]
+
+    s2 = redact_tool_result(frozenset({"b", "a"}), sink="result")
+    assert json.loads(s2) == ["a", "b"], s2
+
+
+def test_e3_redaction_fail_closed_sentinel_unquoted():
+    """[bug·medium] Fail-closed *** sentinel must stay unquoted on the dict/list path."""
+    from hero_quant.tools import redaction as red_mod
+
+    orig = red_mod._maybe_redact
+    red_mod._maybe_redact = lambda value, sink="result": "***"  # noqa: E731
+    try:
+        from hero_quant.tools.redaction import redact_tool_result
+
+        assert redact_tool_result({"k": "v"}, sink="result") == "***"
+        assert redact_tool_result(["a"], sink="result") == "***"
+    finally:
+        red_mod._maybe_redact = orig

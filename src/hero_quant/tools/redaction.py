@@ -52,11 +52,21 @@ def redact_tool_result(result: Any, limit: int | None = None, sink: str = "resul
     # 第一步：脱敏（sink-aware）
     if isinstance(result, (dict, list, tuple, set, frozenset)):
         redacted = _maybe_redact(result, sink=sink)
-        # 序列化后统一按字符串预算做截断
-        try:
-            s = json.dumps(redacted, ensure_ascii=False)
-        except Exception:
-            s = str(redacted)
+        if isinstance(redacted, str):
+            # 中文：_maybe_redact 失败时返回 fail-closed 哨兵 "***"，保持无引号原样返回
+            s = redacted
+        else:
+            # 中文：set/frozenset 非 JSON 可序列化，转为有序 list 走 JSON 数组路径（不落 str() repr）
+            if isinstance(redacted, (set, frozenset)):
+                try:
+                    redacted = sorted(redacted, key=repr)
+                except Exception:
+                    redacted = list(redacted)
+            # 序列化后统一按字符串预算做截断
+            try:
+                s = json.dumps(redacted, ensure_ascii=False)
+            except (TypeError, ValueError):
+                s = json.dumps(redacted, ensure_ascii=False, default=str)
     elif isinstance(result, str):
         r = _maybe_redact(result, sink=sink)
         s = r if isinstance(r, str) else str(r)
