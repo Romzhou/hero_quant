@@ -374,7 +374,12 @@ class DedupStore:
 
     # PG 辅助（同步）：插入占位或查询/更新，None 表示回退到 SQLite/内存
     def _pg_insert_pending_sync(self, key: str, tool: str) -> bool | None:
-        """PG 原子插入 PENDING，先 DELETE 过期再 INSERT，成功返回是否插入，否则回退。"""
+        """PG 原子插入 PENDING，先 DELETE 过期再 INSERT，成功返回是否插入，否则回退。
+
+        语义：返回 True/False 表示 PG 权威结论（调用方可缓存）；返回 None 表示 PG 不可用，
+        调用方回退 SQLite/内存。commit/双表写失败抛错（fail-closed），调用方不得缓存成功，
+        仅记录并回退，由后续 get 回读 DB 为准。
+        """
         if not self._is_pg or self.pool is None or _is_async_pool(self.pool):
             return None
         try:
@@ -428,12 +433,20 @@ class DedupStore:
                         try:
                             with conn.cursor() as cur3:  # type: ignore
                                 cur3.execute(sql2, (key, tool))
-                        except Exception:
-                            pass
+                        except Exception as _e:
+                            # 中文：双表第二写失败必须 loud（回滚并上浮），不可吞
+                            logger.warning("dedup pg alias insert failed: %s", _e, exc_info=True)
+                            try:
+                                conn.rollback()  # type: ignore
+                            except Exception:
+                                pass
+                            raise
                     try:
                         conn.commit()  # type: ignore
-                    except Exception:
-                        pass
+                    except Exception as _e:
+                        # 中文：commit 失败必须 loud 上浮，调用方回退而不缓存成功
+                        logger.warning("dedup pg insert_pending commit failed: %s", _e, exc_info=True)
+                        raise
             elif hasattr(self.pool, "getconn"):
                 conn = self.pool.getconn()  # type: ignore
                 try:
@@ -455,9 +468,24 @@ class DedupStore:
                         inserted = getattr(cur, "rowcount", 0) == 1
                         try:
                             cur.execute(sql2, (key, tool))
+                        except Exception as _e:
+                            # 中文：双表第二写失败必须 loud（回滚并上浮），不可吞
+                            logger.warning("dedup pg alias insert failed: %s", _e, exc_info=True)
+                            try:
+                                conn.rollback()
+                            except Exception:
+                                pass
+                            raise
+                    try:
+                        conn.commit()
+                    except Exception as _e:
+                        # 中文：commit 失败必须 loud 上浮，调用方回退而不缓存成功
+                        logger.warning("dedup pg insert_pending commit failed: %s", _e, exc_info=True)
+                        try:
+                            conn.rollback()  # type: ignore
                         except Exception:
                             pass
-                    conn.commit()
+                        raise
                 finally:
                     try:
                         self.pool.putconn(conn)  # type: ignore
@@ -467,6 +495,8 @@ class DedupStore:
                 return None
             return bool(inserted)
         except Exception as e:
+            # 中文：真正意外的执行失败才回退 SQLite/内存；commit/双表写失败已在内部 raise，
+            # 此处仅记录并回退（调用方 insert_pending 不缓存成功，get 回读时以 DB 为准）。
             logger.warning("dedup pg insert_pending failed, fallback: %s", e, exc_info=True)
             _dedup_observe("pg_insert_pending", time.monotonic(), status="error")
             return None
@@ -483,7 +513,13 @@ class DedupStore:
                 ttl_clause = ""
                 ttl_params = ()
             sql = f"SELECT key, tool, status, result, updated_at FROM dedup WHERE key=%s {ttl_clause}"
-            sql2 = "SELECT idempotency_key, status, tool, result, error, created_at, updated_at FROM tool_call_dedup WHERE idempotency_key=%s"
+            # 中文：别名表回退同样执行 TTL（与主键一致），过期键不可复活
+            if self.ttl_seconds > 0:
+                sql2 = "SELECT idempotency_key, status, tool, result, error, created_at, updated_at FROM tool_call_dedup WHERE idempotency_key=%s AND updated_at > now() - %s * INTERVAL '1 second'"
+                sql2_params: tuple = (key, int(self.ttl_seconds))
+            else:
+                sql2 = "SELECT idempotency_key, status, tool, result, error, created_at, updated_at FROM tool_call_dedup WHERE idempotency_key=%s"
+                sql2_params = (key,)
             row = None
             params = (key, *ttl_params) if ttl_clause else (key,)
             if hasattr(self.pool, "connection"):
@@ -522,7 +558,7 @@ class DedupStore:
                     # fallback to alias table
                     try:
                         with conn.cursor() as cur2:  # type: ignore
-                            cur2.execute(sql2, (key,))
+                            cur2.execute(sql2, sql2_params)
                             row2 = cur2.fetchone()
                             if row2 is not None:
                                 cols2 = [d[0] for d in cur2.description] if getattr(cur2, "description", None) else []
@@ -554,6 +590,21 @@ class DedupStore:
                                 except Exception:
                                     pass
                             return rec
+                        # 中文：getconn 分支同样回退别名表（含 TTL），与 connection 分支一致
+                        cur.execute(sql2, sql2_params)
+                        row2 = cur.fetchone()
+                        if row2 is not None:
+                            cols2 = [d[0] for d in cur.description] if getattr(cur, "description", None) else []
+                            if cols2:
+                                rec2 = dict(zip(cols2, row2))
+                            else:
+                                rec2 = {"idempotency_key": row2[0], "status": row2[1], "tool": row2[2], "result": row2[3]}
+                            if rec2.get("result") is not None and isinstance(rec2["result"], str):
+                                try:
+                                    rec2["result"] = json.loads(rec2["result"])
+                                except Exception:
+                                    pass
+                            return rec2
                 finally:
                     try:
                         self.pool.putconn(conn)  # type: ignore
@@ -602,11 +653,13 @@ class DedupStore:
                             with self._lock:
                                 tool = self._mem.get(key, {}).get("tool", "unknown")
                             conn.execute(sql_insert, (key, tool, status, result_json))  # type: ignore
-                        # also update alias table best-effort
+                        # 中文：双表单事务原子提交，第二写失败必须 loud（回滚并上浮），不可吞
                         try:
                             conn.execute(sql2, (status, result_json, error_str, key))  # type: ignore
                         except Exception:
-                            pass
+                            with conn.cursor() as _cc:  # type: ignore
+                                _cc.execute(sql2, (status, result_json, error_str, key))
+                        conn.commit()  # single atomic commit for both tables
                     except Exception:
                         with conn.cursor() as cur2:  # type: ignore
                             cur2.execute(sql, (status, result_json, key))
@@ -615,10 +668,9 @@ class DedupStore:
                                 with self._lock:
                                     tool = self._mem.get(key, {}).get("tool", "unknown")
                                 cur2.execute(sql_insert, (key, tool, status, result_json))
-                    try:
-                        conn.commit()  # type: ignore
-                    except Exception:
-                        pass
+                            # 中文：双表单事务原子提交，第二写失败必须 loud（回滚并上浮），不可吞
+                            cur2.execute(sql2, (status, result_json, error_str, key))
+                            conn.commit()  # single atomic commit for both tables
             elif hasattr(self.pool, "getconn"):
                 conn = self.pool.getconn()  # type: ignore
                 try:
@@ -630,7 +682,9 @@ class DedupStore:
                             with self._lock:
                                 tool = self._mem.get(key, {}).get("tool", "unknown")
                             cur.execute(sql_insert, (key, tool, status, result_json))
-                    conn.commit()
+                        # 中文：双表单事务原子提交，第二写失败必须 loud（回滚并上浮），不可吞
+                        cur.execute(sql2, (status, result_json, error_str, key))
+                        conn.commit()  # single atomic commit for both tables
                 finally:
                     try:
                         self.pool.putconn(conn)  # type: ignore
@@ -638,6 +692,8 @@ class DedupStore:
                         pass
             return True
         except Exception as e:
+            # 中文：双表第二写/commit 失败已在内部 loud 记录并回滚，此处返回 False；
+            # 调用方 mark_success/mark_failed 回退 SQLite/内存而不以 PG 成功为准（不缓存伪成功）。
             logger.warning("dedup pg mark failed, fallback: %s", e, exc_info=True)
             _dedup_observe("pg_mark", time.monotonic(), status="error")
             return False
@@ -699,15 +755,23 @@ class DedupStore:
                             con.execute("DELETE FROM tool_call_dedup WHERE idempotency_key=? AND updated_at < ?", (key, now - self.ttl_seconds))
                         except Exception:
                             pass
-                    cur = con.execute("SELECT status FROM tool_call_dedup WHERE idempotency_key=?", (key,))
+                    cur = con.execute("SELECT idempotency_key, status, tool, result, error, created_at, updated_at FROM tool_call_dedup WHERE idempotency_key=?", (key,))
                     row = cur.fetchone()
                     if row is not None:
                         try:
                             con.execute("ROLLBACK")
                         except Exception:
                             pass
+                        # 中文：缓存整行（含 stored result/error/tool），避免 lossy 状态覆盖后续 wait_for/get
+                        col_names = [d[0] for d in cur.description]
+                        rec = dict(zip(col_names, row))
+                        if rec.get("result") is not None:
+                            try:
+                                rec["result"] = json.loads(rec["result"])
+                            except Exception:
+                                pass
                         with self._lock:
-                            self._mem[key] = {"key": key, "tool": tool, "status": row[0], "result": None, "updated_at": now}
+                            self._mem[key] = rec
                             self._mem_ts[key] = now
                             self._mem_evict_if_needed()
                         return False
@@ -719,8 +783,14 @@ class DedupStore:
                         inserted = getattr(cur2, "rowcount", 1) == 1
                         try:
                             con.execute("COMMIT")
-                        except Exception:
-                            pass
+                        except Exception as _e:
+                            # 中文：COMMIT 失败必须 loud（回滚并上浮），不可按 inserted 缓存成功
+                            logger.warning("dedup sqlite COMMIT failed: %s", _e, exc_info=True)
+                            try:
+                                con.execute("ROLLBACK")
+                            except Exception:
+                                pass
+                            raise
                         if inserted:
                             with self._lock:
                                 self._mem[key] = {"key": key, "tool": tool, "status": "PENDING", "result": None, "updated_at": now}
@@ -851,6 +921,29 @@ class DedupStore:
             if self._is_pg:
                 pg_rec = self._pg_get_sync(key)
                 if pg_rec is not None:
+                    # 中文：PG 命中同样执行 TTL（防已过期行经别名/主查复活），过期则删除并返回 None
+                    if self.ttl_seconds > 0 and pg_rec.get("updated_at") is not None:
+                        try:
+                            from datetime import datetime, timezone
+                            _ts = pg_rec["updated_at"]
+                            _age: float | None = None
+                            if isinstance(_ts, (int, float)):
+                                _age = time.time() - float(_ts)
+                            elif isinstance(_ts, str):
+                                try:
+                                    _dt = datetime.fromisoformat(_ts.replace("Z", "+00:00"))
+                                    if _dt.tzinfo is None:
+                                        _dt = _dt.replace(tzinfo=timezone.utc)
+                                    _age = (datetime.now(timezone.utc) - _dt).total_seconds()
+                                except (ValueError, TypeError):
+                                    _age = None
+                            if _age is not None and _age > self.ttl_seconds:
+                                with self._lock:
+                                    self._mem.pop(key, None)
+                                    self._mem_ts.pop(key, None)
+                                return None
+                        except Exception:
+                            pass
                     with self._lock:
                         self._mem[key] = pg_rec
                         self._mem_ts[key] = time.time()
