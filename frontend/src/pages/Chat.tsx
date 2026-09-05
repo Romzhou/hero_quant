@@ -11,12 +11,21 @@ import { useChatStore } from "../store/chat"
 
 type ToolCall = { id: string; tool: string; status: "pending" | "success" | "error"; latencyMs?: number; preview?: string }
 
+// 非安全上下文兼容：crypto.randomUUID 在 http/旧浏览器可能缺失，退化为随机串（仅本地消息 id，无安全需求）
+function safeUUID(): string {
+  try {
+    if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") return crypto.randomUUID()
+  } catch {}
+  return `id-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
+}
+
 export const API_ENDPOINTS = {
   TICKET: "/v1/query/ticket",
   STREAM: "/v1/query/stream",
 } as const
 export const SSE_DONE = "[DONE]"
 export const SSE_CONNECT_TIMEOUT_MS = 5500
+export const SSE_FIRST_MESSAGE_TIMEOUT_MS = 15_000
 export const SSE_FILL_DELAY_MS = 80
 export const EMPTY_FALLBACK_MSG = "模型未返回内容，请检查 HERO_API_KEY 配置（当前为合成演示模式）"
 
@@ -33,37 +42,44 @@ export const TRACE_DOT_CLASS: Record<ToolCall["status"], string> = {
   pending: "bg-white/10",
 }
 
+// 协议噪声判定：SSE 注释心跳（`:` 开头）、HTML 代理错误页、空帧一律视为 no-op，不进入对话内容
+function isProtocolNoise(raw: string): boolean {
+  const t = raw.trim()
+  if (!t) return true
+  return t.startsWith(":") || t.startsWith("<")
+}
+
 // 纯函数：统一解析 SSE payload，fetch 回退与 EventSource 共用
 export function parseSseData(raw: string): { kind: "delta" | "tool" | "error"; delta?: string; tool?: { tool: string; status: ToolCall["status"]; preview?: string; latencyMs?: number; rawId?: string }; error?: string } | null {
   if (!raw || raw === SSE_DONE) return null
   try {
     const j = JSON.parse(raw) as Record<string, unknown>
     if (j.type === "tool") {
-      const tname = (j.tool || j.name || "unknown_tool") as string
-      const status = (j.status as ToolCall["status"]) || "success"
-      const preview = (j.preview ?? j.msg ?? j.detail ?? undefined) as string | undefined
-      const latencyMs = (j.latencyMs ?? j.latency ?? j.durationMs ?? undefined) as number | undefined
+      const rawName = j.tool ?? j.name
+      const tname = typeof rawName === "string" && rawName ? rawName : "unknown_tool"
+      // 枚举白名单：未知 status 回退 success，避免 TOOL_STATUS_CLASS[t.status] 为 undefined 污染 className
+      const rawStatus = j.status
+      const status: ToolCall["status"] = rawStatus === "pending" || rawStatus === "error" || rawStatus === "success" ? rawStatus : "success"
+      // 类型收窄：非 string preview 统一 String() 化（防 React 子节点渲染崩溃），非有限数 latency 丢弃（防 "NaNms" 双单位）
+      const rawPreview = j.preview ?? j.msg ?? j.detail ?? undefined
+      const preview = typeof rawPreview === "string" ? rawPreview : rawPreview != null ? String(rawPreview) : undefined
+      const rawLatency = j.latencyMs ?? j.latency ?? j.durationMs ?? undefined
+      const latencyMs = typeof rawLatency === "number" && Number.isFinite(rawLatency) ? rawLatency : undefined
       const rawId = j.id !== null && j.id !== undefined ? String(j.id) : (j.tool_call_id !== null && j.tool_call_id !== undefined ? String(j.tool_call_id) : undefined)
       return { kind: "tool", tool: { tool: tname, status, preview, latencyMs, rawId } }
     }
     if (j.type === "error") {
       return { kind: "error", error: (j.msg as string) || (j.message as string) || "stream error" }
     }
-    // 兼容：含 tool 字段但未标 type 且无 delta 时视为轨迹
-    if (j.tool && !("delta" in j) && !("text" in j) && !("content" in j) && !("answer" in j)) {
-      const tname = (j.tool || j.name) as string
-      return { kind: "tool", tool: { tool: tname, status: (j.status as ToolCall["status"]) || "success", preview: j.preview as string | undefined, latencyMs: j.latencyMs as number | undefined, rawId: j.id !== null && j.id !== undefined ? String(j.id) : undefined } }
-    }
+    // 严格轨迹判定：仅 type==="tool" 视为轨迹；含 tool 字段的 delta 按正常文本处理，避免误路由
     const delta = (j.delta as string) || (j.text as string) || (j.content as string) || (j.answer as string) || ""
-    if (delta) return { kind: "delta", delta }
+    if (typeof delta === "string" && delta) return { kind: "delta", delta }
     // 无可识别字段时视为无操作，避免误判为 delta 空
     return null
-  } catch (e) {
-    if (e instanceof SyntaxError) {
-      if (raw) return { kind: "delta", delta: raw }
-      return null
-    }
-    throw e
+  } catch {
+    // JSON.parse 仅抛 SyntaxError；噪声帧丢弃，普通文本分片仍视为 delta（兼容 text/plain）
+    if (raw && !isProtocolNoise(raw)) return { kind: "delta", delta: raw }
+    return null
   }
 }
 
@@ -71,24 +87,33 @@ export default function Chat() {
   const { messages, input, streaming, setInput, push, setStreaming } = useChatStore()
   const [error, setError] = useState<string | null>(null)
   const [traceByMsgId, setTraceByMsgId] = useState<Record<string, ToolCall[]>>({})
+  // 活跃消息 id 用 state 而非 ref：render 期读取 ref 不会触发重渲染，占位条会 stale
+  const [activeAid, setActiveAid] = useState<string | null>(null)
   const listRef = useRef<HTMLDivElement>(null)
   const abortRef = useRef<AbortController | null>(null)
   const esRef = useRef<EventSource | null>(null)
-  const rafIdsRef = useRef<number[]>([])
   const timeoutIdsRef = useRef<number[]>([])
   const toolSeqRef = useRef(0)
+  // send 代际：每次 send() 递增，finally 仅当自己仍是最新一代才清理共享 refs，避免旧 promise 冲掉新一轮
+  const sendSeqRef = useRef(0)
+  // 挂起的 EventSource promise 结算器：手动 close 不触发 onerror，stop/中断需显式 resolve 唤醒 send
+  const settleRef = useRef<{ resolve: () => void; reject: (e: unknown) => void } | null>(null)
   // 单 rAF 合并：全局仅保留一个待执行的滚动任务，避免逐 delta 独立 rAF 导致布局抖动与 rafIds 无限增长
   const pendingScrollRef = useRef<number | null>(null)
   // 卸载防护：标记组件是否已卸载，避免异步回调在卸载后 setState
   const mountedRef = useRef(true)
-  // 活跃消息：仅当前流式消息展示“等待工具调度”占位，避免全局 streaming 导致历史消息错位高亮
-  const activeAidRef = useRef<string | null>(null)
+  // 活跃消息占位走 activeAid state（ref 变更不触发重渲染，渲染期读 ref 会 stale）
 
-  function trackRaf(id: number) {
-    rafIdsRef.current.push(id)
-  }
+  // 单发计时器：触发后自清理，不进 timeoutIdsRef，避免长会话无界增长
   function trackTimeout(id: number) {
     timeoutIdsRef.current.push(id)
+  }
+  function untrackTimeout(id: number) {
+    timeoutIdsRef.current = timeoutIdsRef.current.filter(t => t !== id)
+  }
+  function clearTrackedTimeout(id: number) {
+    window.clearTimeout(id)
+    untrackTimeout(id)
   }
 
   function abortAll() {
@@ -97,9 +122,12 @@ export default function Chat() {
       try { esRef.current.close() } catch {}
       esRef.current = null
     }
-    rafIdsRef.current.forEach(id => cancelAnimationFrame(id))
-    timeoutIdsRef.current.forEach(id => clearTimeout(id))
-    rafIdsRef.current = []
+    if (pendingScrollRef.current !== null) {
+      cancelAnimationFrame(pendingScrollRef.current)
+    }
+    // SSE 超时兜底：本轮 sseTids 在闭包内但全部进追踪表，此处清表即清全部残留，
+    // stop/新一轮抢占后迟发 timer 不得复活 fetchFallback
+    timeoutIdsRef.current.forEach(id => window.clearTimeout(id))
     timeoutIdsRef.current = []
     pendingScrollRef.current = null
   }
@@ -121,20 +149,18 @@ export default function Chat() {
     else el.scrollTop = top
   }
 
-  // 单 rAF 调度：合并多次 delta 触发的滚动为一次
+  // 单 rAF 调度：合并多次 delta 触发的滚动为一次；合并 rAF 不进追踪表（单 pending 标记足够）
   function scheduleScroll() {
     if (pendingScrollRef.current !== null) return
-    const raf = requestAnimationFrame(() => {
+    pendingScrollRef.current = requestAnimationFrame(() => {
       pendingScrollRef.current = null
       scrollToBottom()
     })
-    pendingScrollRef.current = raf
-    trackRaf(raf)
   }
 
   // 抽取公共 upsert：消除 handlePayload 与 EventSource onmessage 的双份聚合逻辑
   function upsertTrace(aid: string, e: { tool: string; status: ToolCall["status"]; preview?: string; latencyMs?: number; rawId?: string }) {
-    const uniqueId = e.rawId ?? `${e.tool}-${toolSeqRef.current++}-${crypto.randomUUID()}`
+    const uniqueId = e.rawId ?? `${e.tool}-${toolSeqRef.current++}-${safeUUID()}`
     setTraceByMsgId(prev => {
       const cur = prev[aid] ?? []
       if (e.rawId) {
@@ -147,28 +173,47 @@ export default function Chat() {
     })
   }
 
+  // 停止当前流（中断按钮）：走 abortAll 统一清理（含共享 SSE 超时），finally 仅当自己仍是最新一代才清共享 refs
+  function stop() {
+    abortAll()
+    // AbortError 将在 send 的 catch/finally 中收尾；显式唤醒挂起的 EventSource promise
+    const st = settleRef.current
+    settleRef.current = null
+    try { st?.resolve() } catch {}
+  }
+
   async function send() {
-    // 闭包 stale 修复：从 store 实时读取 input/streaming，避免 demo 按钮 setInput 后仍读到旧闭包空值
+    // 中止上一轮并开启新一轮。`streaming` 为 UI 展示/按钮禁用态（非锁）；真正的互斥由 sendSeq 代际保证
     const q = (useChatStore.getState().input ?? "").trim()
-    if (!q || useChatStore.getState().streaming) return
-    const userMsg = { id: crypto.randomUUID(), role: "user" as const, content: q }
+    if (!q) return
+    const mySeq = ++sendSeqRef.current
+    const isCurrent = () => mySeq === sendSeqRef.current
+    abortAll()
+    const userMsg = { id: safeUUID(), role: "user" as const, content: q }
     push(userMsg)
     setInput("")
     setStreaming(true)
     setError(null)
 
-    const aid = crypto.randomUUID()
+    const aid = safeUUID()
     push({ id: aid, role: "assistant", content: "" })
     // 初始化空轨迹，占位保证 UI 结构稳定，后续由后端 type=="tool" 事件填充
     setTraceByMsgId(s => ({ ...s, [aid]: [] }))
-    activeAidRef.current = aid
+    setActiveAid(aid)
 
-    // 中断上一轮未结束的流，避免并发 SSE 串扰 — 必须同时关闭 EventSource
-    abortAll()
     const controller = new AbortController()
     abortRef.current = controller
     // 泄漏防护：在每次异步分支前检查 mounted 与 signal，避免卸载后 setState
     const isAlive = () => mountedRef.current && !controller.signal.aborted
+
+    // 用户中断/新一轮抢占时唤醒挂起的 EventSource promise（手动 close 不触发 onerror）
+    const onAbort = () => {
+      if (isCurrent()) return
+      const st = settleRef.current
+      settleRef.current = null
+      try { st?.resolve() } catch {}
+    }
+    controller.signal.addEventListener("abort", onAbort)
 
     const issueSseTicket = async () => {
       const resp = await fetch(API_ENDPOINTS.TICKET, {
@@ -188,6 +233,31 @@ export default function Chat() {
     let acc = ""
     let hasDelta = false
     let settled = false
+    let gotDone = false
+
+    // 空响应兜底统一入口：finally/各分支共用，避免 EMPTY_FALLBACK_MSG 三处重复赋值
+    const ensureNonEmpty = () => {
+      if (!hasDelta && !acc && isAlive()) {
+        useChatStore.setState(s => ({
+          messages: s.messages.map(m => m.id === aid ? { ...m, content: EMPTY_FALLBACK_MSG } : m),
+        }))
+      }
+    }
+    // 截断标注：收到过 delta 但未见 [DONE] 即中断，追加提示而非静默按成功处理；pending 轨迹同步转 error 防无限脉冲
+    // 守卫用 mounted 而非 isAlive：abort/中断后 signal 已失效，但残留 delta 的标注仍需落盘
+    const markTruncated = (reason?: string) => {
+      if (hasDelta && mountedRef.current) {
+        acc += reason ? `\n\n（响应未完整结束：${reason}）` : "\n\n（响应未完整结束，可能被截断）"
+        useChatStore.setState(s => ({
+          messages: s.messages.map(m => m.id === aid ? { ...m, content: acc } : m),
+        }))
+        setTraceByMsgId(prev => {
+          const cur = prev[aid] ?? []
+          if (!cur.some(t => t.status === "pending")) return prev
+          return { ...prev, [aid]: cur.map(t => (t.status === "pending" ? { ...t, status: "error" as const } : t)) }
+        })
+      }
+    }
 
     const appendDelta = (delta: string) => {
       if (!delta) return
@@ -257,7 +327,7 @@ export default function Chat() {
               .map(l => l.replace(/^data:\s*/, ""))
             if (dataLines.length === 0) continue
             const data = dataLines.join("\n")
-            if (data === SSE_DONE) { outerDone = true; break }
+            if (data === SSE_DONE) { gotDone = true; outerDone = true; break }
             handlePayload(data)
           }
           if (outerDone) break
@@ -267,44 +337,56 @@ export default function Chat() {
         if (buffer.trim()) {
           const tailLines = buffer.split("\n").filter(l => l.startsWith("data:")).map(l => l.replace(/^data:\s*/, ""))
           const tailData = tailLines.join("\n").trim()
-          if (tailData && tailData !== SSE_DONE) handlePayload(tailData)
+          if (tailData) {
+            if (tailData === SSE_DONE) gotDone = true
+            else handlePayload(tailData)
+          }
         }
-        if (!hasDelta && !acc && isAlive()) {
-          useChatStore.setState(s => ({
-            messages: s.messages.map(m => m.id === aid ? { ...m, content: EMPTY_FALLBACK_MSG } : m),
-          }))
-        }
+        ensureNonEmpty()
       } finally {
         try { await reader.cancel() } catch {}
         try { reader.releaseLock() } catch {}
       }
     }
-
     // 优先 EventSource：浏览器原生 SSE 自动重连，失败或超时再回退 fetch
     const tryEventSource = async () => {
       const ticket = await issueSseTicket()
       return new Promise<void>((resolve, reject) => {
+        settleRef.current = { resolve: () => { if (!settled) { settled = true; resolve() } }, reject: (e: unknown) => { if (!settled) { settled = true; reject(e as Error) } } }
+        const settleResolve = () => { const st = settleRef.current; settleRef.current = null; try { st?.resolve() } catch {} }
+        const settleReject = (e: unknown) => { const st = settleRef.current; settleRef.current = null; try { st?.reject(e) } catch {} }
         let gotMessage = false
         let fallbackTriggered = false
         const url = `${API_ENDPOINTS.STREAM}?q=${encodeURIComponent(q)}&ticket=${encodeURIComponent(ticket)}`
+        // 本轮 SSE 超时句柄组（建连超时 + 首包超时），任一终态即全部 clear，残留由 abortAll 兜底
+        const sseTids: number[] = []
+        // 超时句柄：首包/[DONE]/error/回退任一发生即 clear，避免迟发二次回退；残留由 abortAll 清表兜底
+        const clearSseTimeout = () => {
+          sseTids.forEach(t => clearTrackedTimeout(t))
+          sseTids.length = 0
+        }
+        const closeEs = () => {
+          clearSseTimeout()
+          try { esRef.current?.close() } catch {}
+          esRef.current = null
+        }
+        const runFallback = () => {
+          fallbackTriggered = true
+          closeEs()
+          // 尚未收到任何消息时判定为连接失败，回退到 fetch 手动解析 SSE
+          fetchFallback().then(settleResolve, settleReject)
+        }
         try {
           const es = new EventSource(url)
           esRef.current = es
           es.onmessage = (ev) => {
             gotMessage = true
+            clearSseTimeout()
             const data: string = ev.data
             if (data === SSE_DONE) {
-              es.close()
-              esRef.current = null
-              if (!settled) {
-                settled = true
-                if (!hasDelta && !acc && isAlive()) {
-                  useChatStore.setState(s => ({
-                    messages: s.messages.map(m => m.id === aid ? { ...m, content: EMPTY_FALLBACK_MSG } : m),
-                  }))
-                }
-                resolve()
-              }
+              gotDone = true
+              closeEs()
+              settleResolve()
               return
             }
             const parsed = parseSseData(data)
@@ -316,115 +398,81 @@ export default function Chat() {
               return
             }
             if (parsed.kind === "error" && parsed.error) {
-              es.close()
-              esRef.current = null
-              if (!settled) {
-                settled = true
-                reject(new Error(parsed.error))
-              }
+              closeEs()
+              settleReject(new Error(parsed.error))
               return
             }
             if (parsed.kind === "delta" && parsed.delta) appendDelta(parsed.delta)
           }
           es.onerror = () => {
-            es.close()
-            esRef.current = null
+            closeEs()
             if (!gotMessage && !fallbackTriggered) {
-              fallbackTriggered = true
-              // 尚未收到任何消息时判定为连接失败，回退到 fetch 手动解析 SSE
-              fetchFallback()
-                .then(() => {
-                  if (!settled) {
-                    settled = true
-                    resolve()
-                  }
-                })
-                .catch((err) => {
-                  if (!settled) {
-                    settled = true
-                    reject(err)
-                  }
-                })
+              runFallback()
             } else {
-              if (!settled) {
-                settled = true
-                // if we already got messages, treat as complete
-                if (!hasDelta && !acc && isAlive()) {
-                  useChatStore.setState(s => ({
-                    messages: s.messages.map(m => m.id === aid ? { ...m, content: EMPTY_FALLBACK_MSG } : m),
-                  }))
-                }
-                resolve()
-              }
+              // 收尾判定统一收敛到 finally（截断标注/空兜底），此处仅结算
+              settleResolve()
             }
           }
-          // 超时保护：SSE_CONNECT_TIMEOUT_MS 内未建连则主动回退，避免 EventSource 挂起无反馈
-          const tid = window.setTimeout(() => {
-            if (!gotMessage && es.readyState !== 1 && !fallbackTriggered) {
-              fallbackTriggered = true
-              es.close()
-              esRef.current = null
-              fetchFallback()
-                .then(() => {
-                  if (!settled) {
-                    settled = true
-                    resolve()
-                  }
-                })
-                .catch((err) => {
-                  if (!settled) {
-                    settled = true
-                    reject(err)
-                  }
-                })
-            }
+          // 超时保护两级：建连超时（未 OPEN 则回退）+ 首包超时（已 OPEN 但无数据则回退，避免心跳空转卡死 streaming）
+          const connectTid = window.setTimeout(() => {
+            if (!gotMessage && es.readyState !== 1 && !fallbackTriggered) runFallback()
           }, SSE_CONNECT_TIMEOUT_MS)
-          trackTimeout(tid as unknown as number)
-        } catch (_err) {
+          trackTimeout(connectTid)
+          sseTids.push(connectTid)
+          const firstMsgTid = window.setTimeout(() => {
+            if (!gotMessage && !fallbackTriggered) runFallback()
+          }, SSE_FIRST_MESSAGE_TIMEOUT_MS)
+          trackTimeout(firstMsgTid)
+          sseTids.push(firstMsgTid)
+        } catch {
           // 环境不支持 EventSource 时直接走 fetch 回退
-          fetchFallback()
-            .then(() => {
-              if (!settled) {
-                settled = true
-                resolve()
-              }
-            })
-            .catch((e2) => {
-              if (!settled) {
-                settled = true
-                reject(e2 as Error)
-              }
-            })
+          fetchFallback().then(settleResolve, settleReject)
         }
       })
     }
 
     try {
       await tryEventSource()
+      // 正常结算：未见 [DONE] 即视为截断（有 delta 标注截断，无内容走空兜底）
+      if (isAlive()) {
+        if (hasDelta && !gotDone) markTruncated()
+        else ensureNonEmpty()
+      }
     } catch (e: unknown) {
-      if ((e as Error)?.name === "AbortError") return
+      if ((e as Error)?.name === "AbortError") {
+        // 中断/新一轮抢占：abort 后 isAlive() 恒为 false，改用 mounted 守卫 + 代际守卫标注残留 delta
+        if (hasDelta && !gotDone && mountedRef.current && isCurrent()) markTruncated("已中断")
+        return
+      }
       const msg = e instanceof Error ? e.message : String(e)
-      // 仅在无任何 delta 时展示错误，避免已流式部分内容被错误覆盖；同时守卫卸载
-      if (!hasDelta && isAlive()) {
+      // 错误始终可见：无 delta 时覆写正文 + 错误条；有残留 delta 时保留正文但错误条 + 截断原因可诊断
+      if (isAlive()) {
         setError(msg)
-        useChatStore.setState(s => ({
-          messages: s.messages.map(m => m.id === aid ? { ...m, content: `请求失败：${msg}` } : m),
-        }))
+        if (!hasDelta) {
+          useChatStore.setState(s => ({
+            messages: s.messages.map(m => m.id === aid ? { ...m, content: `请求失败：${msg}` } : m),
+          }))
+        } else if (!gotDone) {
+          markTruncated(msg)
+          // 有残留 delta 的错误分支同样需翻转 pending 轨迹（markTruncated 内已处理，此处兜底幂等）
+        }
         setTraceByMsgId(prev => {
           const cur = prev[aid] ?? []
           return { ...prev, [aid]: cur.map(t => (t.status === "pending" ? { ...t, status: "error" as const } : t)) }
         })
       }
     } finally {
-      if (isAlive()) setStreaming(false)
-      else {
-        // 卸载后仍需重置 streaming 状态但通过守卫避免 setState 冲突，依赖 store 直接写入需再次检查
-        try { if (mountedRef.current) setStreaming(false) } catch {}
+      // 代际守卫：旧 send 结算不得翻转新一轮的 streaming（修复重叠发送状态闪烁）
+      const current = isCurrent()
+      if (current && mountedRef.current) setStreaming(false)
+      if (current) {
+        abortRef.current = null
+        try { esRef.current?.close() } catch {}
+        esRef.current = null
+        settleRef.current = null
+        setActiveAid(null)
       }
-      abortRef.current = null
-      try { esRef.current?.close() } catch {}
-      esRef.current = null
-      activeAidRef.current = null
+      controller.signal.removeEventListener("abort", onAbort)
       // 收尾滚动到底，确保最后 delta 可见（单 rAF 合并）
       scheduleScroll()
     }
@@ -493,7 +541,7 @@ export default function Chat() {
                             >
                               <div className="flex items-center gap-1.5">
                                 <span className="font-mono text-[11px]">{t.tool}</span>
-                                {t.latencyMs ? <span className="rounded bg-white/10 px-1 py-0.5 font-mono text-[10px] leading-none">{t.latencyMs}ms</span> : null}
+                                {t.latencyMs !== undefined && t.latencyMs !== null ? <span className="rounded bg-white/10 px-1 py-0.5 font-mono text-[10px] leading-none">{t.latencyMs}ms</span> : null}
                               </div>
                               <div className="mt-1 text-[10px] opacity-70 truncate max-w-[140px]">{t.preview ?? ""}</div>
                             </div>
@@ -509,7 +557,7 @@ export default function Chat() {
                         </div>
                       </div>
                     )}
-                    {traceByMsgId[m.id]?.length === 0 && streaming && m.id === activeAidRef.current && (
+                    {traceByMsgId[m.id]?.length === 0 && streaming && m.id === activeAid && (
                       <div className="mt-3 rounded-xl border border-dashed border-white/10 bg-ink-900/40 px-3 py-2 text-[11px] text-slate-500">等待工具调度… 后端将以 type=tool 事件推送 preview/latency</div>
                     )}
                   </>
@@ -543,13 +591,6 @@ export default function Chat() {
                 key={q}
                 onClick={() => {
                   setInput(q)
-                  const tid = window.setTimeout(() => {
-                    const cur = useChatStore.getState().input
-                    if (cur === q) {
-                      // 保持 setInput 行为兼容测试，不自动发送，避免误触
-                    }
-                  }, SSE_FILL_DELAY_MS)
-                  trackTimeout(tid as unknown as number)
                 }}
                 className="group rounded-xl border border-white/10 bg-white/[0.04] px-3 py-3 text-left text-xs leading-5 text-slate-300 hover:bg-white/[0.08] hover:border-amber-500/20 transition"
               >
@@ -575,11 +616,13 @@ export default function Chat() {
             onClick={() => {
               const q = "回测 600519.SH 近一月等权"
               setInput(q)
+              // 单发 UI 计时器：触发后自清理，不进 timeoutIdsRef（长会话无界增长）
               const tid = window.setTimeout(() => {
+                untrackTimeout(tid)
                 const cur = useChatStore.getState().input
                 if (cur.trim() === q) send()
               }, SSE_FILL_DELAY_MS)
-              trackTimeout(tid as unknown as number)
+              trackTimeout(tid)
             }}
             className="rounded-lg bg-amber-500 px-3 py-1.5 text-xs font-semibold text-ink-900 hover:bg-amber-400 transition"
           >
@@ -607,11 +650,14 @@ export default function Chat() {
             </div>
           </div>
           <button
-            onClick={send}
-            disabled={streaming || !input.trim()}
+            onClick={() => {
+              if (useChatStore.getState().streaming) stop()
+              else send()
+            }}
+            disabled={!streaming && !input.trim()}
             className="h-[52px] shrink-0 rounded-2xl bg-gradient-to-br from-amber-400 to-amber-600 px-6 text-sm font-semibold text-ink-900 shadow-glow transition hover:brightness-105 disabled:opacity-40 disabled:cursor-not-allowed"
           >
-            {streaming ? "流式中…" : "发送"}
+            {streaming ? "停止" : "发送"}
           </button>
         </div>
         <p className="mx-auto mt-2 max-w-3xl text-center text-[11px] leading-4 text-slate-500">

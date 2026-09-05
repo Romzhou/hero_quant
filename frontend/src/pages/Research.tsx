@@ -8,16 +8,14 @@
  * - 泄漏防护：所有 fetch 共享 AbortController + isAlive 守卫，卸载时 abort
  */
 
-// 集中管理：后端回测产物路径与截断上限，后续迁至 src/config/api 统一维护，避免跨页硬编码漂移
-const API_METRICS = "/v1/backtest/metrics.json"
-const API_POSITIONS = "/v1/backtest/positions.csv"
-const API_TEARSHEET = "/v1/backtest/tearsheet.html"
-const API_DRAWDOWNS = "/v1/backtest/drawdowns.json"
+import { useEffect, useMemo, useRef, useState } from "react"
+import ReactECharts from "echarts-for-react"
+import { API_METRICS, API_POSITIONS, API_TEARSHEET, API_DRAWDOWNS } from "../config/api"
+
+// 集中管理：后端回测产物路径统一由 src/config/api 维护（避免跨页硬编码漂移）；截断上限保留本地
 const MAX_CSV_CHARS = 4000
 const MAX_HTML_CHARS = 8000
-
-import { useEffect, useMemo, useState } from "react"
-import ReactECharts from "echarts-for-react"
+const MAX_POINTS = 30
 
 type Metrics = { sharpe?: number; annual_return?: number; max_drawdown?: number; turnover?: number; monthly?: number[] | Record<string, number> | [number, number, number][]; monthly_returns?: number[] | Record<string, number> | [number, number, number][]; isMock?: boolean; provenance?: string; synthetic?: boolean }
 type Drawdown = { start: string; end: string; depth: number; duration: number }
@@ -75,8 +73,12 @@ export function parseCsvLine(line: string): string[] {
 }
 
 export function formatDateForDisplay(raw: string): string {
+  return formatMonthDay(raw)
+}
+
+// 日期展示统一入口：标准 YYYY-MM-DD（含时间后缀）取 MM-DD，其余原样保留，避免 slice(5) 产生垃圾
+export function formatMonthDay(raw: string): string {
   const t = (raw || "").trim()
-  // 仅对标准 YYYY-MM-DD（含时间后缀）做 MM-DD 展示，其他格式原样保留避免 slice(5) 产生垃圾
   if (/^\d{4}-\d{2}-\d{2}/.test(t)) return t.slice(5, 10)
   return t
 }
@@ -85,12 +87,13 @@ export function truncateOnLineBoundary(txt: string, max: number): string {
   if (txt.length <= max) return txt
   const sliced = txt.slice(0, max)
   const lastNewline = sliced.lastIndexOf("\n")
-  // 若在后半段找到换行则截到行边界，否则保留 max 避免过度截断
-  if (lastNewline > max * 0.5) return sliced.slice(0, lastNewline + 1)
+  // 结构化截断：只要找到换行即截到行边界，避免尾部半行（如截断的 close 值）被解析为错误数据点；
+  // 无换行时无法保行边界，保留 max（调用方 parse 失败走诚实空状态）
+  if (lastNewline !== -1) return sliced.slice(0, lastNewline + 1)
   return sliced
 }
 
-export function parseCumulative(csv: string): { dates: string[]; values: number[] } | null {
+export function parseCumulative(csv: string): { dates: string[]; values: number[]; truncated: boolean; totalRows: number } | null {
   try {
     const lines = csv.trim().split(/\r?\n/).filter(l => l.trim())
     if (lines.length < 2) return null
@@ -115,10 +118,12 @@ export function parseCumulative(csv: string): { dates: string[]; values: number[
     const base = rows[0].close
     const values = rows.map(r => +(r.close / base).toFixed(4))
     const dates = rows.map(r => r.date)
-    if (dates.length > 30) {
-      return { dates: dates.slice(-30), values: values.slice(-30) }
+    const totalRows = rows.length
+    if (dates.length > MAX_POINTS) {
+      // 显式截断标记：调用方必须展示“仅展示最近 N 点（共 M 点）”而非静默 slice
+      return { dates: dates.slice(-MAX_POINTS), values: values.slice(-MAX_POINTS), truncated: true, totalRows }
     }
-    return { dates, values }
+    return { dates, values, truncated: false, totalRows }
   } catch (e) {
     console.debug("[Research] parseCumulative failed:", e)
     return null
@@ -126,21 +131,35 @@ export function parseCumulative(csv: string): { dates: string[]; values: number[
 }
 
 // 单一真实源：热力推导统一实现，消除 deriveHeatmapForTest 与组件内重复推导的双维护
+// 有限性守卫：单条 NaN/Infinity 不得污染整组 visualMap（过滤后再映射与缩放）
 export function deriveHeatmap(metrics: Metrics): [number, number, number][] | null {
   const raw: unknown = (metrics as unknown as Record<string, unknown>)?.monthly_returns ?? (metrics as unknown as Record<string, unknown>)?.monthly ?? null
-  if (raw == null) return null
+  if (raw === null || raw === undefined) return null
   try {
     if (Array.isArray(raw) && raw.length > 0) {
       const first = (raw as unknown[])[0]
-      if (Array.isArray(first) && first.length === 3) return raw as [number, number, number][]
+      if (Array.isArray(first) && first.length === 3) {
+        const triples = (raw as unknown[]).filter(
+          (t): t is [number, number, number] =>
+            Array.isArray(t) && t.length === 3 && t.every(v => typeof v === "number" && Number.isFinite(v)),
+        ) as [number, number, number][]
+        return triples.length > 0 ? triples : null
+      }
       if (typeof first === "number") {
-        const arr = raw as number[]
-        return arr.map((v, idx) => [idx % 5, Math.floor(idx / 5) % 7, +(Number(v) * 100).toFixed(2)] as [number, number, number])
+        const arr = raw as unknown[]
+        return arr
+          .map((v, idx) => [idx % 5, Math.floor(idx / 5) % 7, +(Number(v) * 100).toFixed(2)] as [number, number, number])
+          .filter(d => Number.isFinite(d[2]))
       }
     }
     if (typeof raw === "object" && !Array.isArray(raw)) {
       const entries = Object.entries(raw as Record<string, unknown>)
-      if (entries.length) return entries.map(([, v], idx) => [idx % 5, Math.floor(idx / 5) % 7, +(Number(v) * 100)] as [number, number, number])
+      if (entries.length) {
+        const pts = entries
+          .map(([, v], idx) => [idx % 5, Math.floor(idx / 5) % 7, +(Number(v) * 100)] as [number, number, number])
+          .filter(d => Number.isFinite(d[2]))
+        return pts.length > 0 ? pts : null
+      }
     }
   } catch (e) {
     console.debug("[Research] deriveHeatmap failed:", e)
@@ -151,6 +170,24 @@ export function deriveHeatmap(metrics: Metrics): [number, number, number][] | nu
 // 兼容测试导入名，指向单一实现，避免分叉
 export const deriveHeatmapForTest = deriveHeatmap
 
+// provenance 保守判定：缺 markers 即视为 mock，直到后端显式声明 live；DEFAULT_METRICS 指纹全中也强制 mock
+export function isMockProvenance(j: Record<string, unknown>): boolean {
+  if (j.isMock === true || j.provenance === "synthetic" || j.provenance === "mock" || j.synthetic === true) return true
+  if (
+    Number(j.sharpe) === DEFAULT_METRICS.sharpe &&
+    Number(j.annual_return) === DEFAULT_METRICS.annual_return &&
+    Number(j.max_drawdown) === DEFAULT_METRICS.max_drawdown &&
+    Number(j.turnover) === DEFAULT_METRICS.turnover
+  ) return true
+  // 显式 live 声明才视为真实，其余（含空 {} / 无标记）一律保守为 mock
+  return !(j.isMock === false && j.provenance === "live")
+}
+
+// ECharts tooltip HTML 转义：week/day/drawdown 名均可能来自 props 或网络 JSON，HTML 模式下必须转义
+export function escapeHtml(s: unknown): string {
+  return String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]!))
+}
+
 function getTearsheetBadge(tearsheetLoaded: boolean, isSynthetic: boolean): { label: string; className: string } {
   if (!tearsheetLoaded) return { label: "占位预览（未找到则展示占位）", className: "border-white/10 bg-white/5 text-slate-500" }
   if (isSynthetic) return { label: "演示合成", className: "border-amber-400/20 bg-amber-400/10 text-amber-300" }
@@ -158,9 +195,7 @@ function getTearsheetBadge(tearsheetLoaded: boolean, isSynthetic: boolean): { la
 }
 
 function formatDrawdownDate(s: string): string {
-  const t = (s || "").trim()
-  if (/^\d{4}-\d{2}-\d{2}/.test(t)) return t.slice(5, 10)
-  return t
+  return formatMonthDay(s)
 }
 
 // 回撤条目校验：缺 depth/start 时不渲染，避免 toFixed 抛错
@@ -170,14 +205,17 @@ function isValidDrawdown(d: unknown): d is Drawdown {
   return typeof o.start === "string" && typeof o.end === "string" && typeof o.depth === "number" && Number.isFinite(o.depth) && typeof o.duration === "number" && Number.isFinite(o.duration)
 }
 
+// 指标数值归一：后端可能返回字符串数字（"1.62"），先 Number() 再有限性校验，避免 toFixed 抛错
+function toFiniteNumber(v: unknown): number | undefined {
+  const n = typeof v === "number" ? v : typeof v === "string" && v.trim() !== "" ? Number(v) : NaN
+  return Number.isFinite(n) ? n : undefined
+}
+
 export default function Research(props: ResearchProps) {
   const [metrics, setMetrics] = useState<Metrics>(props.metrics ?? DEFAULT_METRICS)
   const [metricsIsMock, setMetricsIsMock] = useState<boolean>(() => {
     if (!props.metrics) return true
-    const m = props.metrics as unknown as Record<string, unknown>
-    if (typeof m.isMock === "boolean") return m.isMock as boolean
-    if (m.provenance === "synthetic" || m.provenance === "mock" || m.synthetic === true) return true
-    return false
+    return isMockProvenance(props.metrics as unknown as Record<string, unknown>)
   })
   const [drawdowns, setDrawdowns] = useState<Drawdown[]>(() => {
     const init = props.drawdowns ?? DEFAULT_DRAWDOWNS
@@ -191,13 +229,15 @@ export default function Research(props: ResearchProps) {
   const [tearsheetLoaded, setTearsheetLoaded] = useState(false)
   const [tearsheetIsSynthetic, setTearsheetIsSynthetic] = useState<boolean>(true)
 
-  // 单一真实源：props 变更时同步到 state（修复 props-to-state 脱节）
+  // 按资源拆分请求作用域：共享 controller 负责卸载取消；csvReqId 防止过期 fetch 覆盖更新的 props
+  // （声明前置：上方 props 同步 effect 需递增代际声明优先权）
+  const csvReqIdRef = useRef(0)
+
+  // 单一真实源：props 变更时同步到 state（修复 props-to-state 脱节），provenance 走保守判定
   useEffect(() => {
     if (props.metrics) {
       setMetrics(props.metrics)
-      const m = props.metrics as unknown as Record<string, unknown>
-      const isMock = m.isMock === true || m.provenance === "synthetic" || m.provenance === "mock" || m.synthetic === true
-      setMetricsIsMock(!!isMock)
+      setMetricsIsMock(isMockProvenance(props.metrics as unknown as Record<string, unknown>))
     }
   }, [props.metrics])
   useEffect(() => {
@@ -209,6 +249,8 @@ export default function Research(props: ResearchProps) {
   }, [props.drawdowns])
   useEffect(() => {
     if (props.csvPreview !== undefined) {
+      // props 优先：递增请求代际，迟到的 in-flight fetch 不得覆盖新 props
+      csvReqIdRef.current++
       setCsvPreview(props.csvPreview)
       setCsvIsMock(false)
       setCsvLoading(false)
@@ -221,21 +263,24 @@ export default function Research(props: ResearchProps) {
     const { signal } = controller
     let aborted = false
     // 共享 fetcher：统一 cache 策略、signal 与 aborted 守卫，消除重复 boilerplate
-    const fetchNoStore = (url: string) => fetch(url, { cache: "no-store", signal } as RequestInit)
+    const fetchNoStore = (url: string) => fetch(url, { cache: "no-store", signal })
     const isAlive = () => !aborted && !signal.aborted
 
     async function fetchArtifact(path: string, setter: (v: string) => void, onReal: () => void, maxChars: number) {
-      setCsvLoading(true)
+      const myId = ++csvReqIdRef.current
+      if (!props.csvPreview) setCsvLoading(true)
       try {
         const r = await fetchNoStore(path)
         if (!r.ok) throw new Error(String(r.status))
         const txt = await r.text()
+        // 过期响应丢弃：props 已同步更新时不再覆盖
+        if (myId !== csvReqIdRef.current) return
         if (isAlive() && txt) { setter(truncateOnLineBoundary(txt, maxChars)); onReal() }
       } catch (e) {
         console.debug("[Research] fetchArtifact failed:", e)
         // keep mock, honest fallback handled via parsed === null
       } finally {
-        if (isAlive()) setCsvLoading(false)
+        if (myId === csvReqIdRef.current && isAlive()) setCsvLoading(false)
       }
     }
     async function fetchMetrics() {
@@ -250,10 +295,8 @@ export default function Research(props: ResearchProps) {
         const j = await r.json() as Record<string, unknown>
         if (!isAlive()) return
         setMetrics(j as Metrics)
-        // provenance 必传：后端应返回 isMock/provenance，缺失时保守标记为 mock，不冒充 live
-        const isMock = j.isMock === true || j.provenance === "synthetic" || j.provenance === "mock" || (j as Record<string, unknown>).synthetic === true
-        // 若后端未显式标记但返回全量 DEFAULT_METRICS 特征值，也视为 mock（防御静默回退）
-        setMetricsIsMock(!!isMock)
+        // provenance 保守判定：缺 markers 即视为 mock；DEFAULT_METRICS 指纹全中也强制 mock
+        setMetricsIsMock(isMockProvenance(j))
       } catch (e) {
         console.debug("[Research] fetchMetrics failed:", e)
         if (isAlive()) {
@@ -274,8 +317,18 @@ export default function Research(props: ResearchProps) {
           const valid = (arr as unknown[]).filter(isValidDrawdown) as Drawdown[]
           if (valid.length > 0) {
             setDrawdowns(valid)
-            const isMock = (j as Record<string, unknown>)?.isMock === true || (j as Record<string, unknown>)?.provenance === "synthetic"
-            setDrawdownsIsMock(!!isMock)
+            // 裸数组信封无 provenance 字段：命中 DEFAULT 指纹视为 mock 回退形状，否则视为 live 载荷（不误标真实数据）
+            if (Array.isArray(j)) {
+              const first = valid[0]
+              const isDefaultShape =
+                valid.length === DEFAULT_DRAWDOWNS.length &&
+                first.start === DEFAULT_DRAWDOWNS[0].start &&
+                first.end === DEFAULT_DRAWDOWNS[0].end &&
+                first.depth === DEFAULT_DRAWDOWNS[0].depth
+              setDrawdownsIsMock(isDefaultShape)
+            } else {
+              setDrawdownsIsMock(isMockProvenance((j ?? {}) as Record<string, unknown>))
+            }
             return
           }
         }
@@ -293,7 +346,8 @@ export default function Research(props: ResearchProps) {
         const html = await r.text()
         if (!isAlive()) return
         const sliced = truncateOnLineBoundary(html, MAX_HTML_CHARS)
-        const isSynthetic = /synthetic|placeholder|占位|演示合成/i.test(sliced) || sliced.length < 300
+        // 合成判定仅看显式标记：小体积真实 tearsheet 不得以 length 误判为合成
+        const isSynthetic = /synthetic|placeholder|占位|演示合成/i.test(sliced)
         setTearsheetLoaded(true)
         setTearsheetIsSynthetic(isSynthetic)
       } catch (e) {
@@ -378,22 +432,34 @@ export default function Research(props: ResearchProps) {
     const weeks = props.heatmapWeeks ?? ["W1","W2","W3","W4","W5"]
     let data: [number, number, number][]
     if (props.heatmapDataset && props.heatmapDataset.length > 0) {
-      data = props.heatmapDataset
+      // props 直传同样需有限性过滤：单条 NaN/Infinity 不得污染 visualMap 缩放
+      data = props.heatmapDataset.filter(
+        (d): d is [number, number, number] =>
+          Array.isArray(d) && d.length === 3 && d.every(v => typeof v === "number" && Number.isFinite(v)),
+      ) as [number, number, number][]
     } else if (derivedHeatmap && derivedHeatmap.length > 0) {
       data = derivedHeatmap
     } else {
       data = []
     }
     // 动态 visualMap 范围：基于真实数据极值，避免固定 -1..1.2 截断；无数据时保留默认
+    // 有限性守卫 + 迭代求极值：过滤 NaN/Infinity 后再缩放，避免 spread 大数组栈溢出
     let vMin = -1, vMax = 1.2
     if (data.length > 0) {
-      const vals = data.map(d => d[2])
-      const dMin = Math.min(...vals)
-      const dMax = Math.max(...vals)
-      // 加 10% padding 且至少覆盖数据
-      vMin = Math.floor(Math.min(dMin, -0.5) * 1.1 * 10) / 10
-      vMax = Math.ceil(Math.max(dMax, 0.5) * 1.1 * 10) / 10
-      if (vMin === vMax) { vMin -= 1; vMax += 1 }
+      const vals = data.map(d => d[2]).filter(v => Number.isFinite(v))
+      if (vals.length > 0) {
+        let dMin = vals[0]
+        let dMax = vals[0]
+        for (let i = 1; i < vals.length; i++) {
+          if (vals[i] < dMin) dMin = vals[i]
+          if (vals[i] > dMax) dMax = vals[i]
+        }
+        // 加 10% padding 且至少覆盖数据
+        vMin = Math.floor(Math.min(dMin, -0.5) * 1.1 * 10) / 10
+        vMax = Math.ceil(Math.max(dMax, 0.5) * 1.1 * 10) / 10
+        if (!Number.isFinite(vMin) || !Number.isFinite(vMax)) { vMin = -1; vMax = 1.2 }
+        if (vMin === vMax) { vMin -= 1; vMax += 1 }
+      }
     }
     return {
       backgroundColor: "transparent",
@@ -404,8 +470,9 @@ export default function Research(props: ResearchProps) {
         const v = d[2] as number
         const wi = d[0] as number
         const di = d[1] as number
-        const w = weeks[wi] ?? String(wi)
-        const day = days[di] ?? String(di)
+        // XSS 防护：week/day 来自 props（外部可控），HTML tooltip 模式下转义后再插值
+        const w = escapeHtml(weeks[wi] ?? String(wi))
+        const day = escapeHtml(days[di] ?? String(di))
         return `${w} ${day}<br/>日收益: ${v > 0 ? "+" : ""}${v.toFixed(2)}%`
       }, backgroundColor: "#121722", borderColor: "rgba(255,255,255,0.1)", textStyle: { color: "#E6EAF2", fontSize: 11 } },
       grid: { left: 56, right: 12, top: 8, bottom: 36 },
@@ -428,10 +495,18 @@ export default function Research(props: ResearchProps) {
     backgroundColor: "transparent",
     grid: { left: 48, right: 16, top: 12, bottom: 24 },
     tooltip: { trigger: "axis" as const, backgroundColor: "#121722", borderColor: "rgba(255,255,255,0.1)", textStyle: { color: "#E6EAF2" }, formatter: (params: unknown) => {
-      // ECharts axis 触发时 params 为数组，单项触发时为对象；均做空与类型守卫
-      const arr = Array.isArray(params) ? (params as { value: number; name: string }[]) : (params as { value: number; name: string } | null) ? [(params as { value: number; name: string })] : []
-      if (!arr.length || arr[0] == null || typeof arr[0].value !== "number") return ""
-      return `${String(arr[0].name ?? "")}<br/>回撤 ${Number(arr[0].value).toFixed(2)}%`
+      // ECharts axis 触发时 params 为数组，单项触发时为对象；if/else 替代嵌套三元
+      let arr: { value: number; name: string }[]
+      if (Array.isArray(params)) {
+        arr = params as { value: number; name: string }[]
+      } else if (params !== null && params !== undefined) {
+        arr = [params as { value: number; name: string }]
+      } else {
+        arr = []
+      }
+      if (arr.length === 0 || arr[0] === null || arr[0] === undefined || typeof arr[0].value !== "number") return ""
+      // XSS 防护：name 源自 drawdowns 日期（网络 JSON 可控），HTML tooltip 下转义
+      return `${escapeHtml(arr[0].name ?? "")}<br/>回撤 ${Number(arr[0].value).toFixed(2)}%`
     } },
     xAxis: {
       type: "category" as const,
@@ -454,6 +529,29 @@ export default function Research(props: ResearchProps) {
 
   const tearsheetBadge = getTearsheetBadge(tearsheetLoaded, tearsheetIsSynthetic)
 
+  // 净值徽标文案：if/else 替代嵌套三元
+  function cumulativeBadgeText(): string {
+    if (!hasParsed) return "暂无有效数据 · 请检查文件"
+    if (parsed!.truncated) return `真 positions.csv 驱动 · 仅展示最近${MAX_POINTS}点（共 ${parsed!.totalRows} 点，已截断）`
+    return "真 positions.csv 驱动 · 含累积净值"
+  }
+
+  // 净值区正文：if/else 替代嵌套三元（加载骨架 / 诚实空状态 / 图表）
+  function renderCumulativeBody() {
+    if (csvLoading) {
+      return <div className="mt-4 h-[300px] animate-pulse rounded-xl bg-white/5" />
+    }
+    if (!hasParsed) {
+      return (
+        <div className="mt-4 flex h-[300px] flex-col items-center justify-center rounded-xl border border-dashed border-white/10 bg-ink-900/50 px-6 text-center">
+          <p className="text-sm font-medium text-slate-300">暂无有效回测数据</p>
+          <p className="mt-1 max-w-md text-xs leading-5 text-slate-500">解析失败或数据不足 · 请检查 positions.csv 格式（需包含 date,close 且至少 2 行有效数据，引号包裹字段已支持）</p>
+        </div>
+      )
+    }
+    return <ReactECharts option={cumulativeOption} style={CHART_STYLE_CUMULATIVE} opts={{ renderer: "canvas" }} notMerge={true} lazyUpdate={true} />
+  }
+
   return (
     <div className="mx-auto max-w-7xl px-6 py-6">
       <div className="flex flex-wrap items-start justify-between gap-4">
@@ -468,14 +566,20 @@ export default function Research(props: ResearchProps) {
         </div>
       </div>
 
-      {/* 指标卡 */}
+      {/* 指标卡：数值经 toFiniteNumber 归一，字符串数字不抛错 */}
       <div className="mt-6 grid grid-cols-2 gap-3 md:grid-cols-4">
-        {[
-          { k: "年化收益", v: metrics.annual_return !== undefined ? `${(metrics.annual_return*100).toFixed(1)}%` : "+18.4%", sub: "annual_return" },
-          { k: "夏普", v: metrics.sharpe?.toFixed(2) ?? "1.62", sub: "sharpe" },
-          { k: "最大回撤", v: metrics.max_drawdown !== undefined ? `${(metrics.max_drawdown*100).toFixed(1)}%` : "-3.2%", sub: "max_drawdown" },
-          { k: "换手率", v: metrics.turnover !== undefined ? String(metrics.turnover) : "0.42", sub: "turnover" },
-        ].map(c => (
+        {(() => {
+          const annual = toFiniteNumber(metrics.annual_return)
+          const sharpe = toFiniteNumber(metrics.sharpe)
+          const dd = toFiniteNumber(metrics.max_drawdown)
+          const turnover = toFiniteNumber(metrics.turnover)
+          return [
+            { k: "年化收益", v: annual !== undefined ? `${(annual * 100).toFixed(1)}%` : "+18.4%", sub: "annual_return" },
+            { k: "夏普", v: sharpe !== undefined ? sharpe.toFixed(2) : "1.62", sub: "sharpe" },
+            { k: "最大回撤", v: dd !== undefined ? `${(dd * 100).toFixed(1)}%` : "-3.2%", sub: "max_drawdown" },
+            { k: "换手率", v: turnover !== undefined ? String(turnover) : "0.42", sub: "turnover" },
+          ]
+        })().map(c => (
           <div key={c.k} className="group relative overflow-hidden rounded-2xl border border-white/10 bg-white/[0.04] p-4 backdrop-blur hover:bg-white/[0.06] transition">
             <div className="absolute -right-6 -top-6 h-16 w-16 rounded-full bg-amber-500/10 blur-xl group-hover:bg-amber-500/15 transition" />
             <div className="text-[11px] tracking-[0.14em] text-slate-400">{c.k} {metricsLoading && <span className="inline-block h-2 w-2 animate-pulse rounded-full bg-amber-400/60" />}</div>
@@ -493,19 +597,10 @@ export default function Research(props: ResearchProps) {
         <div className="lg:col-span-3 rounded-2xl border border-white/10 bg-ink-800/60 p-4 backdrop-blur">
           <div className="flex items-center justify-between">
             <h2 className="text-sm font-semibold text-mist">净值曲线</h2>
-            <span className={"rounded-full border px-2.5 py-1 text-[11px] " + (hasParsed ? "border-emerald-400/20 bg-emerald-400/10 text-emerald-300" : "border-amber-400/20 bg-amber-400/10 text-amber-300")}>{hasParsed ? "真 positions.csv 驱动 · 含累积净值" : "暂无有效数据 · 请检查文件"}</span>
+            <span className={"rounded-full border px-2.5 py-1 text-[11px] " + (hasParsed ? "border-emerald-400/20 bg-emerald-400/10 text-emerald-300" : "border-amber-400/20 bg-amber-400/10 text-amber-300")}>{cumulativeBadgeText()}</span>
           </div>
           {/* 诚实空状态：解析失败不展示伪造 mock 曲线 */}
-          {!hasParsed && !csvLoading ? (
-            <div className="mt-4 flex h-[300px] flex-col items-center justify-center rounded-xl border border-dashed border-white/10 bg-ink-900/50 px-6 text-center">
-              <p className="text-sm font-medium text-slate-300">暂无有效回测数据</p>
-              <p className="mt-1 max-w-md text-xs leading-5 text-slate-500">解析失败或数据不足 · 请检查 positions.csv 格式（需包含 date,close 且至少 2 行有效数据，引号包裹字段已支持）</p>
-            </div>
-          ) : csvLoading ? (
-            <div className="mt-4 h-[300px] animate-pulse rounded-xl bg-white/5" />
-          ) : (
-            <ReactECharts option={cumulativeOption} style={CHART_STYLE_CUMULATIVE} opts={{ renderer: "canvas" }} notMerge={true} lazyUpdate={true} />
-          )}
+          {renderCumulativeBody()}
           <div className="mt-2 flex flex-wrap gap-2 text-xs">
             <span className="rounded-lg bg-amber-500/15 px-2 py-1 text-amber-300">600519 等权</span>
             <span className="rounded-lg bg-white/5 px-2 py-1 text-slate-300">对比基准(合成)</span>
