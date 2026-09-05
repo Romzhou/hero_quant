@@ -276,6 +276,10 @@ def test_laneA_init_stub_landlock_construction_contract():
     Stub = _stub("LandlockSandbox")
     inst = Stub(policy={"mode": "workspace-write"})
     assert inst.enforcement == "unusable"
+    # rescan: stub must mirror real-constructor attributes for safe inspection
+    assert inst._policy == {"mode": "workspace-write"}
+    assert isinstance(inst._launcher, str) and inst._launcher
+    assert inst._verdict() == "unusable"
     with pytest.raises(SandboxUnavailableError):
         inst.execute(["echo", "hi"])
     with pytest.raises(SandboxUnavailableError):
