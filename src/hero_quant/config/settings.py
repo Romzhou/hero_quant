@@ -232,7 +232,8 @@ def _redis_dsn_from_env() -> str | None:
             return s
         warnings.warn(f"HERO_REDIS_DSN does not look like redis DSN: {_redact_dsn(s)!r}", UserWarning, stacklevel=2)
         logger.warning("HERO_REDIS_DSN invalid redis DSN: %r", _redact_dsn(s))
-        return None  # fail-visible：调用方走 HERO_REDIS_HOST/REDIS_URL 拼装或 fakeredis/fail-closed，不传垃圾给 redis 库
+        # fall through：非法 DSN 不直接返回，继续走 HERO_REDIS_HOST 拼装/REDIS_URL 兼容，
+        # 避免一次笔误在 HOST/URL 有效时彻底禁用 Redis（fail-visible：已 warn+log）。
     # HERO_REDIS_HOST 拼装
     host = (os.getenv("HERO_REDIS_HOST", "") or "").strip()
     if host:

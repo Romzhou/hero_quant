@@ -207,16 +207,28 @@ def test_e2_settings_singleton_isolated():
 
 
 def test_e2_settings_invalid_redis_dsn_returns_none(monkeypatch):
-    """Invalid HERO_REDIS_DSN must return None (fail-visible fallback chain)."""
+    """Invalid HERO_REDIS_DSN must warn (fail-visible) and fall through to HOST/URL chain.
+
+    Prescribed fix evolved on rescan: returning None short-circuits the
+    documented HERO_REDIS_HOST/REDIS_URL fallback. Correct behavior: warn, then
+    continue the chain; only None when nothing usable remains.
+    """
     monkeypatch.setenv("HERO_REDIS_DSN", "http://:s3cret@host:6379/0")
     monkeypatch.setenv("HERO_REDIS_HOST", "")
     monkeypatch.setenv("REDIS_URL", "")
     import hero_quant.config.settings as sett
 
-    with warnings.catch_warnings(record=True):
+    with warnings.catch_warnings(record=True) as w:
         warnings.simplefilter("always")
         val = sett._redis_dsn_from_env()
-    assert val is None, f"invalid redis DSN must return None, got {val!r}"
+    assert val is None, f"nothing usable configured, expected None, got {val!r}"
+    assert any("HERO_REDIS_DSN" in str(x.message) for x in w), "must warn fail-visible"
+    # fall-through: valid HOST still wins despite typo'd DSN
+    monkeypatch.setenv("HERO_REDIS_HOST", "myhost")
+    with warnings.catch_warnings(record=True):
+        warnings.simplefilter("always")
+        val2 = sett._redis_dsn_from_env()
+    assert val2 == "redis://myhost:6379/0", f"must fall through to HOST assembly, got {val2!r}"
 
 
 def test_e2_settings_whitespace_env_falls_back(monkeypatch):
