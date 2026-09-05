@@ -56,11 +56,11 @@ _OUTPUT_STRIP_CHARS = (
 _OUTPUT_STRIP_TABLE = str.maketrans("", "", _OUTPUT_STRIP_CHARS)
 
 # 中文：检测用剥离类别——Cf（含 variation selector 等格式控制）+ Mn（变体选择符等
-# 非间距标记）+ Zl/Zp（行段分隔）；ZWJ/ZWNJ 检测时亦保留，避免误伤合法连接语义。
-# 注意检测剥离强于输出剥离：U+2064、U+FE00 等切分 token 的字符在检测副本中被去掉，
-# 命中后再映射回原文转义。
+# 非间距标记）+ Zl/Zp（行段分隔）；检测副本剥离全部（含 ZWJ/ZWNJ），因为切分 token
+# 的连接符对下游 tokenizer 同样透明（`<\u200D|im_start|>` 仍可被识别为边界 token）；
+# 非命中文本原样拼回，emoji ZWJ 序列等合法内容不受影响（输出级仍保留 ZWJ/ZWNJ）。
 _STRIP_CATEGORIES = frozenset({"Cf", "Mn", "Zl", "Zp"})
-_DETECTION_PRESERVE = frozenset({"\u200c", "\u200d"})
+_DETECTION_PRESERVE: frozenset[str] = frozenset()
 
 
 def _detection_copy(text: str) -> tuple[str, list[int], list[int]]:
@@ -93,17 +93,15 @@ def _detection_copy(text: str) -> tuple[str, list[int], list[int]]:
 def _escape_span(norm_token: str, orig_span: str) -> str:
     """转义映射回原文的命中 span。
 
-    中文：预转义形态（`\\u003c|..|\\u003e`）只中和管道符，与存量 `\\uXXXX`
-    转义同 depth（下游单次 unicode_escape/JSON 解码不直接还原 token）；
-    普通 token 原子转义全部定界符（含全宽 `｜/＞/＜`，其经 NFKC 折叠后命中，
-    但原文 span 中仍为全宽形态，故替换分支可达而非死代码）。
+    中文：先滤掉检测期剥离字符（Cf/Mn/Zl/Zp，如 U+2064、variation selector），
+    避免其经原文 span 重新进入输出；再原子转义全部定界符（含全宽 `｜/＞/＜`，
+    其经 NFKC 折叠后命中、原文 span 中仍为全宽形态——含预转义分支统一走
+    _escape_text，与存量 `\\uXXXX` 转义同 depth（下游单次解码不直接还原 token）。
     """
-    if norm_token[:2] == "\\u" or norm_token[:2] == "\\U":
-        s = orig_span.replace("|", r"\u007c")
-        s = s.replace("[", r"\u005b")
-        s = s.replace("]", r"\u005d")
-        return s
-    return _escape_text(orig_span)
+    filtered = "".join(
+        ch for ch in orig_span if unicodedata.category(ch) not in _STRIP_CATEGORIES
+    )
+    return _escape_text(filtered if filtered else orig_span)
 
 
 def _escape_text(s: str) -> str:
@@ -122,11 +120,6 @@ def _escape_text(s: str) -> str:
     s = s.replace("＞", r"\u003e")
     s = s.replace("＜", r"\u003c")
     return s
-
-
-def _escape_special_token(match: re.Match[str]) -> str:
-    """兼容别名：对正则直接命中的 norm 文本做原子转义（内部已改走 span 映射）。"""
-    return _escape_text(match.group(0))
 
 
 def neutralize(text: str) -> str:
