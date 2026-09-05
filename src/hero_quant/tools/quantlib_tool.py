@@ -178,15 +178,24 @@ def compute_indicator(
             values = [float(x) if pd.notna(x) else None for x in res.tolist()]
         elif ind == "rsi":
             if rsi is not None:
-                res = rsi(s, n if n else 14)
+                res = rsi(s, n)
             else:
                 delta = s.diff()
                 gain = delta.where(delta > 0, 0.0)
                 loss = -delta.where(delta < 0, 0.0)
                 avg_gain = gain.ewm(alpha=1 / n, adjust=False, min_periods=1).mean()
                 avg_loss = loss.ewm(alpha=1 / n, adjust=False, min_periods=1).mean()
-                rs = avg_gain / avg_loss.replace(0, 1e-9)
+                # flat series (avg_gain==0 & avg_loss==0) -> undefined RSI (NaN,
+                # surfaced as None); up-only -> 100; else standard formula.
+                # Never fudge zero avg_loss to 1e-9 (that yields RSI=0 oversold).
+                import numpy as _np
+
+                rs = avg_gain / avg_loss.replace(0, _np.nan)
                 res = 100 - (100 / (1 + rs))
+                both_zero = (avg_gain == 0) & (avg_loss == 0)
+                res = res.mask(both_zero, _np.nan)
+                gain_only = (avg_gain > 0) & (avg_loss == 0)
+                res = res.mask(gain_only, 100.0)
                 # 中文：全平序列等退化情形 res 全 NaN，以 None 透出不填 50.0 伪装中性
                 res = res.where(pd.notna(res), None)
             values = [float(x) if pd.notna(x) else None for x in res.tolist()]
@@ -209,15 +218,23 @@ def compute_indicator(
                 return {"values": mid_l, "upper": upper_l, "lower": lower_l, "ok": True, "symbol": symbol, "indicator": indicator}
         elif ind in ("macd",):
             if macd is not None:
-                m_line, sig, hist = macd(s)
+                # Map validated generic window to MACD spans (slow must exceed
+                # fast); callers' window choice takes effect instead of defaults.
+                _fast = max(int(n), 2)
+                _slow = max(int(n) * 2, int(n) + 1)
+                m_line, sig, hist = macd(s, fast=_fast, slow=_slow, signal=9)
                 # 中文：MACD 前段 NaN 以 None 透出，禁止填 0.0 伪装零轴
                 m_l = [float(x) if pd.notna(x) else None for x in m_line.tolist()]
                 sig_l = [float(x) if pd.notna(x) else None for x in sig.tolist()]
                 hist_l = [float(x) if pd.notna(x) else None for x in hist.tolist()]
                 return {"values": m_l, "signal": sig_l, "hist": hist_l, "ok": True, "symbol": symbol, "indicator": indicator}
             else:
-                ef = s.ewm(span=12, adjust=False).mean()
-                es = s.ewm(span=26, adjust=False).mean()
+                # pandas fallback honors the validated window: scale classic
+                # 12/26/9 spans proportionally so window has an effect
+                _ef_span = max(int(round(12 * n / 20)), 2)
+                _es_span = max(int(round(26 * n / 20)), _ef_span + 1)
+                ef = s.ewm(span=_ef_span, adjust=False).mean()
+                es = s.ewm(span=_es_span, adjust=False).mean()
                 m_line = ef - es
                 sig = m_line.ewm(span=9, adjust=False).mean()
                 hist = m_line - sig
@@ -270,13 +287,10 @@ def compute_sharpe(prices: list) -> Dict[str, Any]:
     try:
         if not prices:
             raise ValueError("prices must be non-empty")
-        # validate numeric
-        _ = pd.to_numeric(pd.Series(prices), errors="coerce")
-        if pd.Series(prices).isna().any():
-            # coerce check
-            coerced = pd.to_numeric(pd.Series(prices), errors="coerce")
-            if coerced.isna().any():
-                raise ValueError("prices must be numeric")
+        # validate numeric — reuse single coerced Series for the check
+        coerced = pd.to_numeric(pd.Series(prices), errors="coerce")
+        if coerced.isna().any():
+            raise ValueError("prices must be numeric")
         from hero_quant.backtest.metrics import sharpe_ratio
 
         s = pd.Series(prices, dtype=float)
@@ -284,7 +298,7 @@ def compute_sharpe(prices: list) -> Dict[str, Any]:
         return {"sharpe": float(v), "ok": True}
     except Exception as e:
         logger.warning("compute_sharpe failed: %s", e, exc_info=True)
-        return {"sharpe": 0.0, "ok": False, "error": str(e)}
+        return {"sharpe": None, "ok": False, "error": str(e)}
 
 
 @tool(
@@ -316,7 +330,7 @@ def compute_drawdown(prices: list) -> Dict[str, Any]:
         return {"drawdown": float(v), "ok": True}
     except Exception as e:
         logger.warning("compute_drawdown failed: %s", e, exc_info=True)
-        return {"drawdown": 0.0, "ok": False, "error": str(e)}
+        return {"drawdown": None, "ok": False, "error": str(e)}
 
 
 SUPPORTED_FACTORS = {"momentum", "mom"}
