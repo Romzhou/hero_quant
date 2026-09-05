@@ -83,7 +83,13 @@ def is_path_writable(path: str, policy: dict) -> bool:
     except (OSError, ValueError, RuntimeError, TypeError, AttributeError):
         # fail-closed：非法类型/解析失败一律不可写（TypeError 覆盖 None/int 输入）
         return False
-    roots = policy.get("writableRoots") or []
+    roots = policy.get("writableRoots")
+    # fail-closed 归一化：裸 str 不得逐字符迭代（'/' 字符即命中全盘放行），
+    # 非 list/tuple 一律视为空（由 workspaceRoot 回退或直接拒绝）。
+    if isinstance(roots, str):
+        roots = [roots]
+    if not isinstance(roots, (list, tuple)):
+        roots = []
     if not roots:
         ws = policy.get("workspaceRoot") or policy.get("workspace_root") or policy.get("canonicalPath")
         if ws:
@@ -92,14 +98,21 @@ def is_path_writable(path: str, policy: dict) -> bool:
             except (OSError, ValueError, RuntimeError):
                 return False
     for root in roots:
+        if not isinstance(root, str) or not root:
+            continue
         if root == "/":
-            return True
+            # 与 policy.is_path_writable 对齐：'/' 全盘放行仅 danger-full-access 显式模式可享
+            if isinstance(policy, dict) and policy.get("mode") == "danger-full-access":
+                return True
+            continue
         try:
             r = str(Path(root).resolve())
         except (OSError, ValueError, RuntimeError, TypeError, AttributeError):
             continue
         if r == "/":
-            return True
+            if isinstance(policy, dict) and policy.get("mode") == "danger-full-access":
+                return True
+            continue
         # 使用 commonpath 防 /tmp-evil 前缀欺骗，不再单独回退 raw "/tmp"
         try:
             if cp == r or os.path.commonpath([cp, r]) == r:
@@ -135,14 +148,13 @@ class BaseSandbox(ABC):
                 ws = None
                 if isinstance(policy, dict):
                     ws = policy.get("workspaceRoot") or policy.get("workspace_root") or policy.get("canonicalPath")
-                if ws:
-                    ws_canonical = _resolve_ws_strict(str(ws))
-                else:
-                    # 无显式工作区时使用 /tmp，需严格解析
-                    try:
-                        ws_canonical = str(Path("/tmp").resolve(strict=True))
-                    except (OSError, RuntimeError, ValueError) as e:
-                        raise SandboxUnavailableError(f"workspaceRoot unavailable: {e}") from e
+                if not ws:
+                    # 缺工作区 fail-closed：不得回退绑定宿主 /tmp 可写（超授权 scope，
+                    # 且 --bind /tmp 会遮住前面的 --tmpfs /tmp 私有化）。
+                    raise SandboxUnavailableError(
+                        "workspaceRoot required for workspace-write"
+                    )
+                ws_canonical = _resolve_ws_strict(str(ws))
                 # bwrap 前缀：根目录只读，工作区与 /tmp 可写；保留最小通用参数
                 # 注意：bwrap 挂载按序生效，`--tmpfs /tmp` 必须在工作区 `--bind`
                 # 之前——否则 ws == /tmp 或 ws 在 /tmp 之下时后挂的 tmpfs 会遮住
@@ -187,7 +199,12 @@ class LocalShellBackend(BaseSandbox):
         pol = self._policy if self._policy else {}
         wrapped = self.confine(cmd, pol)  # 仅当 bwrap 可用时才加前缀
         # 安全：显式超时防 hung 子进程 DoS 调用线程（fail-closed 转异常上浮）
-        result = subprocess.run(wrapped, shell=False, capture_output=True, text=True, timeout=60)
+        try:
+            result = subprocess.run(wrapped, shell=False, capture_output=True, text=True, timeout=60)
+        except FileNotFoundError as e:
+            # bwrap 在 _has_bwrap 与 run 之间消失（TOCTOU/PATH 变更）：fail-closed，
+            # 与 DockerBackend.execute 对齐，调用方只捕 SandboxUnavailableError 即可。
+            raise SandboxUnavailableError(f"bwrap launcher not found: {e}") from e
         return result.stdout, result.stderr, result.returncode
 
     def confine(self, argv: List[str], policy: dict) -> List[str]:
@@ -201,9 +218,10 @@ class LocalShellBackend(BaseSandbox):
 
     @property
     def enforcement(self) -> str:
-        # danger-full-access 视为未隔离（partial）；其余需 bwrap 真实可用才算 full，
-        # 否则调用方会高估隔离等级（fail-closed 语义）
-        if isinstance(self._policy, dict) and self._policy.get("mode") == "danger-full-access":
+        # 与 DockerBackend 对齐：仅 workspace-write + bwrap 真实可用才报 full；
+        # read-only / danger-full-access 走基类透传（无 bwrap 前缀），报 full 即虚报。
+        mode = self._policy.get("mode") if isinstance(self._policy, dict) else None
+        if mode != "workspace-write":
             return "partial"
         if not _has_bwrap():
             return "partial"
@@ -241,7 +259,10 @@ class DockerBackend(BaseSandbox):
         mode = merged.get("mode")
         if mode == "workspace-write":
             # workspaceRoot 校验：":"/"\n"/绝对路径/is_dir/containment
-            ws_raw = merged.get("workspaceRoot") or merged.get("workspace_root") or merged.get("canonicalPath") or "/tmp"
+            # 缺工作区 fail-closed：不得默认挂载宿主 /tmp 可写（超授权 scope）。
+            ws_raw = merged.get("workspaceRoot") or merged.get("workspace_root") or merged.get("canonicalPath")
+            if not ws_raw:
+                raise SandboxUnavailableError("workspaceRoot required for workspace-write")
             ws_str = str(ws_raw)
             # 提前校验 Docker -v 注入字符，即使 docker 不可用也需 fail-fast
             _validate_workspace_root(ws_str)

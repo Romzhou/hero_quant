@@ -280,3 +280,61 @@ def test_laneA_init_stub_landlock_construction_contract():
         inst.execute(["echo", "hi"])
     with pytest.raises(SandboxUnavailableError):
         inst.confine(["echo"], {})
+
+
+# ── base.py rescan follow-up ────────────────────────────────────────────
+
+
+def test_laneA_base_str_roots_not_iterated_as_chars():
+    """Critical rescan: writableRoots given as a bare str must not iterate chars into '/' match."""
+    from hero_quant.sandbox.base import is_path_writable
+
+    assert is_path_writable("/etc/passwd", {"mode": "read-only", "writableRoots": "/tmp/ws"}) is False
+
+
+def test_laneA_base_slash_root_gated_on_danger_mode():
+    """Critical rescan: base is_path_writable must gate '/' like policy.py does."""
+    from hero_quant.sandbox.base import is_path_writable
+
+    assert is_path_writable("/etc/passwd", {"mode": "read-only", "writableRoots": ["/"]}) is False
+    assert (
+        is_path_writable("/etc/passwd", {"mode": "workspace-write", "writableRoots": ["/"]})
+        is False
+    )
+    assert (
+        is_path_writable("/etc/passwd", {"mode": "danger-full-access", "writableRoots": ["/"]})
+        is True
+    )
+
+
+def test_laneA_base_local_enforcement_mirrors_docker():
+    """High rescan: LocalShellBackend non-workspace-write modes must not report full."""
+    from hero_quant.sandbox import base as b
+
+    assert b.LocalShellBackend(policy={"mode": "read-only"}).enforcement == "partial"
+    assert b.LocalShellBackend(policy={"mode": "danger-full-access"}).enforcement == "partial"
+
+
+def test_laneA_base_no_workspace_no_tmp_bind(monkeypatch):
+    """High rescan: workspace-write without workspaceRoot must raise, not bind /tmp."""
+    from hero_quant.sandbox import base as b
+
+    monkeypatch.setattr(b, "_has_bwrap", lambda: True)
+    with pytest.raises(b.SandboxUnavailableError):
+        b.LocalShellBackend(policy={"mode": "workspace-write"}).confine(
+            ["echo", "hi"], {"mode": "workspace-write"}
+        )
+
+
+def test_laneA_base_local_execute_maps_missing_launcher(monkeypatch):
+    """High rescan: LocalShellBackend.execute must map FileNotFoundError to fail-closed error."""
+    import subprocess
+
+    from hero_quant.sandbox import base as b
+
+    be = b.LocalShellBackend(policy={"mode": "read-only"})
+    monkeypatch.setattr(
+        subprocess, "run", lambda *a, **k: (_ for _ in ()).throw(FileNotFoundError("bwrap gone"))
+    )
+    with pytest.raises(b.SandboxUnavailableError):
+        be.execute(["echo", "hi"])
