@@ -89,6 +89,14 @@ def _load_runner_stub(name: str) -> Any:
         return _stub
     if name == "LandlockSandbox":
         class _StubLandlock(_Base):  # type: ignore
+            def __init__(self, *a, **kw):  # type: ignore
+                # 构造契约与真实 LandlockSandbox(policy, launcher) 对齐：
+                # 存根无后端，构造成功、调用时 fail-closed 抛，不以 TypeError 破坏调用方。
+                pass
+            @property
+            def enforcement(self):  # type: ignore
+                # 存根无隔离能力，报 unusable 而非继承 BaseSandbox 的 full（防虚报）。
+                return "unusable"
             def execute(self, *a, **kw):  # type: ignore
                 raise _UE("sandbox unavailable: runner not installed")
             def confine(self, argv, policy=None):  # type: ignore

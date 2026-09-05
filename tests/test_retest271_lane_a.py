@@ -245,3 +245,20 @@ def test_laneA_runner_guarded_import_blocks_dynamic_os():
 
     with pytest.raises(SandboxViolation):
         execute_python("__import__(chr(111) + chr(115))")
+
+
+# ── __init__.py (1 high: stub LandlockSandbox constructor contract) ────────
+
+
+def test_laneA_init_stub_landlock_construction_contract():
+    """High: stub LandlockSandbox must accept (policy=...) and report unusable."""
+    from hero_quant.sandbox import _load_runner_stub as _stub
+    from hero_quant.sandbox.base import SandboxUnavailableError
+
+    Stub = _stub("LandlockSandbox")
+    inst = Stub(policy={"mode": "workspace-write"})
+    assert inst.enforcement == "unusable"
+    with pytest.raises(SandboxUnavailableError):
+        inst.execute(["echo", "hi"])
+    with pytest.raises(SandboxUnavailableError):
+        inst.confine(["echo"], {})
