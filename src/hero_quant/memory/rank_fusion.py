@@ -205,7 +205,7 @@ def fuse(bm25_cands, vec_cands, k: int = RRF_K) -> List[Tuple[str, float]]:
         # when dicts carry no usable score field.
         def _has_score(d):
             return d.get("score") is not None or d.get("relevance_score") is not None or d.get("_score") is not None
-        if all(_has_score(d) for d in peek):
+        if any(_has_score(d) for d in peek):
             bm25_pairs = peek
         else:
             bm25_pairs = bm25_from_ordered(peek)
