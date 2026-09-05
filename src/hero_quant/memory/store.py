@@ -1186,6 +1186,22 @@ class MemoryStore:
         try:
             with self._lock:  # 中文注释：SQLite 共享连接需加锁
                 cur = self._conn.cursor()
+                # overwrite parity: file os.replace overwrote any prior content,
+                # so DELETE prior rows for ns_key before INSERT (else stale
+                # duplicates accumulate and search returns outdated versions)
+                try:
+                    cur.execute("SELECT id FROM notes WHERE key = ?", (ns_key,))
+                    _old_rowids = [row[0] for row in cur.fetchall()]
+                    for _rid in _old_rowids:
+                        for _table in ("notes_fts", "notes_fts_bigram"):
+                            try:
+                                cur.execute(f"DELETE FROM {_table} WHERE rowid = ?", (_rid,))
+                            except Exception:
+                                pass
+                    if _old_rowids:
+                        cur.execute("DELETE FROM notes WHERE key = ?", (ns_key,))
+                except Exception:
+                    pass
                 # 探查向量列是否存在以选择写入路径
                 cur.execute("PRAGMA table_info(notes)")
                 cols = [row[1] for row in cur.fetchall()]
@@ -1289,6 +1305,9 @@ class MemoryStore:
             except Exception as _exc:
                 logger.warning("reconcile: failed to clean orphan file", exc_info=_exc)
                 pass
+            # fail-visible: DB index missing while file committed (or restored)
+            # must not report success — caller would assume the note is searchable
+            raise RuntimeError(f"MemoryStore.write DB failed for key {ns_key!r}: {_e}") from _e
         # 初始化 Ebbinghaus 元数据：内存态，无需 DDL
         with self._lock:
             if ns_key not in self._meta:
