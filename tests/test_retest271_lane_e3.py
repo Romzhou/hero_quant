@@ -530,3 +530,19 @@ def test_e3_redaction_fail_closed_sentinel_unquoted():
         assert redact_tool_result(["a"], sink="result") == "***"
     finally:
         red_mod._maybe_redact = orig
+
+
+# ============================================================================
+# tools/presentation.py — 1 item
+# ============================================================================
+
+def test_e3_presentation_multiline_description_commented():
+    """[bug·low] Every description line must be #-prefixed in code rendering."""
+    from hero_quant.tools.presentation import present_as_code
+
+    out = present_as_code({"name": "demo", "description": "line one\nline two\n\nline four"})
+    lines = out.splitlines()
+    assert lines[0] == "# Tool: demo"
+    for ln in lines[1:]:
+        assert ln.startswith("#"), f"uncommented overflow line: {ln!r}"
+    assert "line two" in out and "line four" in out
