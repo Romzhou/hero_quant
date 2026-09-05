@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import socket
+import time
 import uuid
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
@@ -257,15 +258,25 @@ class HeartbeatMonitor:
             for ch in expired:
                 # Pop under WSManager._lock (connect/disconnect mutate the same
                 # dict under it); pop BEFORE close so a reconnect added during
-                # close() is not evicted by a stale snapshot.
+                # close() is not evicted by a stale snapshot. Re-validate
+                # staleness under the lock: a record() that landed after the
+                # snapshot must not be evicted.
                 async with manager._lock:
+                    last = self._last_active.get(ch)
+                    if last is None or now - last <= self.TIMEOUT:
+                        continue
                     conns = list(manager._connections.pop(ch, set()))
                 for ws in conns:
                     try:
                         await ws.close(code=4002, reason="heartbeat timeout")
                     except Exception:
                         pass
-                self.remove(ch)
+                # Do NOT delete a fresh record() from a reconnect that happened
+                # during the awaited close() above — otherwise the new
+                # connection is left unmonitored (never times out).
+                last = self._last_active.get(ch)
+                if last is None or datetime.now(timezone.utc) - last > self.TIMEOUT:
+                    self.remove(ch)
 
 
 heartbeat = HeartbeatMonitor()
@@ -427,6 +438,17 @@ async def broadcast_trace_event(event: dict[str, Any], user: str | None = None) 
         logger.debug("ws.broadcast_failed error=%s", str(e2))
 
 
+def _stream_entry_is_stale(msg_id: str, started_ms: int) -> bool:
+    """True when a Stream entry predates this consumer (restart replay).
+
+    IDs are {ms}-{seq}; unparseable IDs are treated as fresh (deliver).
+    """
+    try:
+        return int(str(msg_id).split("-")[0]) < started_ms
+    except (ValueError, TypeError, AttributeError, IndexError):
+        return False
+
+
 async def run_trace_consumer(stop_event: asyncio.Event | None = None) -> None:
     """Per-worker consumer: forward Stream entries to local manager.send_to.
 
@@ -436,6 +458,10 @@ async def run_trace_consumer(stop_event: asyncio.Event | None = None) -> None:
     stream = RedisStream()
     consumer = f"{INSTANCE_ID}"
     group = _trace_consumer_group()
+    # Per-worker groups are new on every restart while the Stream persists:
+    # skip entries predating this consumer so a restart does not replay
+    # history (duplicate storm). Stream IDs are {ms}-{seq}.
+    started_ms = int(time.time() * 1000)
     while True:
         if stop_event is not None and stop_event.is_set():
             return
@@ -454,6 +480,13 @@ async def run_trace_consumer(stop_event: asyncio.Event | None = None) -> None:
             continue
         for msg_id, fields in entries:
             try:
+                if _stream_entry_is_stale(msg_id, started_ms):
+                    # Pre-restart history for this fresh group: ack and drop.
+                    try:
+                        await stream.ack(TRACE_STREAM, group, msg_id)
+                    except Exception:
+                        pass
+                    continue
                 if str(fields.get("origin") or "") == INSTANCE_ID:
                     # Own publish was already delivered locally by
                     # broadcast_trace_event; suppress the echo (no duplicate).

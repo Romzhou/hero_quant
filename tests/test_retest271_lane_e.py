@@ -330,7 +330,8 @@ def test_lanee_ws_consumer_delivers_foreign_origin():
 
         async def _run():
             await wsmod.manager.connect(ch, ws)
-            await fake.xadd(
+            await _lanee_live_xadd(
+                fake,
                 TRACE_STREAM,
                 {
                     "channel": ch,
@@ -503,7 +504,8 @@ def test_lanee_ws_consumer_no_ack_on_forward_failure(monkeypatch):
     monkeypatch.setattr(wsmod.manager, "broadcast", _boom)
 
     async def _run():
-        await fake.xadd(
+        await _lanee_live_xadd(
+            fake,
             TRACE_STREAM,
             {"channel": "trace", "data": _lanee_json.dumps({"type": "ping"})},
         )
@@ -534,7 +536,9 @@ def test_lanee_ws_consumer_no_ack_on_poison(monkeypatch):
     monkeypatch.setattr(RedisStream, "ack", _spy_ack)
 
     async def _run():
-        await fake.xadd(TRACE_STREAM, {"channel": "trace", "data": "not-json-poison"})
+        await _lanee_live_xadd(
+            fake, TRACE_STREAM, {"channel": "trace", "data": "not-json-poison"}
+        )
         await _lanee_run_consumer_briefly(wsmod)
         assert acked == [], f"poison payload was acked (silently dropped): {acked}"
 
@@ -665,3 +669,98 @@ def test_lanee_rl_unknown_ip_warns(caplog):
     assert any("unknown" in (r.getMessage() or "") for r in caplog.records), (
         "ip:unknown fallback is silent: no warning logged"
     )
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Lane E1 · ws.py follow-up (ocr rescan of lane-e1 files):
+# eviction remove-guard + stale replay skip
+# ══════════════════════════════════════════════════════════════════════
+import time as _lanee_time
+
+
+async def _lanee_live_xadd(fake, stream, fields):
+    """Plant a Stream entry that reads as LIVE traffic (ID in the near
+    future) so the consumer's restart-replay skip does not swallow it."""
+    live_id = f"{int(_lanee_time.time() * 1000) + 5000}-0"
+    return await fake.xadd(stream, fields, id=live_id)
+
+
+def test_lanee_ws_eviction_keeps_fresh_reconnect():
+    """A record() landing during the awaited close() (same-user reconnect)
+    must NOT be wiped by the trailing remove(): the fresh channel stays
+    monitored instead of being orphaned (never times out)."""
+    rmod, fake = _lanee_reset_async_redis()
+    wsmod = _lanee_clear_ws()
+    from datetime import timedelta
+
+    ch = "trace:lanee-reconnect"
+
+    class _ReconnectWS(_lanee_FakeWS):
+        async def close(self, *a, **kw):
+            self.closed = (a, kw)
+            # Simulate a same-channel reconnect recording liveness
+            # while the reaper awaits close().
+            wsmod.heartbeat.record(ch)
+
+    ws = _ReconnectWS()
+
+    async def _run():
+        await wsmod.manager.connect(ch, ws)
+        wsmod.heartbeat.record(ch)
+        wsmod.heartbeat._last_active[ch] -= timedelta(seconds=120)
+        wsmod.heartbeat.CHECK_INTERVAL = 0.05
+        task = asyncio.create_task(wsmod.heartbeat._check_loop())
+        await asyncio.sleep(0.3)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        assert ws.closed is not None, "expired connection was not closed"
+        assert ch in wsmod.heartbeat._last_active, (
+            "fresh reconnect liveness was wiped by trailing remove() "
+            "(orphaned: never times out)"
+        )
+
+    try:
+        asyncio.run(_run())
+    finally:
+        try:
+            del wsmod.heartbeat.CHECK_INTERVAL
+        except AttributeError:
+            pass
+        rmod.clear_redis_instance()
+        wsmod.manager._connections.clear()
+        wsmod.heartbeat._last_active.clear()
+
+
+def test_lanee_ws_consumer_skips_stale_restart_replay():
+    """Entries predating this consumer (restart replay under a fresh
+    per-worker group) must be acked-and-dropped, never redelivered."""
+    rmod, fake = _lanee_reset_async_redis()
+    wsmod = _lanee_clear_ws()
+    from hero_quant.api.ws import TRACE_STREAM
+
+    ch = "trace:lanee-stale"
+    ws = _lanee_FakeWS()
+
+    async def _run():
+        await wsmod.manager.connect(ch, ws)
+        await fake.xadd(
+            TRACE_STREAM,
+            {
+                "channel": ch,
+                "origin": "some-other-worker",
+                "data": _lanee_json.dumps({"type": "delta", "delta": "stale-probe"}),
+            },
+            id="1-1",
+        )
+        await _lanee_run_consumer_briefly(wsmod)
+        assert ws.sent == [], f"restart replay redelivered stale entry: {ws.sent}"
+
+    try:
+        asyncio.run(_run())
+    finally:
+        asyncio.run(wsmod.manager.disconnect(ch, ws))
+        rmod.clear_redis_instance()
+        wsmod.manager._connections.clear()
