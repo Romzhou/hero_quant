@@ -39,10 +39,10 @@ def _get_data_mode(*, force_refresh: bool = False) -> str:
             from hero_quant.config.settings import Settings
 
             m = Settings().data_mode
-            _settings_mode_cache = str(m).strip().lower() if isinstance(m, str) else "live"
-        except (ImportError, AttributeError, ValueError, TypeError, OSError, RuntimeError) as e:  # 中文：窄化捕获，exc_info=True，threading.RLock 契约外使用 Lock
+            _settings_mode_cache = str(m).strip().lower() if isinstance(m, str) else "synthetic"
+        except (ImportError, AttributeError, ValueError, TypeError, OSError, RuntimeError) as e:
             logger.warning("settings load failed for provenance: %s", e, exc_info=True)
-            _settings_mode_cache = "synthetic"  # fail-closed SAFE default
+            return "synthetic"  # fail-closed but do not cache; retry next call
         return _settings_mode_cache
 
 
@@ -55,6 +55,9 @@ def clear_settings_cache() -> None:
 
 def _resolve_provenance(loader, result=None, prov=None) -> str:
     """Single helper used by all 3 provenance blocks; instantiate Settings ONCE via cache.
+
+    Only `loader` drives the decision; `result`/`prov` are reserved for future
+    disambiguation and intentionally unused (kept for backward compatibility).
 
     Unifies class+source+name substring logic: any contains 'synthetic' or data_mode=='synthetic' => synthetic.
     Otherwise infer via _infer_loader_source logic (class name mapping).
@@ -110,15 +113,22 @@ class MarketDataRegistry:
         self._loaders_lock = threading.Lock()
         self.audit_log: deque = deque(maxlen=audit_log_maxlen)
 
+    def get_audit_log(self) -> list:
+        """Locked snapshot of audit_log; iterate this instead of the public deque."""
+        with self._audit_lock:
+            return list(self.audit_log)
+
     def register_trait(self, name: str, trait_cls: type["SourceTrait"]) -> None:
         """注册数据源 Trait 类型，供契约校验与文档列举。"""
-        if name in self._traits:
-            raise ValueError(f"trait already registered: {name}")
-        self._traits[name] = trait_cls
+        with self._loaders_lock:
+            if name in self._traits:
+                raise ValueError(f"trait already registered: {name}")
+            self._traits[name] = trait_cls
 
     def list_sources(self) -> list[str]:
         """列出已注册 Trait 名称。"""
-        return list(self._traits.keys())
+        with self._loaders_lock:
+            return list(self._traits.keys())
 
     def register(self, loader: Any) -> None:
         """注册 loader 实例，需满足 markets/unit/get_bars 最小协议。
@@ -318,8 +328,10 @@ class MarketDataRegistry:
         with self._loaders_lock:
             _loader_cnt = len(self._loaders)
         if _loader_cnt < 2 or self._bars_empty(bars):
+            logger.warning("cross_source check skipped for %s: loaders=%s empty=%s", symbol, _loader_cnt, self._bars_empty(bars))
             return
         if start is None or end is None:
+            logger.warning("cross_source check skipped for %s: missing start/end", symbol)
             return
         # 模式二：以主数据源为基准，遍历其他 loader 做对照
 
@@ -359,8 +371,7 @@ class MarketDataRegistry:
             other_prov = result[1] if isinstance(result, tuple) and len(result) == 2 else None
             other_source = getattr(other_prov, "source", loader_source) if other_prov else loader_source
             if this_is_synthetic or other_source == "synthetic":
-                # synthetic 混比需显式放行：prov 携带 allow_synthetic_comparison 标记时允许
-                _allow_synth = bool(getattr(prov, "allow_synthetic_comparison", False)) if prov is not None and hasattr(prov, "allow_synthetic_comparison") else False
+                _allow_synth = bool(getattr(prov, "allow_synthetic_comparison", False) or (getattr(prov, "extra", {}) or {}).get("allow_synthetic_comparison", False))
                 if not _allow_synth:
                     raise CrossSourceError(
                         f"cross-source synthetic mix rejected for {symbol}: {current_source} vs {other_source} (use synthetic-aware prov to opt-in)"
@@ -462,5 +473,5 @@ class MarketDataRegistry:
                 raise ImportError(f"pip install hero-quant[us] or [ashare] - {msg}") from last_error
             raise last_error
         if last_error is not None:
-            raise ImportError(f"pip install hero-quant[us] or [ashare] for {symbol}: no loader available for market {market}") from last_error
+            raise last_error
         raise ImportError(f"pip install hero-quant[us] or [ashare] for {symbol}: no loader available for market {market}")

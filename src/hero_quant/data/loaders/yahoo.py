@@ -5,6 +5,7 @@
 """
 
 import logging
+import math
 
 logger = logging.getLogger(__name__)
 
@@ -23,7 +24,9 @@ class YahooLoader:
 
     def get_bars(self, symbol, start, end, interval="1d"):
         """拉取 US 行情，兼容旧参数顺序；双路径 download→history 做容错。synthetic 需 HERO_DATA_MODE=synthetic。"""
-        _intervals = {"1d", "1m", "5m", "15m", "30m", "1h", "1wk", "1mo", "1D", "1W"}
+        _intervals = {"1d", "1m", "5m", "15m", "30m", "1h", "1wk", "1mo"}
+        # normalize legacy aliases before validation: {"1D": "1d", "1W": "1wk"}
+        interval = {"1D": "1d", "1W": "1wk"}.get(interval, interval)
         if start in _intervals:
             if "-" in str(end) and "-" in str(interval):
                 start, end, interval = end, interval, start
@@ -46,12 +49,16 @@ class YahooLoader:
                 from datetime import datetime, timedelta
                 s_dt = datetime.strptime(str(start), "%Y-%m-%d")
                 e_dt = datetime.strptime(str(end), "%Y-%m-%d")
+                if e_dt <= s_dt:
+                    raise DataValidationError(f"yahoo synthetic invalid range: start={start!r} end={end!r}")
                 cur = s_dt
                 idx = 0
                 while cur < e_dt:
                     _bars.append({"date": cur.strftime("%Y-%m-%d"), "open": 1500.0+idx, "close": 1500.5+idx, "high": 1510+idx, "low": 1490+idx, "volume": 100.0})
                     cur += timedelta(days=1)
                     idx += 1
+            except DataValidationError:
+                raise
             except (ValueError, TypeError) as e:
                 raise DataValidationError(f"yahoo synthetic date parse failed: {e}") from e
             from hero_quant.data.registry import Provenance as _YProv
@@ -102,7 +109,7 @@ class YahooLoader:
                 df = None
 
         if df is None or len(df) == 0:
-            raise ValueError("no data from yahoo")
+            raise DataValidationError("no data from yahoo")
 
         # helper 提升至循环外，避免逐 bar 重建
         def _get_required(row, key_options, field_name):
@@ -113,10 +120,10 @@ class YahooLoader:
                         fv = float(v)
                     except (ValueError, TypeError) as e:
                         raise DataValidationError(f"yahoo {field_name} invalid {v!r}: {e}") from e
-                    if field_name in ("close", "open", "high", "low") and (fv != fv or fv <= 0):
-                        raise DataValidationError(f"yahoo {field_name} non-positive/NaN {fv!r}")
-                    if field_name == "volume" and (fv != fv or fv < 0):
-                        raise DataValidationError(f"yahoo volume NaN/negative {fv!r}")
+                    if field_name in ("close", "open", "high", "low") and (not math.isfinite(fv) or fv <= 0):
+                        raise DataValidationError(f"yahoo {field_name} non-positive/non-finite {fv!r}")
+                    if field_name == "volume" and (not math.isfinite(fv) or fv < 0):
+                        raise DataValidationError(f"yahoo volume non-finite/negative {fv!r}")
                     return fv
             raise DataValidationError(f"yahoo missing required field {field_name} options {key_options} in row {row.to_dict() if hasattr(row,'to_dict') else row}")
 

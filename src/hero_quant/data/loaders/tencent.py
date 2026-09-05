@@ -81,6 +81,10 @@ class TencentLoader:
             logger.warning("_rate_limit error: %s", e, exc_info=True)
 
     @cache("market:bars", expire=60)
+    def _get_bars_live_cached(self, symbol, start, end, interval="1d"):
+        """Cached live path only — mode resolved before cache lookup (no cross-mode poisoning)."""
+        return self._fetch_live_bars(symbol, start, end, interval)
+
     def get_bars(self, symbol, start, end, interval="1d"):
         """拉取行情，兼容旧参数顺序并遵循 HERO_DATA_MODE 门控。"""
         _intervals = {"1d", "1m", "5m", "15m", "30m", "1h", "1wk", "1mo", "1D", "1W"}
@@ -109,6 +113,19 @@ class TencentLoader:
         if mode == "synthetic":
             return self._synthetic_bars(symbol, start, end)
 
+        return self._get_bars_live_cached(symbol, start, end, interval)
+
+    def _fetch_live_bars(self, symbol, start, end, interval="1d"):
+        """Uncached live fetch body (mode already resolved by get_bars)."""
+        # Validate + sanitize dates BEFORE building the URL (injection fail-closed)
+        try:
+            s_dt_pre = datetime.strptime(str(start), "%Y-%m-%d")
+            e_dt_pre = datetime.strptime(str(end), "%Y-%m-%d")
+        except (ValueError, TypeError) as e:
+            raise DataValidationError(f"invalid date format start={start!r} end={end!r}: {e}") from e
+        if e_dt_pre < s_dt_pre:
+            raise DataValidationError(f"invalid range: end {end!r} before start {start!r}")
+
         self._rate_limit()
         # live 模式下禁止静默回退合成：解析/网络失败必须抛出
         try:
@@ -120,23 +137,36 @@ class TencentLoader:
                 tencent_symbol = code
             # Force https and sanitize symbol to prevent injection (MITM protection)
             tencent_symbol = urllib.parse.quote(tencent_symbol, safe="")
-            url = f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={tencent_symbol},day,{start},{end},{320},qfq"
+            url = (
+                f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={tencent_symbol},day,"
+                f"{urllib.parse.quote(str(start), safe='')},{urllib.parse.quote(str(end), safe='')},{320},qfq"
+            )
             with urllib.request.urlopen(url, timeout=2) as resp:
                 raw = resp.read()
                 text = raw.decode("utf-8", errors="ignore") if isinstance(raw, (bytes, bytearray)) else str(raw)
                 j = json.loads(text)
                 data = j.get("data") if isinstance(j, dict) else None
                 if isinstance(data, dict):
+                    # Explicit qfq-day key resolution: never first-list-wins (metadata risk).
+                    entry = data.get(tencent_symbol) or data.get(code) or {}
                     candidate = None
-                    for v in data.values():
-                        if isinstance(v, dict):
-                            for kk, vv in v.items():
-                                if isinstance(vv, list) and len(vv) > 0:
-                                    candidate = vv
+                    if isinstance(entry, dict):
+                        candidate = entry.get("qfqday") or entry.get("day")
+                    elif isinstance(entry, list):
+                        candidate = entry
+                    if not isinstance(candidate, list) or not candidate:
+                        # Fallback: scan known bar keys only (skip metadata like qt/info)
+                        for v in data.values():
+                            if isinstance(v, dict):
+                                for kk in ("qfqday", "day"):
+                                    vv = v.get(kk)
+                                    if isinstance(vv, list) and len(vv) > 0:
+                                        candidate = vv
+                                        break
+                                if candidate is not None:
                                     break
-                        elif isinstance(v, list) and len(v) > 0:
-                            candidate = v
-                            break
+                    if not isinstance(candidate, list) or not candidate:
+                        raise ValueError("no qfqday bars in response")
                     if candidate is not None and len(candidate) > 0:
                         bars = []
                         for item in candidate:
@@ -183,22 +213,31 @@ class TencentLoader:
                                     "volume": float(item.get("volume")),
                                 })
                         if len(bars) > 0:
-                            # 必须裁到 [start,end]，不静默返回全量 320 根
+                            # 必须裁到 [start,end]，不静默返回全量 320 根；逐 bar strptime 校验日期
                             try:
-                                s_dt = datetime.strptime(start, "%Y-%m-%d")
-                                e_dt = datetime.strptime(end, "%Y-%m-%d")
+                                s_dt = datetime.strptime(str(start), "%Y-%m-%d")
+                                e_dt = datetime.strptime(str(end), "%Y-%m-%d")
                             except (ValueError, TypeError) as e:
                                 raise DataValidationError(f"invalid date format start={start!r} end={end!r}: {e}") from e
-                            bars = [b for b in bars if s_dt.strftime("%Y-%m-%d") <= b["date"][:10] <= e_dt.strftime("%Y-%m-%d")]
+                            clipped = []
+                            for b in bars:
+                                try:
+                                    d = datetime.strptime(str(b["date"])[:10], "%Y-%m-%d")
+                                except (ValueError, TypeError) as e:
+                                    raise DataValidationError(f"tencent bar date invalid {b['date']!r}: {e}") from e
+                                if s_dt <= d <= e_dt:
+                                    b["date"] = d.strftime("%Y-%m-%d")
+                                    clipped.append(b)
+                            bars = clipped
                             if len(bars) == 0:
                                 raise ValueError("no bars in requested window after clipping")
                             return bars
                 raise ValueError("no bars parsed")
         except DataValidationError:
             raise
-        except ValueError as e:
+        except (ValueError, TypeError) as e:
             logger.warning("tencent parse failed for %s: %s", symbol, e, exc_info=True)
             raise RuntimeError(f"tencent fetch failed for {symbol}: {e}") from e
-        except (RuntimeError, OSError, json.JSONDecodeError) as e:
+        except (RuntimeError, OSError) as e:
             logger.warning("tencent network error for %s: %s", symbol, e, exc_info=True)
             raise RuntimeError(f"tencent fetch failed for {symbol}: {e}") from e
