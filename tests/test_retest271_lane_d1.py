@@ -392,3 +392,81 @@ def test_d1_akshare_volume_lots_documented(monkeypatch):
 
     src = inspect.getsource(AKShareLoader._normalize_akshare)
     assert "board_lots" in src and "100" in src
+
+
+# ---------------- loaders/ccxt_loader.py (4 items: 1 high + 2 medium + 1 low) ----------------
+
+def _ccxt_loader(monkeypatch, mode):
+    monkeypatch.setenv("HERO_DATA_MODE", mode)
+    import importlib
+    import hero_quant.config.settings as s
+    importlib.reload(s)
+    from hero_quant.data.loaders.ccxt_loader import CCXTLoader
+    return CCXTLoader()
+
+
+def _mock_ccxt(monkeypatch, ohlcv_or_exc):
+    import sys
+    import types
+
+    class _Exch:
+        def fetch_ohlcv(self, *a, **k):
+            if isinstance(ohlcv_or_exc, BaseException):
+                raise ohlcv_or_exc
+            return ohlcv_or_exc
+
+    fake = types.ModuleType("ccxt")
+
+    class _BaseError(Exception):
+        pass
+
+    fake.BaseError = _BaseError
+    fake.ExchangeError = type("ExchangeError", (_BaseError,), {})
+    fake.binance = lambda *a, **k: _Exch()
+    monkeypatch.setitem(sys.modules, "ccxt", fake)
+    return fake
+
+
+def test_d1_ccxt_exchange_error_wrapped(monkeypatch):
+    """High: ccxt.BaseError subclasses must be wrapped in RuntimeError, not escape."""
+    loader = _ccxt_loader(monkeypatch, "live")
+    fake = _mock_ccxt(monkeypatch, None)
+    with pytest.raises(RuntimeError, match="ccxt fetch failed"):
+        loader.get_bars("BTC/USDT", "2025-01-01", "2025-01-03")
+    err = fake.ExchangeError("exchange down")
+    _mock_ccxt(monkeypatch, err)
+    with pytest.raises(RuntimeError, match="ccxt fetch failed"):
+        loader.get_bars("BTC/USDT", "2025-01-01", "2025-01-03")
+
+
+def test_d1_ccxt_no_dead_limit_var(monkeypatch):
+    """Medium: no unused `limit = min(1500, ...)` dead variable; pagination uses chunk_limit."""
+    import inspect
+
+    from hero_quant.data.loaders import ccxt_loader as m
+
+    import re
+    src = inspect.getsource(m.CCXTLoader.get_bars)
+    assert not re.search(r"(?<![_a-z])limit\s*=\s*min\(1500", src)
+    assert "chunk_limit" in src
+
+
+def test_d1_ccxt_clip_fallback_respects_timeframe(monkeypatch):
+    """Medium: clip-failure fallback must slice [:requested], not [:days]."""
+    import inspect
+
+    from hero_quant.data.loaders import ccxt_loader as m
+
+    src = inspect.getsource(m.CCXTLoader.get_bars)
+    assert "df.iloc[:requested]" in src
+    assert "df.iloc[:days]" not in src
+
+
+def test_d1_ccxt_no_unreachable_empty_check(monkeypatch):
+    """Low: unreachable `if len(df) == 0: raise ValueError("empty df")` removed."""
+    import inspect
+
+    from hero_quant.data.loaders import ccxt_loader as m
+
+    src = inspect.getsource(m.CCXTLoader.get_bars)
+    assert 'raise ValueError("empty df")' not in src

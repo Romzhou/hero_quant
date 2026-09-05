@@ -145,9 +145,9 @@ class CCXTLoader:
         _intraday_multipliers = {"1m": 1440, "5m": 288, "15m": 96, "30m": 48, "1h": 24}
         if timeframe in _intraday_multipliers:
             requested = days * _intraday_multipliers[timeframe]
-            limit = min(1500, max(requested, 5))
+            # remove unused `limit`; pagination below uses `remaining/chunk_limit`
             if requested > 1500:
-                logger.warning("ccxt limit truncated: requested %s truncated to %s for %s timeframe=%s days=%s (pagination required)", requested, limit, symbol, timeframe, days)
+                logger.warning("ccxt limit truncated: requested %s exceeds 1500 for %s timeframe=%s days=%s (pagination required)", requested, symbol, timeframe, days)
         else:
             # 日线/周线/月线：按实际周期估算，避免用 days 高估周/月（原死逻辑双分支同值）
             if timeframe == "1d":
@@ -158,7 +158,6 @@ class CCXTLoader:
                 requested = (days // 30) + 5
             else:
                 requested = days + 5
-            limit = min(1500, max(requested, 5))
             if requested > 1500:
                 logger.warning("ccxt pagination needed: requested %s >1500 for %s timeframe=%s; will paginate", requested, symbol, timeframe)
 
@@ -205,8 +204,6 @@ class CCXTLoader:
                 raise ValueError("no rows parsed")
             df = pd.DataFrame(rows, columns=["open", "high", "low", "close", "volume"], index=pd.Index(idx))
             df = df[["open", "high", "low", "close", "volume"]]
-            if len(df) == 0:
-                raise ValueError("empty df")
             # 必须裁到 [start,end] 并尊重 interval；避免 over-fetch 外溢
             df = df.sort_index()
             df = df[~df.index.duplicated(keep="first")]
@@ -216,8 +213,8 @@ class CCXTLoader:
                 df = df[(df.index >= s_ts) & (df.index <= e_ts)]
             except (ValueError, TypeError, AttributeError) as e:
                 logger.warning("ccxt clip to window failed for %s: %s", symbol, e, exc_info=True)
-                # 保底按位置截断
-                df = df.iloc[:days]
+                # fallback must respect timeframe size, not days
+                df = df.iloc[:requested]
             return df
         except DataValidationError:
             raise
@@ -226,6 +223,6 @@ class CCXTLoader:
             raise RuntimeError(f"ccxt fetch failed for {symbol}: {e}") from e
         except ImportError:
             raise
-        except (RuntimeError, OSError) as e:
+        except Exception as e:
             logger.warning("ccxt error for %s: %s", symbol, e, exc_info=True)
             raise RuntimeError(f"ccxt fetch failed for {symbol}: {e}") from e
