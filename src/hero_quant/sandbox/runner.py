@@ -361,7 +361,12 @@ class LandlockSandbox(BaseSandbox):
             raise SandboxUnavailableError(
                 f"{_FATAL_PREFIX}workspaceRoot required for workspace-write (exit {LAUNCHER_FAILURE_EXIT})"
             )
-        # symlink 拒绝：工作区本身若为符号链接则直接 fail-closed，防止 TOCTOU 逃逸
+        # symlink 拒绝 + fd 持有校验（TOCTOU 收敛）：工作区本身若为符号链接直接
+        # fail-closed；Linux 上以 O_NOFOLLOW|O_DIRECTORY 打开目录 fd 并经
+        # /proc/self/fd 复核 canonical，防止校验→使用窗口内的 symlink/dir 置换。
+        # 非 Linux（无 O_NOFOLLOW/O_DIRECTORY）沿用 strict 解析 + 目录校验。
+        _use_fd = hasattr(os, "O_NOFOLLOW") and hasattr(os, "O_DIRECTORY") and sys.platform == "linux"
+        _ws_fd: int | None = None
         try:
             if Path(ws).is_symlink():
                 raise SandboxUnavailableError(
@@ -372,19 +377,39 @@ class LandlockSandbox(BaseSandbox):
                 f"{_FATAL_PREFIX}workspaceRoot unavailable: {ws} (exit {LAUNCHER_FAILURE_EXIT})"
             ) from e
         try:
-            # strict 解析 + 目录校验：缺失/悬空链接 fail-closed，不回退未解析路径
-            ws_canonical = str(Path(ws).resolve(strict=True))
+            if _use_fd:
+                try:
+                    _ws_fd = os.open(ws, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY)
+                except OSError as e:
+                    raise SandboxUnavailableError(
+                        f"{_FATAL_PREFIX}workspaceRoot unavailable: {ws} (exit {LAUNCHER_FAILURE_EXIT})"
+                    ) from e
+                # 经 fd 复核：校验与授权同一打开实例，置换窗口收敛到 open 原子点
+                ws_canonical = str(Path(f"/proc/self/fd/{_ws_fd}").resolve(strict=True))
+            else:
+                # strict 解析 + 目录校验：缺失/悬空链接 fail-closed，不回退未解析路径
+                ws_canonical = str(Path(ws).resolve(strict=True))
         except (OSError, RuntimeError, ValueError) as e:
             raise SandboxUnavailableError(
                 f"{_FATAL_PREFIX}workspaceRoot unavailable: {ws} (exit {LAUNCHER_FAILURE_EXIT})"
             ) from e
+        finally:
+            if _ws_fd is not None:
+                try:
+                    os.close(_ws_fd)
+                except OSError:
+                    pass
+        # 注：fd 在授权构造前已关闭，残余 TOCTOU（授权→subprocess.run 间隔）仍存在；
+        # 完全消除需 Landlock/bwrap 内核级挂载隔离，此处仅收敛校验窗口并文档化。
         if not Path(ws_canonical).is_dir():
             raise SandboxUnavailableError(
                 f"{_FATAL_PREFIX}workspaceRoot not a directory: {ws} (exit {LAUNCHER_FAILURE_EXIT})"
             )
         grants = {
             "readOnly": ["/"],
-            "readWrite": [ws_canonical, "/tmp"],
+            # 默认不再共享 /tmp（防跨租户干扰）：仅当策略显式要求
+            # （grantSharedTmp=True，须为调用方显式声明的 per-job 私有 tmp）才授予。
+            "readWrite": [ws_canonical] + (["/tmp"] if merged.get("grantSharedTmp") is True else []),
         }
         prefix = [self._launcher] + grant_args(grants) + ["--"]
         return prefix + [str(x) for x in argv]
@@ -412,75 +437,23 @@ class LandlockSandbox(BaseSandbox):
         # 构造隔离后的 argv（可能是 landlock 前缀或 bwrap/no-op 回退）
         wrapped = self.confine(argv, {})
         # 非 Linux 下 landlock 前缀无意义，避免 ENOENT；已在上方处理 require_enforcement 分支
-        # 宽松模式亦不静默裸跑：先试 bwrap 回退，再试原 argv（loud 警告），全失败则 fail-closed
+        # fail-closed：启动器缺失/失败一律抛，不再回退裸 argv（loud 警告亦不执行——
+        # 警告后执行即 fail-open，与模块 fail-closed 契约矛盾）。
         if wrapped and wrapped[0] == self._launcher and sys.platform != "linux":
-            if not require_enforcement:
-                import logging as _logging
-
-                fallback = super().confine(argv, self._policy)
-                try:
-                    result = subprocess.run(fallback, shell=False, capture_output=True, text=True, timeout=timeout)
-                except (FileNotFoundError, PermissionError, OSError, subprocess.TimeoutExpired) as e:
-                    _logging.getLogger(__name__).warning(
-                        "landlock unavailable, sandboxed fallback failed, running without isolation: %s",
-                        e, exc_info=True,
-                    )
-                    try:
-                        result = subprocess.run(argv, shell=False, capture_output=True, text=True, timeout=timeout)
-                    except (OSError, subprocess.TimeoutExpired) as e2:
-                        raise SandboxUnavailableError(f"{_FATAL_PREFIX}{e2} (exit {LAUNCHER_FAILURE_EXIT})") from e2
-                return result.stdout, result.stderr, result.returncode
+            raise SandboxUnavailableError(
+                f"{_FATAL_PREFIX}launcher not usable on {sys.platform}: {self._launcher} "
+                f"(exit {LAUNCHER_FAILURE_EXIT}); command not run"
+            )
         # Linux 下若二进制缺失，探针已为 unusable，此处包裹应为 no-op；防御性再检查
         if wrapped and wrapped[0] == self._launcher:
             if not Path(self._launcher).exists() and shutil.which(self._launcher) is None:
-                if not require_enforcement:
-                    import logging as _logging
-
-                    _logging.getLogger(__name__).warning(
-                        "landlock launcher missing, trying bwrap fallback before raw argv"
-                    )
-                    try:
-                        fallback = super().confine(argv, self._policy)
-                        result = subprocess.run(fallback, shell=False, capture_output=True, text=True, timeout=timeout)
-                    except (FileNotFoundError, PermissionError, OSError, subprocess.TimeoutExpired):
-                        # bwrap 亦不可用才退到原 argv（loud 警告），失败则 fail-closed
-                        _logging.getLogger(__name__).warning(
-                            "sandboxed fallback failed, running without isolation", exc_info=True
-                        )
-                        try:
-                            result = subprocess.run(argv, shell=False, capture_output=True, text=True, timeout=timeout)
-                        except (OSError, subprocess.TimeoutExpired) as e2:
-                            raise SandboxUnavailableError(
-                                f"{_FATAL_PREFIX}{e2} (exit {LAUNCHER_FAILURE_EXIT})"
-                            ) from e2
-                    return result.stdout, result.stderr, result.returncode
                 raise SandboxUnavailableError(f"{_FATAL_PREFIX}launcher not found: {self._launcher} (exit {LAUNCHER_FAILURE_EXIT})")
 
         try:
             result = subprocess.run(wrapped, shell=False, capture_output=True, text=True, timeout=timeout)
         except (FileNotFoundError, PermissionError, OSError) as e:
-            # 启动器失败 fail-closed 收口：缺失/无权限/不可执行一律转 SandboxUnavailableError；
-            # 宽松模式先试 bwrap 再试原 argv（loud 警告），全失败仍抛
-            if not require_enforcement:
-                import logging as _logging
-
-                _logging.getLogger(__name__).warning(
-                    "launcher failed, trying bwrap fallback before raw argv: %s", e, exc_info=True
-                )
-                try:
-                    fallback = super().confine(argv, self._policy)
-                    result = subprocess.run(fallback, shell=False, capture_output=True, text=True, timeout=timeout)
-                except (FileNotFoundError, PermissionError, OSError, subprocess.TimeoutExpired):
-                    _logging.getLogger(__name__).warning(
-                        "sandboxed fallback failed, running without isolation", exc_info=True
-                    )
-                    try:
-                        result = subprocess.run(argv, shell=False, capture_output=True, text=True, timeout=timeout)
-                    except (OSError, subprocess.TimeoutExpired) as e2:
-                        raise SandboxUnavailableError(
-                            f"{_FATAL_PREFIX}{e2} (exit {LAUNCHER_FAILURE_EXIT})"
-                        ) from e2
-                return result.stdout, result.stderr, result.returncode
+            # 启动器失败 fail-closed 收口：缺失/无权限/不可执行一律转 SandboxUnavailableError，
+            # 宽松模式亦不再回退裸 argv（fail-open 已删）。
             raise SandboxUnavailableError(f"{_FATAL_PREFIX}{e} (exit {LAUNCHER_FAILURE_EXIT})") from e
         except subprocess.TimeoutExpired as e:
             raise SandboxUnavailableError(

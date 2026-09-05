@@ -167,3 +167,81 @@ def test_laneA_base_malformed_roots_fail_closed():
 
     pol = {"mode": "workspace-write", "writableRoots": [None, 123, b"/tmp"]}
     assert is_path_writable("/tmp/x", pol) is False
+
+
+# ── runner.py (4 items: 2 high + 2 medium; critical __import__ already fixed) ──
+
+
+def test_laneA_runner_no_raw_argv_fallback(monkeypatch, tmp_path):
+    """High: launcher failure in relaxed mode must raise, not run raw argv."""
+    import subprocess
+
+    from hero_quant.sandbox import runner as r
+    from hero_quant.sandbox.runner import LandlockSandbox, SandboxUnavailableError
+
+    # force the Linux launcher-missing path (cf. test_a17 platform mock);
+    # bwrap present so the relaxed bwrap-fallback is constructed and fails at
+    # run time, exposing the raw-argv fallback below it
+    monkeypatch.setattr(r.sys, "platform", "linux")
+    from hero_quant.sandbox import base as b
+
+    monkeypatch.setattr(b, "_has_bwrap", lambda: True)
+    sb = LandlockSandbox(policy={"mode": "workspace-write", "workspaceRoot": str(tmp_path)})
+    monkeypatch.setattr(sb, "_verdict", lambda: "full")
+    assert sb._launcher and "landlock" in sb._launcher.lower()
+
+    class _R:
+        stdout = ""
+        stderr = ""
+        returncode = 0
+
+    def _selective(*a, **k):
+        argv = a[0] if a else k.get("args", [])
+        # sandboxed/launcher invocations fail; bare raw argv would succeed
+        if argv and argv[0] != "echo":
+            raise PermissionError("denied")
+        return _R()
+
+    monkeypatch.setattr(subprocess, "run", _selective)
+    with pytest.raises(SandboxUnavailableError):
+        sb.execute(["echo", "hi"], require_enforcement=False)
+
+
+def test_laneA_runner_no_default_tmp_grant(monkeypatch, tmp_path):
+    """High: workspace-write grants must not include shared /tmp by default."""
+    from hero_quant.sandbox.runner import LandlockSandbox
+
+    sb = LandlockSandbox(policy={"mode": "workspace-write", "workspaceRoot": str(tmp_path)})
+    monkeypatch.setattr(sb, "_verdict", lambda: "full")
+    argv = sb.confine(["echo", "hi"], {"mode": "workspace-write", "workspaceRoot": str(tmp_path)})
+    rw_targets = [argv[i + 1] for i, t in enumerate(argv) if t == "--rw" and i + 1 < len(argv)]
+    assert "/tmp" not in rw_targets
+
+
+def test_laneA_runner_workspace_symlink_swap_rejected(tmp_path):
+    """Medium: workspaceRoot that is a symlink must fail closed (TOCTOU guard)."""
+    import pytest
+
+    from hero_quant.sandbox.runner import LandlockSandbox, SandboxUnavailableError
+
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "link"
+    try:
+        link.symlink_to(real, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlink not supported")
+    sb = LandlockSandbox(policy={"mode": "workspace-write", "workspaceRoot": str(link)})
+    sb._verdict = lambda: "full"  # noqa: SLF001 - force grant path w/o probe
+    with pytest.raises(SandboxUnavailableError):
+        sb.confine(["echo", "hi"], {"mode": "workspace-write", "workspaceRoot": str(link)})
+
+
+def test_laneA_runner_guarded_import_blocks_dynamic_os():
+    """Critical (already fixed in baseline): runtime __import__('os') via dynamic name denied."""
+    import pytest
+
+    from hero_quant.sandbox.runner import SandboxViolation, execute_python
+
+    with pytest.raises(SandboxViolation):
+        execute_python("__import__(chr(111) + chr(115))")
