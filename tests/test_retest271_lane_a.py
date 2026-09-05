@@ -124,3 +124,46 @@ def test_laneA_policy_canonical_non_str_valueerror():
         canonical_path(None)
     with pytest.raises(ValueError):
         canonical_path(123)
+
+
+# ── base.py (4 items: 2 high + 2 medium) ────────────────────────────────
+
+
+def test_laneA_base_root_workspace_rejected():
+    """High: '/' must not validate as a workspace root (whole-disk write)."""
+    import pytest
+
+    from hero_quant.sandbox.base import _resolve_ws_strict, _validate_workspace_root
+
+    with pytest.raises(ValueError):
+        _validate_workspace_root("/")
+    with pytest.raises((ValueError, Exception)):
+        _resolve_ws_strict("/")
+
+
+def test_laneA_base_docker_enforcement_not_overstated(monkeypatch):
+    """High: DockerBackend.enforcement must mirror LocalShellBackend downgrades."""
+    from hero_quant.sandbox import base as b
+
+    monkeypatch.setattr(b, "_has_docker", lambda: True)
+    assert b.DockerBackend(policy={"mode": "danger-full-access"}).enforcement == "partial"
+    assert b.DockerBackend(policy={"mode": "read-only"}).enforcement == "partial"
+    assert b.DockerBackend(policy={"mode": "workspace-write"}).enforcement == "full"
+
+
+def test_laneA_base_tmpfs_before_workspace_bind(monkeypatch, tmp_path):
+    """Medium: --tmpfs /tmp must precede the workspace --bind (bwrap order)."""
+    from hero_quant.sandbox import base as b
+
+    monkeypatch.setattr(b, "_has_bwrap", lambda: True)
+    pol = {"mode": "workspace-write", "workspaceRoot": str(tmp_path)}
+    out = b.LocalShellBackend(policy=pol).confine(["echo", "hi"], pol)
+    assert out.index("--tmpfs") < out.index("--bind")
+
+
+def test_laneA_base_malformed_roots_fail_closed():
+    """Medium: non-string writableRoots entries must deny, not raise."""
+    from hero_quant.sandbox.base import is_path_writable
+
+    pol = {"mode": "workspace-write", "writableRoots": [None, 123, b"/tmp"]}
+    assert is_path_writable("/tmp/x", pol) is False

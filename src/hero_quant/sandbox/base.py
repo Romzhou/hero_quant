@@ -52,6 +52,8 @@ def _validate_workspace_root(ws: str) -> None:
         raise ValueError("workspaceRoot must not contain ':' or newline")
     if not os.path.isabs(ws):
         raise ValueError("workspaceRoot must be absolute path")
+    if ws == "/" or ws.rstrip("/\\") == "" or Path(ws).parent == Path(ws):
+        raise ValueError("workspaceRoot must not be '/'")
 
 
 def _resolve_ws_strict(ws: str) -> str:
@@ -94,7 +96,7 @@ def is_path_writable(path: str, policy: dict) -> bool:
             return True
         try:
             r = str(Path(root).resolve())
-        except (OSError, ValueError, RuntimeError):
+        except (OSError, ValueError, RuntimeError, TypeError, AttributeError):
             continue
         if r == "/":
             return True
@@ -142,18 +144,24 @@ class BaseSandbox(ABC):
                     except (OSError, RuntimeError, ValueError) as e:
                         raise SandboxUnavailableError(f"workspaceRoot unavailable: {e}") from e
                 # bwrap 前缀：根目录只读，工作区与 /tmp 可写；保留最小通用参数
+                # 注意：bwrap 挂载按序生效，`--tmpfs /tmp` 必须在工作区 `--bind`
+                # 之前——否则 ws == /tmp 或 ws 在 /tmp 之下时后挂的 tmpfs 会遮住
+                # 已绑定的工作区，宿主文件在沙箱内不可见/丢失。
                 prefix: List[str] = [
                     "bwrap",
                     "--ro-bind", "/", "/",
+                    # 安全：/tmp 私有化（--tmpfs），防跨沙箱污染/tmp 竞态
+                    "--tmpfs", "/tmp",
                     "--bind", ws_canonical, ws_canonical,
                     "--dev", "/dev",
                     "--proc", "/proc",
-                    # 安全：/tmp 私有化（--tmpfs），防跨沙箱污染/tmp 竞态
-                    "--tmpfs", "/tmp",
                     "--unshare-all",
                     "--die-with-parent",
                     "--",
                 ]
+                # 当 ws 即 /tmp 或其子目录时：沿用“先 tmpfs 后重绑”顺序——
+                # tmpfs 先挂、随后 --bind 工作区覆盖其上，工作区文件保持可见，
+                # 其余 /tmp 仍为私有隔离。
                 return prefix + argv
             # 无 bwrap 时 fail-closed：由工具调度层捕获后决定降级或拒绝
             raise SandboxUnavailableError("bwrap unavailable: workspace-write requires bwrap but binary not found")
@@ -265,7 +273,14 @@ class DockerBackend(BaseSandbox):
 
     @property
     def enforcement(self) -> str:
-        # 有 docker 视为 full，无 docker 标记为 partial 以提示未真正隔离
+        # 与 LocalShellBackend 对齐：仅 workspace-write + 真实容器隔离才报 full；
+        # danger-full-access / read-only 走 super().confine() 透传（无 docker 前缀），
+        # 报 full 即虚报隔离等级。
+        mode = self._policy.get("mode") if isinstance(self._policy, dict) else None
+        if mode == "danger-full-access":
+            return "partial"
+        if mode != "workspace-write":
+            return "partial"  # no docker prefix applied for these modes
         if _has_docker():
             return "full"
         return "partial"
