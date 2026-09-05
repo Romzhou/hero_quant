@@ -298,8 +298,12 @@ class MemoryLifecycle:
 
     def _execute_gc_action(self, file_path: Path, action: str) -> None:
         """执行单条 GC 动作：归档或删除。"""
-        archive_dir = self.memory_dir / "archive"
-        archive_dir.mkdir(exist_ok=True)
+        try:
+            archive_dir = self.memory_dir / "archive"
+            archive_dir.mkdir(exist_ok=True)
+        except OSError as exc:
+            logger.warning("GC archive mkdir failed for %s: %s", file_path, exc)
+            return
         try:
             if action == "archive":
                 dest = archive_dir / file_path.name
@@ -534,6 +538,8 @@ class MemoryLifecycle:
         delta = float(self._EVENT_DELTAS[event])
         current = float(self._session_deltas.get(name, 0.0))
         capped = max(-self._MAX_SESSION_DELTA, min(self._MAX_SESSION_DELTA, current + delta))
+        # only the increment actually applied to the capped total flows through
+        applied = capped - current
         self._session_deltas[name] = capped
         try:
             meta_dict = getattr(self._memory, "_meta", None)
@@ -550,7 +556,7 @@ class MemoryLifecycle:
                         q = float(entry.get("quality_score", 0.5))
                     except (TypeError, ValueError):
                         q = 0.5
-                    entry["quality_score"] = min(1.0, max(0.0, q + delta))
+                    entry["quality_score"] = min(1.0, max(0.0, q + applied))
                     entry["last_accessed"] = time.time()
                     try:
                         entry["access_count"] = int(entry.get("access_count", 0)) + 1
