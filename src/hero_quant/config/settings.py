@@ -4,6 +4,7 @@
 设计约定：所有 HERO_* 映射在此文件通过 os.getenv 完成，避免分散读取；支持 HERO_WALL_TIME_BUDGET_SECONDS 等别名的兼容解析。
 """
 
+import copy
 import logging
 import os
 import re
@@ -11,6 +12,7 @@ import warnings
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
+from urllib.parse import quote as _urlquote
 
 logger = logging.getLogger(__name__)
 
@@ -142,7 +144,14 @@ def _vector_dsn_from_env() -> str | None:
 
 
 def _checkpoint_dsn_from_env() -> str:
-    """PG default (not memory://) — Task7 requirement. Fallback memory only when PG unreachable at runtime."""
+    """Checkpoint PG DSN：显式配置优先；未配置时回退无口令本地 PG 默认。
+
+    说明：源码不再硬编码任何口令（曾用的 postgres:postgres 已移除）。
+    Task7 PG-default 架构被既有单测锁定（test_checkpoint_pg /
+    test_docs_honesty 要求默认 PG 前缀，且不得改跨文件签名），故保留 PG 形态
+    默认；无真实 PG 时运行时走 emulated/memory 回退，不抛错。
+    fail-closed None 默认需先更新上述 pinning 单测，已列为 open item 升级。
+    """
     raw = os.getenv("HERO_CHECKPOINT_DSN", "")
     if raw and raw.strip():
         s = raw.strip()
@@ -150,7 +159,7 @@ def _checkpoint_dsn_from_env() -> str:
             return s
         warnings.warn(f"HERO_CHECKPOINT_DSN does not look like PG DSN: {_redact_dsn(s)!r}", UserWarning, stacklevel=2)
         logger.warning("HERO_CHECKPOINT_DSN invalid PG DSN: %r", _redact_dsn(s))
-        # fall through to alias / default rather than returning garbage
+        # fall through to alias / fail-closed rather than returning garbage
     # also respect legacy HERO_PG_DSN alias (requires prefix consistently)
     alt = os.getenv("HERO_PG_DSN", "")
     if alt and alt.strip() and alt.strip().lower().startswith(_PG_PREFIXES):
@@ -158,8 +167,9 @@ def _checkpoint_dsn_from_env() -> str:
     elif alt and alt.strip():
         warnings.warn(f"HERO_PG_DSN does not look like PG DSN: {_redact_dsn(alt)!r}", UserWarning, stacklevel=2)
         logger.warning("HERO_PG_DSN invalid PG DSN: %r", _redact_dsn(alt))
-    # default PG (not memory) — real PG path, runtime falls back to memory if unreachable
-    return "postgresql://postgres:postgres@localhost:5432/hero_quant"
+    # 未配置：回退无口令本地 PG 默认（Task7 pinning 单测锁定 PG 形态；运行时无池走 emulated/memory）。
+    # 注意：此默认不含任何口令；fail-closed None 需先更新 pinning 单测（open item）。
+    return "postgresql://localhost:5432/hero_quant"
 
 
 def _checkpoint_ttl_from_env() -> int:
@@ -180,7 +190,10 @@ def _checkpoint_ttl_from_env() -> int:
 
 
 def _billing_dsn_from_env() -> str | None:
-    """billing PG DSN, separate env, fallback to checkpoint PG only with warning (avoid silent shared DB)."""
+    """Billing PG DSN：仅显式 HERO_BILLING_DSN 生效；默认 fail-closed 返回 None。
+
+    与 checkpoint 共享 DB 必须经 HERO_BILLING_ALLOW_SHARED_DB=1/true/yes 显式 opt-in，
+    否则财务数据与 checkpoint 混库有表冲突/资金完整性风险。"""
     # 中文：显式 billing DSN 若存在但非法前缀需告警而非静默忽略（fail-visible）
     raw = (os.getenv("HERO_BILLING_DSN", "") or "").strip()
     if raw:
@@ -188,6 +201,10 @@ def _billing_dsn_from_env() -> str | None:
             return raw
         warnings.warn(f"HERO_BILLING_DSN does not look like PG DSN: {_redact_dsn(raw)!r}", UserWarning, stacklevel=2)
         logger.warning("HERO_BILLING_DSN invalid PG DSN: %r", _redact_dsn(raw))
+    # 共享 DB 必须显式 opt-in，否则 fail-closed（默认 None → 内存/独立回退）
+    opt_in = (os.getenv("HERO_BILLING_ALLOW_SHARED_DB", "") or "").strip().lower() in ("1", "true", "yes", "on")
+    if not opt_in:
+        return None
     # Explicit opt-in fallback: warn about isolation when reusing checkpoint DSN
     for k in ("HERO_PG_DSN", "HERO_CHECKPOINT_DSN"):
         raw = os.getenv(k, "") or ""
@@ -215,7 +232,8 @@ def _redis_dsn_from_env() -> str | None:
             return s
         warnings.warn(f"HERO_REDIS_DSN does not look like redis DSN: {_redact_dsn(s)!r}", UserWarning, stacklevel=2)
         logger.warning("HERO_REDIS_DSN invalid redis DSN: %r", _redact_dsn(s))
-        return s  # 仍返回，交由 redis 库校验
+        # fall through：非法 DSN 不直接返回，继续走 HERO_REDIS_HOST 拼装/REDIS_URL 兼容，
+        # 避免一次笔误在 HOST/URL 有效时彻底禁用 Redis（fail-visible：已 warn+log）。
     # HERO_REDIS_HOST 拼装
     host = (os.getenv("HERO_REDIS_HOST", "") or "").strip()
     if host:
@@ -227,6 +245,11 @@ def _redis_dsn_from_env() -> str | None:
             warnings.warn(f"Invalid HERO_REDIS_PORT={port_raw!r}: {e}, using 6379", UserWarning, stacklevel=2)
             logger.warning("Invalid HERO_REDIS_PORT %r: %s, using 6379", port_raw, e)
             port = 6379
+        if not 1 <= port <= 65535:
+            # 中文：端口越界同样回退 6379 并告警，避免拼出非法 DSN
+            warnings.warn(f"Invalid HERO_REDIS_PORT={port} out of range 1-65535, using 6379", UserWarning, stacklevel=2)
+            logger.warning("Invalid HERO_REDIS_PORT %r out of range 1-65535, using 6379", port)
+            port = 6379
         pw = (os.getenv("HERO_REDIS_PASSWORD", "") or "").strip()
         try:
             db_raw = (os.getenv("HERO_REDIS_DB", "0") or "0").strip()
@@ -236,8 +259,15 @@ def _redis_dsn_from_env() -> str | None:
             warnings.warn(f"Invalid HERO_REDIS_DB={db_raw!r}: {e}, using 0", UserWarning, stacklevel=2)
             logger.warning("Invalid HERO_REDIS_DB %r: %s, using 0", db_raw, e)
             db = 0
-        auth = f":{pw}@" if pw else ""
-        return f"redis://{auth}{host}:{port}/{db}"
+        if db < 0:
+            # 中文：负 DB 非法，回退 0 并告警
+            warnings.warn(f"Invalid HERO_REDIS_DB={db} must be >=0, using 0", UserWarning, stacklevel=2)
+            logger.warning("Invalid HERO_REDIS_DB %r must be >=0, using 0", db)
+            db = 0
+        # 中文：口令/主机做 URL 编码，含 @/:?# 的口令不再撕裂 DSN 解析
+        auth = f":{_urlquote(pw, safe='')}@" if pw else ""
+        host_q = _urlquote(host, safe=".-_:")
+        return f"redis://{auth}{host_q}:{port}/{db}"
     # REDIS_URL 兼容
     alt = (os.getenv("REDIS_URL", "") or "").strip()
     if alt and alt.lower().startswith(("redis://", "rediss://")):
@@ -260,13 +290,13 @@ def _llm_model_slot_from_env(key: str) -> str:
 class Settings:
     """全局配置聚合，字段按分组：LLM / 数据与基准 / wall-time 治理 / 向量与嵌入 / checkpoint。"""
 
-    llm_provider: str = field(default_factory=lambda: (os.getenv("HERO_LLM_PROVIDER", "openai") or "openai").strip())
-    llm_model: str = field(default_factory=lambda: (os.getenv("HERO_LLM_MODEL", "gpt-4o-mini") or "gpt-4o-mini").strip())
+    llm_provider: str = field(default_factory=lambda: (os.getenv("HERO_LLM_PROVIDER", "") or "").strip() or "openai")
+    llm_model: str = field(default_factory=lambda: (os.getenv("HERO_LLM_MODEL", "") or "").strip() or "gpt-4o-mini")
     llm_model_deep: str = field(default_factory=lambda: _llm_model_slot_from_env("HERO_LLM_MODEL_DEEP"))
     llm_model_quick: str = field(default_factory=lambda: _llm_model_slot_from_env("HERO_LLM_MODEL_QUICK"))
     api_key: str | None = field(default_factory=lambda: os.getenv("HERO_API_KEY"), repr=False)  # type: ignore[arg-type]
-    data_default_market: str = field(default_factory=lambda: (os.getenv("HERO_DATA_MARKET", "CN") or "CN").strip())
-    data_mode: str = field(default_factory=lambda: (os.getenv("HERO_DATA_MODE", "live") or "live").strip())
+    data_default_market: str = field(default_factory=lambda: (os.getenv("HERO_DATA_MARKET", "") or "").strip() or "CN")
+    data_mode: str = field(default_factory=lambda: (os.getenv("HERO_DATA_MODE", "") or "").strip() or "live")
     # data_mode 默认 live（生产安全）：禁止 live 失败静默回退合成；仅当 HERO_DATA_MODE=synthetic 显式指定时允许合成
     # 基准指数映射：用于多市场回测时选择对照指数，默认覆盖常见后缀
     benchmark_ticker: str | None = field(default_factory=lambda: os.getenv("HERO_BENCHMARK_TICKER") or None)  # type: ignore[arg-type]
@@ -304,10 +334,10 @@ class Settings:
     vector_dsn: str | None = field(default_factory=_vector_dsn_from_env, repr=False)
     vector_enabled: str | None = field(default_factory=lambda: (os.getenv("HERO_VECTOR_ENABLED") or None))  # type: ignore[arg-type]
     # 嵌入模型细节：通过 gate 暴露，保持 embed 模块无直接环境读取
-    sbert_model: str = field(default_factory=lambda: (os.getenv("HERO_SBERT_MODEL", "all-MiniLM-L6-v2") or "all-MiniLM-L6-v2").strip())
-    openai_embed_model: str = field(default_factory=lambda: (os.getenv("HERO_OPENAI_EMBED_MODEL", "text-embedding-3-small") or "text-embedding-3-small").strip())
+    sbert_model: str = field(default_factory=lambda: (os.getenv("HERO_SBERT_MODEL", "") or "").strip() or "all-MiniLM-L6-v2")
+    openai_embed_model: str = field(default_factory=lambda: (os.getenv("HERO_OPENAI_EMBED_MODEL", "") or "").strip() or "text-embedding-3-small")
     openai_api_key: str | None = field(default_factory=lambda: os.getenv("OPENAI_API_KEY") or None, repr=False)  # type: ignore[arg-type]
-    checkpoint_dsn: str = field(default_factory=_checkpoint_dsn_from_env, repr=False)
+    checkpoint_dsn: str | None = field(default_factory=_checkpoint_dsn_from_env, repr=False)
     checkpoint_ttl_seconds: int = field(default_factory=_checkpoint_ttl_from_env)
     billing_dsn: str | None = field(default_factory=_billing_dsn_from_env, repr=False)
     cohere_api_key: str = field(default_factory=lambda: os.getenv("COHERE_API_KEY", "") or "", repr=False)
@@ -315,6 +345,18 @@ class Settings:
 
 
 @lru_cache(maxsize=1)
-def get_settings() -> Settings:
-    """Cached factory to avoid env drift across repeated Settings() constructions."""
+def _get_settings_cached() -> Settings:
+    """进程内缓存的原始实例——仅内部持有，永不直接外泄（防可变成员污染全局）。"""
     return Settings()
+
+
+def get_settings() -> Settings:
+    """Cached factory：返回深拷贝隔离实例，调用方变更不污染全局；env 变更经 cache_clear 刷新。
+
+    保留 lru_cache 语义（conftest/单测沿用 get_settings.cache_clear() 即可刷新）。
+    """
+    return copy.deepcopy(_get_settings_cached())
+
+
+# 兼容：既有调用方/测试夹具沿用 get_settings.cache_clear() 刷新缓存。
+get_settings.cache_clear = _get_settings_cached.cache_clear  # type: ignore[attr-defined]

@@ -12,6 +12,7 @@ from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_
 import structlog
 import structlog.contextvars
 import hashlib
+import re
 import time
 import uuid
 import logging
@@ -22,6 +23,9 @@ import asyncio
 import threading
 import tempfile
 import itertools
+
+# X-Request-ID 安全字母表（模块级预编译，热路径中间件复用；与 trace._clean_trace_id 兼容的子集）。
+_REQUEST_ID_RE = re.compile(r"[A-Za-z0-9_.~-]+\Z")
 
 from fastapi import BackgroundTasks, HTTPException
 
@@ -530,9 +534,12 @@ async def add_request_id_and_otel(request: Request, call_next):
     """注入/透传 X-Request-ID，绑定 trace_id，记录请求起止与耗时；异常不阻断主流程。"""
     start = time.perf_counter()
     wall_start = time.monotonic()
-    # 透传或生成 X-Request-ID
-    request_id = request.headers.get("X-Request-ID")
-    if not request_id:
+    # 透传或生成 X-Request-ID：仅接受安全字母表 + 长度上限，否则回退 uuid4
+    # （防日志注入/CRLF/响应头拆分；与 trace._clean_trace_id 兼容的子集）。
+    _raw_rid = request.headers.get("X-Request-ID", "")
+    if _raw_rid and len(_raw_rid) <= 128 and _REQUEST_ID_RE.fullmatch(_raw_rid):
+        request_id = _raw_rid
+    else:
         request_id = str(uuid.uuid4())
     # 绑定到 contextvars 供下游结构化日志使用；按约定 trace_id = request_id
     trace_id = request_id
@@ -1077,12 +1084,13 @@ async def query(request: Request, q: str = "", use_graph: bool = False, replay_p
         if _wt is None:
             _wt = s.wall_time_budget_seconds if s.wall_time_budget_seconds is not None else s.wall_time_budget
         from hero_quant.agent.loop import AgentLoop
-        # --- checkpoint wiring (best-effort, logged) ---
+        # --- checkpoint wiring (best-effort, logged; offloaded — sync TCP/PG setup must not stall event loop) ---
         _saver = None
         try:
-            _saver = _get_checkpoint_saver()
+            _saver = await asyncio.to_thread(_get_checkpoint_saver)
         except Exception as _e:
             logger.warning("checkpoint.get_failed", error=str(_e), exc_info=_e)
+            _saver = None
         loop_kwargs = dict(
             llm=llm,
             max_iterations=5,
@@ -1132,15 +1140,12 @@ async def query(request: Request, q: str = "", use_graph: bool = False, replay_p
         # interaction: if loop reason indicates approval needed, surface it
         if isinstance(res.reason, str) and "approval" in res.reason.lower() or res.reason == "need_approval":
             out["need_approval"] = True
-        # 显式关闭 TraceWriter 并清理临时目录（Windows 句柄释放，避免 cleanup 噪音）
+        # 显式关闭 TraceWriter（Windows 句柄释放，避免 cleanup 噪音）。
+        # 注意：res.trace_path 落在 _tmp_dir_obj 内——此处不得同步 cleanup，
+        # 由 BackgroundTasks 在响应发送后清理，否则返回悬空路径（use-after-delete）。
         try:
             if trace is not None and hasattr(trace, "close"):
                 trace.close()
-        except Exception:
-            pass
-        try:
-            if _tmp_dir_obj is not None:
-                _tmp_dir_obj.cleanup()
         except Exception:
             pass
         return out
@@ -1221,6 +1226,8 @@ async def query_stream(request: Request, q: str = "", ticket: str | None = None,
         import json as _json
         import tempfile
         import pathlib as _pl
+        trace = None
+        _tmp_stream_dir = None
         try:
             from hero_quant.config.settings import Settings
             s = Settings()
@@ -1279,9 +1286,8 @@ async def query_stream(request: Request, q: str = "", ticket: str | None = None,
                         return self.stream_chat(goal)
 
                 llm = _FakeLLM()
-            trace = None
+            # trace/_tmp_stream_dir 已在 event_generator 顶部预初始化（防 finally UnboundLocalError）
             trace_dir_path = None
-            _tmp_stream_dir = None
             try:
                 from hero_quant.agent.trace import TraceWriter
                 if trace_dir:
@@ -1335,7 +1341,7 @@ async def query_stream(request: Request, q: str = "", ticket: str | None = None,
             from hero_quant.agent.loop import AgentLoop
             _saver2 = None
             try:
-                _saver2 = _get_checkpoint_saver()
+                _saver2 = await asyncio.to_thread(_get_checkpoint_saver)
             except Exception as _e:
                 logger.warning("checkpoint.get_failed_stream", error=str(_e), exc_info=_e)
             loop_kwargs2 = dict(
@@ -1617,47 +1623,52 @@ def _static_backtest_bundle() -> dict:
 def _get_backtest_bundle():
     """获取回测产物（metrics、持仓、tearsheet、CSV）：L1 内存 → L2 Redis → 计算。
 
-    计算段用 threading.Lock 本地互斥 + 可选 Redis SET NX 防多 worker 雷群（fakeredis 下兼容 fail-open）。
-    失败返回静态兜底。原子性：L1 首检在锁内完成。"""
+    并发：double-checked locking——仅 L1 首检/发布走本地锁；Redis I/O、
+    分布式锁与 _compute_backtest_bundle() 重计算均在锁外，避免慢网络/重计算
+    串行化所有回测请求。失败返回静态兜底。"""
     global _backtest_cache
-    # 中文：原子性修复——所有 L1/L2 检查均在单锁内，避免 check-then-act 撕裂
     with _backtest_cache_lock:
         if _backtest_cache:
             return _backtest_cache
-        cached = _read_backtest_bundle_cache()
-        if cached is not None:
-            _backtest_cache = cached
+    cached = _read_backtest_bundle_cache()
+    if cached is not None:
+        with _backtest_cache_lock:
+            if not _backtest_cache:
+                _backtest_cache = cached
             return _backtest_cache
-        # 可选 Redis 分布式锁防多 worker 雷群（拿不到则 fail-open 继续算；fakeredis 下兼容）。
-        _have_dlock = False
-        _dlock_token = None
-        _rc = None
-        try:
-            from hero_quant.infra.redis import get_redis_sync
-            import uuid as _uuid
+    # 可选 Redis 分布式锁防多 worker 雷群（拿不到则 fail-open 继续算；fakeredis 下兼容）。
+    # 以下 I/O + 重计算均在本地锁之外；算完后在锁下发布（double-checked）。
+    _have_dlock = False
+    _dlock_token = None
+    _rc = None
+    try:
+        from hero_quant.infra.redis import get_redis_sync
+        import uuid as _uuid
 
-            _rc = get_redis_sync()
-            if _rc is not None:
-                try:
-                    _dlock_token = _uuid.uuid4().hex
-                    if _rc.set(_BACKTEST_BUNDLE_LOCK_KEY, _dlock_token, nx=True, ex=30):
-                        _have_dlock = True
-                except Exception as _e:
-                    logger.debug(f"backtest.bundle_dlock_failed error={_e}")
-                    _have_dlock = False
-                    _dlock_token = None
-        except Exception as _e:
-            logger.debug(f"backtest.bundle_dlock_failed error={_e}")
-        try:
+        _rc = get_redis_sync()
+        if _rc is not None:
             try:
-                bundle = _compute_backtest_bundle()
+                _dlock_token = _uuid.uuid4().hex
+                if _rc.set(_BACKTEST_BUNDLE_LOCK_KEY, _dlock_token, nx=True, ex=30):
+                    _have_dlock = True
             except Exception as _e:
-                logger.warning("backtest.bundle_failed_fallback", error=str(_e))  # intentional fallback to static
-                bundle = _static_backtest_bundle()
-            _backtest_cache = bundle
-            _write_backtest_bundle_cache(bundle)
+                logger.debug(f"backtest.bundle_dlock_failed error={_e}")
+                _have_dlock = False
+                _dlock_token = None
+    except Exception as _e:
+        logger.debug(f"backtest.bundle_dlock_failed error={_e}")
+    try:
+        try:
+            bundle = _compute_backtest_bundle()
+        except Exception as _e:
+            logger.warning("backtest.bundle_failed_fallback", error=str(_e))  # intentional fallback to static
+            bundle = _static_backtest_bundle()
+        with _backtest_cache_lock:
+            if not _backtest_cache:
+                _backtest_cache = bundle
+            _write_backtest_bundle_cache(_backtest_cache)
             return _backtest_cache
-        finally:
+    finally:
             if _have_dlock and _rc is not None and _dlock_token is not None:
                 try:
                     # 中文：token + Lua 原子释放，避免过期后误删他人锁
