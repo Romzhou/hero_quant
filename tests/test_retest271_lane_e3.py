@@ -214,3 +214,173 @@ def test_e3_llm_langchain_fallback_forwards_timeout():
     c2 = LLMClient(InvokeOnly(), timeout=11, max_retries=0)
     assert c2.invoke("hi") == "ok"
     assert seen.get("direct_t") == 11, f"invoke must get timeout=11, got {seen}"
+
+
+# ============================================================================
+# telemetry/otel.py — 2 items
+# ============================================================================
+
+def test_e3_otel_dns_no_global_socket_mutation():
+    """[bug·high] _cached_getaddrinfo must not touch socket.setdefaulttimeout (process-global)."""
+    import socket
+
+    import hero_quant.telemetry.otel as otel_mod
+
+    otel_mod._clear_dns_cache()
+    calls = {"n": 0}
+    orig_resolver = socket.getaddrinfo
+
+    def counting(host, *a, **k):
+        calls["n"] += 1
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", 0))]
+
+    seen_defaults = []
+    orig_setdefault = socket.setdefaulttimeout
+
+    def spy_setdefault(t):
+        seen_defaults.append(t)
+        return orig_setdefault(t)
+
+    socket.getaddrinfo = counting  # noqa
+    socket.setdefaulttimeout = spy_setdefault  # noqa
+    try:
+        before = socket.getdefaulttimeout()
+        otel_mod._cached_getaddrinfo("e3-no-mutate.invalid")
+        otel_mod._cached_getaddrinfo("e3-no-mutate.invalid")
+        after = socket.getdefaulttimeout()
+        assert seen_defaults == [], f"must not touch global default, saw {seen_defaults}"
+        assert after == before, "pre-existing default must be preserved"
+        assert calls["n"] <= 1, "TTL cache must still work"
+    finally:
+        socket.getaddrinfo = orig_resolver  # noqa
+        socket.setdefaulttimeout = orig_setdefault  # noqa
+        otel_mod._clear_dns_cache()
+
+
+def test_e3_otel_provider_build_race_no_leak():
+    """[bug·medium] Concurrent export() must not leak the loser's provider/processor."""
+    import threading
+
+    import hero_quant.telemetry.otel as otel_mod
+    from hero_quant.telemetry.otel import SessionTelemetryCoordinator
+
+    created = []
+    shut = {"n": 0}
+    entered = threading.Event()
+    release = threading.Event()
+
+    class FakeProcessor:
+        def shutdown(self):
+            shut["n"] += 1
+
+    class FakeProvider:
+        def __init__(self):
+            self.processor = None
+
+        def add_log_record_processor(self, p):
+            self.processor = p
+
+        def get_logger(self, name):
+            return None
+
+        def force_flush(self, timeout_millis=None):
+            return True
+
+        def shutdown(self):
+            shut["n"] += 1
+
+    class FakeExporter:
+        def __init__(self, *a, **k):
+            created.append(1)
+            if len(created) == 1:
+                entered.set()
+                assert release.wait(timeout=10), "second builder never arrived"
+
+    import sys
+    import types
+
+    monkey_mods = {}
+    try:
+        import opentelemetry.sdk._logs as sdk_logs  # noqa
+        import opentelemetry.sdk._logs.export as sdk_export  # noqa
+        real_lp, real_blrp = sdk_logs.LoggerProvider, sdk_export.BatchLogRecordProcessor
+        sdk_logs.LoggerProvider = FakeProvider  # noqa
+        sdk_export.BatchLogRecordProcessor = lambda e: FakeProcessor()  # noqa
+        monkey_mods["sdk"] = (sdk_logs, sdk_export, real_lp, real_blrp)
+    except ImportError:
+        sdk_pkg = types.ModuleType("opentelemetry.sdk")
+        logs_mod = types.ModuleType("opentelemetry.sdk._logs")
+        logs_mod.LoggerProvider = FakeProvider
+        export_mod = types.ModuleType("opentelemetry.sdk._logs.export")
+        export_mod.BatchLogRecordProcessor = lambda e: FakeProcessor()
+        sys.modules["opentelemetry.sdk"] = sdk_pkg
+        sys.modules["opentelemetry.sdk._logs"] = logs_mod
+        sys.modules["opentelemetry.sdk._logs.export"] = export_mod
+        monkey_mods["sys"] = True
+
+    try:
+        import opentelemetry.exporter.otlp.proto.http._log_exporter as http_mod  # noqa
+        real_exp = http_mod.OTLPLogExporter
+        http_mod.OTLPLogExporter = FakeExporter  # noqa
+        monkey_mods["http"] = (http_mod, real_exp)
+    except ImportError:
+        for pkg in ("opentelemetry", "opentelemetry.exporter", "opentelemetry.exporter.otlp",
+                    "opentelemetry.exporter.otlp.proto", "opentelemetry.exporter.otlp.proto.http"):
+            sys.modules.setdefault(pkg, types.ModuleType(pkg))
+        http_mod = types.ModuleType("opentelemetry.exporter.otlp.proto.http._log_exporter")
+        http_mod.OTLPLogExporter = FakeExporter
+        sys.modules["opentelemetry.exporter.otlp.proto.http._log_exporter"] = http_mod
+        monkey_mods.setdefault("sys", True)
+
+    import os
+    import socket
+
+    old_endpoint = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT")
+    os.environ["OTEL_EXPORTER_OTLP_ENDPOINT"] = "https://example.com/v1/logs"
+    real_gai = socket.getaddrinfo
+    socket.getaddrinfo = lambda *a, **k: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", 0))]  # noqa
+    otel_mod._OTEL_CACHED_PROVIDER = None
+    otel_mod._OTEL_CACHED_PROCESSOR = None
+    otel_mod._OTEL_CACHED_ENDPOINT = None
+    coord = SessionTelemetryCoordinator(mode="private")
+    errs = []
+
+    def run_export():
+        try:
+            coord.export({"e": 1})
+        except Exception as e:  # noqa
+            errs.append(e)
+
+    try:
+        t1 = threading.Thread(target=run_export)
+        t2 = threading.Thread(target=run_export)
+        t1.start()
+        assert entered.wait(timeout=10), "first builder never started"
+        t2.start()
+        release.set()
+        t1.join(timeout=20)
+        t2.join(timeout=20)
+        assert not errs, f"export raised: {errs}"
+        # two providers built, exactly one published → loser must be shut down
+        assert len(created) == 2, f"expected 2 concurrent builds, got {len(created)}"
+        assert shut["n"] >= 1, "loser provider/processor must be shut down, not leaked"
+        assert otel_mod._OTEL_CACHED_PROVIDER is not None
+    finally:
+        release.set()
+        socket.getaddrinfo = real_gai  # noqa
+        if old_endpoint is None:
+            os.environ.pop("OTEL_EXPORTER_OTLP_ENDPOINT", None)
+        else:
+            os.environ["OTEL_EXPORTER_OTLP_ENDPOINT"] = old_endpoint
+        if "sdk" in monkey_mods:
+            sdk_logs, sdk_export, real_lp, real_blrp = monkey_mods["sdk"]
+            sdk_logs.LoggerProvider = real_lp  # noqa
+            sdk_export.BatchLogRecordProcessor = real_blrp  # noqa
+        if "http" in monkey_mods:
+            http_mod, real_exp = monkey_mods["http"]
+            http_mod.OTLPLogExporter = real_exp  # noqa
+        if monkey_mods.get("sys") and "sdk" not in monkey_mods:
+            for m in ("opentelemetry.sdk._logs.export", "opentelemetry.sdk._logs", "opentelemetry.sdk",
+                      "opentelemetry.exporter.otlp.proto.http._log_exporter"):
+                sys.modules.pop(m, None)
+        otel_mod.shutdown_otel()
