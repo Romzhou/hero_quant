@@ -56,12 +56,11 @@ class MemoryStore:
                 if evicted_buffer is not None:
                     evicted_buffer.clear()
                 logger.warning("memory store full, evicted session: %s", evicted_id)
+            old = self._buffers.get(session_id)
+            if old is not None and old is not buffer:
+                old.clear()
             self._buffers[session_id] = buffer
-            try:
-                self._buffers.move_to_end(session_id)
-            except KeyError:
-                # 并发删除竞争下已不在字典，忽略
-                pass
+            self._buffers.move_to_end(session_id)
 
     def clear_buffer(self, session_id: int):
         """清除会话记忆"""
@@ -73,10 +72,7 @@ class MemoryStore:
         """删除缓冲区"""
         with self._lock:
             if session_id in self._buffers:
-                try:
-                    buffer = self._buffers.pop(session_id)
-                except KeyError:
-                    return
+                buffer = self._buffers.pop(session_id)
                 if buffer is not None:
                     buffer.clear()
 
