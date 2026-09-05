@@ -167,9 +167,14 @@ def tool(
                 raise ValueError(f"tool name '{name}' already registered")
         if not description:
             raise ValueError("description must be non-empty")
-        # 中文：对深拷贝后的输出合约做使用时校验（防 tool(...) 与 dec(func) 之间被篡改）；
+        # 中文：对深拷贝后的输入/输出合约做使用时校验（防 tool(...) 与 dec(func) 之间被篡改）；
         # 仅精确 {"schema", "render"} 视为 wrapped 形态（validate output["schema"] when wrapped），
         # 避免原始 schema 误判。
+        if parameters is not None:
+            parameters_snapshot = copy.deepcopy(parameters)
+            assertSupportedJsonSchema(parameters_snapshot)
+        else:
+            parameters_snapshot = None
         if output is not None:
             output_snapshot = copy.deepcopy(output)
             if isinstance(output_snapshot, dict) and set(output_snapshot) == {"schema", "render"}:
@@ -215,8 +220,8 @@ def tool(
             description=description,
             func=func,
             signature=inspect.signature(func),
-            # 中文：存调用方 dict 的深拷贝，事后改原 dict 不得漂移已注册合约
-            parameters=copy.deepcopy(parameters),
+            # 中文：存使用时快照（已深拷贝+重校验），事后改原 dict 不得漂移已注册合约
+            parameters=parameters_snapshot,
             output=copy.deepcopy(output_wrapped),
             is_concurrency_safe=safe_fn,
             timeoutMs=t_ms,

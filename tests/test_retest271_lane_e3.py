@@ -563,3 +563,21 @@ def test_e3_llm_stream_no_timeout_backend_single_execution():
     chunks = list(c.stream_chat("hi"))
     assert chunks == ["ok"]
     assert len(calls) == 1, f"non-idempotent stream RPC must execute once, got {len(calls)}"
+
+
+def test_e3_registry_parameters_mutation_window_closed():
+    """[bug·high] Mutating parameters between tool(...) and decorator must not bypass validation."""
+    import pytest
+
+    from hero_quant.tools.registry import TOOL_REGISTRY, tool
+
+    params = {"type": "object", "properties": {}}
+    factory = tool(name="e3_params_toctou_xyz", description="toctou", parameters=params)
+    params.clear()
+    params["type"] = "not-a-real-type"
+    with pytest.raises(ValueError):
+        @factory
+        def _h():
+            pass
+
+    assert "e3_params_toctou_xyz" not in TOOL_REGISTRY
