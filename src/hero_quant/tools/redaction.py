@@ -66,7 +66,11 @@ def redact_tool_result(result: Any, limit: int | None = None, sink: str = "resul
             try:
                 s = json.dumps(redacted, ensure_ascii=False)
             except (TypeError, ValueError):
-                s = json.dumps(redacted, ensure_ascii=False, default=str)
+                try:
+                    s = json.dumps(redacted, ensure_ascii=False, default=str)
+                except Exception:
+                    # 中文：循环引用等导致序列化彻底失败时 fail-closed（RecursionError 非 ValueError 子类）
+                    s = "***"
     elif isinstance(result, str):
         r = _maybe_redact(result, sink=sink)
         s = r if isinstance(r, str) else str(r)

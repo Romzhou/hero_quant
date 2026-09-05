@@ -581,3 +581,12 @@ def test_e3_registry_parameters_mutation_window_closed():
             pass
 
     assert "e3_params_toctou_xyz" not in TOOL_REGISTRY
+
+
+def test_e3_redaction_circular_fail_closed():
+    """[bug·high] Circular structures must fail closed, never raise (RecursionError)."""
+    from hero_quant.tools.redaction import redact_tool_result
+
+    d = {"k": "v"}
+    d["self"] = d
+    assert redact_tool_result(d, sink="result") == "***"
