@@ -238,12 +238,48 @@ def _execute_python_impl(
         "any", "all", "repr", "Exception", "ValueError", "TypeError", "RuntimeError",
     )
     _safe_builtins = {k: getattr(_builtins, k) for k in _safe_names if hasattr(_builtins, k)}
-    # __import__ 必须透传真实实现：import 语句与第三方库的传递导入依赖完整导入机制；
-    # 门控在静态 check_source（用户源码中的危险导入/调用已先行拒绝），此处不做运行时二次拦截
-    _safe_builtins["__import__"] = _builtins.__import__
+    _real_import = _builtins.__import__
     g_dict: dict = {} if globals_dict is None else dict(globals_dict)
-    # 调用方显式给的 __builtins__ 予以尊重；否则注入受限子集（纵深防御）
-    g_dict.setdefault("__builtins__", _safe_builtins)
+    # 调用方显式给的 __builtins__/预注入危险模块不得信任：强制覆盖，防预注入绕过
+    # （如 globals={'os': os} 或 __builtins__=完整内置可直接拿到 system/eval）。
+    for _bad in (ast_guard.BANNED_CALL_NAMES | ast_guard.BANNED_GETATTR_NAMES | {"__builtins__"} | set(ast_guard.BANNED_IMPORT_ROOTS)):
+        g_dict.pop(_bad, None)
+    if isinstance(locals_dict, dict):
+        for _bad in (ast_guard.BANNED_CALL_NAMES | ast_guard.BANNED_GETATTR_NAMES | {"__builtins__"} | set(ast_guard.BANNED_IMPORT_ROOTS)):
+            if _bad in locals_dict:
+                raise SandboxViolation(f"banned name in locals_dict: {_bad}")
+
+    def _guarded_import(name, globals=None, locals=None, fromlist=(), level=0):  # type: ignore[no-redef]
+        """运行时导入门控：用户源码的直接导入走 allowlist，第三方库传递导入放行。
+
+        背景：静态 check_source 已拒绝用户源码中的危险导入/``__import__`` 调用，
+        但运行时仍需纵深防御——调用方经 globals_dict 预注入或动态构造
+        （如 ``python -c "__import__('os').system(...)"`` 经 execute_python 路径）
+        仍可拿到真实 ``__import__``。故此处不透传裸实现。
+        区分依据：import 语句/显式 __import__ 的 globals 即用户 g_dict；
+        第三方库内部传递导入的 globals 为其自身模块命名空间，直接放行以免破坏
+        pandas/numpy 等内部 ``import os`` 传递导入。
+        """
+        try:
+            _is_user = globals is None or globals is g_dict
+        except Exception:
+            _is_user = True
+        if _is_user:
+            if not isinstance(name, str) or not name:
+                raise SandboxViolation("banned import: empty module name")
+            if level != 0:
+                raise SandboxViolation("banned relative import (fail-closed)")
+            _root = name.split(".")[0]
+            if _root in ast_guard.BANNED_IMPORT_ROOTS or name in ast_guard.BANNED_IMPORT_ROOTS:
+                raise SandboxViolation(f"banned import: {name}")
+            _allowed = ast_guard.get_allowed_roots()
+            if _root not in _allowed:
+                raise SandboxViolation(f"import allowlist violation: {name}")
+        return _real_import(name, globals, locals, fromlist, level)
+
+    _safe_builtins["__import__"] = _guarded_import
+    # 纵深防御：调用方显式给的 __builtins__ 不予尊重，一律覆盖为受限子集
+    g_dict["__builtins__"] = _safe_builtins
     if locals_dict is None:
         exec(code, g_dict)  # type: ignore[arg-type]
         return g_dict

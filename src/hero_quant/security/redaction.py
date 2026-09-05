@@ -76,29 +76,28 @@ def _redact_string(value: str, sink: str) -> str:
             return _REDACTED
         if _JWT_RE.search(value):
             return _REDACTED
-        m = _LONG_TOKEN_RE.search(value)
-        if m:
+        # 长 token 必须遍历全部命中：仅看首个 re.search 可被绕过
+        # （如 "xxxx...40 + 真密钥" 首命中为单字符重复即 pass 后直接透传）。
+        for m in _LONG_TOKEN_RE.finditer(value):
             tok = m.group(0)
             # hex 编码密钥很常见，仅单字符重复（如 x*100）视为非密钥放行
             if len(set(tok)) == 1:
-                pass  # 单字符重复如 x*100，非密钥
-            else:
-                return _REDACTED
+                continue  # 本命中 benign，继续看后续命中而非直接透传
+            return _REDACTED
         return value
     if sink == RESULT_SINK:
         # 结果槽：仅确定性密钥形态必脱敏；长 token 需非纯 hex 且熵>3.0 才脱敏，避免误杀 commit SHA
         if _BEARER_RE.search(value) or _SK_RE.search(value) or _AKIA_RE.search(value) or _JWT_RE.search(value):
             return _REDACTED
-        m = _LONG_TOKEN_RE.search(value)
-        if m:
+        for m in _LONG_TOKEN_RE.finditer(value):
             tok = m.group(0)
-            # 纯数字指纹视为非密钥，跳过
+            # 纯数字指纹视为非密钥，跳过本命中而非直接透传
             if tok.isdigit():
-                return value
+                continue
             # 长 token 按长度+熵脱敏：单大小写密钥同样拦截，不再要求大小写混合或符号
             uniq = len(set(tok))
             if uniq / max(1, len(tok)) < 0.35:
-                return value
+                continue
             return _REDACTED
         return value
     # 未知 sink 回退 ARGUMENTS_SINK 语义：无模式命中则透传，避免拼写 typo 致过脱敏

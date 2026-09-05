@@ -279,11 +279,14 @@ class DedupStore:
     async def _pg_setup_async(self) -> None:
         if not self._is_pg or self.pool is None:
             return
+        # 与同步路径一致 fail-closed：RLS/DDL 是租户隔离根基，失败必须 loud 上浮，
+        # 不可 except: pass 静默放行（否则异步 PG 形同无隔离而同步路径已拒绝）。
         if hasattr(self.pool, "open"):
             try:
                 await self.pool.open()  # type: ignore
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("dedup PG async open failed: %s", exc, exc_info=True)
+                raise
         if _is_async_pool(self.pool):
             try:
                 async with self.pool.connection() as conn:  # type: ignore
@@ -291,26 +294,16 @@ class DedupStore:
                     try:
                         await conn.execute(DDL_TOOL_CALL_PG)  # type: ignore
                     except Exception:
-                        pass
+                        async with conn.cursor() as _cur:  # type: ignore
+                            await _cur.execute(DDL_TOOL_CALL_PG)
                     try:
                         await conn.execute(DDL_RLS_PG)  # type: ignore
                     except Exception:
-                        pass
-            except Exception:
-                try:
-                    async with self.pool.connection() as conn:  # type: ignore
-                        async with conn.cursor() as cur:  # type: ignore
-                            await cur.execute(DDL_DEDUP_PG)
-                            try:
-                                await cur.execute(DDL_TOOL_CALL_PG)
-                            except Exception:
-                                pass
-                            try:
-                                await cur.execute(DDL_RLS_PG)
-                            except Exception:
-                                pass
-                except Exception:
-                    pass
+                        async with conn.cursor() as _cur2:  # type: ignore
+                            await _cur2.execute(DDL_RLS_PG)
+            except Exception as exc:
+                logger.warning("dedup PG async setup failed: %s", exc, exc_info=True)
+                raise
 
     # SQLite 连接：WAL + NORMAL 同步以兼顾并发与持久性
     def _connect(self) -> sqlite3.Connection:

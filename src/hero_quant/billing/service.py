@@ -602,41 +602,13 @@ class BillingService:
         return True
 
     def _pg_purchase_sync(self, receipt: dict) -> bool:
-        """无 pool 不伪成功（返回 False），有 pool 才做 SET LOCAL 双写并返回 True。"""
-        if not self._is_real_pg() or getattr(self, "_pool", None) is None:
-            _log_warning("PG purchase skipped (no real pool) tenant=%s", str(receipt.get("buyer_tenant") or receipt.get("tenant") or "default"), exc_info=False)
-            return False
-        _tenant = str(receipt.get("buyer_tenant") or receipt.get("tenant") or "default")
-        _log_warning("PG purchase SET LOCAL app.tenant=%s (dual write with app.current_tenant)", _tenant, exc_info=False)
-        pool = getattr(self, "_pool", None)
-        if pool is not None:
-            # 中文：SET LOCAL 双写在同一复用路径内，未与 INSERT 同事务的旧逻辑保留为 no-op 双写但不每 key 新开事务
-            # 保留现有行为但避免每 key 全新连接的误导（两键共享同一判定）
-            _sqls = ["SET LOCAL app.tenant = %s", "SET LOCAL app.current_tenant = %s"]
-            _keys = ["app.tenant", "app.current_tenant"]
-            for _sql, _k in zip(_sqls, _keys):
-                try:
-                    if hasattr(pool, "connection"):
-                        with pool.connection() as _conn:  # type: ignore
-                            try:
-                                _conn.execute(_sql, (_tenant,))  # type: ignore
-                            except Exception:
-                                with _conn.cursor() as _c:  # type: ignore
-                                    _c.execute(_sql, (_tenant,))
-                    elif hasattr(pool, "getconn"):
-                        _conn2 = pool.getconn()  # type: ignore
-                        try:
-                            with _conn2.cursor() as _c2:
-                                _c2.execute(_sql, (_tenant,))
-                            _conn2.commit()
-                        finally:
-                            try:
-                                pool.putconn(_conn2)  # type: ignore
-                            except Exception:
-                                pass
-                except Exception as _e:
-                    _log_warning("billing SET LOCAL %s failed: %s", _k, _e, exc_info=True)
-                    continue
+        """PG purchase 侧 RLS 说明：真实隔离由 _pg_insert_purchase_sync 在同一连接同一事务内
+        (SET LOCAL + INSERT + commit) 强制；本方法不再单独发 SET LOCAL。
+
+        原因：短连接池上单独 `with pool.connection(): SET LOCAL` 随即归还连接，
+        SET LOCAL 仅事务级有效，归还即丢弃，RLS 形同虚设且给调用方虚假安全感。
+        故此处显式 no-op，返回 True，保持调用兼容。
+        """
         return True
 
     def _pg_get_factor_sync(self, factor_id: str, tenant: str | None = None) -> dict | None:

@@ -89,9 +89,20 @@ def mask_pii(value: str, mask_char: str = "*", visible_prefix: int = 3, visible_
     """脱敏：保留前后缀，中间掩码。"""
     if not value:
         return ""
+    # 防御：负数/非 int 统一 fail-closed 全掩码，避免切片语义泄露明文
+    try:
+        visible_prefix = int(visible_prefix)
+        visible_suffix = int(visible_suffix)
+    except (TypeError, ValueError):
+        return mask_char * len(value)
+    if visible_prefix < 0 or visible_suffix < 0:
+        return mask_char * len(value)
     if len(value) < visible_prefix + visible_suffix:
         return mask_char * len(value)
-    return value[:visible_prefix] + mask_char * (len(value) - visible_prefix - visible_suffix) + value[-visible_suffix:]
+    # 关键：visible_suffix=0 时 value[-0:] == value[0:] 会追加全文明文，必须短路为空
+    prefix = value[:visible_prefix] if visible_prefix > 0 else ""
+    suffix = value[-visible_suffix:] if visible_suffix > 0 else ""
+    return prefix + mask_char * (len(value) - visible_prefix - visible_suffix) + suffix
 
 
 def is_pii_field(field_name: object) -> bool:

@@ -38,8 +38,8 @@ _CHAIN_FIELDS = frozenset({"seq", "prev_record_hash", "record_hash"})
 
 _fsync_warned = False
 
-# PR2-E: 追加前校验的增量缓存 —— path -> (mtime, size, count, tail_hash, tenants)，tenants 为 {tenant: [count, tail_hash]}；
-# 命中（四元一致 + O(1) 尾自检）跳过全扫，未命中且前缀连续时仅校验新增段 O(k)，否则回落全扫
+# PR2-E: 追加前校验的增量缓存 —— path -> (content_sha256, size, count, tail_hash, tenants)，tenants 为 {tenant: [count, tail_hash]}；
+# 命中（内容哈希一致 + O(1) 尾自检）跳过全扫；内容变化时必须先证明前缀字节未变（append-only）才可仅验新增段，否则回落全扫
 _tail_verify_cache: dict[str, tuple[float, int, int, str, dict[str, list]]] = {}
 
 __all__ = [
@@ -940,7 +940,7 @@ class Ledger:
                         import hashlib as _hl
 
                         _cur_content = _hl.sha256(raw_bytes).hexdigest()
-                        _ch, _cc, _ct, _ctenants = _cached[0], _cached[2], _cached[3], _cached[4]
+                        _ch, _cs, _cc, _ct, _ctenants = _cached[0], _cached[1], _cached[2], _cached[3], _cached[4]
                         _cur_tail = entries[-1].get("record_hash", "") if entries else GENESIS_PREV_HASH
                         if _cc == len(entries) and _ct == _cur_tail and _ch == _cur_content:
                             # 中文：内容哈希一致证明文件逐字节未变，短路可信；
@@ -951,41 +951,55 @@ class Ledger:
                             else:
                                 ok, brk = self._verify_entries(entries)
                         elif _cc <= len(entries) and not any("_raw" in e for e in entries):
-                            # 增量分支：从缓存 count 处切分新增段
-                            _suffix = entries[_cc:]
-                            _anchor_ok = True
-                            if _cc == 0:
-                                _exp_prev_map: dict[str, str] = {}
-                            else:
-                                if len(_suffix) == 0:
-                                    _anchor_ok = False
-                                else:
-                                    _exp_prev_map = {}
-                                    for _e in _suffix:
-                                        _t = _e.get("tenant", "default")
-                                        if _t not in _exp_prev_map:
-                                            _slot = _ctenants.get(_t)
-                                            _exp_prev_map[_t] = _slot[1] if _slot is not None else GENESIS_PREV_HASH
-                                    _first = _suffix[0]
-                                    _ft = _first.get("tenant", "default")
-                                    _fph = _first.get("prev_hash")
-                                    _fprev = _exp_prev_map[_ft]
-                                    _anchor_ok = _fph == _fprev or (
-                                        _ctenants.get(_ft) is None and _is_genesis(_fph) and _is_genesis(_fprev)
-                                    )
-                            if _anchor_ok and _suffix and all(e.get("tenant_seq") is not None and "_raw" not in e for e in _suffix):
-                                # 锚点记录本身 O(1) 自检：确认缓存边界条目未被替换（深层前缀以前次全量/增量校验结论为信任基础；
-                                # 带外篡改的最终兜底仍是 verify()/verify_chain 全扫审计路径）
-                                if _cc > 0 and not _tail_self_check(entries[_cc - 1]):
-                                    ok, brk = self._verify_entries(entries)
-                                else:
-                                    ok, brk, _new_tenants = _verify_suffix_incremental(
-                                        _suffix, start_seq=_cc + 1, tenant_state=_ctenants
-                                    )
-                                    if not ok:
-                                        _new_tenants = None
-                            else:
+                            # 增量分支前必须先证明前缀字节未变：账本是 append-only，
+                            # 合法增长意味着旧文件内容是当前文件的字节前缀。
+                            # 仅锚点连续+边界自检不足——攻击者可篡改前缀中间记录后
+                            # 再追加一条锚定正确的后缀，使后缀校验通过而前缀篡改漏检。
+                            # 故先验旧长度前缀的 sha256 是否等于缓存内容哈希，否则回落全扫。
+                            _prefix_ok = False
+                            try:
+                                if isinstance(_cs, int) and len(raw_bytes) >= _cs:
+                                    _prefix_ok = _hl.sha256(raw_bytes[:_cs]).hexdigest() == _ch
+                            except Exception:
+                                _prefix_ok = False
+                            if not _prefix_ok:
                                 ok, brk = self._verify_entries(entries)
+                            else:
+                                # 前缀字节已证未变：从缓存 count 处切分新增段
+                                _suffix = entries[_cc:]
+                                _anchor_ok = True
+                                if _cc == 0:
+                                    _exp_prev_map: dict[str, str] = {}
+                                else:
+                                    if len(_suffix) == 0:
+                                        _anchor_ok = False
+                                    else:
+                                        _exp_prev_map = {}
+                                        for _e in _suffix:
+                                            _t = _e.get("tenant", "default")
+                                            if _t not in _exp_prev_map:
+                                                _slot = _ctenants.get(_t)
+                                                _exp_prev_map[_t] = _slot[1] if _slot is not None else GENESIS_PREV_HASH
+                                        _first = _suffix[0]
+                                        _ft = _first.get("tenant", "default")
+                                        _fph = _first.get("prev_hash")
+                                        _fprev = _exp_prev_map[_ft]
+                                        _anchor_ok = _fph == _fprev or (
+                                            _ctenants.get(_ft) is None and _is_genesis(_fph) and _is_genesis(_fprev)
+                                        )
+                                if _anchor_ok and _suffix and all(e.get("tenant_seq") is not None and "_raw" not in e for e in _suffix):
+                                    # 锚点记录本身 O(1) 自检：确认缓存边界条目未被替换（深层前缀以前次全量/增量校验结论为信任基础；
+                                    # 带外篡改的最终兜底仍是 verify()/verify_chain 全扫审计路径）
+                                    if _cc > 0 and not _tail_self_check(entries[_cc - 1]):
+                                        ok, brk = self._verify_entries(entries)
+                                    else:
+                                        ok, brk, _new_tenants = _verify_suffix_incremental(
+                                            _suffix, start_seq=_cc + 1, tenant_state=_ctenants
+                                        )
+                                        if not ok:
+                                            _new_tenants = None
+                                else:
+                                    ok, brk = self._verify_entries(entries)
                         else:
                             ok, brk = self._verify_entries(entries)
                     except LedgerCorruptionError:
