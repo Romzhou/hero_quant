@@ -40,6 +40,10 @@ def limit_key(request: Request) -> str:
         ip = getattr(getattr(request, "client", None), "host", None) or "unknown"
     except Exception:
         ip = "unknown"
+    if ip == "unknown":
+        # 可观测性：缺失 IP 的调用方全部折叠进同一 ip:unknown 桶（单 actor 可
+        # 耗尽配额误伤他人；反向代理后未取真实 IP 时同理），打 warning 暴露配置问题。
+        logger.warning("ratelimiter.unknown_ip endpoint_bucket_fallback")
     return f"ip:{ip}"
 
 
@@ -48,12 +52,13 @@ limiter = _SlowLimiter(key_func=limit_key) if SLOWAPI_AVAILABLE and _SlowLimiter
 
 
 async def _check(request: Request, quota: int, endpoint: str) -> bool:
-    """按 endpoint 隔离 bucket；Redis 故障 fail-closed 抛 503。"""
+    """按 endpoint 隔离 bucket；注意：infra RateLimiter 当前 fail-open（后端异常返回 True），此处 503 仅覆盖非预期异常。"""
+    # key 构造在 try 之外：limit_key 自身的程序错误不得被误标为 503
+    # 'Rate limiter unavailable'（三档隔离：key 含 endpoint 前缀，避免共用同一桶）。
+    key = f"{endpoint}:{limit_key(request)}"
     try:
-        # 三档隔离：key 包含 endpoint 前缀，避免 chat/tool/session 共用同一桶
-        ok = await RateLimiter().try_acquire(f"{endpoint}:{limit_key(request)}", quota, WINDOW_SECONDS)
+        ok = await RateLimiter().try_acquire(key, quota, WINDOW_SECONDS)
     except Exception as e:
-        # fail-closed：限流后端故障时不放行，避免在最需限流时失守
         logger.warning("ratelimiter.check_failed endpoint=%s error=%s", endpoint, str(e))
         raise HTTPException(status_code=503, detail="Rate limiter unavailable") from e
     if not ok:

@@ -586,3 +586,82 @@ def test_lanee_ws_server_pong_renewal_bounded():
         wsmod.heartbeat._last_active.clear()
         if hasattr(wsmod.heartbeat, "_server_keepalives"):
             wsmod.heartbeat._server_keepalives.clear()
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Lane E1 · rate_limiter.py repro tests
+# (detail log src__hero_quant__api__rate_limiter_py.log)
+# ══════════════════════════════════════════════════════════════════════
+
+def _lanee_rl_request(user_id=_lanee_SNS(), host="9.9.9.9"):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(state=SimpleNamespace(current_user=user_id), client=SimpleNamespace(host=host))
+
+
+# ── rate_limiter.py high: fail-closed 503 unreachable / key built in try ──
+
+
+def test_lanee_rl_limitkey_error_not_mislabeled_503(monkeypatch):
+    """A programming error in limit_key() must NOT be mislabeled 503 'Rate
+    limiter unavailable': the key must be built OUTSIDE the backend try so
+    only genuine backend failures map to 503."""
+    import hero_quant.api.rate_limiter as rl
+    from fastapi import HTTPException
+
+    def _boom(request):
+        raise ValueError("lanee-key-construction-bug")
+
+    monkeypatch.setattr(rl, "limit_key", _boom)
+    req = _lanee_rl_request()
+    with pytest.raises(ValueError, match="lanee-key-construction-bug"):
+        asyncio.run(rl.rate_limit_chat(req))
+
+
+def test_lanee_rl_check_documents_failopen_contract():
+    """_check docstring must not claim fail-closed 503 while infra
+    RateLimiter.try_acquire fail-opens (returns True on backend errors):
+    document the real contract instead."""
+    import hero_quant.api.rate_limiter as rl
+
+    doc = rl._check.__doc__ or ""
+    assert "fail-open" in doc, (
+        f"_check still advertises fail-closed 503, hiding the fail-open infra "
+        f"contract: {doc!r}"
+    )
+
+
+def test_lanee_rl_backend_error_still_503(monkeypatch):
+    """Guard: a genuine backend failure from try_acquire still maps to 503
+    (contract lock; the except path covers unexpected backend errors)."""
+    import hero_quant.api.rate_limiter as rl
+    from fastapi import HTTPException
+
+    class _Boom:
+        async def try_acquire(self, *a, **k):
+            raise RuntimeError("lanee-redis-down")
+
+    monkeypatch.setattr(rl, "RateLimiter", lambda: _Boom())
+    req = _lanee_rl_request(user_id=None)
+    with pytest.raises(HTTPException) as ei:
+        asyncio.run(rl.rate_limit_chat(req))
+    assert ei.value.status_code == 503
+
+
+# ── rate_limiter.py medium: anonymous ip:unknown bucket collapse ──
+
+
+def test_lanee_rl_unknown_ip_warns(caplog):
+    """Missing client IP must be observable: falling back to the shared
+    ip:unknown bucket logs a warning so proxy/misconfig DoS-collapse is
+    visible instead of silent."""
+    import hero_quant.api.rate_limiter as rl
+    from types import SimpleNamespace
+
+    req = SimpleNamespace(state=SimpleNamespace(current_user=None), client=None)
+    with caplog.at_level("WARNING", logger="hero_quant.api.rate_limiter"):
+        key = rl.limit_key(req)
+    assert key == "ip:unknown"
+    assert any("unknown" in (r.getMessage() or "") for r in caplog.records), (
+        "ip:unknown fallback is silent: no warning logged"
+    )
