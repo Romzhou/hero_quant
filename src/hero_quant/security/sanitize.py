@@ -64,9 +64,12 @@ def safe_join(base: str | Path, ticker: str, *, max_len: int = 32) -> Path:
     规范化并校验 ``is_relative_to``，防目录穿越与符号链接逃逸。
     """
     validated = safe_ticker_component(ticker, max_len=max_len)
-    # 中文：空 base（''/空白/None/非 str-Path/嵌 NUL）静默锚定 CWD（Path('')==Path('.')），
-    # 必须显式拒绝；base 构造纳入归一化 try（含 TypeError），保证调用方只见到 ValueError。
-    if not isinstance(base, (str, Path)) or (isinstance(base, str) and not base.strip()) or (isinstance(base, Path) and str(base).strip() in ("", ".")):
+    # 中文：空/CWD base（''/空白/'.'/None/非 str-Path/嵌 NUL）静默锚定 CWD
+    #（Path('')==Path('.')），必须显式拒绝；str 与 Path 同一逻辑同一处理。
+    # base 构造纳入归一化 try（含 TypeError），保证调用方只见到 ValueError。
+    def _base_text(b: str | Path) -> str:
+        return b.strip() if isinstance(b, str) else str(b).strip()
+    if not isinstance(base, (str, Path)) or _base_text(base) in ("", "."):
         raise ValueError(f"invalid base path: {base!r}")
     if isinstance(base, str) and "\x00" in base:
         raise ValueError(f"invalid base path: {base!r}")
@@ -82,11 +85,13 @@ def safe_join(base: str | Path, ticker: str, *, max_len: int = 32) -> Path:
         raise ValueError(f"invalid base or ticker path: {e}") from e
     # 中文：已存在的 file base 仍可通过 is_relative_to 前缀语义（/tmp/f 为 /tmp/f/AAPL 前缀），
     # 必须要求存在路径为目录，否则调用方的“锚定目录”假设被打破。
+    # 校验 raise 置于 try 之外，避免自捕获重包误报根因；try 内仅包文件系统调用。
     try:
-        if base_resolved.exists() and not base_resolved.is_dir():
-            raise ValueError(f"base must be a directory, got {base_resolved}")
-    except (OSError, ValueError, RuntimeError) as e:
+        is_file_base = base_resolved.exists() and not base_resolved.is_dir()
+    except (OSError, RuntimeError) as e:
         raise ValueError(f"invalid base path: {e}") from e
+    if is_file_base:
+        raise ValueError(f"base must be a directory, got {base_resolved}")
     # is_relative_to 在 Python 3.9+ 可用；兼容处理
     try:
         if not target.is_relative_to(base_resolved):  # type: ignore[attr-defined]
