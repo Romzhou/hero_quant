@@ -523,3 +523,94 @@ def test_d1_news_generic_date_not_trade_date():
 
     assert _extract_trade_date({"date": "2024-01-05"}) is None
     assert _extract_trade_date({"trade_date": "2024-01-05"}) == "2024-01-05"
+
+
+# ---------------- loaders/yahoo.py (4 items: 1 high + 3 medium) ----------------
+
+def _yahoo_loader(monkeypatch, mode):
+    monkeypatch.setenv("HERO_DATA_MODE", mode)
+    import importlib
+    import hero_quant.config.settings as s
+    importlib.reload(s)
+    from hero_quant.data.loaders.yahoo import YahooLoader
+    return YahooLoader()
+
+
+def test_d1_yahoo_synthetic_empty_range_rejected(monkeypatch):
+    """Medium: synthetic start>=end must raise DataValidationError, not return []."""
+    from hero_quant.data.loaders.yahoo import DataValidationError
+
+    loader = _yahoo_loader(monkeypatch, "synthetic")
+    with pytest.raises(DataValidationError):
+        loader.get_bars("AAPL.US", "2025-01-05", "2025-01-01")
+    with pytest.raises(DataValidationError):
+        loader.get_bars("AAPL.US", "2025-01-05", "2025-01-05")
+
+
+def test_d1_yahoo_no_data_error_type(monkeypatch):
+    """Medium: empty yfinance result must raise DataValidationError (a ValueError)."""
+    import sys
+    import types
+
+    import pandas as pd
+    from hero_quant.data.loaders.yahoo import DataValidationError
+
+    fake_yf = types.ModuleType("yfinance")
+    fake_yf.download = lambda *a, **k: pd.DataFrame()
+    fake_yf.Ticker = lambda *a, **k: types.SimpleNamespace(
+        history=lambda *a, **k: pd.DataFrame()
+    )
+    monkeypatch.setitem(sys.modules, "yfinance", fake_yf)
+    loader = _yahoo_loader(monkeypatch, "live")
+    with pytest.raises(DataValidationError):
+        loader.get_bars("AAPL.US", "2025-01-01", "2025-01-05")
+
+
+def test_d1_yahoo_interval_normalized(monkeypatch):
+    """Medium: 1D->1d / 1W->1wk normalized before forwarding to yfinance."""
+    import sys
+    import types
+
+    import pandas as pd
+    from hero_quant.data.loaders.yahoo import DataValidationError
+
+    seen = {}
+    idx = pd.to_datetime(["2025-01-02"])
+    df = pd.DataFrame({"Open": [10.0], "High": [12.0], "Low": [9.0], "Close": [11.0], "Volume": [100.0]}, index=idx)
+    fake_yf = types.ModuleType("yfinance")
+    fake_yf.download = lambda *a, **k: (_ for _ in ()).throw(AssertionError("unused"))
+    def _ticker(sym):
+        class _T:
+            def history(self, *a, **k):
+                seen["interval"] = k.get("interval")
+                return df
+        return _T()
+    fake_yf.Ticker = _ticker
+    # download returns empty so history path runs
+    fake_yf.download = lambda *a, **k: pd.DataFrame()
+    monkeypatch.setitem(sys.modules, "yfinance", fake_yf)
+    loader = _yahoo_loader(monkeypatch, "live")
+    loader.get_bars("AAPL.US", "2025-01-01", "2025-01-05", "1W")
+    assert seen["interval"] == "1wk"
+    loader.get_bars("AAPL.US", "2025-01-01", "2025-01-05", "1D")
+    assert seen["interval"] == "1d"
+    with pytest.raises(DataValidationError):
+        loader.get_bars("AAPL.US", "2025-01-01", "2025-01-05", "2x")
+
+
+def test_d1_yahoo_inf_rejected(monkeypatch):
+    """High: inf OHLCV must be rejected via math.isfinite, not pass guards."""
+    import sys
+    import types
+
+    import pandas as pd
+    from hero_quant.data.loaders.yahoo import DataValidationError
+
+    idx = pd.to_datetime(["2025-01-02"])
+    df = pd.DataFrame({"Open": [float("inf")], "High": [12.0], "Low": [9.0], "Close": [11.0], "Volume": [100.0]}, index=idx)
+    fake_yf = types.ModuleType("yfinance")
+    fake_yf.download = lambda *a, **k: df
+    monkeypatch.setitem(sys.modules, "yfinance", fake_yf)
+    loader = _yahoo_loader(monkeypatch, "live")
+    with pytest.raises(DataValidationError):
+        loader.get_bars("AAPL.US", "2025-01-01", "2025-01-05")
