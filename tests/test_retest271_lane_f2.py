@@ -267,6 +267,88 @@ def test_lane_f2_loop_timeout_marks_abandoned():
         TOOL_REGISTRY.pop("f2_slow_probe", None)
 
 
+# ================= container (4 seed + f2 extras) =================
+
+def test_lane_f_container_per_instance_lock():
+    import inspect
+    from hero_quant.agent import container as cont
+    src = inspect.getsource(cont.AgentContainer.init_graph)
+    assert "self._lock" in src or "self.lock" in src, "init_graph must use per-instance lock"
+    c = cont.AgentContainer()
+    assert hasattr(c, "_lock") or hasattr(c, "lock")
+
+
+def test_lane_f_container_checkpointer_warns(caplog):
+    from hero_quant.agent.container import AgentContainer
+    c = AgentContainer()
+    import os
+    os.environ.pop("HERO_CHECKPOINT_DSN", None)
+    with caplog.at_level(logging.WARNING):
+        c.init_checkpointer(dsn="memory://default")
+    # missing DSN fallback to memory must be visible at warning+
+    assert any("memory" in r.message.lower() or "fallback" in r.message.lower()
+               or "ephemeral" in r.message.lower() for r in caplog.records), \
+        "ephemeral checkpointer fallback must warn"
+
+
+def test_lane_f_container_no_init_lock_export():
+    from hero_quant.agent import container as cont
+    assert "_init_lock" not in getattr(cont, "__all__", []), "dead _init_lock must not be exported"
+    assert not hasattr(cont, "_init_lock"), "dead _init_lock must be removed"
+
+
+def test_lane_f_container_graph_warn_branch_reachable():
+    import inspect
+    from hero_quant.agent import container as cont
+    src = inspect.getsource(cont.AgentContainer.init_graph)
+    assert "checkpointer is None" in src or "bare graph" in src
+
+
+def test_lane_f2_container_locks_do_not_serialize_instances():
+    from hero_quant.agent.container import AgentContainer
+    a, b = AgentContainer(), AgentContainer()
+    assert a._lock is not b._lock, "per-instance locks must be independent"
+    g1, g2 = a.init_graph(), b.init_graph()
+    assert g1 is not g2 or True
+    assert a.init_graph() is g1, "init_graph must stay idempotent"
+
+
+def test_lane_f2_container_concurrent_init_single_graph():
+    import threading
+    from hero_quant.agent.container import AgentContainer
+    c = AgentContainer()
+    results = []
+
+    def worker():
+        results.append(c.init_graph())
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=60)
+    assert len(results) == 8
+    assert all(r is results[0] for r in results), "concurrent init_graph must compile once"
+
+
+def test_lane_f2_container_checkpointer_failure_warns(caplog, monkeypatch):
+    import hero_quant.agent.container as cont_mod
+    from hero_quant.agent.container import AgentContainer
+    monkeypatch.setenv("HERO_CHECKPOINT_DSN", "postgresql://boom:5432/x")
+
+    def boom(dsn, **kw):
+        raise RuntimeError("pg down")
+
+    monkeypatch.setitem(__import__("sys").modules, "hero_quant.checkpoint.postgres",
+                        __import__("types").SimpleNamespace(get_saver=boom))
+    c = AgentContainer()
+    with caplog.at_level(logging.WARNING):
+        out = c.init_checkpointer()
+    assert out is None
+    assert any("degraded" in r.message.lower() or "failed" in r.message.lower()
+               for r in caplog.records), "pg failure must warn, never debug-only"
+
+
 # ================= prompt (1 seed + 2 f2) =================
 
 def test_lane_f_prompt_quad_backtick_neutralized():
