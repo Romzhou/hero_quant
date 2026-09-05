@@ -66,21 +66,34 @@ _SHARING_MAP = {
 def _cached_getaddrinfo(host: str) -> list:
     """带 TTL/超时的 DNS 解析缓存。
 
-    中文：命中 TTL 直接返回（不阻塞）；未命中则带超时解析，失败抛 gaierror 由调用方 fail-closed。
+    中文：命中 TTL 直接返回（不阻塞）；未命中则在工作线程中解析并以
+    timeout 上限等待，失败抛 gaierror 由调用方 fail-closed。
+    绝不触碰 socket.setdefaulttimeout（进程级全局，多线程竞态且对
+    getaddrinfo 无效）。
     """
+    import concurrent.futures as _fut
+
     now = time.monotonic()
     resolver = _socket.getaddrinfo
     with _DNS_CACHE_LOCK:
         hit = _DNS_CACHE.get(host.lower())
         if hit is not None and now - hit[0] < _DNS_CACHE_TTL_SECONDS and hit[1] is resolver:
             return hit[2]
-    _socket.setdefaulttimeout(_DNS_TIMEOUT_SECONDS)
+    # 中文：工作线程 + result(timeout) 界定 DNS 等待；超时按 gaierror 处理（fail-closed）。
+    # 不用 with（退出时 shutdown(wait=True) 会等卡死的 worker，超时失效）；手动
+    # shutdown(wait=False, cancel_futures=True) 让超时真正生效。
+    _ex = _fut.ThreadPoolExecutor(max_workers=1)
     try:
-        infos = resolver(host, None, family=_socket.AF_UNSPEC, type=_socket.SOCK_STREAM)
+        try:
+            infos = _ex.submit(resolver, host, None, _socket.AF_UNSPEC, _socket.SOCK_STREAM).result(
+                timeout=_DNS_TIMEOUT_SECONDS
+            )
+        except _fut.TimeoutError as e:
+            raise _socket.gaierror(f"DNS resolution timed out after {_DNS_TIMEOUT_SECONDS}s: {host}") from e
     finally:
         try:
-            _socket.setdefaulttimeout(None)
-        except (OSError, ValueError):
+            _ex.shutdown(wait=False, cancel_futures=True)
+        except (OSError, ValueError, RuntimeError):
             pass
     with _DNS_CACHE_LOCK:
         _DNS_CACHE[host.lower()] = (now, resolver, infos)
@@ -326,9 +339,20 @@ class SessionTelemetryCoordinator:
                 provider = LoggerProvider()  # type: ignore
                 provider.add_log_record_processor(processor)  # type: ignore
                 with _OTEL_PROVIDER_LOCK:
-                    _OTEL_CACHED_PROVIDER = provider
-                    _OTEL_CACHED_PROCESSOR = processor
-                    _OTEL_CACHED_ENDPOINT = endpoint
+                    # 中文：发布前二次校验（double-checked publish）：并发 export 已发布
+                    # 同 endpoint 时，关闭本线程刚建的 loser 管线（防泄漏），复用赢家。
+                    if _OTEL_CACHED_PROVIDER is not None and _OTEL_CACHED_ENDPOINT == endpoint:
+                        for _loser in (provider, processor):
+                            try:
+                                if hasattr(_loser, "shutdown"):
+                                    _loser.shutdown()  # type: ignore
+                            except (ValueError, TypeError, AttributeError, OSError, RuntimeError):
+                                pass
+                        provider = _OTEL_CACHED_PROVIDER
+                    else:
+                        _OTEL_CACHED_PROVIDER = provider
+                        _OTEL_CACHED_PROCESSOR = processor
+                        _OTEL_CACHED_ENDPOINT = endpoint
 
             otel_logger = None
             try:

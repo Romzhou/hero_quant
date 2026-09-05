@@ -32,6 +32,13 @@ _ticket_lock = threading.Lock()
 # Redis key prefix for tickets
 _REDIS_TICKET_PREFIX = "hero:ticket:"
 
+try:  # 中文：复用 infra/redis.py 模式，补齐 redis.exceptions.RedisError（ConnectionError/TimeoutError 基类）。
+    from redis.exceptions import RedisError as _RedisError
+
+    _REDIS_ERRORS = (_RedisError, OSError, ValueError, TypeError, AttributeError, RuntimeError)
+except ImportError:  # 中文：未安装 redis-py 时退化为标准异常元组。
+    _REDIS_ERRORS = (OSError, ValueError, TypeError, AttributeError, RuntimeError)
+
 
 def _get_redis_for_ticket():
     """Obtain sync Redis client for ticket operations; None if unavailable.
@@ -42,7 +49,8 @@ def _get_redis_for_ticket():
         from hero_quant.infra.redis import get_redis_sync
 
         return get_redis_sync()
-    except (ImportError, AttributeError, ValueError, TypeError, OSError, RuntimeError) as e:
+    except (ImportError, *_REDIS_ERRORS) as e:
+        # 中文：ImportError（redis-py/ infra 缺失）同样回退内存，保持原有契约
         logger.debug("security.redis_unavailable error=%s", str(e))
         return None
 
@@ -106,9 +114,11 @@ def issue_ticket(ttl: float = SSE_TICKET_TTL_SECONDS) -> str:
             # Extremely unlikely collision — retry once with new ticket
             ticket2 = secrets.token_urlsafe(32)
             key2 = f"{_REDIS_TICKET_PREFIX}{ticket2}"
-            r.set(key2, "1", nx=True, ex=ttl_int)
-            return ticket2
-        except (AttributeError, TypeError, ValueError, OSError, RuntimeError) as e:
+            ok2 = r.set(key2, "1", nx=True, ex=ttl_int)
+            if ok2:
+                return ticket2
+            return _issue_ticket_memory(ttl_int)
+        except _REDIS_ERRORS as e:
             logger.warning("security.redis_issue_fallback_memory error=%s", str(e))
     # Fallback to memory
     return _issue_ticket_memory(ttl_int)
@@ -132,7 +142,7 @@ def consume_ticket(ticket: str | None) -> bool:
                 val = r.getdel(key)
                 if val is not None:
                     return True
-            except (AttributeError, TypeError, ValueError, OSError, RuntimeError):
+            except _REDIS_ERRORS:
                 # 中文：无 getdel 的旧客户端走 Lua 原子比较删除。
                 try:
                     result = r.eval(
@@ -142,11 +152,11 @@ def consume_ticket(ticket: str | None) -> bool:
                     )
                     if bool(result):
                         return True
-                except (AttributeError, TypeError, ValueError, OSError, RuntimeError):
+                except _REDIS_ERRORS:
                     pass
             # 中文：Redis 未命中回查内存（签发时 Redis 不可用→内存，恢复后仍可消费）。
             return _consume_ticket_memory(ticket)
-        except (AttributeError, TypeError, ValueError, OSError, RuntimeError) as e:
+        except _REDIS_ERRORS as e:
             logger.warning("security.redis_consume_fallback_memory error=%s", str(e))
     return _consume_ticket_memory(ticket)
 
@@ -239,13 +249,16 @@ def verify_hmac(payload: bytes | Any, signature: str | None = None, secret: str 
         if not secret_env:
             logger.warning("security.hmac_secret_missing")
             return False
-        # body 取显参（signature 位置传入 bytes）或尝试从 request 读取
+        # body 取显参（signature 位置传入 bytes/str，含空串）或尝试从 request 读取
         body = b""
+        body_is_explicit = False
         if isinstance(signature, (bytes, bytearray)):
             body = bytes(signature)
-        elif isinstance(signature, str) and signature:
-            # 显式字符串 body 兼容
+            body_is_explicit = True
+        elif isinstance(signature, str):
+            # 显式字符串 body 兼容（含空串：显式空 body，不得回退 _body 缓存）
             body = signature.encode()
+            body_is_explicit = True
         else:
             # 尝试从 request 对象读取 body
             try:
@@ -273,8 +286,8 @@ def verify_hmac(payload: bytes | Any, signature: str | None = None, secret: str 
                     except (OSError, ValueError, TypeError, AttributeError) as e:
                         logger.warning("security.hmac_body_call_failed error=%s", str(e))
                         body = b""
-                # Starlette 缓存属性 _body
-                if body == b"":
+                # Starlette 缓存属性 _body — 仅 body 非显式提供时使用，避免显式空 body 被覆盖
+                if not body_is_explicit and body == b"":
                     for attr in ("_body", "_content"):
                         alt = getattr(request, attr, None)
                         if isinstance(alt, (bytes, bytearray)):
@@ -301,7 +314,7 @@ def verify_hmac(payload: bytes | Any, signature: str | None = None, secret: str 
             payload = payload.encode()
         else:
             return False
-    if signature is None or secret is None:
+    if not signature or not secret:
         return False
     try:
         expected = hmac.new(secret.encode(), payload, hashlib.sha256).hexdigest()
