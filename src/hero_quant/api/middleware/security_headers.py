@@ -30,7 +30,14 @@ class SecurityHeadersMiddleware:
 
     def __init__(self, app, extra_headers: dict | None = None):
         self.app = app
-        self.extra_headers = {**DEFAULT_SECURITY_HEADERS, **(extra_headers or {})}
+        # 大小写归一合并：HTTP 头名大小写不敏感，未归一会导致重复冲突头。
+        merged: dict[str, str] = {}
+        for k, v in list(DEFAULT_SECURITY_HEADERS.items()) + list((extra_headers or {}).items()):
+            try:
+                merged[k.lower()] = (k, v)
+            except Exception:
+                continue
+        self.extra_headers = {orig_k: v for _, (orig_k, v) in merged.items()}
 
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":
@@ -48,6 +55,8 @@ class SecurityHeadersMiddleware:
                             if k.lower() not in headers:
                                 headers.append(k, v)
                         except Exception:
+                            # 单个头注入失败仅跳过该头（已在响应 start 上，能加的已加），
+                            # 不吞整体：继续外层 send，保证响应仍可发出。
                             continue
                 except Exception:
                     pass
