@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import socket
+import time
 import uuid
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
@@ -210,16 +211,37 @@ manager = WSManager()
 class HeartbeatMonitor:
     TIMEOUT = timedelta(seconds=60)
     CHECK_INTERVAL = 10
+    # Server-driven keepalive budget: at most this many CONSECUTIVE server
+    # pongs (zero client traffic) may renew liveness. Real client traffic
+    # resets the budget via record(). Bounds ghost-connection lifetime so
+    # dead peers eventually expire instead of being renewed forever.
+    MAX_SERVER_KEEPALIVES = 3
 
     def __init__(self):
         self._last_active: dict[str, datetime] = {}
+        self._server_keepalives: dict[str, int] = {}
         self._task: asyncio.Task | None = None
 
     def record(self, channel: str) -> None:
         self._last_active[channel] = datetime.now(timezone.utc)
+        # Genuine client traffic resets the server-pong budget.
+        self._server_keepalives[channel] = 0
+
+    def record_keepalive(self, channel: str) -> bool:
+        """Bounded server-keepalive renewal: renew liveness only while the
+        consecutive server-pong budget lasts; return False once exhausted
+        (caller must then skip heartbeat/presence renewal so the channel
+        becomes evictable)."""
+        n = self._server_keepalives.get(channel, 0) + 1
+        if n > self.MAX_SERVER_KEEPALIVES:
+            return False
+        self.record(channel)  # refresh _last_active; also resets budget to 0
+        self._server_keepalives[channel] = n  # re-apply consecutive count
+        return True
 
     def remove(self, channel: str) -> None:
         self._last_active.pop(channel, None)
+        self._server_keepalives.pop(channel, None)
         # 同步清理 presence 续约节流表，否则 _presence_touched 随 channel 增长无界膨胀
         _presence_touched.pop(channel, None)
 
@@ -234,14 +256,27 @@ class HeartbeatMonitor:
             now = datetime.now(timezone.utc)
             expired = [ch for ch, last in self._last_active.items() if now - last > self.TIMEOUT]
             for ch in expired:
-                conns = list(manager._connections.get(ch, ()))
+                # Pop under WSManager._lock (connect/disconnect mutate the same
+                # dict under it); pop BEFORE close so a reconnect added during
+                # close() is not evicted by a stale snapshot. Re-validate
+                # staleness under the lock: a record() that landed after the
+                # snapshot must not be evicted.
+                async with manager._lock:
+                    last = self._last_active.get(ch)
+                    if last is None or now - last <= self.TIMEOUT:
+                        continue
+                    conns = list(manager._connections.pop(ch, set()))
                 for ws in conns:
                     try:
                         await ws.close(code=4002, reason="heartbeat timeout")
                     except Exception:
                         pass
-                manager._connections.pop(ch, None)
-                self.remove(ch)
+                # Do NOT delete a fresh record() from a reconnect that happened
+                # during the awaited close() above — otherwise the new
+                # connection is left unmonitored (never times out).
+                last = self._last_active.get(ch)
+                if last is None or datetime.now(timezone.utc) - last > self.TIMEOUT:
+                    self.remove(ch)
 
 
 heartbeat = HeartbeatMonitor()
@@ -281,13 +316,15 @@ async def ws_trace(
             try:
                 raw = await asyncio.wait_for(websocket.receive_json(), timeout=30)
             except asyncio.TimeoutError:
-                # 空闲发送 pong 即视为存活：续 heartbeat 并续约 presence，避免误杀
+                # Server keepalive only: send pong but renew liveness ONLY
+                # within the bounded keepalive budget (record_keepalive).
+                # Unbounded renewal would keep dead peers alive forever.
                 try:
                     await websocket.send_json({"type": "pong"})
-                    heartbeat.record(channel)
-                    await refresh_presence(channel)
                 except Exception:
                     break
+                if heartbeat.record_keepalive(channel):
+                    await refresh_presence(channel)
                 continue
             heartbeat.record(channel)
             await refresh_presence(channel)
@@ -330,12 +367,13 @@ async def ws_query(
             try:
                 raw = await asyncio.wait_for(websocket.receive_json(), timeout=60)
             except asyncio.TimeoutError:
+                # Server keepalive only: bounded renewal (same policy as trace).
                 try:
                     await websocket.send_json({"type": "pong"})
-                    heartbeat.record(channel)
-                    await refresh_presence(channel)
                 except Exception:
                     break
+                if heartbeat.record_keepalive(channel):
+                    await refresh_presence(channel)
                 continue
             heartbeat.record(channel)
             await refresh_presence(channel)
@@ -360,27 +398,55 @@ async def ws_query(
 
 
 # Helper for TraceWriter to broadcast events without blocking
+def _trace_consumer_group() -> str:
+    """Per-worker consumer group: every worker receives every Stream entry
+    (true broadcast). A single shared group would deliver each entry to
+    exactly one worker, so most workers would miss the event."""
+    return f"{TRACE_GROUP}:{INSTANCE_ID}"
+
+
 async def broadcast_trace_event(event: dict[str, Any], user: str | None = None) -> None:
-    """Best-effort broadcast: publish to Redis Stream, then deliver locally.
+    """Best-effort broadcast: publish to Redis Stream (tagged with origin),
+    then deliver locally.
 
     R3: user 非空 → 定向投递该用户频道（Redis payload channel=ws:channel:{user}，
     本地 send_to 同频道，跨 user 隔离）；user 为空 → 旧语义全量广播 + channel=trace。
+    Local delivery is kept for single-process/low-latency + Monitor compat;
+    the origin tag lets each worker's consumer suppress its own echo (no
+    duplicate), while per-worker groups ensure every worker still sees
+    entries from OTHER workers (no miss).
     """
     channel = resolve_user_channel(user, None, kind="trace")
     try:
         await RedisStream().publish(
             TRACE_STREAM,
-            {"channel": channel, "data": json.dumps(event, ensure_ascii=False, default=str)},
+            {
+                "channel": channel,
+                "origin": INSTANCE_ID,
+                "data": json.dumps(event, ensure_ascii=False, default=str),
+            },
         )
     except Exception as e:
         logger.debug("ws.stream_publish_failed error=%s", str(e))
+        # Fall back to local delivery only when publish failed / no Redis.
     try:
         if channel == TRACE_CHANNEL:
             await manager.broadcast(event)
         else:
             await manager.send_to(channel, event)
-    except Exception as e:
-        logger.debug("ws.broadcast_failed error=%s", str(e))
+    except Exception as e2:
+        logger.debug("ws.broadcast_failed error=%s", str(e2))
+
+
+def _stream_entry_is_stale(msg_id: str, started_ms: int) -> bool:
+    """True when a Stream entry predates this consumer (restart replay).
+
+    IDs are {ms}-{seq}; unparseable IDs are treated as fresh (deliver).
+    """
+    try:
+        return int(str(msg_id).split("-")[0]) < started_ms
+    except (ValueError, TypeError, AttributeError, IndexError):
+        return False
 
 
 async def run_trace_consumer(stop_event: asyncio.Event | None = None) -> None:
@@ -391,21 +457,44 @@ async def run_trace_consumer(stop_event: asyncio.Event | None = None) -> None:
     """
     stream = RedisStream()
     consumer = f"{INSTANCE_ID}"
+    group = _trace_consumer_group()
+    # Per-worker groups are new on every restart while the Stream persists:
+    # skip entries predating this consumer so a restart does not replay
+    # history (duplicate storm). Stream IDs are {ms}-{seq}.
+    started_ms = int(time.time() * 1000)
     while True:
         if stop_event is not None and stop_event.is_set():
             return
         try:
             entries = await stream.subscribe_consumer(
-                TRACE_STREAM, TRACE_GROUP, consumer, count=20, block=1000
+                TRACE_STREAM, group, consumer, count=20, block=1000
             )
         except Exception as e:
             logger.debug("ws.consumer_read_failed error=%s", str(e))
             await asyncio.sleep(1.0)
             continue
         if not entries:
+            # fakeredis / non-blocking backends return instantly when empty;
+            # yield so the loop never hot-spins and stop_event stays honored.
+            await asyncio.sleep(0.1)
             continue
         for msg_id, fields in entries:
             try:
+                if _stream_entry_is_stale(msg_id, started_ms):
+                    # Pre-restart history for this fresh group: ack and drop.
+                    try:
+                        await stream.ack(TRACE_STREAM, group, msg_id)
+                    except Exception:
+                        pass
+                    continue
+                if str(fields.get("origin") or "") == INSTANCE_ID:
+                    # Own publish was already delivered locally by
+                    # broadcast_trace_event; suppress the echo (no duplicate).
+                    try:
+                        await stream.ack(TRACE_STREAM, group, msg_id)
+                    except Exception:
+                        pass
+                    continue
                 chan = str(fields.get("channel", TRACE_CHANNEL) or TRACE_CHANNEL)
                 raw = fields.get("data", "{}")
                 payload = json.loads(raw) if isinstance(raw, str) else {}
@@ -415,16 +504,22 @@ async def run_trace_consumer(stop_event: asyncio.Event | None = None) -> None:
                     else:
                         await manager.send_to(chan, payload)
             except Exception as e:
+                # Forward/parse failure: do NOT ack — the entry stays pending
+                # for redelivery instead of being silently dropped.
                 logger.debug("ws.consumer_forward_failed error=%s", str(e))
-            finally:
-                try:
-                    await stream.ack(TRACE_STREAM, TRACE_GROUP, msg_id)
-                except Exception:
-                    pass
+                continue
+            try:
+                await stream.ack(TRACE_STREAM, group, msg_id)
+            except Exception:
+                pass
 
 
-def broadcast_trace_event_sync(event: dict[str, Any]) -> None:
-    """Sync wrapper for non-async call sites (e.g. TraceWriter.append)."""
+def broadcast_trace_event_sync(event: dict[str, Any], user: str | None = None) -> None:
+    """Sync wrapper for non-async call sites (e.g. TraceWriter.append).
+
+    user 非空 → 仅投递该用户频道；为空则保持旧全量广播语义。user 路由必须
+    显式透传，禁止默认 user=None 把用户级事件广播给所有连接用户。
+    """
     try:
         try:
             loop = asyncio.get_running_loop()
@@ -432,7 +527,12 @@ def broadcast_trace_event_sync(event: dict[str, Any]) -> None:
             # 无运行中 loop 时不再静默吞事件：打日志便于排查调用方上下文问题
             logger.debug("ws.broadcast_sync_no_loop dropping event type=%s", type(event).__name__)
             return
-        task = loop.create_task(broadcast_trace_event(event))
+        # Keep the single-arg call shape when no routing is needed (call-site
+        # monkeypatch compat); pass user through only when set.
+        if user is None:
+            task = loop.create_task(broadcast_trace_event(event))
+        else:
+            task = loop.create_task(broadcast_trace_event(event, user=user))
     except Exception as e:
         logger.debug("ws.broadcast_sync_schedule_failed error=%s", str(e))
         return

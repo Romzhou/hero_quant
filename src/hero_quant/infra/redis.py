@@ -30,7 +30,11 @@ _REDIS_PREFIX_CACHE = "hero:cache:"
 _redis_sync_instance: Any | None = None
 _redis_async_instance: Any | None = None
 _redis_thread_lock = _threading.Lock()
-_redis_async_lock: asyncio.Lock | None = None
+_redis_async_lock: asyncio.Lock | None = None  # legacy 兼容保留；get_redis 已改用 per-loop 锁
+# 中文：per-loop 异步守卫（loop 对象 → asyncio.Lock；loop 关闭即清理，避免全局锁跨 loop 复用 RuntimeError）。
+_redis_async_locks: dict[Any, asyncio.Lock] = {}
+# 中文：sync 限流回退序列的进程内串行锁（只保护同步多步序列，不横跨 await；跨进程精确限流仍需 Lua）。
+_RATELIMIT_SYNC_LOCK = _threading.Lock()
 
 try:  # 中文：窄化捕获 eval/命令错误类型（fakeredis 不支持 eval 时走兼容路径）。
     from redis.exceptions import RedisError as _RedisError
@@ -44,11 +48,62 @@ except ImportError:  # 中文：未安装 redis-py 时退化为标准异常元�
 
 
 def _get_async_lock() -> asyncio.Lock:
-    """返回异步路径锁（懒创建 asyncio.Lock；threading.Lock 绝不横跨 await）。"""
-    global _redis_async_lock
-    if _redis_async_lock is None:
-        _redis_async_lock = asyncio.Lock()
-    return _redis_async_lock
+    """返回当前 loop 的异步路径锁（per-loop；threading.Lock 只在创建瞬间保护，不横跨 await）。
+
+    全局单例 asyncio.Lock 会绑定到首次创建的 loop，loop 关闭后复用抛 RuntimeError；
+    此处按 loop 分发表，loop 切换即重建。
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        global _redis_async_lock
+        if _redis_async_lock is None:
+            _redis_async_lock = asyncio.Lock()
+        return _redis_async_lock
+    with _redis_thread_lock:
+        lock = _redis_async_locks.get(loop)
+        if lock is None:
+            lock = asyncio.Lock()
+            _redis_async_locks[loop] = lock
+        return lock
+
+
+def _get_client_kind(inst: Any) -> str:
+    """判定客户端类型：'async' / 'sync' / 'unknown'（构造时类型探测，避免运行时误判）。"""
+    try:
+        import redis.asyncio as _aioredis  # type: ignore
+
+        if isinstance(inst, _aioredis.Redis):
+            return "async"
+    except ImportError:
+        pass
+    try:
+        import redis as _sync_redis  # type: ignore
+
+        if isinstance(inst, _sync_redis.Redis):
+            return "sync"
+    except ImportError:
+        pass
+    try:
+        import fakeredis.aioredis as _fake_async  # type: ignore
+
+        if isinstance(inst, _fake_async.FakeRedis):
+            return "async"
+    except ImportError:
+        pass
+    try:
+        import fakeredis as _fake_sync  # type: ignore
+
+        if isinstance(inst, _fake_sync.FakeRedis):
+            return "sync"
+    except ImportError:
+        pass
+    get = getattr(inst, "get", None)
+    if asyncio.iscoroutinefunction(get):
+        return "async"
+    if callable(get):
+        return "sync"
+    return "unknown"
 
 
 async def _await_if_needed(value: Any) -> Any:
@@ -201,7 +256,8 @@ async def get_redis():
 
     优先 HERO_REDIS_DSN，失败或未配置时回退 fakeredis（保证 tests 不依赖真实 Redis）。
     调用方若需强依赖可自行判断 get_redis() 是否为 fakeredis。
-    中文：async 路径用 asyncio 锁（同步锁绝不横跨 await，避免阻塞事件循环线程）。
+    中文：async 路径用 per-loop asyncio 锁（同步锁绝不横跨 await，避免阻塞事件循环线程；
+    全局单例 asyncio.Lock 会绑定首个 loop，loop 关闭后复用抛 RuntimeError，故按 loop 分发）。
     """
     global _redis_async_instance
     if _redis_async_instance is not None:
@@ -240,18 +296,57 @@ async def get_redis():
         return None
 
 
-def set_redis_instance(inst: Any) -> None:
-    """Test hook: inject a Redis instance (e.g. fakeredis). Sync/async 双槽同注，避免类型污染测试。"""
+def set_redis_instance(inst: Any, *, for_sync: bool = False, for_async: bool = False) -> None:
+    """Test hook: inject a Redis instance (e.g. fakeredis).
+
+    双槽分离存储，避免 sync/async 类型污染：无 flag 的裸调用按客户端类型路由
+    （sync→sync 槽，async→async 槽；类型未知的小替身保留旧语义双槽同注以兼容）；
+    显式 flag 则只注入声明的槽，且类型冲突时拒绝（sync 槽拒收 async 客户端，反之亦然）。
+    同步注入亦可用 set_redis_sync_instance。
+    """
     global _redis_async_instance, _redis_sync_instance
-    _redis_async_instance = inst
+    kind = _get_client_kind(inst)
+    if not for_sync and not for_async:
+        if kind == "sync":
+            _redis_sync_instance = inst
+            return
+        if kind == "async":
+            _redis_async_instance = inst
+            return
+        # 中文：类型未知（无 get/EVAL 的小替身）→ 保留旧双槽同注，调用方可走任一 getter。
+        _redis_async_instance = inst
+        _redis_sync_instance = inst
+        return
+    if for_async:
+        if kind == "sync":
+            logger.warning("redis.inject_async_slot_rejected_sync_client")
+        else:
+            _redis_async_instance = inst
+    if for_sync:
+        if kind == "async":
+            logger.warning("redis.inject_sync_slot_rejected_async_client")
+        else:
+            _redis_sync_instance = inst
+
+
+def set_redis_sync_instance(inst: Any) -> None:
+    """Test hook: inject the sync-slot client only（拒绝 async 客户端，避免 sync 路径拿到协程）。"""
+    global _redis_sync_instance
+    kind = _get_client_kind(inst)
+    if kind == "async":
+        logger.warning("redis.inject_sync_slot_rejected_async_client")
+        return
     _redis_sync_instance = inst
 
 
 def clear_redis_instance() -> None:
-    global _redis_async_instance, _redis_sync_instance
+    global _redis_async_instance, _redis_sync_instance, _redis_async_lock
     with _redis_thread_lock:
         _redis_async_instance = None
         _redis_sync_instance = None
+        # 中文：同时清理 per-loop 锁表与 legacy 单例，避免关闭的 loop 绑定的锁被复用。
+        _redis_async_locks.clear()
+        _redis_async_lock = None
 
 
 # ── Cache decorator (ported from python-redis-module-skill) ──
@@ -538,13 +633,19 @@ class RedisLock:
         try:
             yield True
         finally:
-            # 中文：token 比对后删（Lua）；eval 不可用时读比对后删（仍带 token 校验）。
+            # 中文：token 比对后删（Lua 首选）；eval 不可用时做“读后删”但必须再比 token
+            # （GET-then-DEL 是 check-then-act：锁过期瞬间旧持有者会误删新持有者锁，
+            # 故仅在“比对且值仍为己方 token”时才删；续用旧实现的 get 脚本即此语义）。
+            # fakeredis 不支持 eval（ResponseError）时 eval 路径抛错→回退到此分支；
+            # 真 Redis 上 Lua 可用，互斥由 Lua 保证。
             try:
                 done = await _eval_or_fallback(redis_client, _LOCK_RELEASE_LUA, 1, lock_key, token)
                 if done is None:
                     cur = await _await_if_needed(redis_client.get(lock_key))
                     if cur == token:
                         await _await_if_needed(redis_client.delete(lock_key))
+                    elif cur is not None:
+                        logger.warning("redis.lock_release_token_mismatch_skip key=%s", lock_key)
             except _REDIS_ERRORS:
                 pass
 
@@ -573,16 +674,25 @@ class RateLimiter:
             res = await _eval_or_fallback(redis_client, _RATELIMIT_LUA, 1, *self._lua_args(window_key, max_requests, window_seconds))
             if res is not None:
                 return bool(int(res))
-            # 中文：eval 不可用（fakeredis）时退化为“单锁收拢”本地判定：仍用唯一成员计数。
+            # 中文：eval 不可用（fakeredis）时退化为串行“单锁收拢”本地判定：仍用唯一成员计数；
+            # 三轮询无锁会并发超发，故用 RedisLock（其 Lua 路径可用时原子，无 Lua 时退化为
+            # 单实例内串行；跨进程精确限流仍要求 Lua-capable Redis）。
             now = time.time()
             member = f"{now}:{uuid.uuid4().hex}"
-            await _await_if_needed(redis_client.zremrangebyscore(window_key, 0, now - window_seconds))
-            current = await _await_if_needed(redis_client.zcard(window_key))
-            if int(current) >= max_requests:
+            lock = RedisLock(key_prefix=f"{self.key_prefix}lock:")
+            try:
+                async with lock.lock(f"{key}", timeout=5, retry=10, delay=0.05):
+                    await _await_if_needed(redis_client.zremrangebyscore(window_key, 0, now - window_seconds))
+                    current = await _await_if_needed(redis_client.zcard(window_key))
+                    if int(current) >= max_requests:
+                        return False
+                    await _await_if_needed(redis_client.zadd(window_key, {member: now}))
+                    await _await_if_needed(redis_client.expire(window_key, window_seconds))
+                    return True
+            except TimeoutError:
+                # 拿不到收拢锁：fail-closed 拒绝，避免无保护超发。
+                logger.warning("redis.ratelimit_fallback_lock_timeout")
                 return False
-            await _await_if_needed(redis_client.zadd(window_key, {member: now}))
-            await _await_if_needed(redis_client.expire(window_key, window_seconds))
-            return True
         except _REDIS_ERRORS as e:
             logger.debug("redis.ratelimit_failed error=%s", str(e))
             return True
@@ -597,18 +707,9 @@ class RateLimiter:
             res = redis_client.eval(_RATELIMIT_LUA, 1, *self._lua_args(window_key, max_requests, window_seconds))
             if res is not None:
                 return bool(int(res))
-            now = time.time()
-            member = f"{now}:{uuid.uuid4().hex}"
-            redis_client.zremrangebyscore(window_key, 0, now - window_seconds)
-            current = redis_client.zcard(window_key)
-            if int(current) >= max_requests:
-                return False
-            redis_client.zadd(window_key, {member: now})
-            redis_client.expire(window_key, window_seconds)
-            return True
-        except _EVAL_ERRORS:
-            # 中文：eval 不可用（旧 fakeredis）时退化为唯一成员计数的本地判定。
-            try:
+            # 中文：eval 不可用（fakeredis）但 eval 调用本身没抛错、仅返回 None 时：
+            # 进程内串行三轮询（仍用唯一成员计数）；跨进程精确限流仍需 Lua 原子。
+            with _RATELIMIT_SYNC_LOCK:
                 now = time.time()
                 member = f"{now}:{uuid.uuid4().hex}"
                 redis_client.zremrangebyscore(window_key, 0, now - window_seconds)
@@ -618,6 +719,19 @@ class RateLimiter:
                 redis_client.zadd(window_key, {member: now})
                 redis_client.expire(window_key, window_seconds)
                 return True
+        except _EVAL_ERRORS:
+            # 中文：eval 不可用（旧 fakeredis）时退化为进程内串行的唯一成员计数本地判定。
+            try:
+                with _RATELIMIT_SYNC_LOCK:
+                    now = time.time()
+                    member = f"{now}:{uuid.uuid4().hex}"
+                    redis_client.zremrangebyscore(window_key, 0, now - window_seconds)
+                    current = redis_client.zcard(window_key)
+                    if int(current) >= max_requests:
+                        return False
+                    redis_client.zadd(window_key, {member: now})
+                    redis_client.expire(window_key, window_seconds)
+                    return True
             except _REDIS_ERRORS as e:
                 logger.debug("redis.ratelimit_sync_failed error=%s", str(e))
                 return True
@@ -693,13 +807,22 @@ class RedisStream:
             return ""
 
     def publish_sync(self, stream: str, data: Dict[str, Any]) -> str:
-        """同步发布（普通 def：同步 xadd，不阻塞事件循环）。"""
+        """同步发布（普通 def：同步 xadd，不阻塞事件循环；与 async publish 同 cap 防无界增长）。"""
         client = get_redis_sync()
         if client is None:
             return ""
         try:
             str_data = {k: str(v) for k, v in data.items()}
-            return client.xadd(stream, str_data)
+            try:
+                return client.xadd(stream, str_data, maxlen=self.STREAM_MAXLEN, approximate=True)
+            except TypeError:
+                # 旧 fakeredis/redis 无 maxlen 形参 → 裸 xadd 后 xtrim 兜底
+                msg_id = client.xadd(stream, str_data)
+                try:
+                    client.xtrim(stream, maxlen=self.STREAM_MAXLEN, approximate=True)
+                except _REDIS_ERRORS:
+                    pass
+                return msg_id
         except _REDIS_ERRORS as e:
             logger.debug("redis.stream_publish_sync_failed error=%s", str(e))
             return ""
