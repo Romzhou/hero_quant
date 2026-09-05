@@ -145,7 +145,16 @@ def run_backtest(
         # 调用方靠 provenance 区分演示数字与真实市场回测
         is_synthetic = True
         logger.warning("no market bars for %s %s->%s, using synthetic fallback", symbol, start, end)
-        closes = [100, 101, 102]
+        # Derive bar count from the requested start/end+freq instead of a fixed
+        # 3-point series, so equity length matches the query coverage.
+        _freq_map_fb = {"1d": "D", "1h": "h", "1m": "min", "1w": "W", "1M": "M"}
+        _freq_fb = _freq_map_fb.get(interval or "1d", "D")
+        try:
+            _idx_tmp = pd.date_range(start, end, freq=_freq_fb)
+            _n = max(len(_idx_tmp), 1)
+        except (ValueError, TypeError):
+            _n = 3
+        closes = [100.0 + i for i in range(_n)]
     else:
         is_synthetic = False
     # 以起始日为锚点构建 DatetimeIndex — interval aware
@@ -175,12 +184,14 @@ def run_backtest(
                 "engine": engine or "default",
                 "provenance": {"source": "synthetic" if is_synthetic else "market"},
             }
-        # 合成每标的的 close 序列
+        # 合成每标的的 close 序列 — any matrix built from synthetic prices is
+        # synthetic regardless of the initial fetch result (provenance honesty)
         price_dict: dict[str, pd.Series] = {}
         for t in tickers:
             df_syn = _synthetic_prices_for_backtest(idx, t)
             price_dict[t] = df_syn["close"]
         prices = pd.DataFrame(price_dict, index=idx)
+        is_synthetic = True
         # 补充 open 列为首资产的 open — but do not leak into price matrix for engine
         # keep auxiliary separate and drop before run
     elif need_multi and not is_comma_symbol:
@@ -192,6 +203,7 @@ def run_backtest(
             df_syn = _synthetic_prices_for_backtest(idx, t)
             price_dict[f"asset_{i}"] = df_syn["close"]
         prices = pd.DataFrame(price_dict, index=idx)
+        is_synthetic = True
     else:
         # 单资产路径
         prices = pd.DataFrame({"close": closes}, index=idx)
@@ -204,7 +216,10 @@ def run_backtest(
         from hero_quant.backtest.engine import BacktestEngine
 
         eng = BacktestEngine()
-        res = eng.run(prices, weights=weights, costs=float(costs) if costs is not None else 0.0005, engine=engine or "default")
+        # 合成价格天然无 PIT 日期：显式 allow_synthetic=True（与 bench 一致），
+        # 真实 bars 路径仍走默认 PIT 守卫
+        _eng_kw = {"allow_synthetic": True} if is_synthetic else {}
+        res = eng.run(prices, weights=weights, costs=float(costs) if costs is not None else 0.0005, engine=engine or "default", **_eng_kw)
     except (ValueError, RuntimeError) as e:
         logger.warning("run_backtest engine failed: %s", e, exc_info=True)
         return {"equity": [], "metrics": {}, "ok": False, "error": str(e), "engine": engine or "default", "provenance": {"source": "synthetic" if is_synthetic else "market"}}
@@ -247,14 +262,14 @@ def run_backtest(
 def validate_backtest(weights_on: str, price_date: str) -> Dict[str, Any]:
     """校验回测 PIT 正确性（权重日期不得晚于行情日期）。 PIT: weights_on must be <= price_date"""
     try:
-        from hero_quant.backtest.validation import validate
+        from hero_quant.backtest.validation import ValidationError, validate
 
         import pandas as pd
 
         prices = pd.DataFrame({"close": [100, 101]}, index=pd.date_range(price_date, periods=2))
         validate(prices, weights_on=weights_on, price_date=price_date)
         return {"valid": True, "ok": True}
-    except (ValueError, TypeError, AttributeError, RuntimeError) as e:
+    except (ValidationError, ValueError, TypeError, AttributeError, RuntimeError) as e:
         logger.warning("validate_backtest failed: %s", e, exc_info=True)
         return {"valid": False, "ok": False, "error": str(e)}
 
@@ -282,10 +297,12 @@ def get_backtest_metrics(equity: list) -> Dict[str, Any]:
         import pandas as pd
         from hero_quant.backtest.metrics import compute_metrics
 
+        if equity is None or len(equity) == 0:
+            return {"metrics": {}, "ok": False, "error": "equity is empty"}
         s = pd.Series(equity)
         m = compute_metrics(s)
         return {"metrics": m, "ok": True}
-    except (ValueError, TypeError, AttributeError) as e:
+    except (ValueError, TypeError, AttributeError, KeyError, IndexError, ZeroDivisionError, RuntimeError) as e:
         logger.warning("get_backtest_metrics failed: %s", e, exc_info=True)
         return {"metrics": {}, "ok": False, "error": str(e)}
 

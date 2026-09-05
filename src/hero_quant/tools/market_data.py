@@ -55,8 +55,17 @@ def _synthetic_fallback(symbol: str, start: str, end: str):
         from hero_quant.data.loaders.tencent import generate_synthetic_bars  # type: ignore
 
         return generate_synthetic_bars(symbol, start, end)
-    except (ImportError, AttributeError, ValueError, TypeError, RuntimeError, OSError) as e:  # 中文：窄化捕获
+    except (ImportError, AttributeError, OSError, RuntimeError) as e:  # 中文：窄化捕获
         _logger.debug("public synthetic helper not available: %s", e, exc_info=True)
+    # 本地最小合成前先校验日期 — validation errors must fail closed, never
+    # propagate invalid dates as if they were data
+    try:
+        import pandas as _pd
+
+        _pd.to_datetime(start)
+        _pd.to_datetime(end)
+    except (ValueError, TypeError) as e:
+        raise ValueError(f"invalid start/end for synthetic fallback: {e}") from e
     # 本地最小合成 — 直接返回字面量（构造不可能抛，避免无效包裹）
     return [
         {"date": start, "open": 100.0, "close": 100.5, "high": 101.0, "low": 99.5, "volume": 100},
@@ -127,7 +136,7 @@ def get_market_data(
             # 校验类错误 fail-closed，不得合成冒充 live
             _logger.warning("get_market_data validation failed for %s: %s", symbol, e, exc_info=True)
             raise
-        if isinstance(e, ImportError) or "no loader" in str(e).lower():
+        if isinstance(e, ImportError):
             raise RuntimeError("market data misconfigured: no loader available") from e
         if isinstance(e, (TimeoutError, ConnectionError, OSError, RuntimeError)):
             # 仅瞬时/网络/运行时错误回退合成，且标记 ok:False + provenance synthetic 不可用作 live
@@ -299,6 +308,12 @@ def get_bars_range(
 
             if isinstance(e, _CSE):
                 raise
+            # 与 get_market_data 对齐 fail-closed：校验类与缺配置错误逐 symbol
+            # 透传，不回退合成冒充数据
+            if isinstance(e, (ValueError, TypeError)):
+                raise
+            if isinstance(e, ImportError):
+                raise RuntimeError("market data misconfigured: no loader available") from e
             # 非 CrossSource 场景按 symbol 回退合成，但标记 ok:False + provenance synthetic
             try:
                 bars_fb = _synthetic_fallback(sym, start, end)

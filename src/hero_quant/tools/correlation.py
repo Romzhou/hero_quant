@@ -17,6 +17,10 @@ from typing import Any, Dict
 from hero_quant.tools.registry import tool
 
 
+class SyntheticDataUnavailable(ValueError):
+    """Explicit signal for synthetic/unavailable closes — replaces message-substring routing."""
+
+
 def _fetch_closes(symbol: str, start: str, end: str):
     """拉取收盘价序列，保留日期索引以便调用方按日期对齐。
 
@@ -42,12 +46,13 @@ def _fetch_closes(symbol: str, start: str, end: str):
 
             _logging.getLogger(__name__).warning("YahooLoader register failed: %s", e, exc_info=True)
         bars, prov = reg.get_bars(symbol, start, end, interval="1d")
-        # 中文：保留日期索引，避免丢日期后按位置错配
+        # 中文：保留日期索引，避免丢日期后按位置错配 — normalize to YYYY-MM-DD
+        # so datetime objects vs 'YYYY-MM-DD' vs 'YYYY-MM-DD HH:MM:SS' join
         closes: list[tuple[str, float]] = []
         for b in bars or []:
             c = b.get("close")
-            d = b.get("date") or b.get("trade_date") or b.get("time") or b.get("datetime")
-            if c is None or d is None:
+            raw_d = b.get("date") or b.get("trade_date") or b.get("time") or b.get("datetime")
+            if c is None or raw_d is None:
                 continue
             try:
                 v = float(c)
@@ -55,7 +60,13 @@ def _fetch_closes(symbol: str, start: str, end: str):
                 continue
             if v != v:  # NaN
                 continue
-            closes.append((str(d), v))
+            try:
+                import pandas as _pd
+
+                d = _pd.to_datetime(raw_d).date().isoformat()
+            except (ValueError, TypeError):
+                continue
+            closes.append((d, v))
         if closes:
             return closes
         raise ValueError(f"no valid closes for {symbol} {start}->{end}")
@@ -79,10 +90,10 @@ def _fetch_closes(symbol: str, start: str, end: str):
                 except (ImportError, AttributeError, ValueError, TypeError, OSError, RuntimeError):
                     pass
                 # 中文：合成数据必须标记不可用，调用方将转为 ok:False + provenance synthetic
-                raise ValueError(f"synthetic closes for {symbol} {start}->{end} (synthetic provenance, not live)") from e
-        except ValueError:
+                raise SyntheticDataUnavailable(f"synthetic closes for {symbol} {start}->{end} (synthetic provenance, not live)") from e
+        except SyntheticDataUnavailable:
             raise
-        except (ImportError, AttributeError, OSError, RuntimeError, TypeError, ValueError) as inner:
+        except (ImportError, AttributeError, OSError, RuntimeError, TypeError) as inner:
             import logging as _logging
 
             _logging.getLogger(__name__).debug("synthetic check failed for %s: %s", symbol, inner, exc_info=True)
@@ -140,13 +151,44 @@ def compute_correlation(
     try:
         import pandas as pd
 
+        from hero_quant.data.registry import MarketDataRegistry as _Reg
+
+        _reg = _Reg()
+        try:
+            from hero_quant.data.loaders.tencent import TencentLoader as _TL
+
+            _reg.register(_TL())
+        except Exception:
+            pass
+        try:
+            from hero_quant.data.loaders.yahoo import YahooLoader as _YL
+
+            _reg.register(_YL())
+        except Exception:
+            pass
+        _live_prov = None
+        try:
+            _bars_a, _prov_a = _reg.get_bars(symbol_a, start, end, interval="1d")
+            _bars_b, _prov_b = _reg.get_bars(symbol_b, start, end, interval="1d")
+            _live_prov = _prov_a
+        except Exception:
+            _live_prov = None
         ca = _fetch_closes(symbol_a, start, end)
         cb = _fetch_closes(symbol_b, start, end)
         # 中文：按日期 inner-join 对齐，避免丢日期后按位置错配
-        # 兼容 _fetch_closes 返回 tuple 序列或历史 float 序列
+        # 兼容 _fetch_closes 返回 tuple 序列或历史 float 序列 — normalize keys
+        # to YYYY-MM-DD so heterogeneous source reps join on the same day
         def _to_map(closes):
+            import pandas as _pd
+
             if closes and isinstance(closes[0], (list, tuple)) and len(closes[0]) == 2:
-                return {str(d): float(v) for d, v in closes}
+                out = {}
+                for d, v in closes:
+                    try:
+                        out[_pd.to_datetime(d).date().isoformat()] = float(v)
+                    except (ValueError, TypeError):
+                        continue
+                return out
             # 兜底：无日期序列（历史桩）
             return {str(i): float(v) for i, v in enumerate(closes)}
 
@@ -183,7 +225,18 @@ def compute_correlation(
                 "ok": False,
                 "error": "correlation undefined (zero variance series)",
             }
-        return {"correlation": corr, "points": int(m), "ok": True}
+        # propagate get_bars provenance on the success path (audit trail)
+        _out: Dict[str, Any] = {"correlation": corr, "points": int(m), "ok": True}
+        try:
+            if _live_prov is not None:
+                _out["provenance"] = {
+                    "source": getattr(_live_prov, "source", "unknown"),
+                    "unit": getattr(_live_prov, "unit", "shares"),
+                }
+                _out["isMock"] = False
+        except (AttributeError, TypeError):
+            pass
+        return _out
     except Exception as e:
         import logging as _logging
 
@@ -198,9 +251,8 @@ def compute_correlation(
             )
         except (ImportError, AttributeError, ValueError, TypeError, OSError, RuntimeError):
             pass
-        # 中文：若为合成回退触发的 ValueError，标记 provenance synthetic + isMock，不可用作 live
-        msg = str(e).lower()
-        if "synthetic" in msg:
+        # 中文：合成回退走显式 SyntheticDataUnavailable 信号，不可用作 live
+        if isinstance(e, SyntheticDataUnavailable):
             return {
                 "correlation": 0.0,
                 "points": 0,

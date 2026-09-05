@@ -18,8 +18,11 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 # Shared with BacktestEngine._price_matrix / _align — non-price metadata columns
-# to skip in multi-asset validation loops. Keep in sync with engine.
-NON_PRICE_COLS: frozenset[str] = frozenset({"open", "high", "low", "volume", "currency", "ccy"})
+# to skip in multi-asset validation loops. Single source of truth: engine
+# imports this set instead of duplicating literals. open/high/low are prices
+# (engine._align uses next-day open as executable price) and are validated
+# explicitly whenever present — they must NOT be listed here.
+NON_PRICE_COLS: frozenset[str] = frozenset({"volume", "currency", "ccy"})
 
 
 class ValidationError(Exception):
@@ -49,12 +52,11 @@ def validate(
         currency = kwargs.pop("currency")
 
     # 兼容位置参数 validate(prices, weights_on, price_date, currency)
-    if weights_on is None and len(args) >= 1:
-        weights_on = args[0]
-    if price_date is None and len(args) >= 2:
-        price_date = args[1]
-    if currency is None and len(args) >= 3:
-        currency = args[2]
+    # fail-closed: Python already binds the first positionals to the named
+    # params, so leftover *args indices no longer align with slots — any extra
+    # positional is rejected instead of remapped (remapping misaligns/drops).
+    if len(args) > 0:
+        raise ValidationError(f"too many positional args (fail-closed): {len(args)} extra")
     # 中文：未知 kwargs fail-closed（防拼写错误关闭校验，如 weights_onn）
     if kwargs:
         raise ValidationError(f"unknown kwargs rejected (fail-closed): {sorted(kwargs)}")
@@ -92,6 +94,36 @@ def validate(
         return ts
 
     if weights_on is not None and price_date is not None:
+        # Mixed naive/aware PIT inputs: normalize both to UTC-aware instants
+        # (naive interpreted as UTC, documented convention) and compare actual
+        # instants — the OCR mixed-awareness finding vs the Task13-10 contract
+        # (same instant in any representation is NOT a violation).
+        # Resolution: normalize-then-compare (keeps Task13-10 green); only a
+        # genuinely ambiguous mixed pair — same wall-clock reading where the
+        # aware side carries a NON-UTC offset — is fail-closed rejected, since
+        # assuming UTC for the naive side could invert the verdict by hours.
+        # Same-instant pairs (incl. UTC-aware vs naive) compare exactly.
+        try:
+            _w_ts_raw = pd.Timestamp(weights_on)
+            _p_ts_raw = pd.Timestamp(price_date)
+        except (ValueError, TypeError, AttributeError) as e:
+            raise ValidationError(f"invalid timestamp: {e}") from e
+        _w_aware = _w_ts_raw.tz is not None
+        _p_aware = _p_ts_raw.tz is not None
+        if _w_aware != _p_aware:
+            _aware_raw = _w_ts_raw if _w_aware else _p_ts_raw
+            try:
+                _off = _aware_raw.utcoffset()
+                _off_s = _off.total_seconds() if _off is not None else 0.0
+            except (ValueError, TypeError, AttributeError):
+                _off_s = 0.0
+            _naive_wall = _p_ts_raw if _w_aware else _w_ts_raw
+            try:
+                _same_wall = _naive_wall == _aware_raw.tz_localize(None)
+            except (ValueError, TypeError, AttributeError):
+                _same_wall = False
+            if _same_wall and _off_s != 0.0:
+                raise ValidationError("mixed naive/aware PIT timestamps (fail-closed)")
         try:
             ts_w = _norm_ts(weights_on)
             ts_p = _norm_ts(price_date)
@@ -109,10 +141,14 @@ def validate(
         _price_cols = ["close"] + [c for c in prices.columns if c != "close" and str(c).lower() not in NON_PRICE_COLS]
         for _pc in _price_cols:
             try:
-                # 数值化后检查，避免字符串误判；NaN/null 视为脏数据直接拒绝
+                # 数值化后检查，避免字符串误判；NaN/null/非正/非有限(inf)均拒绝
                 _series = pd.to_numeric(prices[_pc], errors="coerce")
-                # fail-closed: any NaN (including coercion-introduced) 或非正均拒绝
-                if _series.isna().any() or (_series <= 0).any():
+                # fail-closed: any NaN (including coercion-introduced), non-positive,
+                # or non-finite (+/-inf bypasses both isna and <=0) is dirty
+                import numpy as _np
+
+                _arr = _series.to_numpy(dtype=float, na_value=float("nan"))
+                if _series.isna().any() or (_series <= 0).any() or (~_np.isfinite(_arr)).any():
                     # 更精确提示：区分 NaN 与非正
                     if _series.isna().any():
                         # 检测是否由非数值 coercion 产生
@@ -136,7 +172,10 @@ def validate(
                     continue
                 try:
                     series = pd.to_numeric(prices[col], errors="coerce")
-                    if series.isna().any() or (series <= 0).any():
+                    import numpy as _np2
+
+                    _arr2 = series.to_numpy(dtype=float, na_value=float("nan"))
+                    if series.isna().any() or (series <= 0).any() or (~_np2.isfinite(_arr2)).any():
                         if series.isna().any():
                             mask = prices[col].notna() & series.isna()
                             bad_idx = mask[mask].index.tolist()[:5]
@@ -151,19 +190,21 @@ def validate(
                     raise ValidationError(f"price validation failed for column {col!r}: {e}") from e
 
     # 3. 混币种聚合拒绝 — 一致 NaN 策略：NaN 视为无效，fail-closed
-    if isinstance(prices, pd.DataFrame) and "currency" in prices.columns:
+    # case-insensitive currency/ccy lookup matching NON_PRICE_COLS skip semantics
+    _ccy_col = next((c for c in prices.columns if str(c).lower() in ("currency", "ccy")), None)
+    if isinstance(prices, pd.DataFrame) and _ccy_col is not None:
         try:
             # fail-closed NaN: any NaN currency is invalid (covers both paths consistently)
-            if prices["currency"].isna().any():
-                bad_idx = prices[prices["currency"].isna()].index.tolist()[:5]
+            if prices[_ccy_col].isna().any():
+                bad_idx = prices[prices[_ccy_col].isna()].index.tolist()[:5]
                 raise ValidationError(f"NaN currency detected at {bad_idx} (fail-closed)")
-            nuniq = prices["currency"].nunique(dropna=False)
+            nuniq = prices[_ccy_col].nunique(dropna=False)
             if nuniq > 1:
-                raise ValidationError(f"mixed currencies detected: {prices['currency'].unique().tolist()}")
+                raise ValidationError(f"mixed currencies detected: {prices[_ccy_col].unique().tolist()}")
             if currency is not None:
                 # 显式指定币种时要求与数据一致
-                unique_vals = prices["currency"].dropna().unique()
-                if len(unique_vals) > 0 and not (prices["currency"] == currency).all():
+                unique_vals = prices[_ccy_col].dropna().unique()
+                if len(unique_vals) > 0 and not (prices[_ccy_col] == currency).all():
                     raise ValidationError(
                         f"currency mismatch: expected {currency}, got {unique_vals.tolist()}"
                     )
