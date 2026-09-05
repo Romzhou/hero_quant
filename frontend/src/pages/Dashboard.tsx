@@ -7,14 +7,15 @@
 import { useEffect, useState } from "react"
 import { useNavigate, Link } from "react-router-dom"
 import { useChatStore } from "../store/chat"
+import { API_METRICS, ROUTES } from "../config/api"
 
 type Metrics = { annual_return?: number; sharpe?: number; max_drawdown?: number; turnover?: number; total_equity?: number }
 
-// 占位回退值，仅在 isMock=true 时展示，配合徽标避免与真实数据混淆
-export const FALLBACK: Metrics = { annual_return: 0.184, sharpe: 1.62, max_drawdown: -0.032, turnover: 0.42 }
+// 占位回退值：字段必填（Required），调用处不再需要 `!` 非空断言，避免缺 key 时运行时抛错
+export const FALLBACK: Required<Omit<Metrics, "total_equity">> = { annual_return: 0.184, sharpe: 1.62, max_drawdown: -0.032, turnover: 0.42 }
 
-// 抽取硬编码：API 路径集中管理，避免分散字符串导致 base-path 变更遗漏
-export const API_METRICS = "/v1/backtest/metrics.json"
+// 兼容既有导入：API_METRICS 统一由 src/config/api 导出，此处 re-export 保持导入路径不变
+export { API_METRICS }
 
 // 抽取硬编码：演示查询常量，Hero 文案与 handleDemo 共用，避免文案/逻辑漂移
 export const DEMO_QUERY = "回测 600519.SH 近一月等权"
@@ -26,13 +27,20 @@ function fmtPct(v: unknown, fallback: number): string {
   return isFiniteNumber(v) ? `${(v * 100).toFixed(1)}%` : `${(fallback * 100).toFixed(1)}%`
 }
 function fmtFixed(v: unknown, fallback: number, digits = 2): string {
-  return isFiniteNumber(v) ? (v as number).toFixed(digits) : fallback.toFixed(digits)
+  return isFiniteNumber(v) ? v.toFixed(digits) : fallback.toFixed(digits)
 }
 
 // 抽取重复 cast：统一数字选取，处理 total_equity/totalEquity 别名
 function pickNumber(obj: Record<string, unknown>, key: string, fallback?: number): number | undefined {
-  const v = obj[key]
-  return isFiniteNumber(v) ? (v as number) : fallback
+  const v: unknown = obj[key]
+  return isFiniteNumber(v) ? v : fallback
+}
+
+// 徽标语义（fail-closed：loading > mock > ready）：if/else 替代嵌套三元，满足 no-nested-ternary
+function getBadge(loading: boolean, isMock: boolean): { text: string; cls: string } {
+  if (loading) return { text: "加载中", cls: "border-slate-400/20 bg-slate-400/10 text-slate-300" }
+  if (isMock) return { text: "占位数据", cls: "border-amber-400/20 bg-amber-400/10 text-amber-300" }
+  return { text: "数据就绪", cls: "border-emerald-400/20 bg-emerald-400/10 text-emerald-300" }
 }
 
 export default function Dashboard() {
@@ -51,18 +59,26 @@ export default function Dashboard() {
       setError(null)
       setLoading(true)
       try {
-        const r = await fetch(API_METRICS, { cache: "no-store", signal } as RequestInit)
+        const r = await fetch(API_METRICS, { cache: "no-store", signal })
         if (!r.ok) throw new Error(String(r.status))
-        const j = await r.json()
-        if (!signal.aborted && j && typeof j === "object") {
-          const obj = j as Record<string, unknown>
-          // 统一通过 pickNumber 选取，避免逐字段重复 cast 带来的扩展错误
+        const j: unknown = await r.json()
+        if (!signal.aborted && typeof j === "object" && j !== null && !Array.isArray(j)) {
+          const obj: Record<string, unknown> = j as Record<string, unknown>
+          // 统⼀通过 pickNumber 选取，避免逐字段重复 cast 带来的扩展错误
+          // 有效载荷门槛：零真实数字字段（{} / 全非法）不得标 ready，走 error + 占位回退
+          const annual_return = pickNumber(obj, "annual_return")
+          const sharpe = pickNumber(obj, "sharpe")
+          const max_drawdown = pickNumber(obj, "max_drawdown")
+          const turnover = pickNumber(obj, "turnover")
+          const total_equity = pickNumber(obj, "total_equity", pickNumber(obj, "totalEquity"))
+          const hasRealField = [annual_return, sharpe, max_drawdown, turnover, total_equity].some(isFiniteNumber)
+          if (!hasRealField) throw new Error("invalid metrics payload")
           const parsed: Metrics = {
-            annual_return: pickNumber(obj, "annual_return", FALLBACK.annual_return),
-            sharpe: pickNumber(obj, "sharpe", FALLBACK.sharpe),
-            max_drawdown: pickNumber(obj, "max_drawdown", FALLBACK.max_drawdown),
-            turnover: pickNumber(obj, "turnover", FALLBACK.turnover),
-            total_equity: pickNumber(obj, "total_equity", pickNumber(obj, "totalEquity")),
+            annual_return: annual_return ?? FALLBACK.annual_return,
+            sharpe: sharpe ?? FALLBACK.sharpe,
+            max_drawdown: max_drawdown ?? FALLBACK.max_drawdown,
+            turnover: turnover ?? FALLBACK.turnover,
+            total_equity,
           }
           setMetrics(parsed)
           setIsMock(false)
@@ -87,7 +103,7 @@ export default function Dashboard() {
   const handleDemo = () => {
     // 脆弱点修复：同时写入 store 并通过 router state 传递，Chat 侧以 state.prefill 为可信来源，store 为增强
     useChatStore.getState().setInput(DEMO_QUERY)
-    navigate("/backtest", { state: { prefill: DEMO_QUERY } })
+    navigate(ROUTES.BACKTEST, { state: { prefill: DEMO_QUERY } })
   }
 
   // 展示用有效指标：未加载到真实数据时使用 FALLBACK 占位，但 isMock 徽标会明确标识
@@ -97,18 +113,13 @@ export default function Dashboard() {
   type Card = { k: string; v: string; sub: string; isEquity?: boolean }
   const cards: Card[] = [
     { k: "总资产", v: totalEquityDisplay, sub: "含现金", isEquity: true },
-    { k: "年化", v: loading ? "…" : fmtPct(displayMetrics.annual_return, FALLBACK.annual_return!), sub: `sharpe ${fmtFixed(displayMetrics.sharpe, FALLBACK.sharpe!)}` },
-    { k: "最大回撤", v: loading ? "…" : fmtPct(displayMetrics.max_drawdown, FALLBACK.max_drawdown!), sub: "近30日" },
-    { k: "换手率", v: loading ? "…" : fmtFixed(displayMetrics.turnover, FALLBACK.turnover!, 2), sub: "turnover" },
+    { k: "年化", v: loading ? "…" : fmtPct(displayMetrics.annual_return, FALLBACK.annual_return), sub: `sharpe ${fmtFixed(displayMetrics.sharpe, FALLBACK.sharpe)}` },
+    { k: "最大回撤", v: loading ? "…" : fmtPct(displayMetrics.max_drawdown, FALLBACK.max_drawdown), sub: "近30日" },
+    { k: "换手率", v: loading ? "…" : fmtFixed(displayMetrics.turnover, FALLBACK.turnover, 2), sub: "turnover" },
   ]
 
   // 徽标 fail-closed 语义：加载中/占位数据/数据就绪 三态，避免无条件“数据就绪”误导
-  const badgeText = loading ? "加载中" : isMock ? "占位数据" : "数据就绪"
-  const badgeClass = loading
-    ? "border-slate-400/20 bg-slate-400/10 text-slate-300"
-    : isMock
-      ? "border-amber-400/20 bg-amber-400/10 text-amber-300"
-      : "border-emerald-400/20 bg-emerald-400/10 text-emerald-300"
+  const badge = getBadge(loading, isMock)
 
   return (
     <div className="mx-auto max-w-7xl px-6 py-6">
@@ -139,7 +150,7 @@ export default function Dashboard() {
           <h1 className="font-display text-xl font-semibold text-mist">Dashboard · 总览</h1>
           <p className="mt-1 text-sm text-slate-400">今日概览 · 资产 · 收益 · 风控 · 活动</p>
         </div>
-        <span className={"rounded-full border px-3 py-1 text-xs font-medium " + badgeClass}>{badgeText}</span>
+        <span className={"rounded-full border px-3 py-1 text-xs font-medium " + badge.cls}>{badge.text}</span>
       </div>
 
       {error && !loading && (
@@ -149,7 +160,7 @@ export default function Dashboard() {
         >
           <div className="flex items-center gap-2 text-sm text-amber-200">
             <span className="h-2 w-2 rounded-full bg-amber-400 animate-pulse" aria-hidden />
-            数据获取失败，显示为占位数据
+            数据获取失败，显示为占位数据{error ? `（${error}）` : ""}
           </div>
           <button
             type="button"
@@ -190,9 +201,9 @@ export default function Dashboard() {
         <div className="rounded-2xl border border-white/10 bg-ink-800/60 p-4 backdrop-blur">
           <h2 className="text-sm font-semibold text-mist">快捷入口</h2>
           <div className="mt-3 flex flex-wrap gap-2">
-            <Link to="/research" className="rounded-xl bg-amber-500 px-3 py-2 text-xs font-semibold text-ink-900 hover:bg-amber-400 transition">去研究</Link>
-            <Link to="/backtest" className="rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-xs text-mist hover:bg-white/10 transition">去回测</Link>
-            <Link to="/live" className="rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-xs text-mist hover:bg-white/10 transition">实盘监控</Link>
+            <Link to={ROUTES.RESEARCH} className="rounded-xl bg-amber-500 px-3 py-2 text-xs font-semibold text-ink-900 hover:bg-amber-400 transition">去研究</Link>
+            <Link to={ROUTES.BACKTEST} className="rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-xs text-mist hover:bg-white/10 transition">去回测</Link>
+            <Link to={ROUTES.LIVE} className="rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-xs text-mist hover:bg-white/10 transition">实盘监控</Link>
           </div>
           <p className="mt-3 text-xs leading-5 text-slate-500">聚合 研究/回测/实盘/风控 四域状态；深墨+琥珀视觉统一。</p>
         </div>
@@ -203,17 +214,17 @@ export default function Dashboard() {
           </div>
           <ul className="mt-3 space-y-2 text-xs">
             <li>
-              <Link to="/research" className="flex justify-between rounded-xl bg-ink-900/60 border border-white/5 px-3 py-2 hover:border-amber-500/20 hover:bg-amber-500/5 transition">
-                <span className="text-slate-400">回测完成</span><span className="text-mist">600519.SH 等权 · {fmtPct(displayMetrics.annual_return, FALLBACK.annual_return!)} 年化 → 研究 ↗</span>
+              <Link to={ROUTES.RESEARCH} className="flex justify-between rounded-xl bg-ink-900/60 border border-white/5 px-3 py-2 hover:border-amber-500/20 hover:bg-amber-500/5 transition">
+                <span className="text-slate-400">回测完成</span><span className="text-mist">600519.SH 等权 · {fmtPct(displayMetrics.annual_return, FALLBACK.annual_return)} 年化 → 研究 ↗</span>
               </Link>
             </li>
             <li>
-              <Link to="/risk" className="flex justify-between rounded-xl bg-ink-900/60 border border-white/5 px-3 py-2 hover:border-white/10 transition">
+              <Link to={ROUTES.RISK} className="flex justify-between rounded-xl bg-ink-900/60 border border-white/5 px-3 py-2 hover:border-white/10 transition">
                 <span className="text-slate-400">风控</span><span className="text-emerald-300">PIT 已校验 · 未阻断 → 风控</span>
               </Link>
             </li>
             <li>
-              <Link to="/live" className="flex justify-between rounded-xl bg-ink-900/60 border border-white/5 px-3 py-2 hover:border-white/10 transition">
+              <Link to={ROUTES.LIVE} className="flex justify-between rounded-xl bg-ink-900/60 border border-white/5 px-3 py-2 hover:border-white/10 transition">
                 <span className="text-slate-400">实盘</span><span className="text-slate-300">events.jsonl 实时流 → Live</span>
               </Link>
             </li>

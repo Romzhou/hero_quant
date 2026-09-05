@@ -6,13 +6,20 @@
  */
 import { useEffect, useRef, useState } from "react"
 import { useSettingsStore } from "../store/settings"
+import { RAW_API_PATHS } from "../config/api"
 
 type Check = { ok: boolean | null; latency?: number; status?: number }
 
+// 同源走 Vite 代理相对路径；远端直连走裸路径（见 RAW_API_PATHS，不带 BASE 前缀）
 export const ENDPOINTS = {
-  LIVE: "/live",
-  METRICS: "/v1/backtest/metrics.json",
+  LIVE: RAW_API_PATHS.LIVE,
+  METRICS: RAW_API_PATHS.METRICS,
 } as const
+
+// 探活/防抖可调常量：与 ENDPOINTS 并列，集中可测
+export const PROBE_INTERVAL_MS = 15_000
+export const PROBE_TIMEOUT_MS = 8_000
+export const API_BASE_DEBOUNCE_MS = 350
 
 export function getDotClass(ok: boolean | null): string {
   if (ok === null) return "bg-slate-500 animate-pulse"
@@ -37,16 +44,32 @@ function resolveUrl(apiBase: string, path: string): string {
   return apiBase.replace(/\/+$/, "") + path
 }
 
-// fail-closed 链接构造：apiBase 进入 href 前校验协议，仅 http/https 放行，其余回退相对路径防 javascript: 等
+// fail-closed 链接构造：apiBase 进入 fetch/href 前 trim + 校验协议，仅 http/https 放行，
+// 其余回退相对路径防 javascript: 等；远程直连用裸路径（不带 Vite BASE 前缀，防子路径 404）
 function safeResolveUrl(apiBase: string, path: string): string {
-  if (!apiBase) return path
+  const trimmed = apiBase.trim()
+  if (!trimmed) return path
   try {
-    const u = new URL(apiBase)
+    const u = new URL(trimmed)
     if (u.protocol !== "http:" && u.protocol !== "https:") return path
   } catch {
     return path
   }
-  return resolveUrl(apiBase, path)
+  return resolveUrl(trimmed, path)
+}
+
+// apiBase 统一解析：trim + 去尾斜杠 + new URL + http/https 协议校验，三处调用共用，防漂移
+export function parseApiBase(raw: string): { ok: true; normalized: string } | { ok: false; error: string } {
+  const trimmed = raw.trim()
+  if (trimmed === "") return { ok: false, error: "地址为空" }
+  const normalized = trimmed.replace(/\/+$/, "")
+  try {
+    const u = new URL(normalized)
+    if (u.protocol !== "http:" && u.protocol !== "https:") return { ok: false, error: "仅支持 http(s):// 协议" }
+    return { ok: true, normalized }
+  } catch {
+    return { ok: false, error: "无效 URL，需包含 http(s):// 且格式正确" }
+  }
 }
 
 // 抽取重复卡片：live/metrics 卡片布局、StatusDot、时延/状态渲染一致，抽组件防漂移
@@ -70,40 +93,62 @@ export default function Settings() {
   const [apiBaseError, setApiBaseError] = useState<string | null>(null)
   const [draftApiBase, setDraftApiBase] = useState(apiBase)
 
-  useEffect(() => { setDraftApiBase(apiBase) }, [apiBase])
+  // draft 同步守卫：仅当外部持久化与 draft 实质不同时回写，避免防抖提交 normalize 时冲掉正在输入的内容
+  useEffect(() => {
+    setDraftApiBase(prev => {
+      const prevNorm = prev.trim().replace(/\/+$/, "")
+      return prevNorm === apiBase ? prev : apiBase
+    })
+  }, [apiBase])
 
-  const buildUrl = (path: string) => resolveUrl(apiBase, path)
-  // 渲染期 href 必须走 fail-closed 校验，避免 persisted/tampered 的 javascript: 进入 <a href>
+  // 探活/链接 URL 统一走 fail-closed 校验：篡改后的 persisted apiBase（如 javascript:/data:）回退相对路径
+  // buildUrl 与 safeBuildUrl 同源（重复包装消除，保留 safeBuildUrl 命名兼容渲染调用）
   const safeBuildUrl = (path: string) => safeResolveUrl(apiBase, path)
+  const buildUrl = safeBuildUrl
 
-  // generation 锁：避免重叠探活竞态，旧批次响应不覆盖新批次
+  // generation 锁：每轮 doProbe 递增 round，慢响应不得覆盖更新轮次；叠加超时防 hung 堆积
   const probeSeqRef = useRef(0)
   useEffect(() => {
     const controller = new AbortController()
     const { signal } = controller
     let aborted = false
-    const seq = ++probeSeqRef.current
-    async function probe(url: string, setter: (c: Check) => void) {
+    // apiBase 切换即重置为检测中，避免旧卡片值误导
+    setLive({ ok: null })
+    setMetrics({ ok: null })
+    async function probe(url: string, round: number, setter: (c: Check) => void) {
       const t0 = performance.now()
+      // 超时 + effect signal 组合：hung 后端 8s 即回收，避免轮询无限堆积；
+      // 特性检测兜底：不支持 AbortSignal.timeout/any 的浏览器退化为无超时探活
+      let combined: AbortSignal = signal
+      if (typeof AbortSignal.timeout === "function" && typeof AbortSignal.any === "function") {
+        try {
+          const timeout = AbortSignal.timeout(PROBE_TIMEOUT_MS)
+          combined = AbortSignal.any([signal, timeout])
+        } catch {
+          combined = signal
+        }
+      }
       try {
-        const r = await fetch(url, { cache: "no-store", signal } as RequestInit)
+        const r = await fetch(url, { cache: "no-store", signal: combined })
         const dt = Math.round(performance.now() - t0)
-        // 仅当 generation 仍为当前才写状态，丢弃过期响应
-        if (!aborted && !signal.aborted && seq === probeSeqRef.current) setter({ ok: r.ok, latency: dt, status: r.status })
+        // 仅当 generation/round 仍为最新才写状态，丢弃过期响应
+        if (!aborted && !signal.aborted && round === probeSeqRef.current) setter({ ok: r.ok, latency: dt, status: r.status })
       } catch (e) {
-        if (signal.aborted) return
-        if (e instanceof DOMException && e.name === "AbortError") return
+        // 卸载 abort 静默；超时 abort（effect signal 仍 alive）必须标失败，否则卡片 wise 显示旧成功值
+        if (aborted || signal.aborted) return
         const dt = Math.round(performance.now() - t0)
-        if (!aborted && !signal.aborted && seq === probeSeqRef.current) setter({ ok: false, latency: dt })
+        if (round === probeSeqRef.current) setter({ ok: false, latency: dt })
       }
     }
     const doProbe = () => {
+      // 每轮递增：interval N 的慢响应不得覆盖 N+1
+      const round = ++probeSeqRef.current
       // 并发双探活但受 generation 保护
-      probe(buildUrl(ENDPOINTS.LIVE), setLive)
-      probe(buildUrl(ENDPOINTS.METRICS), setMetrics)
+      probe(buildUrl(ENDPOINTS.LIVE), round, setLive)
+      probe(buildUrl(ENDPOINTS.METRICS), round, setMetrics)
     }
     doProbe()
-    const timer = setInterval(doProbe, 15000)
+    const timer = setInterval(doProbe, PROBE_INTERVAL_MS)
     return () => { aborted = true; controller.abort(); clearInterval(timer) }
   }, [apiBase])
 
@@ -118,26 +163,19 @@ export default function Settings() {
         const id = window.setTimeout(() => {
           setApiBaseError(null)
           setApiBase("")
-        }, 350)
+        }, API_BASE_DEBOUNCE_MS)
         return () => clearTimeout(id)
       }
       return
     }
-    const normalized = trimmed.replace(/\/+$/, "")
-    let valid = false
-    try {
-      const u = new URL(normalized)
-      valid = u.protocol === "http:" || u.protocol === "https:"
-    } catch {
-      valid = false
-    }
-    if (!valid) return
+    const parsed = parseApiBase(raw)
+    if (!parsed.ok) return
     // 已是目标值则不重复提交
-    if (normalized === apiBase) return
+    if (parsed.normalized === apiBase) return
     const id = window.setTimeout(() => {
       setApiBaseError(null)
-      setApiBase(normalized)
-    }, 350)
+      setApiBase(parsed.normalized)
+    }, API_BASE_DEBOUNCE_MS)
     return () => clearTimeout(id)
   }, [draftApiBase, apiBase, setApiBase])
 
@@ -149,14 +187,12 @@ export default function Settings() {
       setApiBaseError(null)
       return
     }
-    const normalized = trimmed.replace(/\/+$/, "")
-    try {
-      const u = new URL(normalized)
-      if (u.protocol !== "http:" && u.protocol !== "https:") throw new Error("invalid protocol")
+    const parsed = parseApiBase(raw)
+    if (parsed.ok) {
       setApiBaseError(null)
       // 合法输入不立即污染 persisted apiBase，由防抖 effect 统一提交
-    } catch {
-      setApiBaseError("无效 URL，需包含 http(s):// 且格式正确")
+    } else {
+      setApiBaseError(parsed.error)
       // 非法输入仅留在 draft，不污染 persisted apiBase，避免 XSS/open-redirect via href
     }
   }
@@ -171,14 +207,12 @@ export default function Settings() {
       }
       return
     }
-    const normalized = trimmed.replace(/\/+$/, "")
-    try {
-      const u = new URL(normalized)
-      if (u.protocol !== "http:" && u.protocol !== "https:") throw new Error("invalid protocol")
+    const parsed = parseApiBase(draftApiBase)
+    if (parsed.ok) {
       setApiBaseError(null)
-      if (normalized !== apiBase) setApiBase(normalized)
-    } catch {
-      setApiBaseError("无效 URL，需包含 http(s):// 且格式正确")
+      if (parsed.normalized !== apiBase) setApiBase(parsed.normalized)
+    } else {
+      setApiBaseError(parsed.error)
     }
   }
 
@@ -191,7 +225,7 @@ export default function Settings() {
       <div className="mt-6 rounded-2xl border border-white/10 bg-ink-800/60 p-5 backdrop-blur">
         <div className="flex items-center justify-between">
           <h2 className="text-sm font-semibold text-mist">连接自检</h2>
-          <span className="text-[11px] text-slate-500">自动探测 · 15s 刷新</span>
+          <span className="text-[11px] text-slate-500">自动探测 · {PROBE_INTERVAL_MS / 1000}s 刷新</span>
         </div>
         <div className="mt-3 grid gap-3 md:grid-cols-2">
           <ConnectivityCard path={ENDPOINTS.LIVE} check={live} okText="连通" failText="未连通" />
@@ -214,7 +248,7 @@ export default function Settings() {
             placeholder="留空则同源代理（/v1）· 可填 https://api.example.com"
             className="mt-2 w-full rounded-xl border border-white/10 bg-ink-900 px-3 py-2.5 text-sm text-mist placeholder:text-slate-500 outline-none focus:border-amber-500/40"
           />
-          {apiBaseError && <p className="mt-2 text-xs text-red-300">无效 URL：请输入完整地址，例如 https://api.example.com</p>}
+          {apiBaseError && <p className="mt-2 text-xs text-red-300">{apiBaseError}</p>}
           <p className="mt-2 text-xs text-slate-500">用于覆盖 fetch 基路径，默认走 Vite proxy 到 localhost:8899</p>
         </div>
 
