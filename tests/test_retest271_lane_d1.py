@@ -195,3 +195,122 @@ def test_d1_registry_resolve_provenance_minimal_signature(monkeypatch):
     assert _resolve_provenance(
         LiveLoader(), [{"close": 1}], Provenance(source="", unit="", symbol="AAPL.US")
     ) == "yahoo"
+
+
+# ---------------- loaders/tencent.py (6 items: 2 high + 3 medium + 1 low) ----------------
+
+def _tencent_loader_live(monkeypatch):
+    monkeypatch.setenv("HERO_DATA_MODE", "live")
+    import importlib
+    import hero_quant.config.settings as s
+    importlib.reload(s)
+    from hero_quant.data.loaders.tencent import TencentLoader
+    return TencentLoader()
+
+
+def _mock_urlopen_json(monkeypatch, payload):
+    import json
+    import unittest.mock as mock
+    import urllib.request
+
+    text = json.dumps(payload).encode()
+    m = mock.MagicMock()
+    m.read.return_value = text
+    m.__enter__ = lambda self: self
+    m.__exit__ = lambda self, *a: False
+    monkeypatch.setattr(urllib.request, "urlopen", lambda url, timeout=2: m)
+    monkeypatch.setattr("hero_quant.data.loaders.tencent.time.sleep", lambda *a, **k: None)
+
+
+def test_d1_tencent_cache_mode_isolated(monkeypatch):
+    """High: synthetic result must not poison a later live read (mode in cache key / bypass)."""
+    from hero_quant.data.loaders.tencent import TencentLoader
+
+    monkeypatch.setenv("HERO_DATA_MODE", "synthetic")
+    import importlib
+    import hero_quant.config.settings as s
+    importlib.reload(s)
+    loader = TencentLoader()
+    synth = loader.get_bars("600519.SH", "2025-01-01", "2025-01-03")
+    assert len(synth) == 3
+    monkeypatch.setenv("HERO_DATA_MODE", "live")
+    importlib.reload(s)
+    _mock_urlopen_json(monkeypatch, {"data": {"sh600519": {"day": [["2025-01-01", 10, 11, 12, 9, 100]]}}})
+    live = loader.get_bars("600519.SH", "2025-01-01", "2025-01-03")
+    assert len(live) == 1 and live[0]["close"] == 11.0  # not the 3 synthetic bars
+
+
+def test_d1_tencent_explicit_qfqday_key(monkeypatch):
+    """High: metadata lists (qt) must not be picked over qfq-day bars; absent key fails closed."""
+    from hero_quant.data.loaders.tencent import TencentLoader
+
+    loader = _tencent_loader_live(monkeypatch)
+    _mock_urlopen_json(monkeypatch, {"data": {
+        "qt": [["2025-01-01", 999, 999, 999, 999, 999]],
+        "sh600519": {"day": [["2025-01-02", 10, 11, 12, 9, 100]]},
+    }})
+    bars = loader.get_bars("600519.SH", "2025-01-01", "2025-01-05")
+    assert bars[0]["date"] == "2025-01-02" and bars[0]["close"] == 11.0
+    _mock_urlopen_json(monkeypatch, {"data": {"sz000001": {"qt": [["2025-01-02", 10, 11, 12, 9, 100]]}}})
+    with pytest.raises((ValueError, RuntimeError)):
+        loader.get_bars("600519.SH", "2025-01-06", "2025-01-09")
+
+
+def test_d1_tencent_live_dates_validated(monkeypatch):
+    """Medium: malformed live bar dates (None) must fail closed via DataValidationError."""
+    from hero_quant.data.loaders.tencent import DataValidationError, TencentLoader
+
+    loader = _tencent_loader_live(monkeypatch)
+    _mock_urlopen_json(monkeypatch, {"data": {"sh600000": {"day": [[None, 10, 11, 12, 9, 100]]}}})
+    with pytest.raises(DataValidationError):
+        loader.get_bars("600000.SH", "2025-01-01", "2025-01-05")
+
+
+def test_d1_tencent_dates_validated_before_url(monkeypatch):
+    """Medium: injection-y start/end must fail closed before URL build; no urlopen call."""
+    import urllib.request
+
+    from hero_quant.data.loaders.tencent import DataValidationError
+
+    loader = _tencent_loader_live(monkeypatch)
+    called = []
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **k: called.append(1))
+    with pytest.raises(DataValidationError):
+        loader.get_bars("600001.SH", "2025-01-01&evil=1", "2025-01-05")
+    assert called == []
+
+
+def test_d1_tencent_malformed_payload_fail_closed(monkeypatch):
+    """Medium: None numeric field must fail closed (DataValidationError/RuntimeError), never raw TypeError."""
+    import json
+    import unittest.mock as mock
+    import urllib.request
+
+    from hero_quant.data.loaders.tencent import DataValidationError
+
+    loader = _tencent_loader_live(monkeypatch)
+    text = json.dumps({"data": {"sh600002": {"day": [["2025-01-02", None, 11, 12, 9, 100]]}}}).encode()
+    m = mock.MagicMock()
+    m.read.return_value = text
+    m.__enter__ = lambda self: self
+    m.__exit__ = lambda self, *a: False
+    monkeypatch.setattr(urllib.request, "urlopen", lambda url, timeout=2: m)
+    monkeypatch.setattr("hero_quant.data.loaders.tencent.time.sleep", lambda *a, **k: None)
+    with pytest.raises((DataValidationError, RuntimeError)):
+        loader.get_bars("600002.SH", "2025-01-01", "2025-01-05")
+
+
+def test_d1_tencent_json_decode_taxonomy(monkeypatch):
+    """Low: garbage body must surface as RuntimeError (network/parse), handler sane."""
+    import unittest.mock as mock
+    import urllib.request
+
+    loader = _tencent_loader_live(monkeypatch)
+    m = mock.MagicMock()
+    m.read.return_value = b"not json {{{"
+    m.__enter__ = lambda self: self
+    m.__exit__ = lambda self, *a: False
+    monkeypatch.setattr(urllib.request, "urlopen", lambda url, timeout=2: m)
+    monkeypatch.setattr("hero_quant.data.loaders.tencent.time.sleep", lambda *a, **k: None)
+    with pytest.raises(RuntimeError):
+        loader.get_bars("600003.SH", "2025-01-01", "2025-01-05")
