@@ -49,7 +49,8 @@ def _get_redis_for_ticket():
         from hero_quant.infra.redis import get_redis_sync
 
         return get_redis_sync()
-    except _REDIS_ERRORS as e:
+    except (ImportError, *_REDIS_ERRORS) as e:
+        # 中文：ImportError（redis-py/ infra 缺失）同样回退内存，保持原有契约
         logger.debug("security.redis_unavailable error=%s", str(e))
         return None
 
