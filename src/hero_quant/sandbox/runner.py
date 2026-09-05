@@ -244,6 +244,18 @@ def _execute_python_impl(
     # （如 globals={'os': os} 或 __builtins__=完整内置可直接拿到 system/eval）。
     for _bad in (ast_guard.BANNED_CALL_NAMES | ast_guard.BANNED_GETATTR_NAMES | {"__builtins__"} | set(ast_guard.BANNED_IMPORT_ROOTS)):
         g_dict.pop(_bad, None)
+    # 别名值身份检查（rescan critical）：仅按 key pop 拦不住 {'myos': os} 这类
+    # 预注入别名——静态守卫只认字面名，运行时必须按值身份拒绝。is 比较防 __eq__ 陷阱。
+    import types as _types
+
+    _banned_builtin_vals = tuple(getattr(_builtins, n, None) for n in ast_guard.BANNED_CALL_NAMES)
+    for _k, _v in list(g_dict.items()):
+        if isinstance(_v, _types.ModuleType):
+            _mod_root = getattr(_v, "__name__", "").split(".")[0]
+            if _mod_root in ast_guard.BANNED_IMPORT_ROOTS:
+                raise SandboxViolation(f"banned module alias in globals_dict: {_k}")
+        if any(_v is _bv for _bv in _banned_builtin_vals if _bv is not None):
+            raise SandboxViolation(f"banned builtin alias in globals_dict: {_k}")
     if isinstance(locals_dict, dict):
         for _bad in (ast_guard.BANNED_CALL_NAMES | ast_guard.BANNED_GETATTR_NAMES | {"__builtins__"} | set(ast_guard.BANNED_IMPORT_ROOTS)):
             if _bad in locals_dict:
@@ -259,19 +271,21 @@ def _execute_python_impl(
         区分依据：import 语句/显式 __import__ 的 globals 即用户 g_dict；
         第三方库内部传递导入的 globals 为其自身模块命名空间，直接放行以免破坏
         pandas/numpy 等内部 ``import os`` 传递导入。
+        例外（rescan）：BANNED 根对一切导入者拒绝——伪造 globals 参数
+        （如 ``__import__('os', {})``）不得借“第三方”身份绕过。
         """
+        if not isinstance(name, str) or not name:
+            raise SandboxViolation("banned import: empty module name")
+        _root = name.split(".")[0]
+        if _root in ast_guard.BANNED_IMPORT_ROOTS or name in ast_guard.BANNED_IMPORT_ROOTS:
+            raise SandboxViolation(f"banned import: {name}")
         try:
             _is_user = globals is None or globals is g_dict
         except Exception:
             _is_user = True
         if _is_user:
-            if not isinstance(name, str) or not name:
-                raise SandboxViolation("banned import: empty module name")
             if level != 0:
                 raise SandboxViolation("banned relative import (fail-closed)")
-            _root = name.split(".")[0]
-            if _root in ast_guard.BANNED_IMPORT_ROOTS or name in ast_guard.BANNED_IMPORT_ROOTS:
-                raise SandboxViolation(f"banned import: {name}")
             _allowed = ast_guard.get_allowed_roots()
             if _root not in _allowed:
                 raise SandboxViolation(f"import allowlist violation: {name}")
@@ -404,6 +418,13 @@ class LandlockSandbox(BaseSandbox):
         if not Path(ws_canonical).is_dir():
             raise SandboxUnavailableError(
                 f"{_FATAL_PREFIX}workspaceRoot not a directory: {ws} (exit {LAUNCHER_FAILURE_EXIT})"
+            )
+        # 与 base/policy 对齐：文件系统根不得作为工作区——否则 readWrite=['/']
+        # 把约束模式静默升级为全盘可写（rescan；Windows 下 '/' 归一化为驱动器根，
+        # 故同时检查字面与归一化形态）。
+        if ws_canonical == "/" or Path(ws_canonical).parent == Path(ws_canonical):
+            raise SandboxUnavailableError(
+                f"{_FATAL_PREFIX}workspaceRoot must not be filesystem root: {ws} (exit {LAUNCHER_FAILURE_EXIT})"
             )
         grants = {
             "readOnly": ["/"],

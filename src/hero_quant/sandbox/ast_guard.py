@@ -291,6 +291,21 @@ BANNED_METHOD_NAMES = {
     "history",
     "fetch_ohlcv",
     "scan_csv",
+    # 命令执行原语（无视调用根：allowlisted 库转手 banned 模块时
+    # 如 logging.os.system / pathlib.os.system，(root, attr) 对够不着；
+    # 仅收无歧义的执行原语——df.query 等纯计算 API 不在此列）
+    "system",
+    "popen",
+    "Popen",
+    "execve",
+    "execv",
+    "execl",
+    "spawnl",
+    "spawnlp",
+    "fork",
+    "kill",
+    "check_call",
+    "check_output",
 }
 BANNED_ATTRS = {
     ("os", "system"),

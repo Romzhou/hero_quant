@@ -338,3 +338,45 @@ def test_laneA_base_local_execute_maps_missing_launcher(monkeypatch):
     )
     with pytest.raises(b.SandboxUnavailableError):
         be.execute(["echo", "hi"])
+
+
+# ── runner.py rescan follow-up ──────────────────────────────────────────
+
+
+def test_laneA_runner_confine_rejects_root_workspace(tmp_path):
+    """Medium rescan: runner confine must reject workspaceRoot='/' like base/policy do."""
+    from hero_quant.sandbox.runner import LandlockSandbox, SandboxUnavailableError
+
+    sb = LandlockSandbox(policy={"mode": "workspace-write", "workspaceRoot": str(tmp_path)})
+    sb._verdict = lambda: "full"  # noqa: SLF001 - force grant path w/o probe
+    with pytest.raises(SandboxUnavailableError):
+        sb.confine(["echo", "hi"], {"mode": "workspace-write", "workspaceRoot": "/"})
+
+
+def test_laneA_runner_guarded_import_forged_globals():
+    """Critical rescan: __import__('os', {}) forged-globals form must still deny banned roots."""
+    import pytest
+
+    from hero_quant.sandbox.runner import SandboxViolation, execute_python
+
+    with pytest.raises(SandboxViolation):
+        execute_python("__import__('os', {'x': 1})")
+
+
+def test_laneA_runner_globals_alias_by_value_rejected():
+    """Critical rescan: pre-injected {'myos': os} alias must be rejected by value identity."""
+    import os
+
+    import pytest
+
+    from hero_quant.sandbox.runner import SandboxViolation, execute_python
+
+    with pytest.raises(SandboxViolation):
+        execute_python("x = 1", globals_dict={"myos": os})
+
+
+def test_laneA_runner_reexported_exec_blocked():
+    """High rescan: allowlisted-lib re-exported exec (logging.os.system) denied by method name."""
+    from hero_quant.sandbox.ast_guard import check_import_allowlist as chk
+
+    assert chk("import logging\nlogging.os.system('id')") is False
