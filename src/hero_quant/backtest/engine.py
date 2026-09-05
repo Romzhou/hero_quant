@@ -17,13 +17,22 @@ import numpy as np
 import pandas as pd
 
 from .metrics import compute_metrics
-from .validation import ValidationError, validate
+from .validation import NON_PRICE_COLS, ValidationError, validate
 
 logger = logging.getLogger(__name__)
 
 
 class DataFeedError(RuntimeError):
     """Raised when price data is empty/malformed and synthetic is not allowed."""
+
+
+# Explicit broker-level notional cap for the capital pre-check, independent of
+# the signal weights. Raw positions are built as eq*wi/total*gross by
+# construction, so comparing against eq*gross is a tautology that never fires;
+# the check must use a limit NOT derived from the same weights. 4.0 keeps
+# legitimate 2x books (B1 contract: w=[1,1] positions ~= equity*2) unscaled
+# while still catching true over-leverage.
+MAX_NOTIONAL_LEVERAGE = 4.0
 
 
 class PITViolation(ValidationError):
@@ -50,8 +59,8 @@ class Signal:
         """根据 method 生成权重向量，长度为 n_assets 或从 prices 推断。"""
         # 推断资产数
         if n_assets is None:
-            # 使用 price_matrix 列数推断
-            non_price = {"open", "high", "low", "volume", "currency", "ccy"}
+            # 使用 price_matrix 列数推断 — single source NON_PRICE_COLS from validation
+            non_price = {c.lower() for c in NON_PRICE_COLS} | {"open", "high", "low"}
             candidate = [c for c in prices.columns if c.lower() not in non_price]
             n_assets = len(candidate) if len(candidate) > 0 else 1
             if n_assets == 0:
@@ -175,8 +184,8 @@ class BacktestEngine:
         n = len(prices)
         if idx < 0:
             idx = 0  # 边界保护：负索引归零，避免越界
-        # 判定多资产（复用 _price_matrix 的候选列逻辑）
-        non_price_cols = {"open", "high", "low", "volume", "currency", "ccy"}
+        # 判定多资产（复用 _price_matrix 的候选列逻辑 — NON_PRICE_COLS single source）
+        non_price_cols = {c.lower() for c in NON_PRICE_COLS} | {"open", "high", "low"}
         candidate_cols: list[str] = []
         for c in prices.columns:
             if c.lower() in non_price_cols:
@@ -444,7 +453,7 @@ class BacktestEngine:
         Single-asset: DataFrame with single 'close' column (plus optional open/high/low)
         Multi-asset: DataFrame with multiple price columns (e.g. ['AAPL','MSFT'] or ['close_0','close_1'])
         """
-        non_price_cols = {"open", "high", "low", "volume", "currency", "ccy"}
+        non_price_cols = {c.lower() for c in NON_PRICE_COLS} | {"open", "high", "low"}
         candidate_cols: list[str] = []
         for c in prices.columns:
             if c.lower() in non_price_cols:
@@ -483,10 +492,18 @@ class BacktestEngine:
         if len(candidate_cols) == 1:
             # 单资产路径：即使权重多于 1，也视为单价格序列的权重分配（文档化）
             mat = prices[candidate_cols].apply(pd.to_numeric, errors="coerce").astype(float)
+            if mat.isna().all().all():
+                raise DataFeedError("price matrix contains no valid numeric data")
+            if ((mat <= 0).any().any()):
+                raise DataFeedError("non-positive price in price matrix")
             return mat, False
 
         # 多资产路径：多个候选列均为不同资产收盘
         mat = prices[candidate_cols].apply(pd.to_numeric, errors="coerce").astype(float)
+        if mat.isna().all().all():
+            raise DataFeedError("price matrix contains no valid numeric data")
+        if ((mat <= 0).any().any()):
+            raise DataFeedError("non-positive price in price matrix")
         return mat, True
 
     # ------------------------------------------------------------------ run
@@ -504,6 +521,7 @@ class BacktestEngine:
         enforce_pit: bool = True,
         skip_pit: bool = False,
         allow_synthetic: bool = False,
+        max_leverage: float | None = None,
     ) -> dict:
         """执行回测主流程：校验→PIT 检查→信号生成→收益与换手计费→事件循环生成权益/持仓并产出 tearsheet。
 
@@ -525,12 +543,14 @@ class BacktestEngine:
         # 若完全无价格列则报错
         try:
             _, _ = self._price_matrix(prices)
+        except DataFeedError:
+            raise
         except (ValueError, TypeError) as e:
             raise ValueError(f"prices DataFrame must contain at least one price column: {e}") from e
         if "close" not in prices.columns:
             # 多资产路径允许无 'close' 列，但需至少一列价格；单列且全非 close 已在 _price_matrix 覆盖
             # 此处仅在完全无法解析时报错，保留兼容
-            non_price = {"open", "high", "low", "volume", "currency", "ccy"}
+            non_price = {c.lower() for c in NON_PRICE_COLS} | {"open", "high", "low"}
             candidate = [c for c in prices.columns if c.lower() not in non_price]
             if not candidate:
                 raise ValueError("prices DataFrame must contain 'close' column or asset price columns")
@@ -619,7 +639,16 @@ class BacktestEngine:
             if np.all(np.isclose(w, 0.0, atol=1e-12)):
                 logger.info("bear signal detected: zero weights preserved (leverage 0), not overriding to equal_weight")
                 # 保留零权重，杠杆与总权重按 isclose 处理
+        # 杠杆语义：leverage 为净敞口 sum(w)（方向/多空判断用），gross_weight 为
+        # 总敞口 sum(|w|)（收益与持仓缩放用）。市场中性组合（w=[0.5,-0.5]）净敞口
+        # ~0 但总敞口 1.0，不得用净敞口把收益与持仓归零。
         leverage = float(np.sum(w))
+        try:
+            gross_weight = float(np.sum(np.abs(w)))
+        except (ValueError, TypeError):
+            gross_weight = 0.0
+        if not np.isfinite(gross_weight):
+            gross_weight = 0.0
         if math.isclose(leverage, 0.0, abs_tol=1e-12) or not np.isfinite(leverage):
             if not math.isclose(leverage, 0.0, abs_tol=1e-12):
                 logger.warning("leverage non-finite %r clamped to 1.0", leverage, exc_info=True)
@@ -662,8 +691,9 @@ class BacktestEngine:
                 daily_ret = pd.Series(0.0, index=rets.index, dtype=float)
                 for i in range(n_use):
                     wi = float(w[i]) / total_weight if total_weight != 0 else 0.0
-                    # scale by leverage to preserve levered intent consistently
-                    wi = wi * float(leverage) if np.isfinite(leverage) else wi
+                    # scale by gross exposure, not net leverage: a market-neutral
+                    # book (net ~0, gross 1.0) must keep its gross P&L
+                    wi = wi * float(gross_weight) if np.isfinite(gross_weight) else wi
                     try:
                         daily_ret = daily_ret + rets.iloc[:, i].astype(float) * wi
                     except (ValueError, TypeError, IndexError) as e:
@@ -675,8 +705,8 @@ class BacktestEngine:
             except (ValueError, TypeError, AttributeError) as e:
                 logger.warning("multi-asset daily_ret computation failed: %s", e, exc_info=True)
                 daily_ret = price_matrix.iloc[:, 0].pct_change().fillna(0.0).replace([np.inf, -np.inf], 0.0).fillna(0.0)
-                if leverage != 1.0:
-                    daily_ret = daily_ret * leverage
+                if gross_weight != 1.0:
+                    daily_ret = daily_ret * gross_weight
         else:
             # 单资产路径：单列 close 的杠杆缩放（文档化）
             try:
@@ -691,8 +721,8 @@ class BacktestEngine:
                 raise DataFeedError(f"single-asset close parse failed (no synthetic fallback here): {e}") from e
             daily_ret = close.pct_change().fillna(0.0)
             daily_ret = daily_ret.replace([np.inf, -np.inf], 0.0).fillna(0.0)
-            if leverage != 1.0:
-                daily_ret = daily_ret * leverage
+            if gross_weight != 1.0:
+                daily_ret = daily_ret * gross_weight
 
         # --- 换手计费：按持仓变动比例扣除成本 ---
         net_ret = daily_ret.copy()
@@ -701,7 +731,9 @@ class BacktestEngine:
             try:
                 gross_equity = (1 + daily_ret).cumprod() * self.initial_capital
                 gross_equity.index = prices.index
-                # 按比例分配的持仓代理用于换手估计
+                # 按比例分配的持仓代理用于换手估计 — 与主循环持仓同口径乘 gross
+                # 敞口（gross_weight），不得漏乘导致成本拖累与执行收益错配
+                _gw = float(gross_weight) if np.isfinite(gross_weight) else 1.0
                 if is_multi:
                     # 多资产持仓：每资产按权重比例分配组合权益
                     pos_proxy_dict = {}
@@ -710,7 +742,7 @@ class BacktestEngine:
                     for i in range(n_use):
                         col = price_cols[i]
                         wi = float(w[i])
-                        pos_proxy_dict[str(col)] = gross_equity * wi / total_weight
+                        pos_proxy_dict[str(col)] = gross_equity * wi / total_weight * _gw
                     # 若权重少于资产数，剩余资产不持仓不计入
                     pos_proxy = pd.DataFrame(pos_proxy_dict, index=prices.index)
                     if pos_proxy.empty:
@@ -719,13 +751,14 @@ class BacktestEngine:
                     n_assets = len(w)
                     if n_assets > 1:
                         pos_proxy = pd.DataFrame(
-                            {f"asset_{i}": gross_equity * float(wi) / total_weight for i, wi in enumerate(w)},
+                            {f"asset_{i}": gross_equity * float(wi) / total_weight * _gw for i, wi in enumerate(w)},
                             index=prices.index,
                         )
                     else:
-                        pos_proxy = pd.DataFrame({"position": gross_equity * float(w[0]) / total_weight}, index=prices.index)
+                        pos_proxy = pd.DataFrame({"position": gross_equity * float(w[0]) / total_weight * _gw}, index=prices.index)
                 # 单口径：委托 _compute_turnover_rate，net_ret 保持 gross，成本单次在主循环扣除
-                turnover_rate = self._compute_turnover_rate(pos_proxy, gross_equity, w, total_weight, leverage=leverage)
+                # 首日补齐按 gross 敞口缩放（与持仓/收益口径一致，不用净杠杆）
+                turnover_rate = self._compute_turnover_rate(pos_proxy, gross_equity, w, total_weight, leverage=_gw)
                 # 周期内收益保持 gross（含杠杆，不含成本），成本仅在主循环逐 Bar 扣除一次，避免双计
                 net_ret = daily_ret.copy()
                 net_ret = net_ret.replace([np.inf, -np.inf], 0.0).fillna(0.0)
@@ -753,9 +786,8 @@ class BacktestEngine:
             logger.debug("_turnover_rate lookup failed: %s", e)
             _turnover_rate = None
         prev_aligned_price: pd.Series | None = None
-        # 中文：对齐收益记到执行 Bar——本轮算出的 aligned 收益存 pending，下轮再用；
-        # 首 Bar 用 close 口径（尚未执行），末 Bar 用上一轮 pending（不再是 0）。
-        pending_aligned: float | None = None
+        # 中文：_align(i) 已返回次日可执行价 P[i+1]，故 E[i]/E[i-1] 即本 Bar 可
+        # 执行收益，直接记到 bar i；不再经 pending 缓冲到 i+1（double delay）。
         for i in range(len(prices)):
             bar = prices.iloc[i]
             # 事件钩子：Bar→Signal→对齐（Wave5：aligned_price 参与 equity 定价）
@@ -766,7 +798,8 @@ class BacktestEngine:
                 _aligned_price = pd.Series(_aligned_price) if _aligned_price is not None else pd.Series(dtype=float)
             # 尝试使用 aligned_price 定价：若可得 aligned_ret 则覆盖 close 基 net_ret
             aligned_ret_raw: float | None = None
-            # 统一杠杆语义：使用归一化 wi/total_weight * leverage，与 positions 一致
+            # 统一杠杆语义：使用归一化 wi/total_weight * gross_weight，与 positions 一致
+            _gw_loop = float(gross_weight) if np.isfinite(gross_weight) else 1.0
             try:
                 if prev_aligned_price is not None:
                     price_cols = list(price_matrix.columns)
@@ -784,7 +817,7 @@ class BacktestEngine:
                                     r = ap / prev - 1
                                     if np.isfinite(r):
                                         wi_norm = float(w[ci]) / total_weight if total_weight != 0 else 0.0
-                                        wi_norm = wi_norm * float(leverage) if np.isfinite(leverage) else wi_norm
+                                        wi_norm = wi_norm * _gw_loop
                                         weighted_ret += wi_norm * r
                                         valid = True
                             except (ValueError, TypeError, KeyError):
@@ -814,24 +847,17 @@ class BacktestEngine:
                 gross_i = 0.0
             if not np.isfinite(gross_i):
                 gross_i = 0.0
-            # 若本 Bar 有有效 aligned_ret，则以 aligned 定价覆盖 gross
+            # E[i]/E[i-1] 已是本 Bar 可执行收益，直接使用（单资产再乘 gross 敞口；
+            # 多资产已在加权时乘过）；无有效 aligned 时回落 close 口径
             ret_gross = gross_i
-            # 中文：执行 Bar 归属——用上一轮 pending（i-1 信号在 _align(i-1) 执行的收益），
-            # 本轮新算的存 pending 供下轮；不把 P[i+1]/P[i] 记到 bar i（timing shift）。
-            if pending_aligned is not None and np.isfinite(pending_aligned):
-                ret_gross = float(pending_aligned)
-            pending_aligned = None
             if aligned_ret_raw is not None:
                 try:
                     if not is_multi:
-                        if leverage is not None and np.isfinite(leverage):
-                            aligned_scaled = float(aligned_ret_raw) * float(leverage)
-                        else:
-                            aligned_scaled = float(aligned_ret_raw)
+                        aligned_scaled = float(aligned_ret_raw) * _gw_loop
                     else:
                         aligned_scaled = float(aligned_ret_raw)
                     if np.isfinite(aligned_scaled):
-                        pending_aligned = float(aligned_scaled)
+                        ret_gross = float(aligned_scaled)
                 except (ValueError, TypeError) as e:
                     logger.warning("aligned_scaled computation failed: %s", e, exc_info=True)
                     pass
@@ -880,9 +906,9 @@ class BacktestEngine:
                 eq = self.initial_capital
             equity_vals.append(float(eq))
 
-            # 构建当 Bar 原始目标持仓（按权重比例分配组合权益，同步收益口径乘杠杆）
+            # 构建当 Bar 原始目标持仓（按权重比例分配组合权益，同步收益口径乘 gross 敞口）
             try:
-                _lev = float(leverage) if leverage is not None and np.isfinite(float(leverage)) else 1.0
+                _lev = float(gross_weight) if gross_weight is not None and np.isfinite(float(gross_weight)) else 1.0
             except (ValueError, TypeError):
                 _lev = 1.0
             if is_multi:
@@ -903,8 +929,18 @@ class BacktestEngine:
                 else:
                     raw = {"position": eq * float(w[0]) / total_weight * _lev}
             raw_s = pd.Series(raw, dtype=float)
-            # 资金预检等比缩放：杠杆下名义敞口上限为 eq*lev，不再按 1× 缩掉合法杠杆
-            scaled = self._execute_bars(raw_s, available_capital=eq * _lev)
+            # 资金预检等比缩放：名义敞口上限为 eq * max_leverage 显式经纪上限，
+            # 不用 eq*gross 自比自（恒成立）；默认 MAX_NOTIONAL_LEVERAGE=4.0 可经
+            # max_leverage 参数覆盖。B1 合同 w=[1,1]（gross=2）持仓 ~= equity*2
+            # 不被缩放；真超杠杆（gross > cap）仍等比截断。
+            _cap_lev = max_leverage if max_leverage is not None else MAX_NOTIONAL_LEVERAGE
+            try:
+                _cap_lev = float(_cap_lev)
+            except (ValueError, TypeError):
+                _cap_lev = MAX_NOTIONAL_LEVERAGE
+            if not np.isfinite(_cap_lev) or _cap_lev <= 0:
+                _cap_lev = MAX_NOTIONAL_LEVERAGE
+            scaled = self._execute_bars(raw_s, available_capital=eq * _cap_lev)
             raw_positions_rows.append(scaled)
 
         # 统一收盘基准用于兜底
@@ -929,9 +965,9 @@ class BacktestEngine:
         equity.name = "equity"
         equity.index = prices.index
 
-        # 由事件循环产出的已缩放持仓（回落路径与主循环同口径：归一权重×杠杆）
+        # 由事件循环产出的已缩放持仓（回落路径与主循环同口径：归一权重×gross 敞口）
         try:
-            _lev_fb = float(leverage) if leverage is not None and np.isfinite(float(leverage)) else 1.0
+            _lev_fb = float(gross_weight) if gross_weight is not None and np.isfinite(float(gross_weight)) else 1.0
         except (ValueError, TypeError):
             _lev_fb = 1.0
         try:
