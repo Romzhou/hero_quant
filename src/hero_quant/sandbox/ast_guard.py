@@ -45,10 +45,8 @@ _STATIC_ALLOWED = {
     "ccxt",
     "polars",
     # 开发期辅助（生成代码可能引用，非安全敏感）
-    "pytest",
-    "pytest_cov",
-    "ruff",
-    "black",
+    # 注意：pytest/pytest_cov/ruff/black 等 dev-only 包已从运行时白名单移除，
+    # 沙箱内单测/格式化工具无执行必要，留存即扩大攻击面（retest-271）。
     # quantlib 扩展
     "joblib",
     "duckdb",
@@ -166,13 +164,15 @@ def _get_dynamic_roots() -> set[str]:
 
 
 def _get_allowed_roots() -> set[str]:
-    """返回完整的白名单集合（静态+动态+扩展），用于懒加载初始化。
+    """返回运行时白名单集合（仅静态+扩展），用于懒加载初始化。
 
-    信任边界声明（trusted input）：pyproject.toml 被视为受信输入（与仓库同等信任等级），
-    其新增依赖经懒合并后自动放行；is_allowlist_synced_with_pyproject() 仅做
-    审计提示，不做强制门控——审计时以本声明为准。
+    Fail-closed（retest-271）：不再将 pyproject.toml 视为可自动放行的 trusted
+    输入——其新增依赖不会自动进入运行时白名单，必须经显式静态条目 + 安全评审
+    后方可执行；is_allowlist_synced_with_pyproject() 仅做审计提示，不做强制门控。
+    动态 roots 仍可经 _get_dynamic_roots()/reload_allowed_roots() 做审计比对，
+    但不参与放行裁决。
     """
-    return set(_STATIC_ALLOWED) | set(_QUANTLIB_EXTRA) | set(_get_dynamic_roots())
+    return set(_STATIC_ALLOWED) | set(_QUANTLIB_EXTRA)
 
 
 _STATIC_ROOTS: set[str] = set(_STATIC_ALLOWED) | set(_QUANTLIB_EXTRA)
@@ -184,8 +184,16 @@ ALLOWED_ROOTS: set[str] = set(_STATIC_ROOTS)
 
 
 def reload_allowed_roots() -> set[str]:
-    """按需将 pyproject 动态 roots 合并进 ALLOWED_ROOTS 并返回拷贝（幂等，原地更新）。"""
-    merged = _get_allowed_roots()
+    """刷新动态 roots 缓存并同步审计镜像 ALLOWED_ROOTS，返回其拷贝（幂等，原地更新）。
+
+    先失效 _DYNAMIC_ROOTS 缓存再重载，否则 reload 只是重新合并 stale 快照。
+    注意裁决唯一真相源：check_import_allowlist() 只认 _get_allowed_roots()
+    （静态+扩展）；ALLOWED_ROOTS 是供审计/测试观察的镜像，reload 不同步
+    裁决——pyproject 新增依赖永不自动放行（fail-closed）。
+    """
+    global _DYNAMIC_ROOTS
+    _DYNAMIC_ROOTS = _load_pyproject_roots()  # invalidate cache
+    merged = set(_STATIC_ALLOWED) | set(_QUANTLIB_EXTRA) | set(_DYNAMIC_ROOTS)
     ALLOWED_ROOTS.clear()
     ALLOWED_ROOTS.update(merged)
     return set(ALLOWED_ROOTS)
@@ -234,6 +242,71 @@ BANNED_DUNDER_ATTRS = {
 # 亦覆盖 allowlist 库的文件 I/O 与外联旁路做纵深防御——即使 OS 层缺失，
 # 显式写文件/外联调用也在此被拦；真正的文件与网络隔离仍由 OS 层强制，
 # 本守卫不声称单独 containment（见 check_import_allowlist 文档）
+#
+# 实例无关的方法名拒绝表（retest-271）：_get_root_name 对 `p = Path(...);
+# p.write_text(...)` / `client = httpx.Client(); client.get(...)` 这类实例调用
+# 只能解析出变量名，(root, attr) 二元组永远匹配不上。危险方法名无视调用根，
+# 一律拦截；纯计算 API（DataFrame/shape 等）不在此表，不影响量化复用。
+BANNED_METHOD_NAMES = {
+    # 文件 I/O（pathlib/pandas/numpy/pyarrow/duckdb/joblib 等一切实例方法）
+    "read_text",
+    "write_text",
+    "read_bytes",
+    "write_bytes",
+    "unlink",
+    "mkdir",
+    "rename",
+    "glob",
+    "rglob",
+    "read_csv",
+    "to_csv",
+    "read_pickle",
+    "to_pickle",
+    "read_parquet",
+    "to_parquet",
+    "read_json",
+    "to_json",
+    "read_excel",
+    "to_excel",
+    "read_sql",
+    "to_sql",
+    "read_hdf",
+    "to_hdf",
+    # pickle/序列化加载（RCE 面）
+    "unsafe_load",
+    "load",
+    "loads",
+    "dump",
+    # 文件打开（实例形态 p.open()；模块形态 open() 另由 BANNED_CALL_NAMES 覆盖）
+    "open",
+    # 网络外联（httpx.Client 实例 / yfinance.Ticker / ccxt / requests 等）
+    "get",
+    "post",
+    "put",
+    "delete",
+    "patch",
+    "request",
+    "stream",
+    "download",
+    "history",
+    "fetch_ohlcv",
+    "scan_csv",
+    # 命令执行原语（无视调用根：allowlisted 库转手 banned 模块时
+    # 如 logging.os.system / pathlib.os.system，(root, attr) 对够不着；
+    # 仅收无歧义的执行原语——df.query 等纯计算 API 不在此列）
+    "system",
+    "popen",
+    "Popen",
+    "execve",
+    "execv",
+    "execl",
+    "spawnl",
+    "spawnlp",
+    "fork",
+    "kill",
+    "check_call",
+    "check_output",
+}
 BANNED_ATTRS = {
     ("os", "system"),
     ("os", "popen"),
@@ -257,6 +330,33 @@ BANNED_ATTRS = {
     ("Path", "write_bytes"),
     ("Path", "unlink"),
     ("Path", "open"),
+    # 全限定 pathlib.Path(...).write_text(...) 解析根为 pathlib，(Path, ...) 够不着
+    ("pathlib", "read_text"),
+    ("pathlib", "write_text"),
+    ("pathlib", "read_bytes"),
+    ("pathlib", "write_bytes"),
+    ("pathlib", "unlink"),
+    ("pathlib", "open"),
+    ("pathlib", "mkdir"),
+    ("pathlib", "rename"),
+    ("pathlib", "glob"),
+    # allowlist 计算库的危险加载器（pickle/RCE、文件、URL）——逐库收敛
+    ("pandas", "read_pickle"),
+    ("pandas", "to_pickle"),
+    ("pandas", "read_csv"),
+    ("pandas", "to_csv"),
+    ("numpy", "load"),
+    ("numpy", "loads"),
+    ("yaml", "load"),
+    ("yaml", "unsafe_load"),
+    ("joblib", "load"),
+    ("joblib", "dump"),
+    ("duckdb", "read_csv"),
+    ("duckdb", "read_parquet"),
+    ("duckdb", "connect"),
+    ("duckdb", "query"),
+    ("pyarrow", "read_table"),
+    ("httpx", "Client"),
     ("httpx", "get"),
     ("httpx", "post"),
     ("httpx", "put"),
@@ -274,10 +374,19 @@ BANNED_ATTRS = {
 
 
 def _is_banned_subscript(node: ast.Subscript) -> bool:
-    """检测 Subscript 索引为危险 dunder 常量字符串（如 obj['__class__']）。"""
+    """检测 Subscript 索引为危险 dunder 常量字符串（如 obj['__class__']）。
+
+    纵深：banned 根上的字符串下标（如 os["system"]）不可验证，一并拒绝。
+    非调用下标的数据访问（如 bar['open'] OHLC 取值）不受影响——真正的下标
+    调用（obj[...]()）另由 Call-Subscript 分支 fail-closed 拒绝。
+    """
     slc = node.slice
     if isinstance(slc, ast.Constant) and isinstance(slc.value, str) and slc.value in BANNED_DUNDER_ATTRS:
         return True
+    if isinstance(slc, ast.Constant) and isinstance(slc.value, str):
+        root = _get_root_name(node.value)
+        if root is not None and root in BANNED_IMPORT_ROOTS:
+            return True
     return False
 
 
@@ -314,6 +423,9 @@ def _is_banned_attribute(node: ast.Attribute, alias_map: dict[str, str] | None =
     if attr in BANNED_DUNDER_ATTRS:
         return True
     if attr in BANNED_GETATTR_NAMES:
+        return True
+    # 实例无关拦截：危险方法名不看调用根（变量/实例/全限定名一律命中）
+    if attr in BANNED_METHOD_NAMES:
         return True
     root = _get_root_name(node)
     if root is None:
@@ -413,9 +525,17 @@ def check_import_allowlist(code: str) -> bool:
                 effective = alias_map.get(func.id, func.id)
                 if effective in BANNED_IMPORT_ROOTS:
                     return False
+                # from-import 危险属性直接调用：`from pandas import read_pickle` 后
+                # 裸 `read_pickle(...)` 无 Attribute 形态，按 (模块, 属性) 对拒绝；
+                # 非对内名字（如 from pandas import DataFrame）不受影响。
+                if (effective, func.id) in BANNED_ATTRS:
+                    return False
             if isinstance(func, ast.Attribute):
                 if _is_banned_attribute(func, alias_map):
                     return False
+            if isinstance(func, ast.Subscript):
+                # fail-closed：os["system"](...) 这类动态分发不可验证，一律拒绝
+                return False
         elif isinstance(node, ast.Attribute):
             # 即使未调用，单纯引用高危属性也应拦截（如 x = os.system）
             if _is_banned_attribute(node, alias_map):
@@ -463,8 +583,14 @@ def get_allowed_roots() -> set[str]:
 
 
 def is_allowlist_synced_with_pyproject() -> tuple[bool, list[str]]:
-    """检查白名单与 pyproject 的同步状态，返回 (是否同步, 缺失列表)。"""
+    """检查白名单与 pyproject 的同步状态，返回 (是否同步, 问题列表)。
+
+    双向比对：既报告 pyproject 新增但静态白名单缺失的（missing），也报告静态
+    白名单有但 pyproject 已移除的 stale 项（stale:<root>，_QUANTLIB_EXTRA 除外）。
+    """
     dynamic = _load_pyproject_roots()
     expected = set(_STATIC_ALLOWED) | set(_QUANTLIB_EXTRA)
-    missing = [r for r in dynamic if r not in expected]
-    return (len(missing) == 0, missing)
+    missing = sorted(r for r in dynamic if r not in expected)
+    stale = sorted(r for r in expected if r not in dynamic and r not in _QUANTLIB_EXTRA)
+    problems = missing + [f"stale:{s}" for s in stale]
+    return (len(problems) == 0, problems)
