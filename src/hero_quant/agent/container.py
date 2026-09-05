@@ -83,9 +83,10 @@ class AgentContainer:
         self.llm: Optional[Any] = None
         self.graph: Optional[Any] = None
         self.checkpointer: Optional[Any] = None
-        # 中文：sync 初始化需用 threading.Lock，asyncio.Lock 不能在 sync 场景下 await；
-        # 实例级锁保护实例级状态，避免模块全局锁串行化无关容器
-        self._lock = threading.Lock()
+        # 中文：sync 初始化需用 threading 锁，asyncio.Lock 不能在 sync 场景下 await；
+        # 实例级锁保护实例级状态，避免模块全局锁串行化无关容器；
+        # RLock 允许 init_graph 持锁调用 init_checkpointer（同实例嵌套加锁）
+        self._lock = threading.RLock()
 
     def init_llm(self, llm: Optional[Any] = None) -> Optional[Any]:
         """初始化 LLM（显式注入优先，否则经 LLMFactory 离线友好创建）。"""
