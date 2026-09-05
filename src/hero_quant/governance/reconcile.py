@@ -30,6 +30,13 @@ class ReconcileResult:
         return asdict(self)
 
 
+_BUY_SIDES = frozenset({"buy", "long", "bid", "cover"})
+_SELL_SIDES = frozenset({"sell", "short", "ask"})
+
+# 可扩展卖出别名（仍显式白名单，未命中一律 fail-closed，避免默认买入反转符号）
+_SELL_ALIASES = frozenset({"sold", "s", "to_close", "close", "sell_to_close", "sell-to-close"})
+
+
 def _normalize_qty(value: Any) -> float:
     """数量归一化：空值/非数值抛 ValueError 并 warning，避免脏数据静默。"""
     if value is None:
@@ -68,16 +75,16 @@ def load_positions_csv(path: str | Path) -> Dict[str, float]:
                 sym_key = lower_map[cand]
                 break
         if sym_key is None:
-            # fallback first column
-            sym_key = reader.fieldnames[0]
+            # 中文：未知表头必须 fail-closed（symbol/quantity 双列），不可位置兜底误映射
+            raise ValueError(f"positions.csv missing symbol header, got {reader.fieldnames!r}")
         qty_key = None
         for cand in ["qty", "quantity", "position", "amount", "shares", "holding", "vol"]:
             if cand in lower_map:
                 qty_key = lower_map[cand]
                 break
         if qty_key is None:
-            # fallback second column if exists else first
-            qty_key = reader.fieldnames[1] if len(reader.fieldnames) > 1 else reader.fieldnames[0]
+            # 中文：未知表头必须 fail-closed（symbol/quantity 双列），不可位置兜底误映射
+            raise ValueError(f"positions.csv missing quantity header, got {reader.fieldnames!r}")
 
         for row in reader:
             sym = str(row.get(sym_key, "")).strip()
@@ -99,10 +106,20 @@ def _shadow_qty_from_trade(trade: Dict[str, Any]) -> tuple[str, float]:
         return "", 0.0
     qty = trade.get("qty", trade.get("quantity", trade.get("amount", 0)))
     q = _normalize_qty(qty)
-    side = str(trade.get("side", "buy")).strip().lower()
-    if side in ("sell", "short", "ask"):
+    # 中文：显式空 side（None/空串/空白）不可默认买入，fail-closed；
+    # 键缺失沿用历史默认 buy（存量影子/ledger 记录多无 side 键，改默认值会断现有流水）。
+    _side_raw = trade.get("side", None) if "side" in trade else "buy"
+    if _side_raw is None or (isinstance(_side_raw, str) and not _side_raw.strip()):
+        logger.warning("shadow trade missing side for symbol %r", sym)
+        raise ValueError(f"missing trade side for symbol {sym!r}")
+    side = str(_side_raw).strip().lower()
+    if side in _SELL_SIDES or side in _SELL_ALIASES:
         # 卖出以负数计入净持仓，便于与券商净持仓直接比对
         q = -abs(q)
+    elif side not in _BUY_SIDES:
+        # 中文：未知 side 必须 fail-closed，不可默认买入（符号反转）
+        logger.warning("unknown trade side %r for symbol %r", trade.get("side"), sym)
+        raise ValueError(f"unknown trade side: {trade.get('side')!r}")
     return sym, q
 
 
@@ -135,9 +152,12 @@ def aggregate_shadow(
         elif isinstance(journal, dict):
             records = [journal]
         for tr in records:
-            if isinstance(tr, dict):
-                sym, q = _shadow_qty_from_trade(tr)
-                add(sym, q)
+            # 中文：非 dict 交易不可静默丢弃（少计影子持仓会误报 zero_diff），fail-closed
+            if not isinstance(tr, dict):
+                logger.warning("aggregate_shadow unsupported journal trade type %r: %r", type(tr).__name__, tr)
+                raise ValueError(f"unsupported journal trade type: {type(tr).__name__}")
+            sym, q = _shadow_qty_from_trade(tr)
+            add(sym, q)
 
     def _same_file_by_inode(a: Path, b: Path) -> bool:
         """以 (st_dev, st_ino) 判同文件（P2），先 stat 再回退 resolve/absolute 对比."""
@@ -155,6 +175,11 @@ def aggregate_shadow(
                 return a.absolute().as_posix() == b.absolute().as_posix()
 
     # 预计算去重标记：journal 与 ledger 是否同源 —— P2: 以 (st_dev, st_ino) 判同文件，避免硬链接/同名不同 inode 误判
+    # 中文：list/dict journal 无来源信息，与 ledger/ledger_path 同传时 fail-closed（防双计），不静默聚合
+    if journal is not None and (ledger is not None or ledger_path is not None):
+        if isinstance(journal, (list, dict)) or not hasattr(journal, "ledger"):
+            logger.warning("aggregate_shadow: journal and ledger/ledger_path both given without provenance; refusing to aggregate both")
+            raise ValueError("aggregate_shadow: journal and ledger/ledger_path both given without provenance (risk of double-count); pass only one")
     same_ledger = False
     if journal is not None and ledger is not None:
         try:
@@ -179,6 +204,10 @@ def aggregate_shadow(
                 same_file = False
 
     # 来自 Ledger 对象：解析 shadow_record/trade 与直接 symbol 记录
+    # 中文：无 _read_all 的 ledger 对象不可静默忽略（会漏计而误报 zero_diff），fail-closed
+    if ledger is not None and not hasattr(ledger, "_read_all"):
+        logger.warning("aggregate_shadow: ledger object missing _read_all: %r", type(ledger))
+        raise TypeError(f"aggregate_shadow: ledger object missing _read_all: {type(ledger)!r}")
     if ledger is not None and hasattr(ledger, "_read_all"):
         if same_ledger:
             # 已通过 journal 计数，跳过 ledger 避免双计
@@ -266,8 +295,20 @@ def reconcile(
     diffs: List[Dict[str, Any]] = []
     total = 0.0
     for sym in sorted(all_syms):
-        s = float(shadow.get(sym, 0))
-        b = float(broker.get(sym, 0))
+        try:
+            s = float(shadow.get(sym, 0))
+        except (ValueError, TypeError) as exc:
+            logger.warning("reconcile non-numeric shadow holding for %r: %s", sym, exc)
+            raise ValueError(f"non-numeric shadow holding for {sym!r}") from exc
+        try:
+            b = float(broker.get(sym, 0))
+        except (ValueError, TypeError) as exc:
+            logger.warning("reconcile non-numeric broker holding for %r: %s", sym, exc)
+            raise ValueError(f"non-numeric broker holding for {sym!r}") from exc
+        # 中文：非有限持仓必须 fail-closed（NaN 会使 ad > tolerance 恒 False 而误报 zero_diff）
+        if not math.isfinite(s) or not math.isfinite(b):
+            logger.warning("reconcile non-finite holding for %r: shadow=%r broker=%r", sym, s, b)
+            raise ValueError(f"non-finite holding for {sym!r}: shadow={s!r} broker={b!r}")
         d = s - b
         ad = abs(d)
         # 修复 tolerance vs total_diff 不一致：仅容差外的差额计入 total，保持 zero 与 total 一致

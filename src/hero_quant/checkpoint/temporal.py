@@ -39,6 +39,23 @@ def _set_thread_details(details: Optional[Dict[str, Any]]) -> None:
     _thread_local.details = details
 
 
+def clear_heartbeat_details() -> None:
+    """清空三槽 heartbeatDetails（ContextVar + thread-local + 共享），防跨 activity 复用旧续跑点。"""
+    try:
+        _heartbeat_details_ctx.set(None)
+    except Exception as _exc:
+        logger.debug("silent handled: offline-safe: temporal sidecar optional", exc_info=_exc)  # intentional: offline-safe: temporal sidecar optional
+        pass  # intentional offline-safe: temporal sidecar optional
+    _set_thread_details(None)
+    try:
+        with _shared_lock:
+            global _shared_details
+            _shared_details = None
+    except Exception as _exc:
+        logger.debug("silent handled: offline-safe: temporal sidecar optional", exc_info=_exc)
+        pass
+
+
 def heartbeat(details: Dict[str, Any] | Any = None) -> None:
     """发送心跳 — 记录 heartbeatDetails 供重试/续跑恢复。"""
     # 归一化为 dict，便于后续序列化与 Temporal 透传
@@ -133,7 +150,16 @@ class HeartbeatHelper:
         self._async_task: Optional[asyncio.Task] = None
 
     def start(self, initial_details: Dict[str, Any] | None = None) -> None:
-        """启动后台心跳线程，立即发送一次初始心跳。"""
+        """启动后台心跳线程，立即发送一次初始心跳。
+
+        混合复用互斥：若异步任务在跑，同步 start 拒绝启动并抛错（调用方须先
+        await astop()），不可悄悄并行双心跳，亦不可火忘取消后丢句柄。
+        """
+        # 中文：混合复用必须互斥——异步循环在跑时同步 start 拒绝启动（fail-closed），
+        # 调用方须先 await astop()；不可悄悄并行（双心跳），亦不可火忘取消后丢句柄。
+        _atask = self._async_task
+        if _atask is not None and not _atask.done():
+            raise RuntimeError("HeartbeatHelper.start: async heartbeat task still running; await astop() first")
         self._details = dict(initial_details) if initial_details else {}
         self._stop.clear()
         heartbeat(self._details)
@@ -167,42 +193,61 @@ class HeartbeatHelper:
         return get_heartbeat_details()
 
     def stop(self) -> None:
-        """停止后台线程，最多等待 1s 保证资源回收。"""
-        # 中文注释：同步 stop 也需取消异步任务，避免泄漏；若在事件循环线程内则直接 cancel
+        """停止后台心跳与异步任务。
+
+        线程安全：绝不在事件循环线程内 join（阻塞 loop）；异步任务取消一律经
+        loop.call_soon_threadsafe，不可跨线程直调 task.cancel()。
+        """
+        # 中文注释：同步 stop 也需取消异步任务，避免泄漏；取消一律经 loop 线程安全投递
         self._stop.set()
         if self._thread is not None:
-            self._thread.join(timeout=1.0)
-            if self._thread.is_alive():
-                logger.warning("temporal 心跳线程未在 1s 内退出")
-        self._thread = None
+            try:
+                _loop = asyncio.get_running_loop()
+            except RuntimeError:
+                _loop = None
+            if _loop is None:
+                self._thread.join(timeout=1.0)
+                if self._thread.is_alive():
+                    logger.warning("temporal 心跳线程未在 1s 内退出")
+                else:
+                    self._thread = None
+            else:
+                # 中文：在事件循环线程内不可 join（阻塞 loop）且不可丢句柄（否则泄漏/双心跳）；
+                # 保留句柄交由 await astop() 回收
+                logger.warning("stop() called on event-loop thread; skipping blocking join, use await astop()")
+                return
+        else:
+            self._thread = None
         if self._async_task is not None:
             task = self._async_task
-            # 尝试在当前 loop 中取消；若无 loop 则 thread-safe 取消
+            # 中文：跨线程取消必须经 loop.call_soon_threadsafe，直调 task.cancel() 非线程安全
             try:
                 if not task.done():
-                    task.cancel()
+                    try:
+                        t_loop = task.get_loop()
+                    except Exception:
+                        t_loop = None
+                    if t_loop is not None and not t_loop.is_closed():
+                        t_loop.call_soon_threadsafe(task.cancel)
+                    else:
+                        try:
+                            task.cancel()
+                        except RuntimeError as _exc:  # noqa: BLE001 窄化
+                            logger.debug("stop 取消任务已完成: %s", _exc)
             except RuntimeError as _exc:  # noqa: BLE001 窄化
                 logger.debug("stop 取消任务已完成: %s", _exc)
             except Exception as _exc:  # noqa: BLE001 兜底
                 logger.debug("stop 取消异步任务失败: %s", _exc, exc_info=True)
-            # 若无运行 loop 但任务绑定了 loop，尝试 thread-safe 取消
-            try:
-                if not task.done():
-                    t_loop = getattr(task, "get_loop", lambda: None)()
-                    if t_loop is not None and not t_loop.is_closed():
-                        t_loop.call_soon_threadsafe(task.cancel)
-                    else:
-                        logger.warning("temporal 异步心跳任务仍在运行，请用 astop() 取消")
-            except Exception as _exc:
-                logger.debug("stop thread-safe 取消失败: %s", _exc, exc_info=True)
             # 已尝试取消，不再置 None 由 astop 或后续清理；此处保留句柄以便 astop await
             # 若任务已被 cancel 且不在 loop 中，置 None 亦可；保留句柄更安全
             if task.done() or task.cancelled():
                 self._async_task = None
+        # 中文：停机即清三槽（sync/async 一致），避免旧续跑点泄漏到后一个 activity
+        clear_heartbeat_details()
 
     # 异步变体占位
     async def astart(self, initial_details: Dict[str, Any] | None = None) -> None:
-        """异步启动 — 仅起异步任务，不复用同步线程（避免双心跳）。"""
+        """异步启动 — 仅起异步任务，不复用同步线程（避免双心跳）；重复启动先取消旧任务。"""
         # 中文注释：重启前需清 _stop，否则 stop 后立即退出
         self._stop.clear()
         self._details = dict(initial_details) if initial_details else {}
@@ -211,6 +256,28 @@ class HeartbeatHelper:
         except Exception as _exc:
             logger.debug("silent handled: offline-safe: temporal sidecar optional", exc_info=_exc)  # intentional: offline-safe: temporal sidecar optional
             pass  # intentional offline-safe: temporal sidecar optional
+        # 中文：重复/混合启动不得孤儿化旧循环——先取消旧异步任务，并停同步线程，避免双心跳
+        _old = self._async_task
+        if _old is not None and not _old.done():
+            _old.cancel()
+            try:
+                await _old
+            except asyncio.CancelledError:
+                pass
+            except Exception as _exc:
+                logger.debug("astart 回收旧任务: %s", _exc, exc_info=True)
+        self._async_task = None
+        if self._thread is not None:
+            try:
+                # 中文：同步线程不停会与异步循环双心跳；不可在 loop 线程阻塞 join，
+                # 仅 signal _stop 并卸载 join 到执行器
+                self._stop.set()
+                await asyncio.to_thread(self._thread.join, 0.2)
+            except Exception as _exc:
+                logger.debug("astart 回收旧线程: %s", _exc, exc_info=True)
+            if not self._thread.is_alive():
+                self._thread = None
+            self._stop.clear()
         # 异步循环占位（可选）
         try:
             loop = asyncio.get_running_loop()
@@ -232,23 +299,37 @@ class HeartbeatHelper:
                 pass  # intentional offline-safe: temporal sidecar optional
 
     async def astop(self) -> None:
-        """异步停止 — 取消异步任务并回收线程。"""
-        # save async task before stop() clears it
-        _task = self._async_task
-        self.stop()
-        # restore if stop cleared it but not yet cancelled/awaited
-        task = _task if _task is not None else None
+        """异步停止 — 取消异步任务并回收线程（join 卸载到执行器，不阻塞事件循环）。"""
+        self._stop.set()
+        # 中文：join 不可在 loop 线程阻塞，卸载到执行器
+        _thread = self._thread
+        if _thread is not None:
+            try:
+                await asyncio.to_thread(_thread.join, 1.0)
+                if _thread.is_alive():
+                    logger.warning("temporal 心跳线程未在 1s 内退出")
+            except Exception as _exc:
+                logger.debug("astop 回收线程: %s", _exc, exc_info=True)
+            self._thread = None
+        # 中文：取消经 loop 线程安全投递并 await 回收（本协程即跑在任务 loop 上）
+        task = self._async_task
+        self._async_task = None
         if task is not None:
             try:
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
+                if not task.done():
+                    try:
+                        task.get_loop().call_soon_threadsafe(task.cancel)
+                    except Exception:
+                        task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
             except Exception as _exc:
                 logger.debug("silent handled: offline-safe: temporal sidecar optional", exc_info=_exc)  # intentional: offline-safe: temporal sidecar optional
                 pass  # intentional offline-safe: temporal sidecar optional
-            self._async_task = None
+        # 中文：停机即清三槽，避免旧续跑点泄漏到后一个 activity
+        clear_heartbeat_details()
 
 
 # 兼容别名 — 历史导入 `HeartbeatTimer` 指向 HeartbeatHelper
@@ -264,6 +345,7 @@ __all__ = [
     "HEARTBEAT_INTERVAL",
     "DEFAULT_HEARTBEAT_TIMEOUT",
     "heartbeat",
+    "clear_heartbeat_details",
     "get_heartbeat_details",
     "HeartbeatHelper",
     "HeartbeatTimer",

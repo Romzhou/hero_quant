@@ -6,6 +6,7 @@ Task8: asyncpg PG + RLS (tenant = current_setting('app.tenant', true))
 """
 from __future__ import annotations
 
+import contextlib
 import copy
 import hashlib
 import math
@@ -87,6 +88,11 @@ _PURCHASE_INSERT_SQL = (
 _GLOBAL_LOCK = threading.RLock()
 _GLOBAL_FACTORS: Dict[str, Dict[str, dict]] = {}  # hashed_dsn -> factor_id -> factor
 _GLOBAL_PURCHASES: Dict[str, List[dict]] = {}  # hashed_dsn -> list[purchase]
+# Per-(factor,buyer,idempotency) reservation locks: serialize purchase check-then-act
+# without holding the global lock across ledger/DB IO. Bounded by active keys only;
+# entry removed when the holder finishes (see _purchase_guard).
+_PURCHASE_KEY_LOCKS: Dict[tuple, threading.Lock] = {}
+_PURCHASE_KEY_LOCKS_GUARD = threading.Lock()
 _PG_WARNING_LOGGED = False
 _PG_WARNING_LOCK = threading.Lock()
 _purchase_counter = 0
@@ -108,6 +114,27 @@ def _dsn_key(dsn: str | None) -> str:
         return hashlib.sha256(dsn.encode()).hexdigest()[:12]
     except Exception:
         return "__memory__"
+
+
+@contextlib.contextmanager
+def _purchase_guard(key: tuple):
+    """Serialize check-then-act for one idempotency key while keeping _GLOBAL_LOCK IO-free.
+
+    Lock object is created under a short guard critical section; the key entry is
+    removed on exit so the map stays bounded by in-flight keys (no unbounded growth).
+    """
+    with _PURCHASE_KEY_LOCKS_GUARD:
+        key_lock = _PURCHASE_KEY_LOCKS.get(key)
+        if key_lock is None:
+            key_lock = threading.Lock()
+            _PURCHASE_KEY_LOCKS[key] = key_lock
+    with key_lock:
+        try:
+            yield
+        finally:
+            with _PURCHASE_KEY_LOCKS_GUARD:
+                if _PURCHASE_KEY_LOCKS.get(key) is key_lock:
+                    del _PURCHASE_KEY_LOCKS[key]
 
 
 def _log_pg_warning_once():
@@ -194,6 +221,15 @@ class BillingService:
         """显式 no-op 桩：购买持久化未实现。"""
         return None
 
+    def _exec_billing_ddl(self, conn) -> None:
+        """在真实 PG 连接上执行 DDL_FACTORS/DDL_PURCHASES（幂等建表），失败抛错由调用方 fail-closed。"""
+        for _ddl in (DDL_FACTORS, DDL_PURCHASES):
+            try:
+                conn.execute(_ddl)  # type: ignore
+            except Exception:
+                with conn.cursor() as _c:  # type: ignore
+                    _c.execute(_ddl)
+
     def publish_factor(
         self,
         factor_id: str,
@@ -240,46 +276,89 @@ class BillingService:
             "tenant": tenant,
             "description": description,
         }
-        # 修复半提交：先写 ledger，失败则不落持久化
-        if self.ledger is not None:
-            try:
-                self.ledger.append(
-                    {"action": "publish_factor", "factor_id": factor_id, "name": name},
-                    tenant=tenant,
-                    price=float(price),
-                )
-            except Exception as e:
-                _log_warning("billing: ledger.append publish_factor failed for factor_id=%s", factor_id, exc_info=e)
-                raise
-        # gate writes: real PG vs emulated-degraded vs memory — 中文：PG 同步结果 fail-closed，False 视为失败
+        # 中文：PG 优先持久化，成功后再追加 ledger（避免 ledger-first 半提交）；
+        # ledger 追加失败则回滚内存/全局写入并抛错（fail-closed）。
         if self._is_real_pg():
-            # 中文：PG 持久化优先，成功后再落内存；False 需 fail-closed 回滚 ledger 语义
+            # 中文：PG 持久化优先，成功后再落内存与 ledger；False 需 fail-closed，不写内存不追加 ledger
             ok = self._pg_publish_sync(factor)
             if not ok:
-                # 已写入 ledger 的补偿：抛错让调用方感知，ledger 追加无法回滚则需外层补偿
                 raise RuntimeError(f"PG publish skipped (no real pool) for factor_id={factor_id}")
             self._pg_publish_noop(factor)
             with _GLOBAL_LOCK:
                 _GLOBAL_FACTORS[_dsn_key(self.dsn)][factor_id] = copy.deepcopy(factor)  # type: ignore
             self._factors[factor_id] = copy.deepcopy(factor)
+            if self.ledger is not None:
+                try:
+                    self.ledger.append(
+                        {"action": "publish_factor", "factor_id": factor_id, "name": name},
+                        tenant=tenant,
+                        price=float(price),
+                    )
+                except Exception as e:
+                    _log_warning("billing: ledger.append publish_factor failed for factor_id=%s", factor_id, exc_info=e)
+                    with _GLOBAL_LOCK:
+                        try:
+                            _GLOBAL_FACTORS.get(_dsn_key(self.dsn), {}).pop(factor_id, None)  # type: ignore
+                        except (AttributeError, TypeError, RuntimeError) as _re:
+                            _log_warning("billing rollback global failed: %s", _re)
+                    try:
+                        self._factors.pop(factor_id, None)
+                    except (AttributeError, TypeError, RuntimeError) as _re2:
+                        _log_warning("billing rollback instance failed: %s", _re2)
+                    raise
         elif self._is_pg_mode():
+            # 中文：emulated 降级路径与真实 PG 同样 fail-closed（与真实分支一致，不可静默成功）
             _log_warning("billing degraded (emulated PG without driver) tenant=%s", str(factor.get("tenant", "default")), exc_info=False)
             ok = self._pg_publish_sync(factor)
             if not ok:
-                _log_warning("billing degraded PG publish returned False for %s", factor_id)
+                raise RuntimeError(f"PG publish failed for factor_id={factor_id}")
             self._pg_publish_noop(factor)
             with _GLOBAL_LOCK:
                 _GLOBAL_FACTORS[_dsn_key(self.dsn)][factor_id] = copy.deepcopy(factor)  # type: ignore
             self._factors[factor_id] = copy.deepcopy(factor)
+            if self.ledger is not None:
+                try:
+                    self.ledger.append(
+                        {"action": "publish_factor", "factor_id": factor_id, "name": name},
+                        tenant=tenant,
+                        price=float(price),
+                    )
+                except Exception as e:
+                    _log_warning("billing: ledger.append publish_factor failed for factor_id=%s", factor_id, exc_info=e)
+                    with _GLOBAL_LOCK:
+                        try:
+                            _GLOBAL_FACTORS.get(_dsn_key(self.dsn), {}).pop(factor_id, None)  # type: ignore
+                        except (AttributeError, TypeError, RuntimeError) as _re:
+                            _log_warning("billing rollback global failed: %s", _re)
+                    try:
+                        self._factors.pop(factor_id, None)
+                    except (AttributeError, TypeError, RuntimeError) as _re2:
+                        _log_warning("billing rollback instance failed: %s", _re2)
+                    raise
         else:
             self._factors[factor_id] = copy.deepcopy(factor)
+            # 中文：纯内存路径无 PG 半提交风险，ledger 在内存写入后追加
+            if self.ledger is not None:
+                try:
+                    self.ledger.append(
+                        {"action": "publish_factor", "factor_id": factor_id, "name": name},
+                        tenant=tenant,
+                        price=float(price),
+                    )
+                except Exception as e:
+                    _log_warning("billing: ledger.append publish_factor failed for factor_id=%s", factor_id, exc_info=e)
+                    raise
         return copy.deepcopy(factor)
 
     def _pg_publish_sync(self, factor: dict) -> bool:
-        """真 PG 同一事务内 SET LOCAL 后紧跟 INSERT INTO factors — 中文：事务级 RLS。"""
+        """真 PG 同一事务内 SET LOCAL 后紧跟 INSERT INTO factors — 中文：事务级 RLS。
+
+        无真实池的 emulated 降级模式下，权威持久化即随后写入的 _GLOBAL_FACTORS（进程内重启可恢复，
+        初始化时已 _log_pg_warning_once  loud 降级），故返回 True；调用方对 False 仍 fail-closed。
+        """
         if not self._is_real_pg():
-            _log_warning("PG publish skipped (no real pool) tenant=%s dsna=%s", str(factor.get("tenant", "default")), "__hashed__", exc_info=False)
-            return False
+            _log_warning("PG publish degraded (no real pool, emulated store authoritative) tenant=%s dsna=%s", str(factor.get("tenant", "default")), "__hashed__", exc_info=False)
+            return True
         if getattr(self, "_pool", None) is None:
             _log_warning("PG publish no pool tenant=%s", str(factor.get("tenant", "default")), exc_info=False)
             return False
@@ -292,6 +371,8 @@ class BillingService:
         try:
             if pool is not None and hasattr(pool, "connection"):
                 with pool.connection() as _conn:  # type: ignore[attr-defined]
+                    # 中文：DDL_FACTORS/DDL_PURCHASES 在真实池建表（幂等），避免 INSERT 假设表存在
+                    self._exec_billing_ddl(_conn)
                     # 中文：两条 SET LOCAL 在同一连接同一事务内执行，不得每 key 新开连接
                     for _sql, _k in [("SET LOCAL app.tenant = %s", "app.tenant"), ("SET LOCAL app.current_tenant = %s", "app.current_tenant")]:
                         try:
@@ -309,17 +390,24 @@ class BillingService:
                             _c2.execute(_factor_sql, _params)
                     try:
                         _conn.commit()  # type: ignore
-                    except Exception:
-                        pass
+                    except Exception as _e:
+                        _log_warning("billing commit failed: %s", _e, exc_info=True)
+                        return False
             elif pool is not None and hasattr(pool, "getconn"):
                 _conn2 = pool.getconn()  # type: ignore
                 try:
+                    # 中文：DDL 在真实连接上幂等建表，避免 INSERT 假设表存在
+                    self._exec_billing_ddl(_conn2)
                     with _conn2.cursor() as _c2:
                         # 中文：两键同一事务内执行
                         for _sql2, _k2 in [("SET LOCAL app.tenant = %s", "app.tenant"), ("SET LOCAL app.current_tenant = %s", "app.current_tenant")]:
                             _c2.execute(_sql2, (_tenant,))
                         _c2.execute(_factor_sql, _params)
-                    _conn2.commit()
+                    try:
+                        _conn2.commit()
+                    except Exception as _e:
+                        _log_warning("billing commit failed: %s", _e, exc_info=True)
+                        return False
                 finally:
                     try:
                         pool.putconn(_conn2)  # type: ignore
@@ -443,13 +531,116 @@ class BillingService:
                     return copy.deepcopy(_prev)
             return None
 
-        # 中文：锁不横跨 IO — 缩小临界区至 dedup 检查与内存插入，ledger/DB IO 在锁外，PG 以 ON CONFLICT 为权威
-        with _GLOBAL_LOCK:
-            _hit = _find_locked()
-            if _hit is not None:
-                return _hit
+        # 中文：幂等 check-then-act 经 PG 权威 + 逐键串行化保证单次 ledger 追加，
+        # _GLOBAL_LOCK 仅覆盖内存读写短临界区，ledger/DB IO 始终在锁外（锁不横跨 IO）。
+        _idem_tuple = (factor_id, buyer_tenant, idempotency_key)
+        with _purchase_guard(_idem_tuple):
+            with _GLOBAL_LOCK:
+                _hit = _find_locked()
+                if _hit is not None:
+                    return _hit
+            if self._is_real_pg():
+                with _purchase_counter_lock:
+                    global _purchase_counter
+                    _purchase_counter += 1
+                    pid = f"{factor_id}:{buyer_tenant}:{_purchase_counter}:{uuid.uuid4().hex[:8]}"
+                receipt = {
+                    "factor_id": factor_id,
+                    "buyer_tenant": buyer_tenant,
+                    "tenant": buyer_tenant,
+                    "price": use_price,
+                    "action": "purchase_factor",
+                    "purchase_id": pid,
+                    "idempotency_key": idempotency_key,
+                }
+                try:
+                    _inserted = self._pg_insert_purchase_sync(receipt)
+                except Exception as e:
+                    _log_warning("billing: _pg_insert_purchase_sync failed for factor_id=%s", factor_id, exc_info=e)
+                    raise
+                if not _inserted:
+                    with _GLOBAL_LOCK:
+                        _existing = _find_locked()
+                        if _existing is not None:
+                            return _existing
+                    return copy.deepcopy(receipt)
+                # 双重检查：内存侧幂等，PG 已写入则落内存
+                with _GLOBAL_LOCK:
+                    _hit2 = _find_locked()
+                    if _hit2 is not None:
+                        return _hit2
+                    _GLOBAL_PURCHASES[_dsn_key(self.dsn)].append(copy.deepcopy(receipt))  # type: ignore
+                    self._purchases.append(copy.deepcopy(receipt))
+                if self.ledger is not None:
+                    try:
+                        self.ledger.append(
+                            {"action": "purchase_factor", "factor_id": factor_id},
+                            tenant=buyer_tenant,
+                            price=use_price,
+                        )
+                    except Exception as e:
+                        _log_warning("billing: ledger.append purchase_factor failed for factor_id=%s", factor_id, exc_info=e)
+                        raise
+                try:
+                    self._pg_purchase_sync(receipt)
+                    self._pg_purchase_noop(receipt)
+                except Exception as e:
+                    _log_warning("billing: _pg_purchase_sync failed for factor_id=%s", factor_id, exc_info=e)
+                return copy.deepcopy(receipt)
+            if self._is_pg_mode():
+                _log_warning("billing degraded (emulated PG without driver) buyer=%s", buyer_tenant, exc_info=False)
+                # 中文：emulated 路径同样 PG-first 语义：先调 PG 同步（失败抛错），成功后再落内存与 ledger
+                with _purchase_counter_lock:
+                    _purchase_counter += 1
+                    pid = f"{factor_id}:{buyer_tenant}:{_purchase_counter}:{uuid.uuid4().hex[:8]}"
+                receipt = {
+                    "factor_id": factor_id,
+                    "buyer_tenant": buyer_tenant,
+                    "tenant": buyer_tenant,
+                    "price": use_price,
+                    "action": "purchase_factor",
+                    "purchase_id": pid,
+                    "idempotency_key": idempotency_key,
+                }
+                try:
+                    self._pg_purchase_sync(receipt)
+                    self._pg_purchase_noop(receipt)
+                except Exception as e:
+                    _log_warning("billing: _pg_purchase_sync failed for factor_id=%s", factor_id, exc_info=e)
+                    raise
+                with _GLOBAL_LOCK:
+                    _hit2 = _find_locked()
+                    if _hit2 is not None:
+                        return _hit2
+                    _GLOBAL_PURCHASES[_dsn_key(self.dsn)].append(copy.deepcopy(receipt))  # type: ignore
+                    self._purchases.append(copy.deepcopy(receipt))
+                if self.ledger is not None:
+                    try:
+                        self.ledger.append(
+                            {"action": "purchase_factor", "factor_id": factor_id},
+                            tenant=buyer_tenant,
+                            price=use_price,
+                        )
+                    except Exception as e:
+                        _log_warning("billing: ledger.append purchase_factor failed for factor_id=%s", factor_id, exc_info=e)
+                        try:
+                            lst = _GLOBAL_PURCHASES.get(_dsn_key(self.dsn), [])  # type: ignore
+                            for i in range(len(lst) - 1, -1, -1):
+                                if lst[i].get("purchase_id") == pid:
+                                    lst.pop(i)
+                                    break
+                        except (ValueError, TypeError, AttributeError, RuntimeError) as _re:
+                            _log_warning("billing rollback global failed: %s", _re)
+                        try:
+                            for i in range(len(self._purchases) - 1, -1, -1):
+                                if self._purchases[i].get("purchase_id") == pid:
+                                    self._purchases.pop(i)
+                                    break
+                        except (ValueError, TypeError, AttributeError, RuntimeError) as _re2:
+                            _log_warning("billing rollback instance failed: %s", _re2)
+                        raise
+                return copy.deepcopy(receipt)
             with _purchase_counter_lock:
-                global _purchase_counter
                 _purchase_counter += 1
                 pid = f"{factor_id}:{buyer_tenant}:{_purchase_counter}:{uuid.uuid4().hex[:8]}"
             receipt = {
@@ -461,78 +652,23 @@ class BillingService:
                 "purchase_id": pid,
                 "idempotency_key": idempotency_key,
             }
-        # 中文：ledger/DB IO 移出全局锁，避免横跨 IO 串行化
-        if self.ledger is not None:
-            try:
-                self.ledger.append(
-                    {"action": "purchase_factor", "factor_id": factor_id},
-                    tenant=buyer_tenant,
-                    price=use_price,
-                )
-            except Exception as e:
-                _log_warning("billing: ledger.append purchase_factor failed for factor_id=%s", factor_id, exc_info=e)
-                raise
-        if self._is_real_pg():
-            try:
-                _inserted = self._pg_insert_purchase_sync(receipt)
-            except Exception as e:
-                _log_warning("billing: _pg_insert_purchase_sync failed for factor_id=%s", factor_id, exc_info=e)
-                raise
-            if not _inserted:
-                with _GLOBAL_LOCK:
-                    _existing = _find_locked()
-                    if _existing is not None:
-                        return _existing
-                return copy.deepcopy(receipt)
-            with _GLOBAL_LOCK:
-                # 双重检查：内存侧幂等，PG 已写入则落内存
-                _hit2 = _find_locked()
-                if _hit2 is not None:
-                    return _hit2
-                _GLOBAL_PURCHASES[_dsn_key(self.dsn)].append(copy.deepcopy(receipt))  # type: ignore
-                self._purchases.append(copy.deepcopy(receipt))
-            try:
-                self._pg_purchase_sync(receipt)
-                self._pg_purchase_noop(receipt)
-            except Exception as e:
-                _log_warning("billing: _pg_purchase_sync failed for factor_id=%s", factor_id, exc_info=e)
-        elif self._is_pg_mode():
-            _log_warning("billing degraded (emulated PG without driver) buyer=%s", buyer_tenant, exc_info=False)
             with _GLOBAL_LOCK:
                 _hit2 = _find_locked()
                 if _hit2 is not None:
                     return _hit2
-                _GLOBAL_PURCHASES[_dsn_key(self.dsn)].append(copy.deepcopy(receipt))  # type: ignore
                 self._purchases.append(copy.deepcopy(receipt))
-            try:
-                self._pg_purchase_sync(receipt)
-                self._pg_purchase_noop(receipt)
-            except Exception as e:
-                _log_warning("billing: _pg_purchase_sync failed for factor_id=%s", factor_id, exc_info=e)
-                with _GLOBAL_LOCK:
-                    try:
-                        lst = _GLOBAL_PURCHASES.get(_dsn_key(self.dsn), [])  # type: ignore
-                        for i in range(len(lst) - 1, -1, -1):
-                            if lst[i].get("purchase_id") == pid:
-                                lst.pop(i)
-                                break
-                    except (ValueError, TypeError, AttributeError, RuntimeError) as _re:
-                        _log_warning("billing rollback global failed: %s", _re)
+            # 中文：纯内存路径无 PG 半提交风险，内存落盘后追加 ledger
+            if self.ledger is not None:
                 try:
-                    for i in range(len(self._purchases) - 1, -1, -1):
-                        if self._purchases[i].get("purchase_id") == pid:
-                            self._purchases.pop(i)
-                            break
-                except (ValueError, TypeError, AttributeError, RuntimeError) as _re2:
-                    _log_warning("billing rollback instance failed: %s", _re2)
-                raise
-        else:
-            with _GLOBAL_LOCK:
-                _hit2 = _find_locked()
-                if _hit2 is not None:
-                    return _hit2
-                self._purchases.append(copy.deepcopy(receipt))
-        return copy.deepcopy(receipt)
+                    self.ledger.append(
+                        {"action": "purchase_factor", "factor_id": factor_id},
+                        tenant=buyer_tenant,
+                        price=use_price,
+                    )
+                except Exception as e:
+                    _log_warning("billing: ledger.append purchase_factor failed for factor_id=%s", factor_id, exc_info=e)
+                    raise
+            return copy.deepcopy(receipt)
 
     def _pg_insert_purchase_sync(self, receipt: dict) -> bool:
         """真 PG 幂等插入：INSERT ... ON CONFLICT (factor_id, buyer_tenant) DO NOTHING.
@@ -553,6 +689,8 @@ class BillingService:
         )
 
         def _run(conn) -> bool:
+            # 中文：DDL_FACTORS/DDL_PURCHASES 在真实连接上幂等建表，避免 INSERT 假设表存在
+            self._exec_billing_ddl(conn)
             try:
                 conn.execute("SET LOCAL app.tenant = %s", (_tenant,))
             except Exception:
@@ -583,8 +721,9 @@ class BillingService:
                     _row = _c4.fetchone()
             try:
                 conn.commit()  # type: ignore
-            except Exception:
-                pass
+            except Exception as _e:
+                _log_warning("billing commit failed: %s", _e, exc_info=True)
+                return False
             return _row is not None
 
         if hasattr(pool, "connection"):

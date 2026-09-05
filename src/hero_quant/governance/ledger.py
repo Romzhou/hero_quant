@@ -34,7 +34,7 @@ _LEGACY_GENESIS = "0" * 64
 EXPORT_FORMAT = "hero-quant-governance-ledger-export/v1"
 DEFAULT_ROTATE_BYTES: int = 64 * 1024 * 1024
 ARCHIVE_SUFFIX_WIDTH: int = 4
-_CHAIN_FIELDS = frozenset({"seq", "prev_record_hash", "record_hash"})
+_CHAIN_FIELDS = frozenset({"seq", "tenant_seq", "tenant", "prev_hash", "record_hash", "record"})
 
 _fsync_warned = False
 
@@ -319,88 +319,95 @@ def rotate_if_needed(path: Path, max_bytes: int = DEFAULT_ROTATE_BYTES, *, fsync
                 pass
             _locked_h = None
             raise LedgerCorruptionError(ChainBreak(0, None, "lock_failed", f"rotate lock_exclusive failed: {exc}")) from exc
-        # 中文：verify 收拢进排他锁后、rename 前，消除空临界区 TOCTOU。
-        # Windows msvcrt 是强制锁：锁区内另开句柄读写会被系统拒绝，
-        # 故复用已加锁句柄读（同 append 路径），不用 tmp.verify() 另开句柄。
-        _locked_h.seek(0)
-        _rot_raw = _locked_h.read()
         try:
-            _rot_text = _rot_raw.decode("utf-8")
-        except UnicodeDecodeError as exc:
-            raise LedgerCorruptionError(ChainBreak(0, None, "malformed_json", f"decode_error: {exc}")) from exc
-        _rot_entries: list[dict[str, Any]] = []
-        for _line in _rot_text.splitlines():
-            _s = _line.strip()
-            if not _s:
-                continue
+            # 中文：verify 收拢进排他锁后、rename 前，消除空临界区 TOCTOU。
+            # Windows msvcrt 是强制锁：锁区内另开句柄读写会被系统拒绝，
+            # 故复用已加锁句柄读（同 append 路径），不用 tmp.verify() 另开句柄。
+            _locked_h.seek(0)
+            _rot_raw = _locked_h.read()
             try:
-                _rot_entries.append(json.loads(_s))
-            except json.JSONDecodeError:
-                _rot_entries.append({"_raw": _s})
-        _rot_ok, _rot_brk = tmp._verify_entries(_rot_entries)
-        if not _rot_ok:
-            for _idx, _e in enumerate(_rot_entries):
-                if "_raw" in _e:
-                    raise LedgerCorruptionError(ChainBreak(_idx, None, "malformed_json", str(_e.get("_raw"))))
-            raise LedgerCorruptionError(
-                ChainBreak(
-                    _rot_brk.index if _rot_brk else 0,
-                    _rot_brk.seq if _rot_brk else None,
-                    _rot_brk.reason if _rot_brk else "prev_hash_mismatch",
-                    _rot_brk.detail if _rot_brk else "ledger corrupted, cannot rotate",
+                _rot_text = _rot_raw.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise LedgerCorruptionError(ChainBreak(0, None, "malformed_json", f"decode_error: {exc}")) from exc
+            _rot_entries: list[dict[str, Any]] = []
+            for _line in _rot_text.splitlines():
+                _s = _line.strip()
+                if not _s:
+                    continue
+                try:
+                    _rot_entries.append(json.loads(_s))
+                except json.JSONDecodeError:
+                    _rot_entries.append({"_raw": _s})
+            _rot_ok, _rot_brk = tmp._verify_entries(_rot_entries)
+            if not _rot_ok:
+                for _idx, _e in enumerate(_rot_entries):
+                    if "_raw" in _e:
+                        raise LedgerCorruptionError(ChainBreak(_idx, None, "malformed_json", str(_e.get("_raw"))))
+                raise LedgerCorruptionError(
+                    ChainBreak(
+                        _rot_brk.index if _rot_brk else 0,
+                        _rot_brk.seq if _rot_brk else None,
+                        _rot_brk.reason if _rot_brk else "prev_hash_mismatch",
+                        _rot_brk.detail if _rot_brk else "ledger corrupted, cannot rotate",
+                    )
                 )
-            )
-        try:
             try:
-                if path.stat().st_size < max_bytes:
-                    return None
-            except Exception:
-                pass
-            counter = len(archive_segments(path)) + 1
-            archive = path.with_name(f"{path.stem}.{counter:0{ARCHIVE_SUFFIX_WIDTH}d}{path.suffix}")
-            try:
-                _locked_h.flush()
                 try:
-                    os.fsync(_locked_h.fileno())
-                except OSError as exc:
-                    _warn_fsync_failure(exc, path)
-            except Exception:
-                pass
-            if _locked:
-                try:
-                    _unlock(_locked_h)
-                    _locked = False
+                    if path.stat().st_size < max_bytes:
+                        return None
                 except Exception:
                     pass
-            # Windows: 解锁后关闭再 rename，避免 WinError 32
-            try:
-                _locked_h.close()
-                _locked_h = None
-            except Exception:
-                pass
-            try:
-                path.rename(archive)
-            except OSError as e:
-                _rename_err = e
-                # Windows 上可能因残留句柄（如 Ledger 实例未关闭）导致共享冲突，改为关闭后重试一次
+                counter = len(archive_segments(path)) + 1
+                archive = path.with_name(f"{path.stem}.{counter:0{ARCHIVE_SUFFIX_WIDTH}d}{path.suffix}")
                 try:
-                    if _locked_h is not None:
-                        _locked_h.close()
-                        _locked_h = None
+                    _locked_h.flush()
+                    try:
+                        os.fsync(_locked_h.fileno())
+                    except OSError as exc:
+                        _warn_fsync_failure(exc, path)
                 except Exception:
                     pass
-                # 再次尝试 rename
+                if _locked:
+                    try:
+                        _unlock(_locked_h)
+                        _locked = False
+                    except Exception:
+                        pass
+                # Windows: 解锁后关闭再 rename，避免 WinError 32
+                try:
+                    _locked_h.close()
+                    _locked_h = None
+                except Exception:
+                    pass
                 try:
                     path.rename(archive)
-                    _rename_err = None
-                except OSError as e2:
-                    _rename_err = e2
-        finally:
-            if _locked:
-                try:
-                    _unlock(_locked_h)  # type: ignore[arg-type]
-                except Exception:
-                    pass
+                except OSError as e:
+                    _rename_err = e
+                    # Windows 上可能因残留句柄（如 Ledger 实例未关闭）导致共享冲突，改为关闭后重试一次
+                    try:
+                        if _locked_h is not None:
+                            _locked_h.close()
+                            _locked_h = None
+                    except Exception:
+                        pass
+                    # 再次尝试 rename
+                    try:
+                        path.rename(archive)
+                        _rename_err = None
+                    except OSError as e2:
+                        _rename_err = e2
+            finally:
+                if _locked:
+                    try:
+                        _unlock(_locked_h)  # type: ignore[arg-type]
+                    except Exception:
+                        pass
+        except LedgerCorruptionError:
+            raise
+        except Exception as _e:
+            raise LedgerCorruptionError(ChainBreak(0, None, "lock_failed", f"rotate rename/archive failed: {_e}")) from _e
+    except LedgerCorruptionError:
+        raise
     except Exception as _e:
         raise LedgerCorruptionError(ChainBreak(0, None, "lock_failed", f"rotate lock_exclusive failed: {_e}")) from _e
     finally:
@@ -419,6 +426,11 @@ def rotate_if_needed(path: Path, max_bytes: int = DEFAULT_ROTATE_BYTES, *, fsync
 
 
 def _read_raw_records(path: Path) -> list[dict[str, Any]]:
+    """原始行读取（共享锁防 TOCTOU/半写）：返回逐行 dict，坏行标记为 {"_raw": ...}。
+
+    与 Ledger._read_all 同语义的模块级入口，供 verify_chain 等审计路径复用；
+    调用方以 _verify_entries 判定 chain break（缺链字段经 _CHAIN_FIELDS 校验）。
+    """
     if not path.exists():
         return []
     records: list[dict[str, Any]] = []
@@ -490,39 +502,20 @@ def export_chain_to_file(path: Path, dest: Path) -> Path:
 
 
 def verify_chain(path: Path) -> ChainVerificationResult:
-    """校验单文件链的完整性（seq 连续与 hash 链）— 加共享锁防 TOCTOU。"""
+    """校验单文件链的完整性（seq 连续与 hash 链）— 加共享锁防 TOCTOU。
+
+    锁获取失败必须 LOUD（抛错），绝不静默回退到无锁读（否则重引入 TOCTOU/半写竞态）。
+    """
     ledger = Ledger(path)
-    # 尝试共享锁读，避免并发 append 半写入
-    entries: list[dict[str, Any]] = []
-    try:
-        if path.exists():
-            with open(path, "rb") as h:
-                _lock_shared(h)
-                try:
-                    h.seek(0)
-                    raw = h.read()
-                    txt = raw.decode("utf-8")
-                    if "\x00" in txt:
-                        for line in txt.splitlines():
-                            if "\x00" in line:
-                                idx = len(entries)
-                                return ChainVerificationResult(ok=False, record_count=idx, first_break=ChainBreak(idx, None, "malformed_json", line))
-                        txt = txt.replace("\x00", "")
-                    for line in txt.splitlines():
-                        s = line.strip()
-                        if not s:
-                            continue
-                        try:
-                            entries.append(json.loads(s))
-                        except json.JSONDecodeError:
-                            entries.append({"_raw": s})
-                    ok, brk = ledger._verify_entries(entries)
-                    return ChainVerificationResult(ok=ok, record_count=len(entries) if ok else (brk.index if brk else 0), first_break=brk)
-                finally:
-                    _unlock(h)
-    except Exception:
-        pass
-    entries = ledger._read_all()
+    # 读经共享锁保护的 _read_raw_records，失败 LOUD（锁/IO 错误直接抛，不无锁重读）
+    entries = _read_raw_records(path)
+    for _ln, e in enumerate(entries):
+        if "_raw" in e:
+            return ChainVerificationResult(ok=False, record_count=_ln, first_break=ChainBreak(_ln, None, "malformed_json", str(e.get("_raw"))))
+        # 中文：缺链字段经 _CHAIN_FIELDS 校验（与 _verify_entries 的 missing_chain_fields 一致）
+        if not _CHAIN_FIELDS.issubset(e.keys()):
+            missing = sorted(_CHAIN_FIELDS - set(e.keys()))
+            return ChainVerificationResult(ok=False, record_count=_ln, first_break=ChainBreak(_ln, e.get("seq"), "missing_chain_fields", f"missing {missing}"))
     ok, brk = ledger._verify_entries(entries)
     return ChainVerificationResult(ok=ok, record_count=len(entries) if ok else (brk.index if brk else 0), first_break=brk)
 
@@ -550,10 +543,11 @@ def verify_chain_with_archives(path: Path) -> ChainVerificationResult:
             return ChainVerificationResult(ok=False, record_count=len(records), first_break=ChainBreak(len(records), None, "malformed_json", f"decode_error: {exc}"))
         if "\x00" in txt:
             # NUL 视为 corruption
-            for line in txt.splitlines():
+            # 中文：跨归档全局下标（len(records)+段内偏移），不用段内偏移（错位）
+            for _off, line in enumerate(txt.splitlines()):
                 if "\x00" in line:
-                    idx = len(records)
-                    return ChainVerificationResult(ok=False, record_count=idx, first_break=ChainBreak(idx, None, "malformed_json", line))
+                    _g = len(records) + _off
+                    return ChainVerificationResult(ok=False, record_count=_g, first_break=ChainBreak(_g, None, "malformed_json", line))
             # 去除 NUL 后继续（但已在上面返回）
             txt = txt.replace("\x00", "")
         for line in txt.splitlines():
@@ -563,8 +557,9 @@ def verify_chain_with_archives(path: Path) -> ChainVerificationResult:
             try:
                 records.append(json.loads(s))
             except json.JSONDecodeError:
-                idx = len(records)
-                return ChainVerificationResult(ok=False, record_count=idx, first_break=ChainBreak(idx, None, "malformed_json", s))
+                # 中文：全局位置索引（enumerate），不用 list.index（重复记录错位）
+                _ln = len(records)
+                return ChainVerificationResult(ok=False, record_count=_ln, first_break=ChainBreak(_ln, None, "malformed_json", s))
     if not records:
         return ChainVerificationResult(ok=True, record_count=0, first_break=None)
     # reuse Ledger._verify_entries logic on concatenated records
@@ -745,11 +740,12 @@ class Ledger:
 
         lock=False 跳过加锁，仅供外层已持排他锁的调用方（如 rotate 内 verify）使用，
         避免 Windows msvcrt 同进程嵌套加锁自死锁。
+        锁获取失败必须 LOUD（抛错），绝不静默回退到无锁读（TOCTOU/半写）。
         """
         if not self.path.exists():
             return []
         entries = []
-        # 尝试共享锁读；失败回退到无锁读以保持离线可用
+        # 共享锁读；锁失败 LOUD（抛错），绝不回退无锁读（TOCTOU/半写）
         raw: bytes | None = None
         try:
             with open(self.path, "rb") as h:
@@ -771,16 +767,6 @@ class Ledger:
         except UnicodeDecodeError as exc:
             entries.append({"_raw": f"decode_error: {exc}"})
             return entries
-        except Exception:
-            # 回退无锁
-            try:
-                raw = self.path.read_bytes()
-                text = raw.decode("utf-8")
-            except FileNotFoundError:
-                return []
-            except UnicodeDecodeError as exc:
-                entries.append({"_raw": f"decode_error: {exc}"})
-                return entries
         if "\x00" in text:
             for line in text.splitlines():
                 if "\x00" in line:
@@ -1180,7 +1166,8 @@ class Ledger:
             logger.warning("ledger query rejected empty tenant %r", tenant)
             raise ValueError("tenant must be non-empty str")
         entries = self._read_all()
-        filtered = [e for e in entries if e.get("tenant", "default") == tenant]
+        # 中文：_raw 腐蚀标记无 tenant 键，不可默认归入 default 租户（隔离击穿）
+        filtered = [e for e in entries if "_raw" not in e and e.get("tenant", "default") == tenant]
         # deep copy to prevent caller mutation leaking state
         return copy.deepcopy(filtered)
 
@@ -1193,6 +1180,6 @@ class Ledger:
         return self.query(tenant)
 
     def list_tenants(self):
-        """列出账本中出现过的所有 tenant。"""
+        """列出账本中出现过的所有 tenant（_raw 腐蚀标记不计入）。"""
         entries = self._read_all()
-        return sorted({e.get("tenant", "default") for e in entries})
+        return sorted({e.get("tenant", "default") for e in entries if "_raw" not in e})
