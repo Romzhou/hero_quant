@@ -152,9 +152,12 @@ def test_lane_f_ingest_settings_fallback_logs(tmp_path, caplog, monkeypatch):
     assert any("memory" in r.message.lower() or "fall" in r.message.lower() for r in caplog.records)
 
 
-def test_lane_f_ingest_no_fence_re():
+def test_lane_f_ingest_fence_re_used():
     import hero_quant.memory.ingest as ing
-    assert not hasattr(ing, "_FENCE_RE"), "dead _FENCE_RE must be removed"
+    import inspect
+    assert hasattr(ing, "_FENCE_RE"), "_FENCE_RE must exist for fence detection"
+    src = inspect.getsource(ing._split_by_heading)
+    assert "_FENCE_RE" in src, "fence detection must use _FENCE_RE (no duplicate inline logic)"
 
 
 def test_lane_f_ingest_no_line_offsets():
