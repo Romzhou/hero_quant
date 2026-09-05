@@ -90,7 +90,7 @@ class AKShareLoader:
                 if need.capitalize() in df_ak.columns:
                     df[need] = df_ak[need.capitalize()]
                 else:
-                    return None
+                    raise DataValidationError(f"akshare missing required column: {need!r}")
         if "date" in df.columns:
             try:
                 df["date"] = pd.to_datetime(df["date"], errors="raise")
@@ -99,7 +99,10 @@ class AKShareLoader:
                 # 窄化捕获，禁止裸 except pass 静默错位
                 logger.warning("akshare date parse failed: %s", e, exc_info=True)
                 raise DataValidationError(f"akshare invalid date index: {e}") from e
-        # 成交量归一：移除 >100000/100 heuristic，禁止静默填补；缺失则 fail-closed
+        # 成交量归一到 board_lots（A股 1 手=100股）；缺失则 fail-closed
+        # NOTE: akshare 东财成交量单位未经确认是否为股；确认前不做 /100 静默换算，
+        # 以免在单位未明时引入 100x 系统性偏差（见 detail log board_lots 项）。
+        # TODO: confirm akshare unit; if in shares: vol = vol / 100.0
         if "volume" in df.columns:
             vol = pd.to_numeric(df["volume"], errors="coerce")
             if vol.isna().any():
@@ -141,8 +144,8 @@ class AKShareLoader:
                 raise DataValidationError(f"ambiguous legacy argument order: start={start!r} end={end!r} interval={interval!r}")
         if interval not in _intervals:
             raise DataValidationError(f"invalid interval {interval!r}, expected one of {sorted(_intervals)}")
-        # akshare 日线 loader 仅支持日线及以上；intraday 必须 fail-closed 而非静默返回日线
-        if interval in ("1m", "5m", "15m", "30m", "1h"):
+        # akshare 日线 loader 仅支持日线；其它粒度必须 fail-closed 而非静默返回日线
+        if interval not in ("1d", "1D"):
             raise DataValidationError(f"unsupported interval for daily loader: {interval!r} (akshare only supports daily)")
 
         try:
@@ -157,9 +160,11 @@ class AKShareLoader:
         if isinstance(mode, str):
             mode = mode.strip().lower()
         else:
-            mode = "live"
+            raise DataValidationError(f"unknown data_mode {mode!r}, expected 'synthetic' or 'live'")
         if mode == "synthetic":
             return self._synthetic_df(symbol, start, end)
+        if mode != "live":
+            raise DataValidationError(f"unknown data_mode {mode!r}, expected 'synthetic' or 'live'")
 
         # live 模式：真实拉取，失败抛出（禁止静默回退合成）
 
@@ -173,12 +178,16 @@ class AKShareLoader:
             code = symbol.split(".")[0]
             # normalize dates to YYYYMMDD — fail fast on unparseable dates
             try:
-                start_n = start.replace("-", "")
-                end_n = end.replace("-", "")
+                start_n = str(start).replace("-", "")
+                end_n = str(end).replace("-", "")
                 # ensure 8 digits
-                datetime.strptime(start_n, "%Y%m%d")
-                datetime.strptime(end_n, "%Y%m%d")
-            except (ValueError, TypeError) as e:
+                s_dt = datetime.strptime(start_n, "%Y%m%d")
+                e_dt = datetime.strptime(end_n, "%Y%m%d")
+                if e_dt < s_dt:
+                    raise DataValidationError(f"invalid range: end {end!r} before start {start!r} (fail-closed)")
+            except DataValidationError:
+                raise
+            except (ValueError, TypeError, AttributeError) as e:
                 raise DataValidationError(f"invalid date format start={start!r} end={end!r}: {e}") from e
             df_ak = None
             # primary: stock_zh_a_hist (retry with different adjust param to handle API variants)

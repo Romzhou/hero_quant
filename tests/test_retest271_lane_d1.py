@@ -314,3 +314,81 @@ def test_d1_tencent_json_decode_taxonomy(monkeypatch):
     monkeypatch.setattr("hero_quant.data.loaders.tencent.time.sleep", lambda *a, **k: None)
     with pytest.raises(RuntimeError):
         loader.get_bars("600003.SH", "2025-01-01", "2025-01-05")
+
+
+# ---------------- loaders/akshare_loader.py (5 items: 1 high + 4 medium) ----------------
+
+def _akshare_loader(monkeypatch, mode):
+    monkeypatch.setenv("HERO_DATA_MODE", mode)
+    import importlib
+    import hero_quant.config.settings as s
+    importlib.reload(s)
+    from hero_quant.data.loaders.akshare_loader import AKShareLoader
+    return AKShareLoader()
+
+
+def test_d1_akshare_weekly_rejected(monkeypatch):
+    """High: 1wk/1mo/1W must fail closed, not silently return daily bars."""
+    from hero_quant.data.loaders.akshare_loader import DataValidationError
+
+    loader = _akshare_loader(monkeypatch, "synthetic")
+    for iv in ("1wk", "1mo", "1W", "1m", "1h"):
+        with pytest.raises(DataValidationError):
+            loader.get_bars("600519.SH", "2025-01-01", "2025-01-05", iv)
+
+
+def test_d1_akshare_unknown_mode_fail_closed(monkeypatch):
+    """Medium: unknown/non-string data_mode must raise, never fail open to live."""
+    import hero_quant.config.settings as s
+    from hero_quant.data.loaders.akshare_loader import AKShareLoader, DataValidationError
+
+    monkeypatch.setenv("HERO_DATA_MODE", "synthetc")
+    import importlib
+    importlib.reload(s)
+    with pytest.raises(DataValidationError):
+        AKShareLoader().get_bars("600519.SH", "2025-01-01", "2025-01-05")
+
+    class _BadSettings:
+        data_mode = 123
+
+    monkeypatch.setattr(s, "Settings", _BadSettings)
+    with pytest.raises(DataValidationError):
+        AKShareLoader().get_bars("600519.SH", "2025-01-01", "2025-01-05")
+
+
+def test_d1_akshare_live_dates_guarded(monkeypatch):
+    """Medium: None dates / inverted range on live path must fail closed pre-network."""
+    import sys
+    import types
+
+    from hero_quant.data.loaders.akshare_loader import DataValidationError
+
+    fake_ak = types.ModuleType("akshare")
+    fake_ak.stock_zh_a_hist = lambda **k: (_ for _ in ()).throw(AssertionError("network must not be hit"))
+    monkeypatch.setitem(sys.modules, "akshare", fake_ak)
+    loader = _akshare_loader(monkeypatch, "live")
+    with pytest.raises(DataValidationError):
+        loader.get_bars("600519.SH", None, "2025-01-05")
+    with pytest.raises(DataValidationError):
+        loader.get_bars("600519.SH", "2025-01-05", "2025-01-01")
+
+
+def test_d1_akshare_missing_ohlc_named(monkeypatch):
+    """Medium: missing OHLC column must raise naming the column, not generic no-bars."""
+    import pandas as pd
+    from hero_quant.data.loaders.akshare_loader import DataValidationError
+
+    loader = _akshare_loader(monkeypatch, "synthetic")
+    df = pd.DataFrame({"日期": ["2025-01-01"], "开盘": [10.0], "收盘": [11.0], "最高": [12.0], "成交量": [100]})
+    with pytest.raises(DataValidationError, match="low"):
+        loader._normalize_akshare(df)
+
+
+def test_d1_akshare_volume_lots_documented(monkeypatch):
+    """Medium: volume normalization documents shares-vs-lots assumption (no silent 100x)."""
+    import inspect
+
+    from hero_quant.data.loaders.akshare_loader import AKShareLoader
+
+    src = inspect.getsource(AKShareLoader._normalize_akshare)
+    assert "board_lots" in src and "100" in src
