@@ -6,7 +6,11 @@
 
 from __future__ import annotations
 
+import logging
+
 from starlette.datastructures import MutableHeaders
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_SECURITY_HEADERS = {
     "X-Content-Type-Options": "nosniff",
@@ -31,12 +35,11 @@ class SecurityHeadersMiddleware:
     def __init__(self, app, extra_headers: dict | None = None):
         self.app = app
         # 大小写归一合并：HTTP 头名大小写不敏感，未归一会导致重复冲突头。
-        merged: dict[str, str] = {}
+        merged: dict[str, tuple[str, str]] = {}
         for k, v in list(DEFAULT_SECURITY_HEADERS.items()) + list((extra_headers or {}).items()):
-            try:
-                merged[k.lower()] = (k, v)
-            except Exception:
-                continue
+            if not isinstance(k, str) or not isinstance(v, str):
+                raise TypeError(f"invalid security header {k!r}: expected (str, str)")
+            merged[k.lower()] = (k, v)
         self.extra_headers = {orig_k: v for _, (orig_k, v) in merged.items()}
 
     async def __call__(self, scope, receive, send):
@@ -54,12 +57,13 @@ class SecurityHeadersMiddleware:
                         try:
                             if k.lower() not in headers:
                                 headers.append(k, v)
-                        except Exception:
-                            # 单个头注入失败仅跳过该头（已在响应 start 上，能加的已加），
+                        except (ValueError, TypeError, UnicodeEncodeError) as e:
+                            # 单个头注入失败仅跳过该头并告警（已在响应 start 上，能加的已加），
                             # 不吞整体：继续外层 send，保证响应仍可发出。
+                            logger.warning("security-headers: skip header %r: %s", k, e)
                             continue
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning("security-headers: injection failed: %s", e)
             await send(message)
 
         await self.app(scope, receive, send_wrapper)
