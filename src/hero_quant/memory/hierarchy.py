@@ -117,8 +117,20 @@ class MemoryHierarchy:
                     continue
                 try:
                     with item.open("r", encoding="utf-8") as f:
-                        head = f.read(512).lstrip("\ufeff").lstrip()
-                except OSError as e:
+                        # read up to 64 lines / 8KB: enough for real frontmatter,
+                        # bounded against huge files; require closing delimiter
+                        chunks: list[str] = []
+                        total = 0
+                        for _ in range(64):
+                            line = f.readline(4096)
+                            if not line:
+                                break
+                            chunks.append(line)
+                            total += len(line)
+                            if total >= 8192:
+                                break
+                        head = "".join(chunks).lstrip("\ufeff").lstrip()
+                except (OSError, UnicodeDecodeError) as e:
                     logger.warning("recover failed for %s: %s", item, e)
                     continue
                 if not head.startswith("---"):
@@ -200,7 +212,7 @@ class MemoryHierarchy:
             if isinstance(keywords, list):
                 cat_data[mtype].keywords.extend(k for k in keywords if isinstance(k, str))
         max_keywords = 10
-        for summary in cat_data.values():
+        for summary in list(cat_data.values()) + [base_fallback]:
             seen: Set[str] = set()
             unique: List[str] = []
             for kw in summary.keywords:
@@ -216,7 +228,7 @@ class MemoryHierarchy:
         data: Dict[str, object] = {
             "rebuilt_at": rebuilt_at,
             "categories": {cat: {"count": cat_data[cat].count, "keywords": cat_data[cat].keywords} for cat in CATEGORIES},
-            "base_fallback": {"count": base_fallback.count, "keywords": base_fallback.keywords[:max_keywords]},
+            "base_fallback": {"count": base_fallback.count, "keywords": base_fallback.keywords},
         }
         self._base_dir.mkdir(parents=True, exist_ok=True)
         # unique tmp in same dir: no cross-rebuild race, no stale fixed-name file
@@ -316,7 +328,12 @@ class MemoryHierarchy:
                 bracket_end = stripped.find("]")
                 if bracket_start != -1 and bracket_end != -1:
                     inner = stripped[bracket_start + 1 : bracket_end]
-                    keywords = [k.strip() for k in inner.split(",") if k.strip()]
+                    # same normalization as YAML path: lowercase, drop null-likes
+                    keywords = [
+                        k.strip().lower()
+                        for k in inner.split(",")
+                        if k.strip() and k.strip().lower() not in ("none", "null", "~")
+                    ]
                     result[current_cat] = keywords
                 else:
                     # block 样式已由 yaml 解析处理，此处忽略
