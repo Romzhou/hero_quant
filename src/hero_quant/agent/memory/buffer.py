@@ -3,7 +3,7 @@
 职责：承载单会话最近 max_turns 轮对话（user+assistant 计 2 条/轮），供
 AgentLoop 经 duck-typing 注入/写回时复用。
 关键设计：collections.deque(maxlen=max_turns*2) O(1) 自动裁剪替代 O(n) 列表
-切片；系统消息单独保存不受裁剪影响。
+切片；溢出时按轮边界裁剪保证窗口头为 user；系统消息单独保存，上限 10 条。
 """
 
 from __future__ import annotations
@@ -33,24 +33,37 @@ class MemoryBuffer:
         if not isinstance(max_turns, int) or isinstance(max_turns, bool) or max_turns <= 0:
             raise ValueError(f"max_turns must be a positive int, got {max_turns!r}")
         self.max_turns = max_turns
-        self._messages: deque = deque(maxlen=max_turns * 2)
-        # 中文：系统消息不受裁剪影响，无界 deque
-        self._system_messages: deque = deque()
+        self._capacity = max_turns * 2
+        self._messages: deque = deque(maxlen=self._capacity)
+        # 中文：系统消息有界（maxlen=10），避免逐轮累积撑爆 LLM 上下文
+        self._system_messages: deque = deque(maxlen=10)
+
+    def _append(self, msg: Message):
+        """追加普通消息；溢出时按轮边界裁剪，保证窗口头为 user。"""
+        at_cap = len(self._messages) >= self._capacity
+        self._messages.append(msg)
+        if at_cap:
+            self._align_head()
+
+    def _align_head(self):
+        """逐出头部孤儿 assistant/tool 消息直到 head 为 user 或为空。"""
+        while self._messages and self._messages[0].role != "user":
+            self._messages.popleft()
 
     def add_user_message(self, content: str):
         """添加用户消息"""
-        self._messages.append(Message(role="user", content=content))
+        self._append(Message(role="user", content=content))
 
     def add_assistant_message(self, content: str):
         """添加助手消息"""
-        self._messages.append(Message(role="assistant", content=content))
+        self._append(Message(role="assistant", content=content))
 
     def add_tool_result(self, tool_name: str, result: str):
         """添加工具结果"""
         # 中文：转义 XML 注入，防闭合标签破坏下游解析
         safe_name = html.escape(tool_name, quote=True)
         safe_result = html.escape(result)
-        self._messages.append(
+        self._append(
             Message(role="tool", content=f'<tool_result name="{safe_name}">{safe_result}</tool_result>')
         )
 
@@ -73,14 +86,29 @@ class MemoryBuffer:
 
     @messages.setter
     def messages(self, value: List[Message]):
-        """兼容旧接口：设置消息列表"""
+        """兼容旧接口：设置消息列表；超容直接抛 ValueError（last-N 需调用方显式裁剪）"""
+        staged_system: list = []
+        staged: list = []
+        for m in value:
+            if isinstance(m, dict):
+                try:
+                    m = Message(m["role"], m["content"])
+                except (KeyError, TypeError) as e:
+                    raise ValueError(f"invalid message entry: {m!r}") from e
+            if not isinstance(m, Message):
+                raise ValueError(f"invalid message entry: {m!r}")
+            (staged_system if m.role == "system" else staged).append(m)
+        if len(staged) > self.max_turns * 2:
+            raise ValueError(f"messages exceed capacity: {len(staged)} > {self.max_turns * 2}")
+        if len(staged_system) > (self._system_messages.maxlen or 0):
+            raise ValueError(
+                f"system messages exceed capacity: {len(staged_system)} > {self._system_messages.maxlen}"
+            )
         self._system_messages.clear()
         self._messages.clear()
-        for m in value:
-            if m.role == "system":
-                self._system_messages.append(m)
-            else:
-                self._messages.append(m)
+        self._system_messages.extend(staged_system)
+        self._messages.extend(staged)
+        self._align_head()
 
     def clear(self):
         """清空记忆"""
@@ -98,14 +126,27 @@ class MemoryBuffer:
         if not isinstance(data, dict):
             raise ValueError(f"invalid buffer data: {type(data).__name__}")
         buffer = cls(max_turns=data.get("max_turns", 20))
-        for m in data.get("messages", []):
+        msgs = data.get("messages", [])
+        if msgs is None:
+            raise ValueError("invalid buffer data: messages is None")
+        if not isinstance(msgs, list):
+            raise ValueError(f"invalid buffer data: messages must be list, got {type(msgs).__name__}")
+        staged_system: list = []
+        staged: list = []
+        for m in msgs:
             try:
                 role, content = m["role"], m["content"]
             except (KeyError, TypeError) as e:
                 raise ValueError(f"invalid message entry: {m!r}") from e
             msg = Message(role, content)
-            if msg.role == "system":
-                buffer._system_messages.append(msg)
-            else:
-                buffer._messages.append(msg)
+            (staged_system if msg.role == "system" else staged).append(msg)
+        if len(staged) > buffer._capacity:
+            raise ValueError(f"messages exceed capacity: {len(staged)} > {buffer._capacity}")
+        if len(staged_system) > (buffer._system_messages.maxlen or 0):
+            raise ValueError(
+                f"system messages exceed capacity: {len(staged_system)} > {buffer._system_messages.maxlen}"
+            )
+        buffer._system_messages.extend(staged_system)
+        buffer._messages.extend(staged)
+        buffer._align_head()
         return buffer

@@ -201,7 +201,15 @@ def fuse(bm25_cands, vec_cands, k: int = RRF_K) -> List[Tuple[str, float]]:
     except TypeError:
         peek = []
     if peek and all(isinstance(x, dict) for x in peek):
-        bm25_pairs = bm25_from_ordered(peek)
+        # Preserve explicit scores when present; only fall back to order scores
+        # when dicts carry no usable score field.
+        def _has_score(d):
+            return d.get("score") is not None or d.get("relevance_score") is not None or d.get("_score") is not None
+        if any(_has_score(d) for d in peek):
+            bm25_pairs = peek
+        else:
+            bm25_pairs = bm25_from_ordered(peek)
     else:
-        bm25_pairs = bm25_cands
+        # reuse materialized peek; original iterator is already consumed
+        bm25_pairs = peek
     return rank_fusion(bm25_pairs, vec_cands, k=kk)
