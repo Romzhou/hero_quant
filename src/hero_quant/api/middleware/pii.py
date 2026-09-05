@@ -1,6 +1,8 @@
 """api.middleware.pii — PII 加密/脱敏辅助。
 
-职责：Fernet 对称加密（cryptography），无依赖/无密钥时回退 !NOENC!/掩码。
+职责：Fernet 对称加密（cryptography），无依赖/无密钥/解密失败时抛错，
+拒绝明文落盘与明文透传（fail-closed）。历史遗留 !NOENC! 明文默认拒绝，
+仅显式 PII_ALLOW_LEGACY_NOENC=1 迁移开关放行并告警。
 参考 skills/fastapi-agent-module-skill/references/pii.py。
 """
 
@@ -8,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import os
+import warnings
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -46,8 +49,10 @@ def _get_key() -> Optional[bytes]:
             _WARNED_NO_KEY = True
         return None
     try:
-        _PII_KEY = key_str.encode()
-        Fernet(_PII_KEY)  # 校验有效性
+        # 无效 key 不得入缓存：先校验后赋值，避免毒化后续调用的错误契约
+        candidate = key_str.strip().encode()
+        Fernet(candidate)  # 校验有效性
+        _PII_KEY = candidate
         return _PII_KEY
     except (ValueError, TypeError) as e:
         logger.error("PII_ENCRYPTION_KEY 无效: %s", e)
@@ -73,7 +78,13 @@ def pii_decrypt(ciphertext: str) -> str:
     if not ciphertext:
         return ciphertext
     if ciphertext.startswith("!NOENC!"):
-        # 历史遗留明文标记：仅剥离标记，不做解密
+        # 历史遗留明文默认拒绝（fail-closed）：无 Fernet 认证即信任明文
+        # 即未认证透传。迁移需显式 PII_ALLOW_LEGACY_NOENC=1 并留下告警审计。
+        if os.getenv("PII_ALLOW_LEGACY_NOENC") != "1":
+            logger.warning("legacy !NOENC! PII 拒绝：需显式 PII_ALLOW_LEGACY_NOENC=1 迁移")
+            raise RuntimeError("legacy plaintext PII rejected (!NOENC!)")
+        warnings.warn("legacy !NOENC! PII 明文放行（显式迁移开关）", UserWarning, stacklevel=2)
+        logger.warning("legacy !NOENC! PII 明文放行（显式迁移开关）")
         return ciphertext[7:]
     key = _get_key()
     if key is None:
@@ -97,7 +108,7 @@ def mask_pii(value: str, mask_char: str = "*", visible_prefix: int = 3, visible_
         return mask_char * len(value)
     if visible_prefix < 0 or visible_suffix < 0:
         return mask_char * len(value)
-    if len(value) < visible_prefix + visible_suffix:
+    if len(value) <= visible_prefix + visible_suffix:
         return mask_char * len(value)
     # 关键：visible_suffix=0 时 value[-0:] == value[0:] 会追加全文明文，必须短路为空
     prefix = value[:visible_prefix] if visible_prefix > 0 else ""
@@ -135,9 +146,9 @@ def safe_log_args(args: object) -> dict:
         if is_pii_field(k):
             safe[k] = mask_pii(str(v)) if v else None
         elif isinstance(v, str):
-            # 未知键字符串默认不信任：短串截断去换行，长串全掩码
+            # 未知键字符串默认不信任：fail-closed 全掩码（短串亦然，防 is_pii_field 漏命中泄露）
             text = _safe_log_text(v)
-            safe[k] = text if len(v) <= 32 else mask_pii(text, visible_prefix=0, visible_suffix=0)
+            safe[k] = mask_pii(text, visible_prefix=0, visible_suffix=0)
         elif isinstance(v, (int, float, bool)) or v is None:
             safe[k] = v
         else:

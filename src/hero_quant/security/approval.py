@@ -40,8 +40,9 @@ class ApprovalPolicy:
     def __eq__(self, other):
         if isinstance(other, ApprovalPolicy):
             return self.value == other.value
-        if isinstance(other, str):
-            return self.value == other.lower()
+        # 中文：不与 plain str 相等——跨类型相等会破坏 hash/eq 契约
+        # （case-insensitive 相等但 hash 取归一化值，dict/set 混用时静默 miss）。
+        # 调用方改用 str(policy) == s 或 policy.value == s.strip().lower()。
         return NotImplemented
 
 
@@ -89,8 +90,18 @@ def _audit(event: str, **fields):
     """内审计占位——以结构化日志记录审批轨迹，后续可对接 ledger/otel。"""
     try:
         logger.info("approval.%s", event, extra=fields)
-    except Exception:
-        pass
+    except Exception as exc:
+        # 中文：审计失败不得静默吞掉（fail-open 日志即审计缺口与成功不可区分）。
+        # 回退 warning 可见；仍失败则 RuntimeWarning 告警，永不静默。
+        try:
+            logger.warning("approval.audit_failed event=%s error=%r", event, exc)
+        except Exception:
+            try:
+                import warnings
+
+                warnings.warn(f"approval audit failed: event={event} error={exc!r}", RuntimeWarning, stacklevel=2)
+            except Exception:
+                pass
 
 
 def requires_approval(policy: object) -> bool:
@@ -116,7 +127,8 @@ class _Decision(dict):
 
     def __eq__(self, other: object) -> bool:
         if isinstance(other, str):
-            return self.get("status") == other.lower()
+            # 中文：两侧同时归一化（存储 status 未必小写），兑现大小写不敏感比较承诺
+            return str(self.get("status", "")).lower() == other.lower()
         return super().__eq__(other)
 
     def __ne__(self, other: object) -> bool:
@@ -125,8 +137,9 @@ class _Decision(dict):
             return eq
         return not eq
 
-    def __hash__(self) -> int:
-        return dict.__hash__(self)
+    # 中文：_Decision 为可变 dict 子类，保持显式不可哈希（dict.__hash__ 为 None，
+    # 旧实现 dict.__hash__(self) 必抛 TypeError 且语义含混；显式 None 语义清晰）。
+    __hash__ = None  # type: ignore[assignment]
 
 
 @dataclass
