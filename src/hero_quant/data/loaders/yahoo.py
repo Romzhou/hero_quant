@@ -57,6 +57,8 @@ class YahooLoader:
                     _bars.append({"date": cur.strftime("%Y-%m-%d"), "open": 1500.0+idx, "close": 1500.5+idx, "high": 1510+idx, "low": 1490+idx, "volume": 100.0})
                     cur += timedelta(days=1)
                     idx += 1
+            except DataValidationError:
+                raise
             except (ValueError, TypeError) as e:
                 raise DataValidationError(f"yahoo synthetic date parse failed: {e}") from e
             from hero_quant.data.registry import Provenance as _YProv
