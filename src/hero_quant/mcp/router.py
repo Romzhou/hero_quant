@@ -466,7 +466,7 @@ def router_hybrid_scores(query: str, candidates: List[str]) -> Dict[str, float]:
                 max_bm25 = max(bm25_raw.values()) if bm25_raw else 1.0
                 out[n] = (bm25_raw.get(n, 0.0) / max_bm25) if max_bm25 > 0 else 0.0
         return out
-    except (ValueError, TypeError, AttributeError, ImportError) as e:
+    except Exception as e:
         logger.warning("router rank_fusion failed, falling back to BM25: %s", e)
         # 回退：归一化 BM25，含向量时与 cosine 均分（避免旧 0.6/0.4 偏置）
         max_bm25 = max(bm25_raw.values()) if bm25_raw else 1.0
@@ -578,7 +578,7 @@ def route(query: str, k: int = 5) -> List[str]:
                 except Exception as _exc:
                     logger.debug("silent handled: router rerank fallback", exc_info=_exc)
                     pass
-        except (ValueError, TypeError, AttributeError, ImportError) as e:
+        except Exception as e:
             logger.warning("router rank_fusion failed, falling back to BM25: %s", e)
             # 回退：归一化 BM25 与 cosine 均分，避免旧 0.6/0.4 权重
             bm25_raw: Dict[str, float] = _bm25_for_candidates(query_tokens, query_lower, candidates, _route_snap)
