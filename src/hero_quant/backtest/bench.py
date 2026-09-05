@@ -290,8 +290,10 @@ def run_batch(
 ) -> dict:
     """批量执行回测并计算相对基准的 alpha：为每只 ticker 合成价格、运行引擎、对比基准收益。"""
     # 中文：fail-closed 前置——合成价必须显式 opt-in，空输入也不静默返回 {}
+    # NOTE: this harness is synthetic-only by design; real-price runs belong to
+    # BacktestEngine/tools with market provenance, not to this batch helper.
     if not allow_synthetic:
-        raise ValueError("bench run_batch synthetic requires allow_synthetic=True (fail-closed); pass allow_synthetic=True or provide real price data")
+        raise ValueError("bench run_batch is synthetic-only and requires allow_synthetic=True (fail-closed)")
     if not tickers:
         raise ValueError("bench run_batch requires non-empty tickers (fail-closed)")
     if isinstance(tickers, str):
@@ -315,8 +317,6 @@ def run_batch(
         bench_prices = _synthetic_prices(idx, bench)
 
         engine = BacktestEngine()
-        if not allow_synthetic:
-            raise ValueError("bench run_batch synthetic requires allow_synthetic=True (fail-closed); pass allow_synthetic=True or provide real price data")
         _engine_kwargs = {"allow_synthetic": True}
         try:
             res = engine.run(prices, **_engine_kwargs)
@@ -338,8 +338,34 @@ def run_batch(
 
         strat_metrics = dict(res.get("metrics", {}))
         _bench_failed = bool(bench_res.get("failed")) or "benchmark_error" in bench_res.get("metrics", {})
-        bench_cum = float(bench_res.get("metrics", {}).get("cumulative_return", 0.0))
-        strat_cum = float(strat_metrics.get("cumulative_return", 0.0))
+
+        def _safe_cum(d, default=0.0):
+            """Coerce cumulative_return without aborting the batch on bad values.
+
+            None, unparseable, or non-finite values mark the leg failed
+            (alpha=None) instead of aborting the batch — and never coerce to
+            a valid-looking 0.0.
+            """
+            try:
+                raw = d.get("cumulative_return", default)
+                if raw is None:
+                    return None
+                if isinstance(raw, np.ndarray):
+                    if raw.size != 1:
+                        return None
+                    raw = raw.flat[0]
+                v = float(raw)
+            except (TypeError, ValueError, AttributeError):
+                return None
+            return v if np.isfinite(v) else None
+
+        bench_cum = _safe_cum(bench_res.get("metrics", {}))
+        strat_cum = _safe_cum(strat_metrics)
+        if strat_cum is None or bench_cum is None:
+            # mark failed / alpha=None instead of aborting batch with partial loss
+            _bench_failed = True
+            bench_cum = bench_cum if bench_cum is not None else 0.0
+            strat_cum = strat_cum if strat_cum is not None else 0.0
         # 中文：基准腿失败时 alpha 置 None，不可用 0.0 伪装有效值
         alpha = float(strat_cum - bench_cum) if not _bench_failed else None
 
@@ -379,12 +405,20 @@ def run_batch(
             enriched["news_pit_verified"] = False
             enriched["pit_status"] = "unavailable"
             enriched["non_pit_count"] = 0
-        # 保证 JSON 可序列化：转换 numpy 标量/数组
-        for k, v in list(enriched.items()):
+        # 保证 JSON 可序列化：递归转换 numpy 标量/数组（含嵌套结构）
+        def _jsonable(v):
             if isinstance(v, (np.floating, np.integer)):
-                enriched[k] = float(v)
-            elif isinstance(v, (np.ndarray,)):
-                enriched[k] = float(v) if v.size == 1 else v.tolist()
+                return float(v)
+            if isinstance(v, np.ndarray):
+                return float(v) if v.size == 1 else [_jsonable(x) for x in v.tolist()]
+            if isinstance(v, dict):
+                return {k: _jsonable(x) for k, x in v.items()}
+            if isinstance(v, (list, tuple)):
+                return [_jsonable(x) for x in v]
+            return v
+
+        for k, v in list(enriched.items()):
+            enriched[k] = _jsonable(v)
 
         results[t] = enriched
 
@@ -419,7 +453,11 @@ def run_batch(
             if not _is_within(_target, _base):
                 raise ValueError(f"output_dir traversal detected: {output_dir!r} escapes {_base}")
         else:
-            # no ".." and relative — optionally validate single-component via safe_join
+            # no ".." and relative — multi-component paths (e.g. a/link_to_etc
+            # where a/link is a symlink outside CWD) must also be contained:
+            # the resolved target must stay within _base (or tmpdir).
+            if not (_is_within(_target, _base) or _is_within(_target, _tmpdir)):
+                raise ValueError(f"output_dir traversal detected: {output_dir!r} escapes {_base}")
             # 中文：safe_join 的 ValueError 是拒绝信号，必须传播；仅 import/类型问题可跳过
             try:
                 from hero_quant.security.sanitize import safe_join as _safe_join  # type: ignore
@@ -432,7 +470,8 @@ def run_batch(
                     raise
                 except (TypeError, AttributeError, OSError) as e:
                     logger.debug("output_dir safe_join check skipped: %s", e)
-        out = pathlib.Path(output_dir)
+        # 中文：写经校验的解析目标 _target，不用未解析的 out（防 symlink TOCTOU）
+        out = _target
         # 若给出的是 .json 文件路径则直接写入其本身，不强行旁写 tearsheet
         if out.suffix.lower() == ".json":
             out.parent.mkdir(parents=True, exist_ok=True)
