@@ -470,3 +470,56 @@ def test_d1_ccxt_no_unreachable_empty_check(monkeypatch):
 
     src = inspect.getsource(m.CCXTLoader.get_bars)
     assert 'raise ValueError("empty df")' not in src
+
+
+# ---------------- loaders/news.py (4 items: 1 high + 3 medium) ----------------
+
+def test_d1_news_mixed_tz_pit_verified():
+    """High: naive snapshot vs aware publish_time must normalize to UTC, pit=True."""
+    from hero_quant.data.loaders.news import load_news
+
+    # aware publish 2024-01-04 08:00 UTC vs naive snapshot midnight 2024-01-05 -> UTC normalize -> verified
+    recs = [{"id": 1, "trade_date": "2024-01-05", "publish_time": "2024-01-04T08:00:00+00:00"}]
+    out = load_news(recs, trade_date="2024-01-05", snapshot_date="2024-01-05")
+    assert out[0]["pit"] is True and out[0]["pit_status"] == "verified"
+    # symmetric: naive publish vs aware snapshot also normalizes
+    recs2 = [{"id": 2, "trade_date": "2024-01-05", "publish_time": "2024-01-04 08:00:00"}]
+    out2 = load_news(recs2, trade_date="2024-01-05", snapshot_date="2024-01-05T00:00:00+00:00")
+    assert out2[0]["pit"] is True and out2[0]["pit_status"] == "verified"
+
+
+def test_d1_news_unparseable_date_is_missing():
+    """Medium: unparseable trade_date must be missing (dropped), never prefix-matched."""
+    from hero_quant.data.loaders.news import _normalize_date_str, load_news
+
+    assert _normalize_date_str("not-a-date!!!") is None
+    recs = [
+        {"id": 1, "trade_date": "2024-01-05", "publish_time": "2024-01-04 10:00:00"},
+        {"id": 2, "trade_date": "garbage-2024-01-05", "publish_time": "2024-01-04 10:00:00"},
+    ]
+    out = load_news(recs, trade_date="2024-01-05", snapshot_date="2024-01-05")
+    assert [r["id"] for r in out] == [1]
+
+
+def test_d1_news_schema_anomaly_warns_not_raises(caplog):
+    """Medium: missing trade_date column entirely must warn + return [], not raise."""
+    import logging
+
+    from hero_quant.data.loaders.news import load_news
+
+    recs = [
+        {"id": 1, "publish_time": "2024-01-01 10:00:00"},
+        {"id": 2, "publish_time": "2024-01-01 10:00:00"},
+    ]
+    with caplog.at_level(logging.WARNING, logger="hero_quant.data.loaders.news"):
+        out = load_news(recs, trade_date="2024-01-02", snapshot_date="2024-01-02")
+    assert out == []
+    assert any("schema anomaly" in r.message for r in caplog.records)
+
+
+def test_d1_news_generic_date_not_trade_date():
+    """Medium: generic `date` must not be treated as trade_date label."""
+    from hero_quant.data.loaders.news import _extract_trade_date
+
+    assert _extract_trade_date({"date": "2024-01-05"}) is None
+    assert _extract_trade_date({"trade_date": "2024-01-05"}) == "2024-01-05"

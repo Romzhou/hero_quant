@@ -73,9 +73,7 @@ def _normalize_date_str(value) -> str | None:
         return None
     ts = _parse_time(value)
     if ts is None:
-        # 回落为字符串去空格比较
-        s = str(value).strip()
-        return s[:10] if s else None
+        return None
     try:
         return ts.strftime("%Y-%m-%d")
     except (ValueError, TypeError):
@@ -84,7 +82,7 @@ def _normalize_date_str(value) -> str | None:
 
 
 def _extract_trade_date(record: dict) -> str | None:
-    for k in ("trade_date", "trading_date", "tradeDate", "date"):
+    for k in ("trade_date", "trading_date", "tradeDate"):
         if k in record and record[k] is not None:
             v = _normalize_date_str(record[k])
             if v:
@@ -129,6 +127,9 @@ def load_news(
         新列表（浅拷贝+新增 pit/pit_status），不修改原 records。
         规则：仅当可验证发布时间且 publish_time ≤ snapshot 时 pit=True，否则 False；
         pit_status: verified(可验且通过) / future(发布时间晚于快照) / unknown|unavailable(缺失)
+    异常:
+        ValueError: bias guard — 当缺失 trade_date 的记录超过 50% 时抛出（schema 漂移保护）；
+        trade_date 列整体缺失时仅告警并返回空列表。
     """
     # 兼容别名：snapshot_date 优先，其次 available_at、snapshot、kwargs
     eff_snapshot_raw = snapshot_date
@@ -160,10 +161,8 @@ def load_news(
                 has_any_trade_date = True
                 break
         if not has_any_trade_date and len(records) > 0:
-            raise ValueError(
-                f"schema anomaly: trade_date column missing entirely for filter {target_date_str!r} "
-                f"(no record contains trade_date/trading_date/tradeDate/date)"
-            )
+            logger.warning("news schema anomaly: no trade_date column for filter %r", target_date_str)
+            return []
 
     out: list[dict] = []
     dropped_missing = 0
@@ -206,7 +205,11 @@ def load_news(
                 pub_aware = _is_aware(pub_ts)
                 snap_aware = _is_aware(snap_ts)
                 if pub_aware != snap_aware:
-                    raise TypeError("mixed tz-naive/aware")
+                    # Normalize naive to UTC instead of forcing non-PIT
+                    if not pub_aware and snap_aware:
+                        pub_ts = pub_ts.tz_localize("UTC")
+                    elif pub_aware and not snap_aware:
+                        snap_ts = snap_ts.tz_localize("UTC")
 
                 if pub_aware and snap_aware:
                     # normalize both to UTC for correct offset comparison
