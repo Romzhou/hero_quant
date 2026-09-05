@@ -162,8 +162,12 @@ class ApprovalService:
         self.mode = raw if raw in ("ask", "never", "auto") else "ask"
 
     def requires_approval(self, tool: str | None = None) -> bool:  # noqa: ARG002
-        """实例 helper：当前模式是否需要人审（ask→True，其余 False）。"""
-        return self.mode == ApprovalPolicy.ASK
+        """实例 helper：判断策略是否需要人审（fail-closed：仅 never/auto 放行）。
+
+        中文：mode 构造后仍可变（外部篡改/误赋值），`== ASK` 判定对非法值返回 False
+        即 fail-open；改与模块级 helper 一致的拒绝默认（未知一律需审批）。
+        """
+        return self.mode not in (ApprovalPolicy.NEVER, ApprovalPolicy.AUTO)
 
     def request_sync(self, tool: str, reason: str | None = None, **kwargs: Any) -> _Decision:
         """同步审批：统一返回含 status 的决议（never→rejected，ask→pending，auto→approved）。"""
@@ -182,9 +186,20 @@ class ApprovalService:
                 reason=reason,
                 mode=self.mode,
             )
-        # auto 直通
-        _audit("decided", tool=tool, outcome="approved", reason=reason)
-        return _Decision("approved", tool=tool, reason=reason, mode=self.mode)
+        if self.mode == ApprovalPolicy.AUTO:
+            # auto 直通（显式分支，非法 mode 不得落入此处）
+            _audit("decided", tool=tool, outcome="approved", reason=reason)
+            return _Decision("approved", tool=tool, reason=reason, mode=self.mode)
+        # fail-closed: 未知 mode 永不 auto 放行，按 pending 由调用方处理阻塞与超时
+        _audit("asked_pending", tool=tool, reason=reason, timeout=300)
+        return _Decision(
+            "pending",
+            need_approval=True,
+            timeout=300,
+            tool=tool,
+            reason=reason,
+            mode=self.mode,
+        )
 
     async def request(self, tool: str, reason: str | None = None, **kwargs: Any) -> Any:
         """异步审批入口，当前委托同步实现。"""
