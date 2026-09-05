@@ -73,8 +73,9 @@ def _sanitize_untrusted(text: str, field: str = "block") -> str:
     if len(text) > _MAX_UNTRUSTED_LEN:
         logger.warning("prompt %s truncated to %d (was %d)", field, _MAX_UNTRUSTED_LEN, len(text))
         text = text[:_MAX_UNTRUSTED_LEN] + "\n[TRUNCATED: exceeds max length]"
-    # 中文：转义围栏终止符，防 breakout；不再做 HTML 转义以保 GT 保真度
-    text = text.replace("```", "`\\``")
+    # 中文：转义所有反引号，防围栏 breakout；4+ 反引号单次 ``` 替换会残留 ```，
+    # 故逐字符转义（不再做 HTML 转义以保 GT 保真度）
+    text = text.replace("`", "\\`")
     # 中文：不做 & < > 的 HTML 转义，避免改动证据原文导致 L2 校验不一致
     # Escape leading markdown headers line by line
     lines = text.splitlines()
