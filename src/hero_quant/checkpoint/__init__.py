@@ -12,6 +12,7 @@ from .temporal import (
     HEARTBEAT_INTERVAL_SECONDS,
     HeartbeatHelper,
     HeartbeatTimer,
+    clear_heartbeat_details,
     get_heartbeat_details,
     heartbeat,
 )
@@ -25,6 +26,7 @@ __all__ = [
     "HEARTBEAT_INTERVAL_SECONDS",
     "HeartbeatHelper",
     "HeartbeatTimer",
+    "clear_heartbeat_details",
     "get_heartbeat_details",
     "heartbeat",
 ]
