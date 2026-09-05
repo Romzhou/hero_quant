@@ -173,6 +173,8 @@ def test_lane_f_lifecycle_enforces_max_count(tmp_path):
     base = tmp_path / "mem"; base.mkdir()
     class M:
         _meta = {}
+        def __init__(self):
+            self.base = base
         def _safe_filename(self, k):
             return f"{k}.md"
     for i in range(510):
