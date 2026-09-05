@@ -172,6 +172,12 @@ def _tokenize(text: str) -> List[str]:
     return [t for t in _TOKEN_RE.split(text.lower()) if t]
 
 
+def _mentions_factor_query(query: str) -> bool:
+    """token 级 factor/momentum 命中判断，避免 'factory' 等子串误触发。"""
+    toks = set(_tokenize(query or ""))
+    return "momentum" in toks or "factor" in toks
+
+
 def _ensure_corpus() -> None:
     """按需构建/刷新 BM25 语料统计（N、avg_dl、df、idf），以内容指纹而非仅大小判断 stale。"""
     global _IDF, _AVG_DL, _N, _DOC_TOKENS, _last_registry_size, _avg_dl, _idf, _last_registry_fingerprint
@@ -180,25 +186,34 @@ def _ensure_corpus() -> None:
         import hero_quant.mcp.server  # noqa: F401
     except ImportError as _exc:
         logger.warning("mcp server import failed for corpus: %s", _exc)
-    # 计算内容指纹（名称+描述）
+    # 计算内容指纹（名称+描述）：注册表快照持 _REGISTRY_LOCK，避免并发注册 torn
     try:
         import hashlib as _hashlib
 
-        fp_parts = []
-        for name in sorted(TOOL_REGISTRY.keys()):
-            desc = getattr(TOOL_REGISTRY[name], "description", "") or ""
-            fp_parts.append(f"{name}:{desc}")
+        from hero_quant.tools.registry import _REGISTRY_LOCK
+
+        with _REGISTRY_LOCK:
+            items = sorted(TOOL_REGISTRY.items(), key=lambda kv: kv[0])
+            fp_parts = [f"{n}:{getattr(s, 'description', '') or ''}" for n, s in items]
         fp = _hashlib.sha256("|".join(fp_parts).encode()).hexdigest()
     except Exception:
         fp = str(len(TOOL_REGISTRY))
-    # 中文：全量在锁内构建，避免指纹检查后释放锁导致的 torn snapshot
+    # 中文：全量在锁内构建，避免指纹检查后释放锁导致的 torn snapshot；
+    # 注册表迭代另持 _REGISTRY_LOCK 快照，避免并发注册 RuntimeError
     with _CORPUS_LOCK:
         if fp == _last_registry_fingerprint and _N != 0:
             return
-        size = len(TOOL_REGISTRY)
+        try:
+            from hero_quant.tools.registry import _REGISTRY_LOCK as _REG_LOCK
+
+            with _REG_LOCK:
+                reg_items = list(TOOL_REGISTRY.items())
+        except Exception:
+            reg_items = list(TOOL_REGISTRY.items())
+        size = len(reg_items)
         corpus: List[List[str]] = []
         doc_tokens: Dict[str, List[str]] = {}
-        for name, spec in TOOL_REGISTRY.items():
+        for name, spec in reg_items:
             desc = getattr(spec, "description", "") or ""
             toks = _tokenize(desc)
             doc_tokens[name] = toks
@@ -233,15 +248,49 @@ def _ensure_corpus() -> None:
         _idf = _IDF
 
 
-def _score_tool(query_tokens: List[str], query_lower: str, tool_name: str, description: str) -> float:
+def _snapshot_corpus():
+    """单次快照语料统计（avg_dl/IDF 引用/目标 doc tokens），供热循环复用。
+
+    返回 (avg_dl, idf, doc_tokens_getter)。idf 传引用不拷贝（调用方只读）；
+    doc tokens 按需在锁内单取，避免全量拷贝。
+    """
+    _ensure_corpus()
+    with _CORPUS_LOCK:
+        return (_AVG_DL, _IDF, _DOC_TOKENS.get)
+
+
+def _bm25_for_candidates(query_tokens: List[str], query_lower: str, candidates: List[str], snap) -> Dict[str, float]:
+    """热循环 BM25：复用单次语料快照；兼容仅 4 参的 _score_tool 替换（测试 monkeypatch）。"""
+    out: Dict[str, float] = {}
+    for name in candidates:
+        spec = TOOL_REGISTRY.get(name)
+        desc = getattr(spec, "description", "") if spec else ""
+        try:
+            out[name] = _score_tool(query_tokens, query_lower, name, desc, _snapshot=snap)
+        except TypeError:
+            # 4 参替换（无 _snapshot 形参）时回退旧签名
+            out[name] = _score_tool(query_tokens, query_lower, name, desc)
+    return out
+
+
+def _score_tool(query_tokens: List[str], query_lower: str, tool_name: str, description: str, _snapshot=None) -> float:
     """对单个工具计算 BM25 分数；空文档或未知词返回 0.0，保留旧签名兼容测试。"""
     # query_lower 保留以兼容历史签名（不参与额外加权）
-    _ensure_corpus()
-    # 中文：读 _DOC_TOKENS 时持锁避免与写 torn 竞态
-    with _CORPUS_LOCK:
-        doc_tokens = _DOC_TOKENS.get(tool_name)
-        _avg = _AVG_DL
-        _idf_local = dict(_IDF)
+    # _snapshot 供 route() 等热循环复用：(avg_dl, idf, doc_tokens_getter)
+    if _snapshot is None:
+        _ensure_corpus()
+        # 中文：读 _DOC_TOKENS 时持锁避免与写 torn 竞态
+        with _CORPUS_LOCK:
+            doc_tokens = _DOC_TOKENS.get(tool_name)
+            _avg = _AVG_DL
+            _idf_local = _IDF
+    else:
+        _avg, _idf_local, _getter = _snapshot
+        try:
+            with _CORPUS_LOCK:
+                doc_tokens = _getter(tool_name)
+        except Exception:
+            doc_tokens = None
     if doc_tokens is None:
         doc_tokens = _tokenize(description or "")
     if not doc_tokens or _avg <= 0:
@@ -288,7 +337,8 @@ def _get_query_embedding(query: str):
         from hero_quant.agent.embed import embed  # type: ignore
 
         return embed(query)
-    except Exception:
+    except Exception as e:
+        logger.warning("router query embed failed: %s", e)
         return None
 
 
@@ -369,9 +419,8 @@ def get_router_vector_backend() -> str:
             if getattr(sc, "_enabled", False):
                 return "pgvector"
         except Exception as _exc:
-            logger.debug("silent handled: offline-safe: mcp router fallback", exc_info=_exc)  # intentional: offline-safe: mcp router fallback
-            pass  # intentional offline-safe: mcp router fallback
-        return "pgvector"
+            logger.debug("silent handled: offline-safe: mcp router fallback", exc_info=_exc)
+        return "local"
     return "local"
 
 
@@ -381,12 +430,9 @@ def router_hybrid_scores(query: str, candidates: List[str]) -> Dict[str, float]:
         return {}
     query_lower = (query or "").lower()
     query_tokens = _tokenize(query_lower)
-    # BM25 原始分
-    bm25_raw: Dict[str, float] = {}
-    for name in candidates:
-        spec = TOOL_REGISTRY.get(name)
-        desc = getattr(spec, "description", "") if spec else ""
-        bm25_raw[name] = _score_tool(query_tokens, query_lower, name, desc)
+    # BM25 原始分（单次快照语料，热循环复用）
+    _snap = _snapshot_corpus()
+    bm25_raw: Dict[str, float] = _bm25_for_candidates(query_tokens, query_lower, candidates, _snap)
     # 向量余弦分
     qvec = _get_query_embedding(query) if _is_router_vector_enabled() else None
     vec_raw: Dict[str, float] = {}
@@ -416,7 +462,8 @@ def router_hybrid_scores(query: str, candidates: List[str]) -> Dict[str, float]:
                 max_bm25 = max(bm25_raw.values()) if bm25_raw else 1.0
                 out[n] = (bm25_raw.get(n, 0.0) / max_bm25) if max_bm25 > 0 else 0.0
         return out
-    except Exception:
+    except (ValueError, TypeError, AttributeError) as e:
+        logger.warning("router rank_fusion failed, falling back to BM25: %s", e)
         # 回退：归一化 BM25，含向量时与 cosine 均分（避免旧 0.6/0.4 偏置）
         max_bm25 = max(bm25_raw.values()) if bm25_raw else 1.0
         out: Dict[str, float] = {}
@@ -444,8 +491,7 @@ def route(query: str, k: int = 5) -> List[str]:
             # 中文：熔断 OPEN 时也保证含 momentum/factor 的查询中 compute_factor 在首位
             curated = CURATED_TOOLS if isinstance(CURATED_TOOLS, list) and len(CURATED_TOOLS) else sorted(TOOL_REGISTRY.keys())
             base = [n for n in curated if n in TOOL_REGISTRY][:k]
-            ql = (query or "").lower()
-            if ("momentum" in ql or "factor" in ql) and "compute_factor" in TOOL_REGISTRY:
+            if _mentions_factor_query(query) and "compute_factor" in TOOL_REGISTRY:
                 if "compute_factor" not in base:
                     base = ["compute_factor"] + [x for x in base if x != "compute_factor"]
                     base = base[:k]
@@ -481,17 +527,15 @@ def route(query: str, k: int = 5) -> List[str]:
     except Exception:
         qvec = None
     scored: List[tuple[float, str]] = []
+    # 热循环语料快照：一次 _ensure_corpus + 单次引用复用
+    _route_snap = _snapshot_corpus()
     if qvec is not None:
         # 统一融合 via rank_fusion.fuse (0.5*RRF + 0.5*cosine) —— 与 store 同一入口
         try:
             from hero_quant.memory.rank_fusion import RRF_K as _RRF_K2
             from hero_quant.memory.rank_fusion import fuse as _rank_fusion
 
-            bm25_raw2: Dict[str, float] = {}
-            for name in candidates:
-                spec = TOOL_REGISTRY.get(name)
-                desc = getattr(spec, "description", "") if spec else ""
-                bm25_raw2[name] = _score_tool(query_tokens, query_lower, name, desc)
+            bm25_raw2: Dict[str, float] = _bm25_for_candidates(query_tokens, query_lower, candidates, _route_snap)
             vec_raw2: Dict[str, float] = {}
             for name in candidates:
                 spec = TOOL_REGISTRY.get(name)
@@ -530,13 +574,10 @@ def route(query: str, k: int = 5) -> List[str]:
                 except Exception as _exc:
                     logger.debug("silent handled: router rerank fallback", exc_info=_exc)
                     pass
-        except Exception:
+        except (ValueError, TypeError, AttributeError) as e:
+            logger.warning("router rank_fusion failed, falling back to BM25: %s", e)
             # 回退：归一化 BM25 与 cosine 均分，避免旧 0.6/0.4 权重
-            bm25_raw: Dict[str, float] = {}
-            for name in candidates:
-                spec = TOOL_REGISTRY.get(name)
-                desc = getattr(spec, "description", "") if spec else ""
-                bm25_raw[name] = _score_tool(query_tokens, query_lower, name, desc)
+            bm25_raw: Dict[str, float] = _bm25_for_candidates(query_tokens, query_lower, candidates, _route_snap)
             max_bm25 = max(bm25_raw.values()) if bm25_raw else 1.0
             if max_bm25 <= 0:
                 max_bm25 = 1.0
@@ -556,11 +597,11 @@ def route(query: str, k: int = 5) -> List[str]:
         for name in candidates:
             spec = TOOL_REGISTRY.get(name)
             desc = getattr(spec, "description", "") if spec else ""
-            s = _score_tool(query_tokens, query_lower, name, desc)
+            s = _score_tool(query_tokens, query_lower, name, desc, _snapshot=_route_snap)
             scored.append((s, name))
     # 业务加分：在排序前对 compute_factor 做 score boost（而非排序后手术式替换）
     # 为保证含 momentum/factor 的查询仍能召回 compute_factor（原硬替换的不变量），boost 需足以进入 TopK
-    if ("momentum" in query_lower or "factor" in query_lower) and "compute_factor" in candidates:
+    if _mentions_factor_query(query_lower) and "compute_factor" in candidates:
         boosted = []
         max_score = max((s for s, _ in scored), default=1.0) or 1.0
         # 若 compute_factor 分数远低于最高分，需保证进入 TopK：boost = max + 小量
