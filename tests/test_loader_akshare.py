@@ -32,13 +32,14 @@ def test_akshare_synthetic_bad_dates_raises_in_live(monkeypatch):
         loader._synthetic_df("600519.SH", "bad-start", "bad-end")
 
 
-def test_akshare_synthetic_bad_dates_warn_in_synthetic(monkeypatch, caplog):
+def test_akshare_synthetic_bad_dates_raises(monkeypatch, caplog):
+    """非法日期在 synthetic 模式同样 fail-closed 抛错（不再 warn + 返回合成数据）。"""
     _reload_settings(monkeypatch, "synthetic")
     from hero_quant.data.loaders.akshare_loader import AKShareLoader
+    from hero_quant.data.loaders.akshare_loader import DataValidationError
     loader = AKShareLoader()
-    caplog.set_level(logging.WARNING)
-    df = loader._synthetic_df("600519.SH", "bad-start", "bad-end")
-    assert len(df) > 0
+    with pytest.raises(DataValidationError):
+        loader._synthetic_df("600519.SH", "bad-start", "bad-end")
 
 
 def test_akshare_live_bad_dates_raises(monkeypatch):
@@ -96,7 +97,7 @@ def test_akshare_volume_heuristic_deterministic(monkeypatch, caplog):
     assert result is not None
     result2 = loader._normalize_akshare(df_ak)
     assert result["volume"].tolist() == result2["volume"].tolist()
-    # heuristic should have logged deterministically if needed (no swallowed silently)
-    # 0 stays 0 after heuristic division, 200000 -> 2000
+    # 中文：实现有意不做 /100 换算（akshare 成交量单位未确认，静默除以 100 会引入 100x 偏差）。
+    # 故 volume 保持原值：0 仍 0，200000 保持 200000（见 akshare_loader._normalize_akshare NOTE）。
     assert result["volume"].iloc[0] == 0.0
-    assert result["volume"].iloc[1] == 2000.0
+    assert result["volume"].iloc[1] == 200000.0

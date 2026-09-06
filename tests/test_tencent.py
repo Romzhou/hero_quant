@@ -40,11 +40,12 @@ def test_tencent_https_and_quoted_symbol(monkeypatch):
             url2 = captured.get("url", "")
             assert ";evil" not in url2 or "%3B" in url2, f"symbol not quoted: {url2}"
 
-def test_tencent_falsy_zero_preserved(monkeypatch):
+def test_tencent_zero_price_rejected(monkeypatch):
+    """0/负价格必须被 fail-closed 拒绝（非正价格会污染回测收益计算），而非保留。"""
     monkeypatch.setenv("HERO_DATA_MODE", "live")
     import hero_quant.config.settings as s
     importlib.reload(s)
-    from hero_quant.data.loaders.tencent import TencentLoader
+    from hero_quant.data.loaders.tencent import DataValidationError, TencentLoader
     loader = TencentLoader()
     def fake_urlopen(url, timeout=2):
         data = {"data": {"sz000001": {"day": [["2025-01-01", 0, 0, 0, 0, 0]]}}}
@@ -56,19 +57,19 @@ def test_tencent_falsy_zero_preserved(monkeypatch):
         return m
     with mock.patch("hero_quant.data.loaders.tencent.time.sleep"):
         with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
-            bars = loader.get_bars("000001.SZ", "2025-01-01", "2025-01-05")
-            assert bars[0]["open"] == 0.0, f"0 price should be preserved, got {bars[0]['open']}"
-            assert bars[0]["volume"] == 0.0, f"0 volume should be preserved, got {bars[0]['volume']}"
+            with pytest.raises(DataValidationError):
+                loader.get_bars("000001.SZ", "2025-01-01", "2025-01-05")
 
-def test_tencent_dict_falsy_zero_preserved(monkeypatch):
+def test_tencent_dict_zero_price_rejected(monkeypatch):
+    """dict 路径的 0 价格同样必须被 fail-closed 拒绝。"""
     monkeypatch.setenv("HERO_DATA_MODE", "live")
     import hero_quant.config.settings as s
     importlib.reload(s)
-    from hero_quant.data.loaders.tencent import TencentLoader
+    from hero_quant.data.loaders.tencent import DataValidationError, TencentLoader
     loader = TencentLoader()
     def fake_urlopen_dict(url, timeout=2):
         inner = [{"date": "2025-01-01", "open": 0, "close": 0, "high": 0, "low": 0, "volume": 0}]
-        data = {"data": {"k1": {"inner_key": inner}}}
+        data = {"data": {"sz000001": {"day": inner}}}
         text = json.dumps(data).encode()
         m = mock.MagicMock()
         m.read.return_value = text
@@ -77,9 +78,8 @@ def test_tencent_dict_falsy_zero_preserved(monkeypatch):
         return m
     with mock.patch("hero_quant.data.loaders.tencent.time.sleep"):
         with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen_dict):
-            bars = loader.get_bars("000001.SZ", "2025-01-01", "2025-01-05")
-            assert bars[0]["open"] == 0.0
-            assert bars[0]["volume"] == 0.0
+            with pytest.raises(DataValidationError):
+                loader.get_bars("000001.SZ", "2025-01-01", "2025-01-05")
 
 def test_tencent_synthetic_mode_fallback(monkeypatch):
     monkeypatch.setenv("HERO_DATA_MODE", "synthetic")
