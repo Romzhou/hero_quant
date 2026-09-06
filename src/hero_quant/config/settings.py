@@ -342,6 +342,9 @@ class Settings:
     billing_dsn: str | None = field(default_factory=_billing_dsn_from_env, repr=False)
     cohere_api_key: str = field(default_factory=lambda: os.getenv("COHERE_API_KEY", "") or "", repr=False)
     redis_dsn: str | None = field(default_factory=_redis_dsn_from_env, repr=False)
+    # PII 加密/脱敏：统一在此 gate 解析，避免 api.middleware.pii 直接读环境变量（test_config 架构门禁校验）
+    pii_encryption_key: str = field(default_factory=lambda: (os.getenv("PII_ENCRYPTION_KEY", "") or "").strip(), repr=False)
+    pii_allow_legacy_noenc: bool = field(default_factory=lambda: (os.getenv("PII_ALLOW_LEGACY_NOENC", "") or "").strip() == "1")
 
 
 @lru_cache(maxsize=1)

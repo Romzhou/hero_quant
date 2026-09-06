@@ -7,8 +7,24 @@ concurrency:
 on: [push, pull_request]
 jobs:
   test:
-    timeout-minutes: 15
+    timeout-minutes: 30
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: hero_quant
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      HERO_CHECKPOINT_DSN: postgresql://postgres:postgres@localhost:5432/hero_quant
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v7

@@ -353,12 +353,13 @@ class BillingService:
     def _pg_publish_sync(self, factor: dict) -> bool:
         """真 PG 同一事务内 SET LOCAL 后紧跟 INSERT INTO factors — 中文：事务级 RLS。
 
-        无真实池的 emulated 降级模式下，权威持久化即随后写入的 _GLOBAL_FACTORS（进程内重启可恢复，
-        初始化时已 _log_pg_warning_once  loud 降级），故返回 True；调用方对 False 仍 fail-closed。
+        无真实池时返回 False（fail-closed，不伪成功）：emulated 降级下权威持久化是
+        随后写入的进程内 _GLOBAL_FACTORS，而非 PG；此处绝不把 emulated 当作真实 PG 成功。
+        调用方对 False 走 emulated 路径，对 True 视为真实 PG 已提交。
         """
         if not self._is_real_pg():
             _log_warning("PG publish degraded (no real pool, emulated store authoritative) tenant=%s dsna=%s", str(factor.get("tenant", "default")), "__hashed__", exc_info=False)
-            return True
+            return False
         if getattr(self, "_pool", None) is None:
             _log_warning("PG publish no pool tenant=%s", str(factor.get("tenant", "default")), exc_info=False)
             return False

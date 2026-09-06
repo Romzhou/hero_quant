@@ -440,6 +440,12 @@ def _is_async_pool(pool: Any) -> bool:
         return False
 
 
+# 中文：pool 参数 sentinel —— 区分「未指定（自动建池）」与「显式 None（调用方明确不要池）」。
+# 直接用 None 做默认会让显式 pool=None 被覆盖成自动建池，导致 test_pg_isolation 的
+# 「无池 fail-closed」断言失效，且每次构造都空等 30s 连接超时。
+_POOL_UNSET = object()
+
+
 class AsyncPostgresSaver:
     """LangGraph PostgresSaver 兼容实现 — 内存与 Postgres 双后端。
 
@@ -454,7 +460,7 @@ class AsyncPostgresSaver:
         *,
         dsn: Optional[str] = None,
         ttl_seconds: int | None = None,
-        pool: Optional[Any] = None,
+        pool: Any = _POOL_UNSET,
     ) -> None:
         raw = dsn if dsn is not None else conn_or_dsn
         if raw is None:
@@ -473,14 +479,16 @@ class AsyncPostgresSaver:
             self._asetup_lock = None  # type: ignore
 
         self.dsn: str = ""
-        self.pool: Optional[Any] = pool
+        pool_explicit = pool is not _POOL_UNSET
+        self.pool: Optional[Any] = pool if pool_explicit else None
         if isinstance(raw, str):
             self.dsn = raw
             if self.dsn.startswith("memory://"):
                 self.pool = None
             elif _is_postgres_dsn(self.dsn):
-                # 中文注释：PG DSN 且 pool=None 时尝试建池；失败则 loud 警告（脱敏 DSN）
-                if self.pool is None and ConnectionPool is not None:
+                # 中文注释：PG DSN 且调用方未显式指定 pool 时尝试建池；失败则 loud 警告（脱敏 DSN）。
+                # 显式 pool=None 表示调用方明确不要池（fail-closed 测试/降级路径），必须尊重。
+                if (not pool_explicit) and ConnectionPool is not None:
                     try:
                         # 尝试建真实池；若当前环境不可用则记录警告，仍保留 emulated 兜底
                         self.pool = ConnectionPool(conninfo=self.dsn)  # type: ignore
@@ -488,7 +496,9 @@ class AsyncPostgresSaver:
                             # 同步池尝试 open 以早暴露不可达，失败不抛
                             if hasattr(self.pool, "open") and not _is_async_pool(self.pool):
                                 try:
-                                    self.pool.open()  # type: ignore
+                                    # 中文：timeout=5 —— 无 PG 环境快速失败（默认 30s 空等曾拖慢全量 28 分钟）；
+                                    # CI/本地有 PG service 时毫秒级连上，不受影响。
+                                    self.pool.open(timeout=5)  # type: ignore
                                 except (OSError, ConnectionError, ValueError) as _exc:  # noqa: BLE001 窄化
                                     logger.warning("PG 池创建失败（%s）: %s", _redact_dsn(self.dsn), _exc)  # type: ignore
                                 except Exception as _exc:  # noqa: BLE001 兜底窄化日志

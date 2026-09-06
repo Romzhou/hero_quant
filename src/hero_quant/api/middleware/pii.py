@@ -9,9 +9,10 @@
 from __future__ import annotations
 
 import logging
-import os
 import warnings
 from typing import Optional
+
+from hero_quant.config.settings import Settings
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +42,7 @@ def _get_key() -> Optional[bytes]:
             logger.warning("cryptography 未安装，PII 加密不可用")
             _WARNED_NO_CRYPTO = True
         return None
-    key_str = os.getenv("PII_ENCRYPTION_KEY")
+    key_str = Settings().pii_encryption_key
     if not key_str:
         # 缺 key 告警只打一次，避免热路径刷屏
         if not _WARNED_NO_KEY:
@@ -80,7 +81,7 @@ def pii_decrypt(ciphertext: str) -> str:
     if ciphertext.startswith("!NOENC!"):
         # 历史遗留明文默认拒绝（fail-closed）：无 Fernet 认证即信任明文
         # 即未认证透传。迁移需显式 PII_ALLOW_LEGACY_NOENC=1 并留下告警审计。
-        if os.getenv("PII_ALLOW_LEGACY_NOENC") != "1":
+        if not Settings().pii_allow_legacy_noenc:
             logger.warning("legacy !NOENC! PII 拒绝：需显式 PII_ALLOW_LEGACY_NOENC=1 迁移")
             raise RuntimeError("legacy plaintext PII rejected (!NOENC!)")
         warnings.warn("legacy !NOENC! PII 明文放行（显式迁移开关）", UserWarning, stacklevel=2)
