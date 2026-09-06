@@ -54,11 +54,13 @@ def test_tool_dispatch_sandbox_wrapper():
         return f"echo:{msg}"
 
     spec = TOOL_REGISTRY[name]
-    # 走 dispatch_tool 包装器：python 分支或受限子进程；应返回结果或 tool_error 前缀
+    # 默认 policy 无 allow_direct_call → 直调被禁止（fail-closed），返回结构化 dict error
     res = dispatch_tool(spec, {"msg": "hello"})
-    assert isinstance(res, str)
-    # 若为直接调用，返回 echo:hello；若为沙箱路径，至少含 tool_error 前缀或 echo
-    assert "echo:hello" in res or "tool_error" in res
+    assert isinstance(res, dict)
+    assert "error" in res and "tool_error" in res["error"]
+    # 显式 allow_direct_call 才允许直调返回结果
+    res2 = dispatch_tool(spec, {"msg": "hello"}, {"allow_direct_call": True})
+    assert res2 == "echo:hello"
 
     # 清理
     del TOOL_REGISTRY[name]

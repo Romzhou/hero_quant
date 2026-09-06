@@ -100,4 +100,6 @@ def test_scanner_errors_do_not_break_redaction(monkeypatch, scanner_name):
     )
 
     assert result["api_key"] == "***"
-    assert result["message"] == "plain"
+    # 中文：scanner 抛错时 fail-closed——无法验证内容安全时宁脱敏不泄漏原始值
+    # （redaction._apply_scanner 捕获异常后返回 _REDACTED），message 亦被全掩码而非保持原文
+    assert result["message"] == "***"

@@ -151,17 +151,16 @@ def _pyproject_import_roots() -> set[str]:
 
 
 def test_ast_allowlist_synced_with_pyproject():
-    from hero_quant.sandbox.ast_guard import ALLOWED_ROOTS, check_import_allowlist
+    from hero_quant.sandbox.ast_guard import check_import_allowlist
 
-    py_roots = _pyproject_import_roots()
-    # Every pyproject dependency import root must be allowlisted
-    missing = [r for r in py_roots if r not in ALLOWED_ROOTS]
-    assert not missing, f"allowlist missing pyproject deps: {missing} (ALLOWED_ROOTS={sorted(ALLOWED_ROOTS)})"
-    # Verify allowlist actually permits them via AST guard
-    for root in sorted(py_roots)[:10]:  # sample 10 to avoid huge loop
-        code = f"import {root}"
-        # Some roots like langchain_openai may not be installed but should still pass allowlist
-        assert check_import_allowlist(code) is True, f"allowlist should permit pyproject dep {root}"
+    # 中文：retest-271 起 pyproject 依赖不再自动放行（fail-closed）。
+    # 白名单是显式静态审计集合，新增依赖须手动加入 _STATIC_ALLOWED。
+    # 故不再断言「所有 pyproject 依赖都在 allowlist」，改为验证 fail-closed 裁决：
+    # 静态白名单内的运行时模块放行，白名单外的拒绝（不因在 pyproject 中而自动放行）。
+    assert check_import_allowlist("import numpy") is True, "numpy 应在静态白名单"
+    assert check_import_allowlist("import pandas") is True, "pandas 应在静态白名单"
+    # 白名单外（即使为运行时依赖）一律拒绝：fail-closed，不自动放行 pyproject 依赖
+    assert check_import_allowlist("import psycopg") is False, "psycopg 不在白名单应被拒绝（不自动放行）"
 
 
 def test_ast_allowlist_allows_quantlib_deps():

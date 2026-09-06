@@ -77,23 +77,29 @@ def test_memory_store_close_idempotent(tmp_path):
 
 
 def test_content_hash_cross_key_dedup(tmp_path):
-    """A3-1 TDD: 同一内容不同 key 30s 内第二笔应被判重，大小写/空白归一."""
+    """同 key 同内容 30s 内判重；跨 key 同内容保留（distinct keys must persist）。"""
     from hero_quant.memory.store import MemoryStore
 
+    # 同 key 同内容：30s 内判重，DB 仅 1 条
     ms = MemoryStore(tmp_path)
     ms.write("a", "hello")
-    ms.write("b", "hello")  # 同内容不同 key，30s 内判重
-    assert len(ms.search("hello")) == 1
-    # DB 层面也应只有 1 条，避免 search 去重掩盖
+    ms.write("a", "hello")
     cur = ms._conn.cursor()
     cur.execute("SELECT COUNT(*) FROM notes")
     assert cur.fetchone()[0] == 1
 
-    # 大小写/空白归一：标准化后仍判重
-    ms2 = MemoryStore(tmp_path / "case_ws")
+    # 跨 key 同内容：distinct keys must persist，各保留一条（不因内容相同而丢失）
+    ms2 = MemoryStore(tmp_path / "cross_key")
     ms2.write("a", "hello")
-    ms2.write("b", "  HELLO  ")
-    assert len(ms2.search("hello")) == 1
+    ms2.write("b", "hello")
     cur2 = ms2._conn.cursor()
     cur2.execute("SELECT COUNT(*) FROM notes")
-    assert cur2.fetchone()[0] == 1
+    assert cur2.fetchone()[0] == 2
+
+    # 大小写/空白归一：同 key 标准化后仍判重
+    ms3 = MemoryStore(tmp_path / "case_ws")
+    ms3.write("a", "hello")
+    ms3.write("a", "  HELLO  ")
+    cur3 = ms3._conn.cursor()
+    cur3.execute("SELECT COUNT(*) FROM notes")
+    assert cur3.fetchone()[0] == 1
