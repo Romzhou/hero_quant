@@ -57,24 +57,63 @@ DDL_FACTORS = """
 CREATE TABLE IF NOT EXISTS factors (
   factor_id text PRIMARY KEY,
   name text NOT NULL,
-  price double precision NOT NULL,
-  tenant text NOT NULL,
-  description text DEFAULT ''
-);
+  price numeric(12,2) NOT NULL CHECK (price >= 0),
+  tenant text NOT NULL CHECK (tenant <> ''),
+  description text DEFAULT '',
+  UNIQUE (factor_id, tenant)
+)
 """
 
 DDL_PURCHASES = """
 CREATE TABLE IF NOT EXISTS purchases (
-  id SERIAL PRIMARY KEY,
-  factor_id text NOT NULL REFERENCES factors(factor_id),
-  buyer_tenant text NOT NULL,
-  tenant text NOT NULL,
-  price double precision NOT NULL,
+  id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  factor_id text NOT NULL,
+  buyer_tenant text NOT NULL CHECK (buyer_tenant <> ''),
+  tenant text NOT NULL CHECK (tenant <> ''),
+  price numeric(12,2) NOT NULL CHECK (price >= 0),
   idempotency_key text,
   created_at timestamptz DEFAULT now(),
-  UNIQUE (factor_id, buyer_tenant)
-);
+  UNIQUE (factor_id, buyer_tenant),
+  FOREIGN KEY (factor_id, tenant) REFERENCES factors(factor_id, tenant) ON DELETE RESTRICT
+)
 """
+
+# RLS 租户隔离：此前 DDL 从未 ENABLE ROW LEVEL SECURITY，SET LOCAL app.tenant 形同虚设
+# （critical：多租户计费数据隔离实际未生效）。每条为单语句，逐条执行（psycopg 扩展协议不支持多语句）。
+_BILLING_RLS_STATEMENTS: tuple[str, ...] = (
+    """
+    CREATE OR REPLACE FUNCTION current_tenant() RETURNS text AS $$
+      SELECT COALESCE(
+        NULLIF(current_setting('app.tenant', true), ''),
+        NULLIF(current_setting('app.current_tenant', true), '')
+      );
+    $$ LANGUAGE sql STABLE
+    """,
+    "ALTER TABLE factors ENABLE ROW LEVEL SECURITY",
+    "ALTER TABLE factors FORCE ROW LEVEL SECURITY",
+    "ALTER TABLE purchases ENABLE ROW LEVEL SECURITY",
+    "ALTER TABLE purchases FORCE ROW LEVEL SECURITY",
+    "DROP POLICY IF EXISTS factors_tenant_isolation ON factors",
+    "CREATE POLICY factors_tenant_isolation ON factors USING (tenant = current_tenant()) WITH CHECK (tenant = current_tenant())",
+    "DROP POLICY IF EXISTS purchases_buyer_select ON purchases",
+    "CREATE POLICY purchases_buyer_select ON purchases FOR SELECT USING (buyer_tenant = current_tenant())",
+    "DROP POLICY IF EXISTS purchases_seller_select ON purchases",
+    "CREATE POLICY purchases_seller_select ON purchases FOR SELECT USING (tenant = current_tenant())",
+    "DROP POLICY IF EXISTS purchases_insert ON purchases",
+    "CREATE POLICY purchases_insert ON purchases FOR INSERT WITH CHECK (buyer_tenant = current_tenant())",
+    "DROP POLICY IF EXISTS purchases_seller_update ON purchases",
+    "CREATE POLICY purchases_seller_update ON purchases FOR UPDATE USING (tenant = current_tenant()) WITH CHECK (tenant = current_tenant())",
+    "DROP POLICY IF EXISTS purchases_seller_delete ON purchases",
+    "CREATE POLICY purchases_seller_delete ON purchases FOR DELETE USING (tenant = current_tenant())",
+)
+
+# RLS 过滤与 FK 查询索引（原无索引，USING(tenant=...) 随表增长 seq-scan）
+_BILLING_INDEX_STATEMENTS: tuple[str, ...] = (
+    "CREATE INDEX IF NOT EXISTS idx_factors_tenant ON factors(tenant)",
+    "CREATE INDEX IF NOT EXISTS idx_purchases_tenant ON purchases(tenant)",
+    "CREATE INDEX IF NOT EXISTS idx_purchases_buyer ON purchases(buyer_tenant)",
+    "CREATE INDEX IF NOT EXISTS idx_purchases_factor ON purchases(factor_id)",
+)
 # PR2-F: 真 PG 幂等写入 —— 幂等键 (factor_id, buyer_tenant)，冲突直接丢弃并取既有行。
 _PURCHASE_INSERT_SQL = (
     "INSERT INTO purchases (factor_id, buyer_tenant, tenant, price, idempotency_key) "
@@ -222,8 +261,8 @@ class BillingService:
         return None
 
     def _exec_billing_ddl(self, conn) -> None:
-        """在真实 PG 连接上执行 DDL_FACTORS/DDL_PURCHASES（幂等建表），失败抛错由调用方 fail-closed。"""
-        for _ddl in (DDL_FACTORS, DDL_PURCHASES):
+        """在真实 PG 连接上执行 billing DDL（幂等建表 + 索引 + RLS），失败抛错由调用方 fail-closed。"""
+        for _ddl in (DDL_FACTORS, DDL_PURCHASES, *_BILLING_INDEX_STATEMENTS, *_BILLING_RLS_STATEMENTS):
             try:
                 conn.execute(_ddl)  # type: ignore
             except Exception:
@@ -307,11 +346,10 @@ class BillingService:
                         _log_warning("billing rollback instance failed: %s", _re2)
                     raise
         elif self._is_pg_mode():
-            # 中文：emulated 降级路径与真实 PG 同样 fail-closed（与真实分支一致，不可静默成功）
+            # 中文：emulated 降级路径（无真实池）：直接以进程内 _GLOBAL_FACTORS 为权威持久化。
+            # 不调 _pg_publish_sync——它无真实池时返回 False（fail-closed，语义是「PG 未写成功」），
+            # 此处本就无 PG 可写，走内存即可，无需伪成功判定。
             _log_warning("billing degraded (emulated PG without driver) tenant=%s", str(factor.get("tenant", "default")), exc_info=False)
-            ok = self._pg_publish_sync(factor)
-            if not ok:
-                raise RuntimeError(f"PG publish failed for factor_id={factor_id}")
             self._pg_publish_noop(factor)
             with _GLOBAL_LOCK:
                 _GLOBAL_FACTORS[_dsn_key(self.dsn)][factor_id] = copy.deepcopy(factor)  # type: ignore

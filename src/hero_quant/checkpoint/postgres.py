@@ -40,16 +40,19 @@ except Exception:
 # (conflict target is the composite PK; see _pg_put_sync/_pg_put_async SQL).
 DDL_CHECKPOINTS = """
 CREATE TABLE IF NOT EXISTS checkpoints (
-  tenant text NOT NULL,
-  thread text NOT NULL,
-  seq int NOT NULL,
+  tenant text NOT NULL CHECK (tenant <> ''),
+  thread text NOT NULL CHECK (thread <> ''),
+  seq int NOT NULL CHECK (seq >= 0),
   checkpoint jsonb NOT NULL,
   run_text TEXT,
   expires_at timestamptz,
   PRIMARY KEY (tenant, thread, seq)
 );
 ALTER TABLE checkpoints ADD COLUMN IF NOT EXISTS run_text TEXT;
-CREATE INDEX IF NOT EXISTS idx_checkpoints_expires_at ON checkpoints (expires_at);
+-- partial index：仅索引非空 expires_at，提升清理扫描选择性（expires_at NULL 表示永不过期）
+CREATE INDEX IF NOT EXISTS idx_checkpoints_expires_at ON checkpoints (expires_at) WHERE expires_at IS NOT NULL;
+-- 清理机制（外部 reaper，未在本 DDL 内建 cron）：pg_cron / 定时任务执行
+--   DELETE FROM checkpoints WHERE expires_at < now();
 -- legacy fallback for older code paths using thread_id primary key
 CREATE TABLE IF NOT EXISTS checkpoints_legacy (
   thread_id TEXT PRIMARY KEY,
@@ -57,7 +60,7 @@ CREATE TABLE IF NOT EXISTS checkpoints_legacy (
   config JSONB,
   expires_at TIMESTAMPTZ
 );
-CREATE INDEX IF NOT EXISTS idx_checkpoints_legacy_expires_at ON checkpoints_legacy (expires_at);
+CREATE INDEX IF NOT EXISTS idx_checkpoints_legacy_expires_at ON checkpoints_legacy (expires_at) WHERE expires_at IS NOT NULL;
 """
 
 _PG_PREFIXES = ("postgresql://", "postgres://", "postgresql+psycopg://")
