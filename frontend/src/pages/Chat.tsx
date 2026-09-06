@@ -298,10 +298,11 @@ export default function Chat() {
       try { esRef.current?.close() } catch {}
       esRef.current = null
       const ticket = await issueSseTicket()
-      const url = `${API_ENDPOINTS.STREAM}?q=${encodeURIComponent(q)}&ticket=${encodeURIComponent(ticket)}`
+      // fetch 回退可用自定义 header，票据经 X-Ticket 传递（不暴露在 URL/history/logs/referer）
+      const url = `${API_ENDPOINTS.STREAM}?q=${encodeURIComponent(q)}`
       const resp = await fetch(url, {
         method: "GET",
-        headers: { Accept: "text/event-stream" },
+        headers: { Accept: "text/event-stream", "X-Ticket": ticket },
         signal: controller.signal,
       })
       if (!resp.ok || !resp.body) throw new Error(`HTTP ${resp.status}`)

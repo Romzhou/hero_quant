@@ -54,6 +54,7 @@ export default function Monitor() {
         }
         let reader: ReadableStreamDefaultReader<Uint8Array> | null = null
         let controller: AbortController | null = null
+        let ticketHeader: string | null = null
         try {
           let url = candidate
           if (candidate.startsWith("/v1/query/stream")) {
@@ -69,18 +70,22 @@ export default function Monitor() {
               continue
             }
             const payload = await ticketResp.json() as { ticket?: unknown }
-            if (typeof payload.ticket !== "string" || !payload.ticket) {
-              console.warn(`[Monitor] SSE candidate failed: ${candidate} missing ticket`)
+            // 票据格式校验（token_urlsafe(32) ≈ 43 字符 URL-safe base64），非空且形态合法才放行
+            if (typeof payload.ticket !== "string" || !/^[A-Za-z0-9_-]{32,64}$/.test(payload.ticket)) {
+              console.warn(`[Monitor] SSE candidate failed: ${candidate} missing/invalid ticket`)
               continue
             }
             if (aborted) return
-            url += `&ticket=${encodeURIComponent(payload.ticket)}`
+            // 票据经 X-Ticket header 传递，避免暴露在 URL/browser history/server logs/referer
+            ticketHeader = payload.ticket
           }
           if (!controller) {
             controller = new AbortController()
             abortRef.current = controller
           }
-          const resp = await fetch(url, { headers: { Accept: "text/event-stream" }, signal: controller.signal })
+          const headers: Record<string, string> = { Accept: "text/event-stream" }
+          if (ticketHeader) headers["X-Ticket"] = ticketHeader
+          const resp = await fetch(url, { headers, signal: controller.signal })
           if (!resp.ok || !resp.body) {
             console.warn(`[Monitor] SSE candidate failed: ${candidate} status ${resp.status}`)
             continue

@@ -5,7 +5,7 @@
 关键设计：最小 CSP（default-src 'self'）+ DNS rebinding 回环白名单；X-Request-ID 透传与 OTel 占位；Prometheus Counter/Histogram 与 wall-time 观测；SPA 回退仅在 API 路由之后生效。
 """
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, Response
+from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse, FileResponse, PlainTextResponse
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
 
@@ -1205,7 +1205,7 @@ def query_ticket(request: Request):
 
 
 @app.get("/v1/query/stream")
-async def query_stream(request: Request, background_tasks: BackgroundTasks, q: str = "", ticket: str | None = None, use_graph: bool = False, replay_path: str | None = None, trace_dir: str | None = None, wall_time_budget: float | None = None):
+async def query_stream(request: Request, background_tasks: BackgroundTasks, q: str = "", ticket: str | None = None, x_ticket: str | None = Header(None, alias="X-Ticket"), use_graph: bool = False, replay_path: str | None = None, trace_dir: str | None = None, wall_time_budget: float | None = None):
     """SSE 查询流：真实 AgentLoop 驱动，产出 tool 轨迹 + 流式 delta + [DONE]。"""
     # 中文：同 query()，注解必须是裸 BackgroundTasks（union 写法会让模块 import 失败）。
     if background_tasks is None:
@@ -1240,7 +1240,9 @@ async def query_stream(request: Request, background_tasks: BackgroundTasks, q: s
             raise
         except Exception as _e:
             raise HTTPException(status_code=400, detail=f"invalid replay_path: {_e}")
-    if not consume_ticket(ticket):
+    # 中文：优先 X-Ticket header（避免票据暴露在 URL/history/logs/referer），回退 query param 兼容旧前端
+    _effective_ticket = x_ticket or ticket
+    if not consume_ticket(_effective_ticket):
         return JSONResponse(status_code=403, content={"detail": "Invalid or expired SSE ticket"})
 
     async def event_generator():
