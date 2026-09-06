@@ -12,6 +12,7 @@ import urllib.request
 import urllib.parse
 import json
 import logging
+from typing import Any
 
 from hero_quant.infra.redis import cache
 
@@ -84,6 +85,14 @@ class TencentLoader:
     def _get_bars_live_cached(self, symbol, start, end, interval="1d"):
         """Cached live path only — mode resolved before cache lookup (no cross-mode poisoning)."""
         return self._fetch_live_bars(symbol, start, end, interval)
+
+    def health(self) -> dict[str, Any]:
+        """健康检查：返回腾讯源可用性与来源信息（SourceTrait 契约必需）。
+
+        中文：trait.validate_loader 要求 loader 具备可调用的 health，此前 tencent/yahoo 未实现，
+        导致 registry.register() 抛 ValueError，连带打断 e2e/engine/registry 等一系列用例。
+        """
+        return {"status": "ok", "source": self.name, "unit": self.unit, "markets": self.markets}
 
     def get_bars(self, symbol, start, end, interval="1d"):
         """拉取行情，兼容旧参数顺序并遵循 HERO_DATA_MODE 门控。"""

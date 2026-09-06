@@ -5,7 +5,7 @@
 关键设计：最小 CSP（default-src 'self'）+ DNS rebinding 回环白名单；X-Request-ID 透传与 OTel 占位；Prometheus Counter/Histogram 与 wall-time 观测；SPA 回退仅在 API 路由之后生效。
 """
 
-from fastapi import FastAPI, Request, Response
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse, FileResponse, PlainTextResponse
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
 
@@ -24,12 +24,10 @@ import threading
 import tempfile
 import itertools
 
+from hero_quant.api.security import SSE_TICKET_TTL_SECONDS, consume_ticket, issue_ticket
+
 # X-Request-ID 安全字母表（模块级预编译，热路径中间件复用；与 trace._clean_trace_id 兼容的子集）。
 _REQUEST_ID_RE = re.compile(r"[A-Za-z0-9_.~-]+\Z")
-
-from fastapi import BackgroundTasks, HTTPException
-
-from hero_quant.api.security import SSE_TICKET_TTL_SECONDS, consume_ticket, issue_ticket
 
 async def _async_exists(p):
     try:

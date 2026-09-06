@@ -6,6 +6,7 @@
 
 import logging
 import math
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +22,13 @@ class YahooLoader:
     source = "yahoo"
     markets = ["US"]
     unit = "shares"
+
+    def health(self) -> dict[str, Any]:
+        """健康检查：返回 Yahoo 源可用性与来源信息（SourceTrait 契约必需）。
+
+        中文：同 tencent.health —— validate_loader 要求 health 可调用，此前缺失导致注册失败。
+        """
+        return {"status": "ok", "source": self.name, "unit": self.unit, "markets": self.markets}
 
     def get_bars(self, symbol, start, end, interval="1d"):
         """拉取 US 行情，兼容旧参数顺序；双路径 download→history 做容错。synthetic 需 HERO_DATA_MODE=synthetic。"""
