@@ -23,6 +23,7 @@ import asyncio
 import threading
 import tempfile
 import itertools
+from contextlib import asynccontextmanager
 
 from hero_quant.api.security import SSE_TICKET_TTL_SECONDS, consume_ticket, issue_ticket
 
@@ -334,7 +335,6 @@ def warm_checkpoint_at_startup() -> int:
         return 0
 
 
-@app.on_event("startup")
 def _warm_checkpoint_maps_on_startup() -> None:
     warm_checkpoint_at_startup()
 
@@ -397,20 +397,20 @@ except Exception as _e:
 # Phase 2: WebSocket progress push (non-blocking, logged)
 try:
     from hero_quant.api.ws import router as _ws_router
-    from hero_quant.api.ws import heartbeat as _ws_heartbeat
 
     app.include_router(_ws_router)
-
-    # Lifespan: start heartbeat monitor (best-effort)
-    @app.on_event("startup")
-    async def _start_ws_heartbeat():
-        try:
-            await _ws_heartbeat.start()
-        except Exception as _e:
-            logger.debug("ws.heartbeat_start_failed error=%s", str(_e))
-
 except Exception as _e:
     logger.debug("ws.router_include_failed error=%s", str(_e))
+
+
+async def _start_ws_heartbeat():
+    """WS 心跳监控（best-effort，懒加载 ws，避免 import 失败时函数缺失）。"""
+    try:
+        from hero_quant.api.ws import heartbeat as _ws_heartbeat
+
+        await _ws_heartbeat.start()
+    except Exception as _e:
+        logger.debug("ws.heartbeat_start_failed error=%s", str(_e))
 
 # R1 lifespan: trace consumer 接线（每 worker 一个消费者；stop_event 在 shutdown 置位）
 _trace_consumer_stop: asyncio.Event | None = None
@@ -425,7 +425,6 @@ def _get_trace_consumer_stop() -> asyncio.Event:
     return _trace_consumer_stop
 
 
-@app.on_event("startup")
 def _inject_r1_state_on_startup() -> None:
     """R1: lifespan state 注入 — memory_store + agent 容器；异常仅 debug，不阻断启动。"""
     try:
@@ -442,7 +441,6 @@ def _inject_r1_state_on_startup() -> None:
         logger.debug("r1.agent_inject_failed", error=str(_e))
 
 
-@app.on_event("startup")
 async def _start_trace_consumer() -> None:
     """R1: startup 启动 run_trace_consumer(stop_event)，异常仅 debug 不阻断启动。"""
     global _trace_consumer_task
@@ -456,7 +454,6 @@ async def _start_trace_consumer() -> None:
         logger.debug("r1.consumer_start_failed", error=str(_e))
 
 
-@app.on_event("shutdown")
 async def _stop_trace_consumer() -> None:
     """R1: shutdown 置位 stop_event 并 await 取消 consumer 任务（带超时）。"""
     global _trace_consumer_task
@@ -477,6 +474,26 @@ async def _stop_trace_consumer() -> None:
                 logger.debug("r1.consumer_cancel_failed", error=str(_e))
     except Exception as _e:
         logger.debug("r1.consumer_cancel_failed", error=str(_e))
+
+
+@asynccontextmanager
+async def _lifespan(app):
+    """聚合生命周期：替代 5 个 @app.on_event（消除 FastAPI DeprecationWarning）。
+
+    startup：checkpoint 暖机 + WS 心跳 + R1 状态注入 + trace 消费者；
+    shutdown：置位 stop_event 并取消消费者。各步骤内部已捕获异常，不阻断启动。
+    """
+    _warm_checkpoint_maps_on_startup()
+    await _start_ws_heartbeat()
+    _inject_r1_state_on_startup()
+    await _start_trace_consumer()
+    yield
+    await _stop_trace_consumer()
+
+
+# 后挂载 lifespan：router.lifespan_context 在 starlette 1.x 支持（on_startup/on_shutdown 已移除）
+app.router.lifespan_context = _lifespan
+
 
 # 复用已注册的 Counter，避免重复注册导致 DuplicateTimeseries（使用公开 API）
 try:
