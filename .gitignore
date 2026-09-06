@@ -70,3 +70,6 @@ docs/loop_mindmap.html
 docs/retrieval_eval.md
 interview_100q*.md
 interview-*.md
+# runtime artifacts: memory db + external memory files, regenerated on every test run
+# 必须带前导斜杠：裸 data/ 会连带匹配 src/hero_quant/data/ 源码目录
+/data/
