@@ -46,9 +46,9 @@ def test_engine_align_and_execute():
         {"close": [100, 101, 102], "open": [99, 100.5, 101.5]},
         index=pd.date_range("2026-08-01", periods=3),
     )
-    # _align should return next-day open when available
+    # _align 始终返回 per-asset Series（消除 float|Series 双态），单资产取首元素
     aligned = e._align(prices, 0)
-    assert aligned == pytest.approx(100.5)
+    assert float(aligned.iloc[0]) == pytest.approx(100.5)
 
     # _execute_bars capital pre-check proportional scaling
     target = pd.Series([80.0, 80.0], index=["asset_0", "asset_1"])  # sum 160 > capital 100

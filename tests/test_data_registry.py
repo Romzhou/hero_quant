@@ -130,6 +130,7 @@ def test_audit_log_bounded_and_threadsafe():
     assert reg.audit_log.maxlen == 3, f"expected maxlen 3 got {reg.audit_log.maxlen}"
 
     class FakeLoader:
+        name = "synthetic"
         markets = ["US"]
         unit = "shares"
         def get_bars(self, symbol, start, end, interval="1d"):
@@ -151,6 +152,7 @@ def test_cross_source_non_critical_not_fatal(caplog):
     from hero_quant.data.registry import MarketDataRegistry
 
     class GoodLoader:
+        name = "synthetic"
         markets = ["US"]
         unit = "shares"
         def get_bars(self, symbol, start, end, interval="1d"):
