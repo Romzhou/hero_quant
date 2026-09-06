@@ -97,63 +97,42 @@ fn ema_vec(data: &[f64], span: usize) -> Vec<f64> {
     out
 }
 
-/// RSI 相对强弱指标（Wilder 平滑，首值 50，warm-up 期前 `n` 个为 50）
+/// RSI 相对强弱指标（Wilder 平滑 ewm，alpha=1/n，adjust=False）
 ///
-/// 采用经典 Wilder：首 `n` 个增益/损失的 SMA 为种子，之后按 `avg = (prev*(n-1)+curr)/n` 递推；
-/// `RS = avg_gain/avg_loss`，`RSI = 100 - 100/(1+RS)`；全涨 100，平盘 50。为保持与 Python
-/// 短序列可用性，`data.len() <= n` 时返回全 50；`i < n` warm-up 亦为 50，避免零种子偏置。
+/// 与 Python 侧 `quantlib.indicators.rsi` 对齐：首元素无 delta 发射中性 50，
+/// 后续按 `avg = alpha*curr + (1-alpha)*prev` 递推（ewm 语义，从第 1 个即出值）。
+/// `RS = avg_gain/avg_loss`，`RSI = 100 - 100/(1+RS)`；全涨 100，平盘 50。
+/// 不再使用「前 n 个 SMA 种子 + warm-up 固定 50」——固定 50 是「数据不足假装中性」的错误语义。
 fn rsi_vec(data: &[f64], period: usize) -> Vec<f64> {
     let n = period;
     if data.is_empty() {
         return vec![];
     }
-    if data.len() <= n {
-        // 样本不足以 Wilder 种子，返回中性值以保持可调用性；上层可通过长度判断 warm-up
-        return vec![50.0; data.len()];
-    }
-    // 种子：前 n 个差分的 SMA
-    let mut gains_sum = 0.0;
-    let mut losses_sum = 0.0;
-    for i in 1..=n {
-        let d = data[i] - data[i - 1];
-        if d > 0.0 {
-            gains_sum += d;
-        } else {
-            losses_sum += -d;
-        }
-    }
-    let mut avg_gain = gains_sum / n as f64;
-    let mut avg_loss = losses_sum / n as f64;
-
+    let alpha = 1.0 / n as f64;
+    let mut avg_gain = 0.0_f64;
+    let mut avg_loss = 0.0_f64;
     let mut out = Vec::with_capacity(data.len());
     for i in 0..data.len() {
         if i == 0 {
             out.push(50.0);
-        } else if i < n {
-            // warm-up 期：尚未完成种子，发射中性值而非偏置的 EWMA
-            out.push(50.0);
-        } else if i == n {
-            let rsi = if avg_loss == 0.0 {
-                if avg_gain == 0.0 { 50.0 } else { 100.0 }
-            } else {
-                let rs = avg_gain / avg_loss;
-                100.0 - (100.0 / (1.0 + rs))
-            };
-            out.push(rsi.clamp(0.0, 100.0));
-        } else {
-            let d = data[i] - data[i - 1];
-            let gain = d.max(0.0);
-            let loss = (-d).max(0.0);
-            avg_gain = (avg_gain * (n as f64 - 1.0) + gain) / n as f64;
-            avg_loss = (avg_loss * (n as f64 - 1.0) + loss) / n as f64;
-            let rsi = if avg_loss == 0.0 {
-                if avg_gain == 0.0 { 50.0 } else { 100.0 }
-            } else {
-                let rs = avg_gain / avg_loss;
-                100.0 - (100.0 / (1.0 + rs))
-            };
-            out.push(rsi.clamp(0.0, 100.0));
+            continue;
         }
+        let d = data[i] - data[i - 1];
+        let gain = d.max(0.0);
+        let loss = (-d).max(0.0);
+        avg_gain = alpha * gain + (1.0 - alpha) * avg_gain;
+        avg_loss = alpha * loss + (1.0 - alpha) * avg_loss;
+        let rsi = if avg_loss == 0.0 {
+            if avg_gain == 0.0 {
+                50.0
+            } else {
+                100.0
+            }
+        } else {
+            let rs = avg_gain / avg_loss;
+            100.0 - (100.0 / (1.0 + rs))
+        };
+        out.push(rsi.clamp(0.0, 100.0));
     }
     out
 }
@@ -161,9 +140,8 @@ fn rsi_vec(data: &[f64], period: usize) -> Vec<f64> {
 /// 最大回撤（max drawdown）
 ///
 /// 遍历权益曲线维护 `cummax`，`dd = v/cummax - 1` 取最小负值；空序列返回 0。
-/// 调用前已校验无非有限值；`cummax == 0` 时跳过除法（零起点权益无回撤语义），
-/// 但若后续出现 `v < 0` 且 `cummax == 0` 视为极端回撤，返回 `f64::NEG_INFINITY` 语义由上层处理。
-/// 不变量：`mdd <= 0.0`，无回测则 0。
+/// `cummax == 0`（零起点权益）时跳过除法，回撤置 0（对齐 Python：除零不产生 -inf，
+/// 避免 -inf 污染下游 Sharpe 等计算）。不变量：`mdd <= 0.0`，无回撤则 0。
 fn max_drawdown_vec(equity: &[f64]) -> f64 {
     if equity.is_empty() {
         return 0.0;
@@ -175,10 +153,7 @@ fn max_drawdown_vec(equity: &[f64]) -> f64 {
             cummax = v;
         }
         if cummax == 0.0 {
-            // 零峰值时除法无意义；若负权益则视为无限回撤，避免静默 0
-            if v < 0.0 {
-                return f64::NEG_INFINITY;
-            }
+            // 零峰值时除法无意义，跳过（对齐 Python：除零回撤置零）
             continue;
         }
         let dd = v / cummax - 1.0;
@@ -186,7 +161,6 @@ fn max_drawdown_vec(equity: &[f64]) -> f64 {
             mdd = dd;
         }
     }
-    // invariant: mdd <= 0.0, 0 means no drawdown (remove dead branch `if mdd>0 {0}`)
     mdd
 }
 
@@ -249,7 +223,7 @@ fn max_drawdown(equity: Vec<f64>) -> PyResult<f64> {
 ///
 /// 中轨为 SMA(n)，上下轨 `m ± k·σ`，σ 为样本标准差（分母 `n-1`），`k` 默认为 2.0；
 /// 不足窗口处为 None。`window==1` 时 σ 未定义，返回 `(mid, mid, mid)`（带宽为 0）。
-/// 采用 O(n) 滚动 `sum`/`sum_sq`，避免每根 K 线全窗口迭代。
+/// 中轨滚动求和 O(n)；σ 用两遍法（先均值后 sum of squared deviations），避免 sum_sq 灾难性抵消。
 #[pyfunction]
 #[pyo3(signature = (data, window=None, num_std=None))]
 fn bollinger(
@@ -261,19 +235,17 @@ fn bollinger(
     let k = validate_num_std(num_std.unwrap_or(DEFAULT_BOLLINGER_K))?;
     validate_finite(&data)?;
 
-    // O(n) 滚动：维护 sum 与 sum_sq
+    // O(n) 滚动维护 sum 算均值；σ 用两遍法（先均值后 sum of squared deviations），
+    // 避免 `sum_sq - sum^2/n` 的灾难性抵消（大数值时两巨数相减丢失精度，甚至负方差被钳 0）。
     let mut mid = Vec::with_capacity(data.len());
     let mut upper = Vec::with_capacity(data.len());
     let mut lower = Vec::with_capacity(data.len());
     let mut sum = 0.0_f64;
-    let mut sum_sq = 0.0_f64;
 
     for i in 0..data.len() {
         sum += data[i];
-        sum_sq += data[i] * data[i];
         if i >= n {
             sum -= data[i - n];
-            sum_sq -= data[i - n] * data[i - n];
         }
         if i + 1 < n {
             mid.push(None);
@@ -282,13 +254,18 @@ fn bollinger(
         } else {
             let m = sum / n as f64;
             mid.push(Some(m));
-            let var = if n == 1 {
-                0.0
-            } else {
-                // 样本方差： (sum_sq - sum^2/n)/(n-1)，钳制浮点负误差
-                let v = (sum_sq - sum * sum / n as f64) / (n as f64 - 1.0);
-                v.max(0.0)
-            };
+            if n == 1 {
+                upper.push(Some(m));
+                lower.push(Some(m));
+                continue;
+            }
+            // 两遍法：窗口内样本方差（ddof=1），对齐 pandas rolling std
+            let mut ssd = 0.0_f64;
+            for j in i + 1 - n..=i {
+                let d = data[j] - m;
+                ssd += d * d;
+            }
+            let var = ssd / (n as f64 - 1.0);
             let std = var.sqrt();
             upper.push(Some(m + k * std));
             lower.push(Some(m - k * std));
@@ -477,24 +454,26 @@ mod tests {
     }
 
     #[test]
-    fn test_max_drawdown_zero_start_negative() {
-        // cummax==0 且 v<0 视为极端回撤，无静默 0
+    fn test_max_drawdown_zero_start_no_neg_inf() {
+        // cummax==0 时跳过除法（对齐 Python：除零回撤置零，不产生 -inf 污染下游）
         let v = vec![0.0, -1.0, 1.0];
         let mdd = max_drawdown_vec(&v);
-        assert!(mdd.is_infinite() && mdd.is_sign_negative());
+        assert!(mdd.is_finite() && mdd <= 0.0, "zero-start must not yield -inf, got {mdd}");
+        assert_eq!(mdd, 0.0);
     }
 
     #[test]
-    fn test_rsi_wilder_seed_not_biased() {
-        // 单调上涨：Wilder 种子应使 RSI 接近 100 而非受零种子拖累
+    fn test_rsi_monotonic_up_near_100() {
+        // 单调上涨：ewm 递推下 avg_loss=0 → RSI 恒 100（除首元素 50），不受 warm-up 固定 50 拖累
         let mut v = vec![10.0];
         for i in 1..30 {
             v.push(10.0 + i as f64);
         }
         let out = rsi_vec(&v, 14);
-        // warm-up 前 14 为 50，之后应快速趋近 100
-        assert!(out[14] > 70.0, "seed biased: {}", out[14]);
-        assert!(out[29] > 90.0);
+        assert_eq!(out[0], 50.0, "first element neutral 50");
+        for &x in &out[1..] {
+            assert!((x - 100.0).abs() < 1e-9, "monotonic up RSI should be 100, got {x}");
+        }
     }
 
     #[test]
