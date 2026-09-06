@@ -933,9 +933,14 @@ def metrics():
 
 
 @app.get("/v1/query")
-async def query(request: Request, q: str = "", use_graph: bool = False, replay_path: str | None = None, trace_dir: str | None = None, wall_time_budget: float | None = None, background_tasks: BackgroundTasks | None = None):
+async def query(request: Request, background_tasks: BackgroundTasks, q: str = "", use_graph: bool = False, replay_path: str | None = None, trace_dir: str | None = None, wall_time_budget: float | None = None):
     """同步查询：组装 AgentLoop 并返回 LoopResult 聚合 JSON。"""
-    # 修复：可变默认改为 None，注入的 BackgroundTasks 不被丢弃
+    # 中文：background_tasks 注解必须是裸 BackgroundTasks，不能写成 `BackgroundTasks | None`。
+    # FastAPI 判该参数靠 lenient_issubclass(annotation, StarletteBackgroundTasks)，
+    # PEP604 union 不是 class → 不匹配 → 退化成普通参数 → 路由注册期抛 FastAPIError，
+    # 整个 server 模块 import 即失败（服务起不来）。勿改回 union 写法。
+    # 位置必须在带默认值的参数之前（Python 语法约束）；显式传 None 时此处兜底新建，
+    # 保证响应发送后才执行 trace 清理，避免返回悬空路径（use-after-delete）。
     if background_tasks is None:
         background_tasks = BackgroundTasks()
     _limited = _check_rate_limit(request, "query", 20, 60)
@@ -1185,8 +1190,9 @@ def query_ticket(request: Request):
 
 
 @app.get("/v1/query/stream")
-async def query_stream(request: Request, q: str = "", ticket: str | None = None, use_graph: bool = False, replay_path: str | None = None, trace_dir: str | None = None, wall_time_budget: float | None = None, background_tasks: BackgroundTasks | None = None):
+async def query_stream(request: Request, background_tasks: BackgroundTasks, q: str = "", ticket: str | None = None, use_graph: bool = False, replay_path: str | None = None, trace_dir: str | None = None, wall_time_budget: float | None = None):
     """SSE 查询流：真实 AgentLoop 驱动，产出 tool 轨迹 + 流式 delta + [DONE]。"""
+    # 中文：同 query()，注解必须是裸 BackgroundTasks（union 写法会让模块 import 失败）。
     if background_tasks is None:
         background_tasks = BackgroundTasks()
     _limited = _check_rate_limit(request, "stream", 10, 60)

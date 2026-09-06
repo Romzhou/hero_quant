@@ -2,7 +2,6 @@
 import json
 import logging
 import time
-import threading
 import inspect
 
 import pytest
@@ -123,14 +122,32 @@ def test_threadpool_timeout_nonblocking():
         TOOL_REGISTRY.pop(tool_name, None)
 
 
-# ---------- container.py:23-24 锁类型与双检 ----------
-def test_container_locks_are_threading():
+# ---------- container.py 锁：实例级 + 可重入 ----------
+def test_container_lock_is_reentrant_instance_level():
+    """容器锁须为「可重入」的「实例级」锁。
+
+    中文：契约在 lane F2 变更——原为模块级 _init_lock/_graph_lock（Lock，不可重入，
+    且全局串行化无关容器），现为实例级 self._lock = threading.RLock()。
+    可重入是硬需求：init_graph 持锁调用 init_checkpointer，同实例嵌套加锁，
+    普通 Lock 会自锁。故此处用行为探测（嵌套 acquire 不死锁）而非类型名匹配。
+    """
     import hero_quant.agent.container as cont
-    assert isinstance(cont._init_lock, threading.Lock) or type(cont._init_lock).__name__ == "lock", f"_init_lock 类型错误: {type(cont._init_lock)}"
-    assert isinstance(cont._graph_lock, threading.Lock) or type(cont._graph_lock).__name__ == "lock", f"_graph_lock 类型错误: {type(cont._graph_lock)}"
-    # 检查 init_graph 使用了锁（双检）
+
+    c = cont.AgentContainer()
+    lock = getattr(c, "_lock", None)
+    assert lock is not None, "容器缺少实例级 _lock"
+    # 行为探测：同线程嵌套加锁必须成功（RLock）；普通 Lock 会在此永久阻塞
+    assert lock.acquire(timeout=2), "首次加锁失败"
+    try:
+        assert lock.acquire(timeout=2), "嵌套加锁失败 → 锁不可重入，init_graph→init_checkpointer 会自锁"
+        lock.release()
+    finally:
+        lock.release()
+    # 实例级：不同容器不共享锁，避免跨容器串行化
+    assert cont.AgentContainer()._lock is not lock, "锁退化为模块级共享锁"
+    # 双检：init_graph 须持实例锁
     src = inspect.getsource(cont.AgentContainer.init_graph)
-    assert "with _graph_lock" in src or "with _init_lock" in src, "init_graph 未使用 threading 锁做双检"
+    assert "with self._lock" in src, "init_graph 未持实例锁做双检"
 
 
 def test_container_init_checkpointer_narrow_except(caplog):
@@ -178,17 +195,38 @@ def test_buffer_max_turns_validation():
         MemoryBuffer(max_turns="bad")  # type: ignore
 
 
-# ---------- buffer.py:33-34 system 不截断 ----------
-def test_buffer_system_messages_unbounded():
+# ---------- buffer.py system 上限：有界 + 可调 + 淘汰不静默 ----------
+def test_buffer_system_messages_bounded_and_not_silent(caplog):
+    """system 消息有界（防撑爆上下文），但淘汰必须显式告警，不得静默丢弃。
+
+    中文：此处曾两轮拉锯——C3 改为无界（deque()），lane F3 又加回上限 10
+    （防逐轮注入累积撑爆上下文，且 setter/from_dict 依赖上限做容量校验）。
+    两边诉求都成立，取交集：默认有界 + system_limit 可调 + 溢出 warning。
+    """
     from hero_quant.agent.memory.buffer import MemoryBuffer
+
+    # 默认有界：超上限只保留最近 N 条，且必须留下告警痕迹（不得静默）
     buf = MemoryBuffer(max_turns=5)
+    with caplog.at_level(logging.WARNING):
+        for i in range(11):
+            buf.add_system_message(f"sys {i}")
+    sys_msgs = [m for m in buf.get_messages() if m.role == "system"]
+    assert len(sys_msgs) == 10, f"默认上限应为 10，实得 {len(sys_msgs)}"
+    assert any("system message limit" in r.message.lower() for r in caplog.records), (
+        "淘汰 system 消息却无告警 → 静默丢弃上下文，重演 G2#4"
+    )
+    contents = [m.content for m in sys_msgs]
+    assert "sys 10" in contents and "sys 0" not in contents, "应保留最近、淘汰最旧"
+
+    # 上限可调：调大后不丢
+    wide = MemoryBuffer(max_turns=5, system_limit=20)
     for i in range(11):
-        buf.add_system_message(f"sys {i}")
-    msgs = buf.get_messages()
-    sys_msgs = [m for m in msgs if m.role == "system"]
-    assert len(sys_msgs) == 11, f"system 被截断为 {len(sys_msgs)}，期望 11"
-    # 检查底层 deque 未设 maxlen=10
-    assert buf._system_messages.maxlen is None or buf._system_messages.maxlen > 10
+        wide.add_system_message(f"sys {i}")
+    assert len([m for m in wide.get_messages() if m.role == "system"]) == 11, "调大上限后不应淘汰"
+
+    # 非法上限仍须拒绝（fail-closed）
+    with pytest.raises(ValueError):
+        MemoryBuffer(max_turns=5, system_limit=0)
 
 
 # ---------- buffer.py:44-48 XML 未转义 ----------

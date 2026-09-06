@@ -3,15 +3,23 @@
 职责：承载单会话最近 max_turns 轮对话（user+assistant 计 2 条/轮），供
 AgentLoop 经 duck-typing 注入/写回时复用。
 关键设计：collections.deque(maxlen=max_turns*2) O(1) 自动裁剪替代 O(n) 列表
-切片；溢出时按轮边界裁剪保证窗口头为 user；系统消息单独保存，上限 10 条。
+切片；溢出时按轮边界裁剪保证窗口头为 user；系统消息单独保存，默认上限
+DEFAULT_SYSTEM_LIMIT 条（system_limit 可调），淘汰时显式 warning 不静默。
 """
 
 from __future__ import annotations
 
 import html
+import logging
 from collections import deque
 from dataclasses import dataclass
 from typing import Any, Dict, List
+
+logger = logging.getLogger(__name__)
+
+# 中文：system 消息默认上限。有界是为避免逐轮注入（skills_digest、memory 片段等）
+# 无限累积撑爆 LLM 上下文；可调 + 淘汰告警是为不静默丢弃上下文（G2#4）。
+DEFAULT_SYSTEM_LIMIT = 10
 
 
 @dataclass
@@ -28,15 +36,23 @@ class Message:
 class MemoryBuffer:
     """对话记忆缓冲区（基于 deque 实现 O(1) 自动裁剪）。"""
 
-    def __init__(self, max_turns: int = 20):
+    def __init__(self, max_turns: int = 20, system_limit: int | None = None):
         # 中文：校验 max_turns 避免 0/负数 丢全部或抛裸 ValueError
         if not isinstance(max_turns, int) or isinstance(max_turns, bool) or max_turns <= 0:
             raise ValueError(f"max_turns must be a positive int, got {max_turns!r}")
         self.max_turns = max_turns
         self._capacity = max_turns * 2
         self._messages: deque = deque(maxlen=self._capacity)
-        # 中文：系统消息有界（maxlen=10），避免逐轮累积撑爆 LLM 上下文
-        self._system_messages: deque = deque(maxlen=10)
+        # 中文：系统消息有界（默认 10 条），避免逐轮累积撑爆 LLM 上下文；
+        # 上限经 system_limit 可调，淘汰时告警（见 add_system_message）。
+        self._system_limit = DEFAULT_SYSTEM_LIMIT if system_limit is None else system_limit
+        if (
+            not isinstance(self._system_limit, int)
+            or isinstance(self._system_limit, bool)
+            or self._system_limit <= 0
+        ):
+            raise ValueError(f"system_limit must be a positive int, got {system_limit!r}")
+        self._system_messages: deque = deque(maxlen=self._system_limit)
 
     def _append(self, msg: Message):
         """追加普通消息；溢出时按轮边界裁剪，保证窗口头为 user。"""
@@ -68,7 +84,13 @@ class MemoryBuffer:
         )
 
     def add_system_message(self, content: str):
-        """添加系统消息（不受 max_turns 限制）"""
+        """添加系统消息（不受 max_turns 限制，受 system_limit 限制，淘汰时告警）。"""
+        if len(self._system_messages) >= self._system_limit:
+            # 中文：淘汰必须可见——静默丢弃会让 Agent 在不知情下丢失指令/约束（G2#4）
+            logger.warning(
+                "system message limit reached (%d): evicting oldest system message",
+                self._system_limit,
+            )
         self._system_messages.append(Message(role="system", content=content))
 
     def get_messages(self) -> List[Message]:
@@ -100,10 +122,8 @@ class MemoryBuffer:
             (staged_system if m.role == "system" else staged).append(m)
         if len(staged) > self.max_turns * 2:
             raise ValueError(f"messages exceed capacity: {len(staged)} > {self.max_turns * 2}")
-        if len(staged_system) > (self._system_messages.maxlen or 0):
-            raise ValueError(
-                f"system messages exceed capacity: {len(staged_system)} > {self._system_messages.maxlen}"
-            )
+        if len(staged_system) > self._system_limit:
+            raise ValueError(f"system messages exceed capacity: {len(staged_system)} > {self._system_limit}")
         self._system_messages.clear()
         self._messages.clear()
         self._system_messages.extend(staged_system)
@@ -142,10 +162,8 @@ class MemoryBuffer:
             (staged_system if msg.role == "system" else staged).append(msg)
         if len(staged) > buffer._capacity:
             raise ValueError(f"messages exceed capacity: {len(staged)} > {buffer._capacity}")
-        if len(staged_system) > (buffer._system_messages.maxlen or 0):
-            raise ValueError(
-                f"system messages exceed capacity: {len(staged_system)} > {buffer._system_messages.maxlen}"
-            )
+        if len(staged_system) > buffer._system_limit:
+            raise ValueError(f"system messages exceed capacity: {len(staged_system)} > {buffer._system_limit}")
         buffer._system_messages.extend(staged_system)
         buffer._messages.extend(staged)
         buffer._align_head()

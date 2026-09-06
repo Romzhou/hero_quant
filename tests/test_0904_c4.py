@@ -147,21 +147,43 @@ def test_c4_rl_top_level_import():
 # ============================================================
 # server.py:873-875 BackgroundTasks 被丢弃+可变默认
 # ============================================================
+def test_c4_server_backgroundtasks_injected_by_fastapi():
+    """background_tasks 必须被 FastAPI 真正识别为注入参数（行为探测，非源码文本匹配）。
+
+    中文：PEP604 写法 `BackgroundTasks | None` 看着合法，但 FastAPI 判该参数靠
+    lenient_issubclass(annotation, StarletteBackgroundTasks)，union 不是 class → 不匹配 →
+    退化成普通参数 → 路由注册期抛 FastAPIError，整个 server 模块 import 即失败。
+    源码文本断言查不出这类"签名看着对但框架不认"的问题，故改用 dependant 探测。
+    """
+    from hero_quant.api.server import app
+
+    routes = {getattr(r, "path", None): r for r in app.routes}
+    for path in ("/v1/query", "/v1/query/stream"):
+        route = routes.get(path)
+        assert route is not None, f"{path} 未注册到 app"
+        dep = getattr(route, "dependant", None)
+        got = getattr(dep, "background_tasks_param_name", None)
+        assert got == "background_tasks", (
+            f"{path} 的 background_tasks 未被 FastAPI 识别（param={got}）；"
+            "注解须为裸 BackgroundTasks，不可写 BackgroundTasks | None"
+        )
+
+
 def test_c4_server_backgroundtasks_no_mutable_default():
-    """query/query_stream 不得用 BackgroundTasks([]) 可变默认且不得丢弃注入。"""
+    """query/query_stream 不得用 BackgroundTasks([]) 可变默认，且不得退回 union 注解。"""
     src = pathlib.Path("D:/kaipanla-data/hero-quant/src/hero_quant/api/server.py").read_text(encoding="utf-8")
     assert "BackgroundTasks([])" not in src, "仍有可变默认 BackgroundTasks([])"
-    import re
-    # 修复后应为 BackgroundTasks | None = None 且按需新建（if is None），不得无条件 shadow
-    assert "BackgroundTasks | None = None" in src, "签名未改为 BackgroundTasks | None = None"
-    # 检查 query/query_stream 定义后 15 行内不得有无条件 background_tasks = BackgroundTasks()
+    # 中文：BackgroundTasks | None 会让该参数退化成普通字段，模块 import 即失败（服务起不来）。
+    # 只在路由签名上比对——注释里出现该字面量属正常说明性文字，不应误伤。
+    sig_lines = [line for line in src.splitlines() if "async def query" in line and "background_tasks" in line]
+    assert len(sig_lines) == 2, f"应匹配 query/query_stream 两条签名，实得 {sig_lines}"
+    for sig in sig_lines:
+        assert "BackgroundTasks | None" not in sig, f"签名退回 PEP604 union，FastAPI 无法识别：{sig}"
+    # 检查 query/query_stream 定义后 15 行内保留了 None 兜底守卫（显式传 None 时不炸）
     lines = src.splitlines()
     for idx, line in enumerate(lines):
         if "async def query(" in line and "background_tasks" in line:
             window = "\n".join(lines[idx:idx+15])
-            # 若出现无条件赋值（行首即 background_tasks =），且无 if 守卫，则失败
-            any(re.match(r"\s*background_tasks\s*=\s*BackgroundTasks\(\)", l) and "if " not in window.split(l)[0][-200:] for l in window.splitlines())
-            # 更精确：检查 window 中是否存在 "if background_tasks is None" 守卫
             assert "if background_tasks is None" in window, f"query 未按需守卫 background_tasks: {window[:300]}"
         if "async def query_stream(" in line and "background_tasks" in line:
             window = "\n".join(lines[idx:idx+15])
@@ -169,12 +191,12 @@ def test_c4_server_backgroundtasks_no_mutable_default():
 
 
 def test_c4_server_backgroundtasks_signature():
-    """签名应无可变默认，推荐 BackgroundTasks | None = None。"""
+    """签名应为裸 BackgroundTasks（无可变默认、无 union），由 FastAPI 注入。"""
     src = pathlib.Path("D:/kaipanla-data/hero-quant/src/hero_quant/api/server.py").read_text(encoding="utf-8")
-    assert "background_tasks: BackgroundTasks | None" in src or "background_tasks: BackgroundTasks | None = None" in src or "background_tasks: BackgroundTasks" in src
-    # 若为 None 默认，则内部应有 if background_tasks is None: 新建
-    if "BackgroundTasks | None = None" in src:
-        assert "if background_tasks is None" in src, "None 默认却无按需新建逻辑"
+    assert (
+        "background_tasks: BackgroundTasks," in src or "background_tasks: BackgroundTasks)" in src
+    ), "未找到裸 BackgroundTasks 注解"
+    assert "background_tasks: BackgroundTasks | None" not in src, "union 注解会让 server 模块 import 失败"
 
 
 # ============================================================

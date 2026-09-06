@@ -7,7 +7,12 @@ requires-python = ">=3.11,<3.14"
 license = {text = "MIT"}
 keywords = ["quant", "trading", "agent", "research", "backtest"]
 dependencies = [
-    "fastapi>=0.104,<1",
+    # 上界 = 已验证最高版本 +1（锁文件 0.141.1，本地实测 0.133.1）。
+    # 上界不可写成 <1：fastapi 1.x 属破坏性跨越，且 starlette 已在 1.x 演进。
+    # 放行下个 minor 前必须先跑 tests/test_0904_c4.py 的注入探测用例——
+    # PEP604 注解（BackgroundTasks | None）会让 FastAPI 认不出该参数，
+    # 模块 import 即崩，且此问题与 fastapi 版本无关（lenient_issubclass 对 union 恒 False）。
+    "fastapi>=0.104,<0.142",
     "uvicorn[standard]>=0.24,<1",
     "pydantic>=2.0,<3",
     "python-dotenv>=1.0,<2",
