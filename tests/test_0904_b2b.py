@@ -420,8 +420,13 @@ def test_b2b_16_raise_preserve_chain():
         reg.get_bars("AAPL.US", "2026-01-01", "2026-01-02")
         assert False
     except ImportError as e:
+        # 缺依赖类错误：链上保留安装提示
         assert e.__cause__ is not None, f"异常链丢失, __cause__ 为 None, 实际 {e!r}"
-        assert "loader broken" in str(e.__cause__) or "loader broken" in str(e), "链上应保留原始错误信息"
+    except ValueError as e:
+        # 非 ImportError 不得伪装成缺依赖：原始错误透出且保留异常链
+        assert "loader broken" in str(e), "链上应保留原始错误信息"
+        assert e.__cause__ is not None, f"异常链丢失, __cause__ 为 None, 实际 {e!r}"
+        assert "loader broken" in str(e.__cause__), "链上应保留原始错误信息"
 
 
 # ---------------------------------------------------------------------------

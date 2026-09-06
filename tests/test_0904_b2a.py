@@ -84,11 +84,18 @@ def test_b2a_akshare_dead_code_removed():
 
 def test_b2a_news_date_overload_not_forge_pit():
     """news: date 键不应同时作为发布/交易双义伪造 PIT。"""
+    import logging
+
     from hero_quant.data.loaders.news import load_news
-    # 仅有 date 字段（交易日标签，非发布时间），即使 snapshot 在后也不应 verified
+    # 仅有 date 字段：date 不再视为 trade_date（交易日标签 vs 事件日期混淆，
+    # OCR 处方已删），故整批缺 trade_date 列 → 告警 + 返回空列表，绝不伪造 PIT。
     rec = [{"id": 1, "date": "2024-01-02"}]
     out = load_news(copy.deepcopy(rec), trade_date="2024-01-02", snapshot_date="2024-01-03")
-    assert out[0]["pit"] is False, f"仅 date 不应伪造 PIT，得到 {out[0]}"
+    assert out == [], f"缺 trade_date 列应返回空列表而非伪造，得到 {out}"
+    # date 仍不作发布时间：带显式 trade_date 的记录，date 不得影响 PIT 判定
+    rec2 = [{"id": 1, "trade_date": "2024-01-02", "date": "2024-01-02"}]
+    out = load_news(copy.deepcopy(rec2), trade_date="2024-01-02", snapshot_date="2024-01-03")
+    assert out[0]["pit"] is False, f"无发布时间不应伪造 PIT，得到 {out[0]}"
     assert out[0]["pit_status"] in ("unknown", "unavailable", "missing", "non-pit", "non_pit")
 
 

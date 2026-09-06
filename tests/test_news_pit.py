@@ -219,19 +219,22 @@ def test_bench_tearsheet_or_output_contains_non_pit_hint():
 def test_load_news_mixed_timezone_naive_aware_does_not_raise():
     from hero_quant.data.loaders.news import load_news
 
-    # publish naive, snapshot aware -> must not raise TypeError, must be honest pit=False
+    # publish naive, snapshot aware -> must not raise TypeError.
+    # （OCR high 处方：naive 按 UTC 理解后比较，恢复 PIT 判定；
+    # 2024-01-01 10:00 UTC ≤ 2024-01-02 12:00 UTC，故 pit=True/verified）
     rec_naive_pub = [{"id": 101, "trade_date": "2024-01-02", "publish_time": "2024-01-01 10:00:00"}]
     out1 = load_news(rec_naive_pub, trade_date="2024-01-02", snapshot_date="2024-01-02 12:00:00+00:00")
     assert len(out1) == 1
-    assert out1[0]["pit"] is False
-    assert out1[0]["pit_status"] in ("unknown", "unavailable", "missing", "non-pit", "non_pit")
+    assert out1[0]["pit"] is True
+    assert out1[0]["pit_status"] == "verified"
 
-    # publish aware, snapshot naive -> must not raise, pit=False
+    # publish aware, snapshot naive -> must not raise; 同理 naive 快照按 UTC 理解
+    # （2024-01-01 10:00+00:00 ≤ 2024-01-02 12:00 UTC，故 pit=True/verified）
     rec_aware_pub = [{"id": 102, "trade_date": "2024-01-02", "publish_time": "2024-01-01 10:00:00+00:00"}]
     out2 = load_news(rec_aware_pub, trade_date="2024-01-02", snapshot_date="2024-01-02 12:00:00")
     assert len(out2) == 1
-    assert out2[0]["pit"] is False
-    assert out2[0]["pit_status"] in ("unknown", "unavailable", "missing", "non-pit", "non_pit")
+    assert out2[0]["pit"] is True
+    assert out2[0]["pit_status"] == "verified"
 
 
 def test_load_news_mixed_timezone_aware_offsets_compare_correctly():
@@ -291,16 +294,16 @@ def test_news_trade_date_filter_logs_and_schema_raise(caplog):
     # should have logged dropped row warning
     assert any("dropped" in r.message.lower() for r in caplog.records), f"expected dropped warning, got {[r.message for r in caplog.records]}"
 
-    # Case 2: schema anomaly - trade_date column missing entirely => raise
+    # Case 2: schema anomaly - trade_date column missing entirely => warn + []
+    # （OCR 处方：缺列告警并返回空列表，不抛错；>50% 缺失的 bias guard 仍抛错见 Case 3）
     bad_recs = [
         {"id": 1, "publish_time": "2024-01-01 10:00:00"},
         {"id": 2, "publish_time": "2024-01-01 10:00:00"},
     ]
-    try:
-        load_news(bad_recs, trade_date="2024-01-02", snapshot_date="2024-01-02")
-        assert False, "should raise on schema anomaly missing trade_date column"
-    except ValueError as e:
-        assert "trade_date" in str(e).lower() or "schema" in str(e).lower()
+    caplog.clear()
+    out_bad = load_news(bad_recs, trade_date="2024-01-02", snapshot_date="2024-01-02")
+    assert out_bad == [], "整批缺 trade_date 列应返回空列表而非伪造"
+    assert any("schema anomaly" in r.message for r in caplog.records)
 
     # Case 3: >50% missing trade_date should raise (bias guard)
     many_missing = [

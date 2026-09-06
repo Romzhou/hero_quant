@@ -467,11 +467,12 @@ class MarketDataRegistry:
                 logger.warning("cross_source check error for %s: %s", symbol, e, exc_info=e)
             return bars, prov
         # 全部 loader 失败，透出最后的可操作错误 — 中文：保留异常链
+        # （OCR high：非 ImportError 不得伪装成缺依赖；异常链必须保留供排查）
         if isinstance(last_error, ImportError) and "pip install" in str(last_error):
             msg = str(last_error)
             if "pip install hero-quant[us] or [ashare]" not in msg and "pip install hero-quant[us]" in msg:
                 raise ImportError(f"pip install hero-quant[us] or [ashare] - {msg}") from last_error
-            raise last_error
+            raise last_error from last_error
         if last_error is not None:
-            raise last_error
+            raise last_error from last_error
         raise ImportError(f"pip install hero-quant[us] or [ashare] for {symbol}: no loader available for market {market}")
