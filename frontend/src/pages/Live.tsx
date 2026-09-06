@@ -120,7 +120,8 @@ export default function Live() {
           if (readerRef.current === reader) readerRef.current = null
         }
       }
-      // fetch 候选均失败，回退 EventSource
+      // fetch 候选均失败，回退 EventSource；但若已 unmount/pause，不得再建连接（防泄漏）
+      if (aborted || pausedRef.current) return
       try {
         const es = new EventSource(`/v1/trace/events?offset=${curOffset}`)
         esRef.current = es
