@@ -68,7 +68,8 @@ def test_market_bars_cached_second_hit(monkeypatch, _redis):
     assert keys, "expected hero:cache:market:* entry"
 
 
-def test_llm_invoke_cached_second_hit(_redis):
+def test_llm_invoke_no_cross_instance_cache(_redis):
+    """LLM invoke 不再缓存：原 @cache 仅以 prompt 为键，跨模型/实例复用导致污染，已移除。"""
     from hero_quant.llm.client import LLMClient
 
     calls = {"n": 0}
@@ -83,9 +84,8 @@ def test_llm_invoke_cached_second_hit(_redis):
     r1 = c.invoke("same prompt")
     r2 = c.invoke("same prompt")
     assert r1 == r2 == "hello world"
-    assert calls["n"] == 1, f"second invoke must hit cache, stream calls={calls['n']}"
-    keys = [k for k in _redis.keys("*") if str(k).startswith("hero:cache:llm:")]
-    assert keys, "expected hero:cache:llm:* entry"
+    # 中文：缓存已移除，每次 invoke 都重新调用（避免跨实例串味）
+    assert calls["n"] == 2, f"invoke 应不缓存（缓存已移除避免串味），stream calls={calls['n']}"
 
 
 def test_memory_search_cached_second_hit(tmp_path, _redis):

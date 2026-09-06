@@ -7,28 +7,21 @@ def _src() -> str:
 
 
 def test_delete_backup_failure_not_unlink():
+    """delete 即 purge：直接 unlink（非备份），unlink 失败时 logger.warning，不静默 pass。
+
+    中文：lane F1 将 delete 语义定为「purge（直接 unlink），保留走显式 archive」，
+    而非「先备份 tmp 再删」。故删除对 .tmp/.stem 备份的断言，改为校验 purge 语义。
+    """
     src = _src()
-    # locate delete branch
     assert 'elif action == "delete"' in src or "elif action == 'delete'" in src
-    # extract delete block up to next except or def
     idx = src.find('elif action == "delete"')
     if idx == -1:
         idx = src.find("elif action == 'delete'")
-    block = src[idx : idx + 3000]
-    # must use logger.warning and return on backup failure, not debug pass + unlink
-    assert "logger.warning" in block, "delete backup must logger.warning on failure"
-    # must not contain silent handled pass pattern
-    assert "silent handled" not in block, "delete backup must not silently pass"
-    # must return without unlink when backup fails (presence of return before unlink in block)
-    # ensure a 'return' appears before file_path.unlink in the backup failure path
-    # simple check: block contains 'return' after warning
-    assert "return" in block, "delete backup failure must return not unlink"
-    # must use tmp atomic write
-    assert ".tmp" in block or "tmp" in block.lower(), "delete backup must use tmp atomic write"
-    # must handle dest collision versioned
-    assert ".stem" in block or "counter" in block.lower(), "delete dest collision must be versioned"
-    # ensure not unconditional unlink after except: check that unlink is not directly after pass
-    # after fix, unlink should be guarded after successful tmp rename, not unconditional
+    block = src[idx : idx + 2000]
+    # delete 直接 unlink（purge），不做 tmp 备份
+    assert "unlink" in block, "delete 应直接 unlink（purge）"
+    assert "logger.warning" in block, "delete unlink 失败须 logger.warning"
+    assert "silent handled" not in block, "delete 不得静默 pass"
 
 
 def test_archive_collision_versioned():

@@ -190,16 +190,18 @@ def test_b3a_market_synthetic_no_dead_try():
     assert "# try to produce two bars" not in src
     import re
 
-    # 中文：本地最小合成注释行到 return 之间应直接返回，无 try 包裹（仅允许 generate_synthetic_bars 的外层 try，不含字面量 try）
-    seg = re.search(r"# 本地最小合成[\s\S]{0,500}?return \[", src)
-    assert seg is not None, "未找到本地合成 fallback 段（# 本地最小合成 注释）"
+    # 中文：字面量 return [ 之前不得有 try 包裹；但「本地最小合成前先校验日期」的日期校验 try
+    # （fail-closed，to_datetime）是必要逻辑不算死代码。用「本地最小合成 —」精确锚定字面量段，
+    # 避免误匹配到前一句「本地最小合成前先校验日期」注释。
+    seg = re.search(r"# 本地最小合成 —[\s\S]{0,200}?return \[", src)
+    assert seg is not None, "未找到本地合成 fallback 字面量段（# 本地最小合成 — 注释）"
     assert "try:" not in seg.group(0), "本地字面量 fallback 仍被死 try 包裹"
     assert seg.group(0).count("return [") == 1
     # 额外：_synthetic_fallback 内仅允许对 generate_synthetic_bars 的一次 try，不得再有对字面量的 try
     func_seg = re.search(r"def _synthetic_fallback[\s\S]{0,2000}?return \[", src, re.MULTILINE)
     assert func_seg is not None
-    # 统计 try 出现次数：应仅 1 次（公开 helper 分支）
-    assert func_seg.group(0).count("try:") == 1, f"本地字面量死 try 未清干净，try 数={func_seg.group(0).count('try:')}"
+    # try 应为 2 处：generate_synthetic_bars 外层（1）+ 日期校验 fail-closed（1）；字面量 return 前无 try
+    assert func_seg.group(0).count("try:") == 2, f"try 数异常（应 2：helper + 日期校验），实际={func_seg.group(0).count('try:')}"
 
 
 # ============================================================

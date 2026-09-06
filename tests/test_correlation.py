@@ -70,17 +70,18 @@ def test_compute_correlation_insufficient_points_returns_not_ok(monkeypatch):
 def test_synthetic_only_when_explicit_flag(monkeypatch):
     import hero_quant.tools.correlation as corr_mod
     import hero_quant.data.registry as reg_mod
+    from hero_quant.tools.correlation import SyntheticDataUnavailable
 
     def failing_get_bars(self, *args, **kwargs):
         raise OSError("network down")
 
     monkeypatch.setattr(reg_mod.MarketDataRegistry, "get_bars", failing_get_bars)
-    # when synthetic mode explicitly enabled, fallback allowed
+    # 中文：synthetic 模式亦 fail-closed——合成数据不得用于相关性（避免假相关），
+    # 显式抛 SyntheticDataUnavailable（调用方转 ok:False + provenance synthetic）。
     monkeypatch.setenv("HERO_DATA_MODE", "synthetic")
-    # need to reload Settings cache? Settings reads env on init, so new Settings() will see env
-    closes = corr_mod._fetch_closes("AAPL", "2026-07-01", "2026-08-01")
-    assert closes == [100 + i * 0.5 for i in range(40)]
-    # when live mode, should raise not return synthetic
+    with pytest.raises(SyntheticDataUnavailable):
+        corr_mod._fetch_closes("AAPL", "2026-07-01", "2026-08-01")
+    # live 模式同样 raise
     monkeypatch.setenv("HERO_DATA_MODE", "live")
     with pytest.raises(Exception):
         corr_mod._fetch_closes("AAPL", "2026-07-01", "2026-08-01")

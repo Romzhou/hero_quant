@@ -31,18 +31,25 @@ def test_quantlib_rsi_uses_window_param():
     # should not hardcode alpha=1 / 14 unconditionally; should use n/window
     assert "alpha=1 / 14" not in txt or "alpha=1/n" in txt or "alpha=1 / n" in txt, "RSI fallback still hardcodes 14 instead of n"
 
-def test_quantlib_bollinger_returns_full_bands_or_documented():
+def test_quantlib_bollinger_returns_full_bands_or_documented(monkeypatch):
     txt = _read(QT)
-    # Bollinger branch should not silently discard upper/lower; either return them or remove dead compute
-    # After fix, it should mention upper/lower in return or have comment about truncation removed
+    # Bollinger branch should not silently discard upper/lower
     assert "upper" in txt.lower() and "lower" in txt.lower()
-    # ensure values are not just mid; check that function returns upper/lower keys when bollinger
-    from hero_quant.tools.quantlib_tool import compute_indicator
-    r = compute_indicator(symbol="TEST", indicator="bollinger", window=5, start="2026-08-01", end="2026-08-10")
-    # after fix should include upper/lower or explicit handling; we check ok True and values present
+    from hero_quant.tools import quantlib_tool
+
+    # 中文：mock _fetch_closes 返回固定收盘价，聚焦 bollinger 计算逻辑本身
+    # （"TEST" 无市场后缀无法解析 loader，synthetic 模式又触发跨源 synthetic 拒绝，
+    # 与计算逻辑无关；数据获取已有专门测试覆盖）。
+    monkeypatch.setattr(
+        quantlib_tool,
+        "_fetch_closes",
+        lambda symbol, start="", end="": [100.0, 101.0, 102.0, 103.0, 104.0, 105.0, 106.0, 107.0, 108.0, 109.0],
+    )
+    r = quantlib_tool.compute_indicator(symbol="TEST", indicator="bollinger", window=5, start="2026-08-01", end="2026-08-10")
     assert r.get("ok") is True
-    # at least values key exists; upper/lower may be in payload
     assert "values" in r
+    # bollinger 应返回完整 upper/lower bands，而非仅中线
+    assert "upper" in r and "lower" in r
 
 def test_quantlib_no_silent_except_pass():
     txt = _read(QT)
@@ -64,11 +71,12 @@ def test_presentation_sorted_iteration():
     assert "TOOL_REGISTRY.values()" not in txt or "sorted" in txt
 
 def test_presentation_dict_fallback_defaults():
-    txt = _read(PRES)
-    # helper _get_field encapsulates spec.get with defaults
-    assert "_get_field" in txt
-    # also ensure defaults are present somewhere
-    assert '"unknown"' in txt or "'unknown'" in txt
+    from hero_quant.tools.presentation import _get_field
+
+    # _get_field 封装 spec.get/getattr 并带默认值（dict 与对象双兼容），默认 None
+    assert _get_field({}, "name") is None
+    assert _get_field({}, "name", "fallback") == "fallback"
+    assert _get_field({"name": "x"}, "name") == "x"
 
 def test_presentation_present_invalid_raises():
     from hero_quant.tools.presentation import present
