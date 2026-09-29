@@ -306,6 +306,13 @@ BANNED_METHOD_NAMES = {
     "kill",
     "check_call",
     "check_output",
+    # operator 反射旁路（retest T1-1）：attrgetter/itemgetter/methodcaller
+    # 可携带 "__class__" 等 dunder 字符串实现 getattr 等价逃逸，
+    # 无视调用根一律拦截（operator.attrgetter / op.attrgetter / 裸 ag 形态
+    # 由 Call 别名分支与 dunder 字符串参数分支纵深覆盖）
+    "attrgetter",
+    "itemgetter",
+    "methodcaller",
 }
 BANNED_ATTRS = {
     ("os", "system"),
@@ -370,6 +377,13 @@ BANNED_ATTRS = {
     ("ccxt", "fetch_ohlcv"),
     ("polars", "read_csv"),
     ("polars", "scan_csv"),
+    # operator 反射旁路（retest T1-1 前缀形态）：operator.attrgetter 等
+    # 直接属性调用（operator.attrgetter("__class__")）走 Attribute 分支时，
+    # 除 BANNED_METHOD_NAMES 实例无关拦截外，此处显式收敛前缀对，
+    # 别名形态（import operator as op）由 alias_map 还原后命中本对
+    ("operator", "attrgetter"),
+    ("operator", "itemgetter"),
+    ("operator", "methodcaller"),
 }
 
 
@@ -409,7 +423,23 @@ def _get_root_name(node: ast.AST) -> str | None:
     return None
 
 
-def _is_banned_attribute(node: ast.Attribute, alias_map: dict[str, str] | None = None) -> bool:
+def _resolve_alias(name: str, alias_map: dict | None = None) -> tuple[str, str]:
+    """解析别名到 (effective_root, original) 二元组。
+
+    alias_map 值形态为 (root, original)；兼容旧的 str 形态（值为 root 时
+    original 回退为 key 本身）。缺失时返回 (name, name)。
+    """
+    if not alias_map:
+        return (name, name)
+    v = alias_map.get(name, None)
+    if v is None:
+        return (name, name)
+    if isinstance(v, tuple):
+        return (v[0], v[1])
+    return (v, name)
+
+
+def _is_banned_attribute(node: ast.Attribute, alias_map: dict | None = None) -> bool:
     """判定属性访问是否命中黑名单（直接执行能力或受限根模块的任意属性）。
 
     支持链式属性（a.b.c）与别名映射：通过 _get_root_name 提取根，
@@ -433,7 +463,7 @@ def _is_banned_attribute(node: ast.Attribute, alias_map: dict[str, str] | None =
     # _get_root_name 对 dunder 下标/属性已透传为 __dunder__*，此处一律拦截
     if isinstance(root, str) and root.startswith("__dunder__"):
         return True
-    effective = alias_map.get(root, root)
+    effective, _orig = _resolve_alias(root, alias_map)
     if (effective, attr) in BANNED_ATTRS:
         return True
     if (root, attr) in BANNED_ATTRS:
@@ -454,24 +484,28 @@ def check_import_allowlist(code: str) -> bool:
     except SyntaxError:
         return False
 
-    # 收集别名映射 {asname -> real_root}，用于链式与别名绕过检测
-    alias_map: dict[str, str] = {}
+    # 收集别名映射 {asname -> (real_root, original)}，用于链式与别名绕过检测
+    # T1-1：存二元组，from-import 同时校验原名与别名
+    #   from pandas import read_pickle as r  ->  {"r": ("pandas", "read_pickle")}
+    #   import operator as op               ->  {"op": ("operator", "operator")}
+    # _resolve_alias 兼容旧 str 形态（值为 root 时 original 回退为 key）
+    alias_map: dict[str, tuple[str, str]] = {}
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
                 root = alias.name.split(".")[0]
                 asname = alias.asname if alias.asname else alias.name.split(".")[0]
-                alias_map[asname] = root
+                alias_map[asname] = (root, alias.name)
                 # 处理 `import os.path` 无别名时，补 root 自映射
                 if alias.asname is None and "." in alias.name:
-                    alias_map[root] = root
+                    alias_map[root] = (root, root)
         elif isinstance(node, ast.ImportFrom):
             if node.module is None:
                 continue
             root = node.module.split(".")[0]
             for alias in node.names:
                 asname = alias.asname if alias.asname else alias.name
-                alias_map[asname] = root
+                alias_map[asname] = (root, alias.name)
 
     def _is_banned_module(mod: str) -> bool:
         # 检查完整模块名或根是否命中黑名单（支持 importlib.util 这类点分黑名单）
@@ -509,6 +543,24 @@ def check_import_allowlist(code: str) -> bool:
             func = node.func
             if isinstance(func, ast.Name) and func.id in BANNED_CALL_NAMES:
                 return False  # 拦截 eval/exec/__import__/compile/open/breakpoint 等
+            # T1-1(2)：Call 节点字符串常量参数若命中 BANNED_DUNDER_ATTRS 一律拒绝
+            # 覆盖 operator.attrgetter("__class__")/itemgetter/methodcaller 等
+            # 反射旁路（getattr 家族外的通用纵深；误杀面为零——正常量化代码
+            # 不会把 "__class__" 等 dunder 字符串当函数参数传递）
+            for _arg in node.args:
+                if (
+                    isinstance(_arg, ast.Constant)
+                    and isinstance(_arg.value, str)
+                    and _arg.value in BANNED_DUNDER_ATTRS
+                ):
+                    return False
+            for _kw in node.keywords:
+                if (
+                    isinstance(_kw.value, ast.Constant)
+                    and isinstance(_kw.value.value, str)
+                    and _kw.value.value in BANNED_DUNDER_ATTRS
+                ):
+                    return False
             if isinstance(func, ast.Name) and func.id in BANNED_GETATTR_NAMES:
                 # getattr 家族一律拦截（含参数为 banned 根或 dunder 的情形）
                 for arg in node.args:
@@ -516,19 +568,30 @@ def check_import_allowlist(code: str) -> bool:
                         return False
                     root = _get_root_name(arg)
                     if root is not None:
-                        effective = alias_map.get(root, root)
+                        effective, _o = _resolve_alias(root, alias_map)
                         if effective in BANNED_IMPORT_ROOTS:
                             return False
                 return False
             # from-import 别名直接调用：`from os import system as s; s(...)`
+            # T1-1(3)：alias_map 值为 (root, original)，同时校验原名与别名
+            #   from pandas import read_pickle as r; r("x.pkl")
+            #   -> effective=pandas, original=read_pickle：
+            #      (pandas, r) 命中不了 BANNED_ATTRS，但 (pandas, read_pickle)
+            #      按原名命中必须拦；裸 Name 本身在 BANNED_METHOD_NAMES
+            #      （read_pickle/get/system/...）时亦拦（from os import system 形态）。
             if isinstance(func, ast.Name) and func.id in alias_map:
-                effective = alias_map.get(func.id, func.id)
+                effective, original = _resolve_alias(func.id, alias_map)
                 if effective in BANNED_IMPORT_ROOTS:
+                    return False
+                if func.id in BANNED_METHOD_NAMES or original in BANNED_METHOD_NAMES:
                     return False
                 # from-import 危险属性直接调用：`from pandas import read_pickle` 后
                 # 裸 `read_pickle(...)` 无 Attribute 形态，按 (模块, 属性) 对拒绝；
                 # 非对内名字（如 from pandas import DataFrame）不受影响。
+                # 同时校验原名与别名：别名 r 调用时 (effective, original) 命中。
                 if (effective, func.id) in BANNED_ATTRS:
+                    return False
+                if (effective, original) in BANNED_ATTRS:
                     return False
             if isinstance(func, ast.Attribute):
                 if _is_banned_attribute(func, alias_map):

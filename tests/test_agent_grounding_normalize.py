@@ -1,15 +1,17 @@
 from hero_quant.agent.grounding import GroundingError, GroundingLedger
 
+_PROV = {"source": "test", "unit": "shares"}
+
 
 def test_ingest_formatted_price():
     g = GroundingLedger()
-    g.ingest("600519.SH", [{"close": "1,500", "low": "$1,400", "high": "¥1,600"}])
+    g.ingest("600519.SH", [{"close": "1,500", "low": "$1,400", "high": "¥1,600"}], provenance=_PROV)
     g.assert_price("600519.SH", "1,500")
 
 
 def test_empty_bars_rejects_zero():
     g = GroundingLedger()
-    g.ingest("X", [])
+    g.ingest("X", [], provenance=_PROV)
     try:
         g.assert_price("X", 0)
         assert False, "should raise GroundingError"
@@ -19,7 +21,7 @@ def test_empty_bars_rejects_zero():
 
 def test_authorized_type_error():
     g = GroundingLedger()
-    g.ingest("A", [{"close": 10}])
+    g.ingest("A", [{"close": 10}], provenance=_PROV)
     try:
         g.assert_price("A", 10, authorized="bad")
         assert False, "should raise TypeError"

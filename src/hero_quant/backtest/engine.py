@@ -17,9 +17,13 @@ import numpy as np
 import pandas as pd
 
 from .metrics import compute_metrics
-from .validation import NON_PRICE_COLS, ValidationError, validate
+from .validation import NON_PRICE_COLS, PIT_ACK, ValidationError, validate
 
 logger = logging.getLogger(__name__)
+
+# PIT 旁路二次确认契约字符串（全局冻结）：复用 validation.PIT_ACK 单一来源，
+# 本模块不再另行定义字面量；engine/bench/测试均以该常量为准。
+__all__ = ["BacktestEngine", "Signal", "generate_signal", "PITViolation", "DataFeedError", "PIT_ACK"]
 
 
 class DataFeedError(RuntimeError):
@@ -522,6 +526,7 @@ class BacktestEngine:
         skip_pit: bool = False,
         allow_synthetic: bool = False,
         max_leverage: float | None = None,
+        pit_ack: str | None = None,
     ) -> dict:
         """执行回测主流程：校验→PIT 检查→信号生成→收益与换手计费→事件循环生成权益/持仓并产出 tearsheet。
 
@@ -530,7 +535,20 @@ class BacktestEngine:
         - 多资产: prices 为多列收盘价（每列一资产），日收益 = sum(wi * ret_i) ，其中 ret_i 为各资产 pct_change
 
         信号：若显式传入 weights 则视为信号；若 signal/signal_method 给出且 weights 为 None，则通过 Signal 模型生成。
+
+        PIT 旁路契约（诚实化要求）：当 skip_pit=True 或 enforce_pit=False 时，
+        调用方必须显式传入 pit_ack="I_KNOW_THIS_IS_NON_PIT"（契约字符串全局冻结，
+        唯一来源为 hero_quant.backtest.validation.PIT_ACK），否则抛 PITViolation；
+        通过后结果 dict 打 non_pit=True 标记，且该结果禁用于实盘阈值。
         """
+        # 费率守卫（run 入口、float 转换后立即校验）：costs<0、NaN、Inf 直接抛 ValueError。
+        # 负费率会在复利中伪造收益，NaN/Inf 会污染整条权益曲线，必须 fail-closed。
+        try:
+            costs_f = float(costs) if costs is not None else 0.0
+        except (ValueError, TypeError) as e:
+            raise ValueError(f"costs must be a finite non-negative number, got {costs!r}") from e
+        if not np.isfinite(costs_f) or costs_f < 0:
+            raise ValueError(f"costs must be finite and >= 0, got {costs!r}")
         # 入口守卫：初始资金必须为正且有限，否则后续复利计算无意义
         if not np.isfinite(self.initial_capital) or self.initial_capital <= 0:
             raise ValueError(f"initial_capital must be >0 and finite, got {self.initial_capital!r}")
@@ -571,8 +589,18 @@ class BacktestEngine:
         # 额外兼容调用方经 **kwargs 传入的 bypass 标记（若存在）
         # 注意：run 签名已显式包含 skip_pit/enforce_pit，额外 kwargs 中的同名键已在上层 pop 忽略，此处不再处理
         if _skip_pit_flag:
-            logger.info("PIT guard bypassed via skip_pit/enforce_pit flag")
+            # PIT 旁路二次确认：非 PIT 结果必须经调用方显式知情确认。
+            # 契约字符串全局冻结（validation.PIT_ACK == "I_KNOW_THIS_IS_NON_PIT"），
+            # 此处仅与该常量全等比较，不接受任何变体/大小写/前后空格。
+            if pit_ack != PIT_ACK:
+                raise PITViolation(
+                    "PIT guard bypass requires explicit pit_ack='I_KNOW_THIS_IS_NON_PIT' "
+                    "(non-PIT result, must not be used for live thresholds)"
+                )
+            non_pit = True
+            logger.info("PIT guard bypassed via skip_pit/enforce_pit flag (non-PIT, ack confirmed)")
         else:
+            non_pit = False
             # PIT fail-closed: 无 PIT 日期且 allow_synthetic=False 时硬抛，Bench/测试需显式 allow_synthetic=True
             if weights_on is None and price_date is None and not allow_synthetic:
                 raise PITViolation("PIT violation: weights_on and price_date are both None but allow_synthetic=False; explicit price_date or allow_synthetic=True required")
@@ -726,7 +754,7 @@ class BacktestEngine:
 
         # --- 换手计费：按持仓变动比例扣除成本 ---
         net_ret = daily_ret.copy()
-        costs_f = float(costs) if costs is not None else 0.0
+        # costs_f 已在 run 入口校验（有限且 >= 0），此处仅复用，不再重新 float()。
         if costs_f and costs_f != 0:
             try:
                 gross_equity = (1 + daily_ret).cumprod() * self.initial_capital
@@ -1059,7 +1087,12 @@ class BacktestEngine:
             "tearsheet": tearsheet_html,
             "metrics_json": json.dumps(metrics, ensure_ascii=False),
             "engine": engine,
+            # PIT 旁路标记：skip_pit/enforce_pit=False 经二次确认后为 True，
+            # 正常 PIT 路径为 False。non_pit=True 的结果禁用于实盘阈值。
+            "non_pit": bool(non_pit),
+            "costs": float(costs_f),
         }
+        result["metrics"] = {**metrics, "non_pit": bool(non_pit)}
         return result
 
     def _build_tearsheet(self, equity: pd.Series, metrics: dict) -> str:

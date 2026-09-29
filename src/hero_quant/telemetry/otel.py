@@ -381,9 +381,9 @@ class SessionTelemetryCoordinator:
                 except (ValueError, TypeError, AttributeError, OSError) as _exc:
                     logger.warning("otel emit failed: %s", _exc)
 
-            # 批量管线复用，不在每次 export 中 shutdown；仅定期 force_flush
+            # 批量管线复用，不在每次 export 中 shutdown；仅 full 档定期 force_flush，basic/disabled 跳过
             try:
-                if hasattr(provider, "force_flush"):
+                if self.mode == "full" and hasattr(provider, "force_flush"):
                     try:
                         provider.force_flush(timeout_millis=1000)  # type: ignore
                     except TypeError:

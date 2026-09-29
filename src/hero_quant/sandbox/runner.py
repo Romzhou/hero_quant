@@ -487,18 +487,184 @@ class LandlockSandbox(BaseSandbox):
         source: str,
         globals_dict: dict | None = None,
         locals_dict: dict | None = None,
+        *,
+        timeout: float | None = None,
+        policy: dict | None = None,
+        allow_direct_call: bool = False,
     ) -> dict:
-        """Python 执行分支：compile/exec 前先经 ast_guard.check_source 审查，fail-closed."""
-        return _execute_python_impl(source, globals_dict, locals_dict)
+        """Python 执行分支：默认子进程+超时真隔离，同进程 exec 仅显式开启。
+
+        - 默认走子进程（复用本类 execute(cmd) 路径，Landlock/bwrap 前缀由
+          confine 按 policy 决定），AST 审查在父进程先行（fail-closed），
+          超时未指定时默认 10s，超时转 SandboxUnavailableError（exit 125）。
+        - 同进程 exec（_execute_python_impl）仅当 ``allow_direct_call=True``
+          且策略 mode 为 danger-full-access（显式传入 policy 或 self._policy）
+          时允许，用于开发期调试；其余一律走子进程。
+        """
+        return _execute_python_via_subprocess(
+            source,
+            globals_dict,
+            locals_dict,
+            sandbox=self,
+            timeout=timeout,
+            policy=policy,
+            allow_direct_call=allow_direct_call,
+        )
+
+
+def _subprocess_python_argv() -> List[str]:
+    """构造子进程 python argv：沿用当前解释器，避免 PATH 劫持。"""
+    return [sys.executable, "-I", "-c"]
+
+
+def _execute_python_via_subprocess(
+    source: str,
+    globals_dict: dict | None = None,
+    locals_dict: dict | None = None,
+    *,
+    sandbox: "LandlockSandbox | None" = None,
+    timeout: float | None = None,
+    policy: dict | None = None,
+    allow_direct_call: bool = False,
+) -> dict:
+    """execute_python 默认路径：子进程 + 超时真隔离。
+
+    - 父进程先 ast_guard.check_source（fail-closed，含空源/语法错误）；
+    - globals_dict/locals_dict 仅 allow_direct_call 同进程路径可用，
+      子进程路径显式传入即 fail-closed 拒绝（防预注入别名绕过）；
+    - 超时默认 10s（None 即默认），非法超时 fail-closed 抛
+      SandboxUnavailableError；子进程超时被 kill 后同样转该异常，
+      主进程不受影响。
+    """
+    import base64 as _b64
+    import json as _json
+
+    if not source or not source.strip():
+        raise SandboxViolation("empty source refused (fail-closed)")
+    # AST 审查在父进程先行：banned/语法错误 fail-closed，不起子进程
+    ast_guard.check_source(source)
+    # 预注入命名空间：子进程路径默认拒绝（防 {'myos': os} 别名绕过）；
+    # 兼容旧调用面的空 dict（{} 与 None 等价、无注入值，直接放行并透传语义）。
+    _has_preinjected = (
+        (isinstance(globals_dict, dict) and len(globals_dict) > 0)
+        or (isinstance(locals_dict, dict) and len(locals_dict) > 0)
+        or (globals_dict is not None and not isinstance(globals_dict, dict))
+        or (locals_dict is not None and not isinstance(locals_dict, dict))
+    )
+    if _has_preinjected:
+        raise SandboxViolation(
+            "globals_dict/locals_dict require allow_direct_call=True with "
+            "danger-full-access (subprocess path refuses pre-injected namespaces)"
+        )
+    # 空 dict 兼容标记：旧调用面 execute_python(src, {}, {}) 期望返回
+    # {"globals":..,"locals":..} 分支；子进程内以空 dict 复现该语义
+    # （非空已在上方拒绝，此处仅剩 None/{}，无注入值）。
+    _want_locals = isinstance(locals_dict, dict)
+    # 策略裁决：同进程 exec 仅 danger-full-access + allow_direct_call=True
+    _pol: dict = {}
+    if isinstance(policy, dict):
+        _pol.update(policy)
+    if sandbox is not None and isinstance(getattr(sandbox, "_policy", None), dict):
+        for _k, _v in sandbox._policy.items():  # type: ignore[union-attr]
+            _pol.setdefault(_k, _v)
+    _mode = _pol.get("mode") if isinstance(_pol, dict) else None
+    if allow_direct_call:
+        if _mode == "danger-full-access":
+            return _execute_python_impl(source, None, None)
+        raise SandboxViolation(
+            "allow_direct_call=True requires danger-full-access policy "
+            f"(mode={_mode!r}); subprocess isolation stays on"
+        )
+    # 默认子进程路径：超时默认 10s（验收：死循环 10 秒内被终止）
+    _timeout: float = 10.0 if timeout is None else timeout
+    if not isinstance(_timeout, (int, float)) or not (_timeout > 0):
+        raise SandboxUnavailableError(
+            f"{_FATAL_PREFIX}invalid python timeout: {_timeout!r} (exit {LAUNCHER_FAILURE_EXIT})"
+        )
+    # 子进程载荷：复用 _execute_python_impl（含受限 builtins/导入门控/裸名检查），
+    # 结果经 JSON 回传；父进程不做 eval，只做 json.loads。
+    # -I 隔离模式不继承 PYTHONPATH，故显式透传 sys.path（父进程已解析的
+    # hero_quant 所在路径），子进程 import hero_quant 才可用；仅追加路径，
+    # 不关闭隔离，AST 审查仍在父进程先行 + 子进程内 _impl 二次审查。
+    _extra_paths = [p for p in sys.path if p and isinstance(p, str)]
+    _runner_src = (
+        "import sys, json, base64\n"
+        "paths = json.loads(base64.b64decode(sys.argv[2]).decode('utf-8'))\n"
+        "for _p in paths:\n"
+        "    if _p and _p not in sys.path:\n"
+        "        sys.path.insert(0, _p)\n"
+        "src = base64.b64decode(sys.argv[1]).decode('utf-8')\n"
+        "from hero_quant.sandbox.runner import _execute_python_impl as _impl\n"
+        "_want_locals = (sys.argv[3] == '1') if len(sys.argv) > 3 else False\n"
+        "try:\n"
+        "    res = _impl(src, {}, {} if _want_locals else None)\n"
+        "    sys.stdout.write(json.dumps({'ok': True, 'result': res}, default=str))\n"
+        "except Exception as e:\n"
+        "    sys.stdout.write(json.dumps({'ok': False, 'error_type': type(e).__name__, 'error': str(e)}))\n"
+    )
+    _sb = sandbox if sandbox is not None else LandlockSandbox(policy=_pol if _pol else {"mode": "read-only"})
+    _encoded = _b64.b64encode(source.encode("utf-8")).decode("ascii")
+    _paths_b64 = _b64.b64encode(_json.dumps(_extra_paths).encode("utf-8")).decode("ascii")
+    # 空 dict 旧语义：locals_dict 显式传入（哪怕 {}）即返回 {"globals":..,"locals":..} 分支
+    _want_locals_flag = "1" if _want_locals else "0"
+    _cmd = _subprocess_python_argv() + [_runner_src, _encoded, _paths_b64, _want_locals_flag]
+    try:
+        out, err, code = _sb.execute(_cmd, require_enforcement=False, timeout=_timeout)  # type: ignore[arg-type]
+    except subprocess.TimeoutExpired as e:
+        raise SandboxUnavailableError(
+            f"{_FATAL_PREFIX}python execution timed out after {_timeout}s (exit {LAUNCHER_FAILURE_EXIT})"
+        ) from e
+    if code != 0:
+        raise SandboxUnavailableError(
+            f"{_FATAL_PREFIX}python subprocess failed (code {code}): {(err or out or '').strip()} (exit {LAUNCHER_FAILURE_EXIT})"
+        )
+    try:
+        _parsed = _json.loads(out.strip().splitlines()[-1] if out.strip() else "{}")
+    except (ValueError, IndexError) as e:
+        raise SandboxUnavailableError(
+            f"{_FATAL_PREFIX}python subprocess bad output: {e} (exit {LAUNCHER_FAILURE_EXIT})"
+        ) from e
+    if not isinstance(_parsed, dict) or not _parsed.get("ok"):
+        _etype = str(_parsed.get("error_type", "")) if isinstance(_parsed, dict) else ""
+        _emsg = str(_parsed.get("error", "python subprocess failed")) if isinstance(_parsed, dict) else "python subprocess failed"
+        if _etype == "SandboxViolation" or "SandboxViolation" in _emsg:
+            raise SandboxViolation(_emsg)
+        raise SandboxUnavailableError(
+            f"{_FATAL_PREFIX}python subprocess error ({_etype}): {_emsg} (exit {LAUNCHER_FAILURE_EXIT})"
+        )
+    _res = _parsed.get("result")
+    if not isinstance(_res, dict):
+        raise SandboxUnavailableError(
+            f"{_FATAL_PREFIX}python subprocess bad result type (exit {LAUNCHER_FAILURE_EXIT})"
+        )
+    return _res
 
 
 def execute_python(
     source: str,
     globals_dict: dict | None = None,
     locals_dict: dict | None = None,
+    *,
+    timeout: float | None = None,
+    policy: dict | None = None,
+    allow_direct_call: bool = False,
 ) -> dict:
-    """模块级 Python 执行入口：先 AST 审查再 compile/exec，fail-closed."""
-    return _execute_python_impl(source, globals_dict, locals_dict)
+    """模块级 Python 执行入口：默认子进程+超时真隔离，fail-closed。
+
+    同进程 exec 仅当 ``allow_direct_call=True`` 且 policy mode 为
+    danger-full-access 时允许；否则一律走子进程（复用 LandlockSandbox
+    execute(cmd) 路径，超时默认 10s，死循环/大内存用例被 kill，
+    主进程存活）。
+    """
+    return _execute_python_via_subprocess(
+        source,
+        globals_dict,
+        locals_dict,
+        sandbox=None,
+        timeout=timeout,
+        policy=policy,
+        allow_direct_call=allow_direct_call,
+    )
 
 
 def dispatch_tool(tool_spec: Any, args: dict | None = None, policy: dict | None = None) -> Any:

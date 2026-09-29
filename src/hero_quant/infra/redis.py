@@ -190,6 +190,26 @@ def _create_fakeredis():
         return None
 
 
+def _require_real_redis_allowed() -> bool:
+    """生产强制真实 Redis 门禁：仅 development/测试允许 fakeredis 回退。
+
+    中文：HERO_ENV==development 或 PYTEST_CURRENT_TEST 在环境中时允许回退；
+    其余（production/staging/未设）一律拒绝 fakeredis（fail-closed 返回 None，
+    调用方限流/票据随即拒绝）。显式注入（set_redis_instance 测试钩子）不受此限。
+    """
+    try:
+        import os as _os_gate
+
+        hero_env = (_os_gate.environ.get("HERO_ENV", "") or "").strip().lower()
+        if hero_env == "development":
+            return True
+        if "PYTEST_CURRENT_TEST" in _os_gate.environ:
+            return True
+        return False
+    except (ValueError, TypeError, AttributeError):
+        return False
+
+
 def get_redis_sync():
     """Sync getter for non-async contexts (security.py). Returns sync redis or fakeredis sync."""
     global _redis_sync_instance
@@ -208,6 +228,10 @@ def get_redis_sync():
                     inst.ping()
                 except _REDIS_ERRORS as e:
                     logger.warning("redis.ping_failed_fallback_fakeredis error=%s", str(e))
+                    # 中文：ping 失败同样受生产门禁约束；development/测试才允许 fakeredis。
+                    if not _require_real_redis_allowed():
+                        logger.warning("redis.production_requires_real_redis_no_fakeredis_fallback")
+                        return None
                     fake = _create_fakeredis_sync_fallback()
                     if fake is not None:
                         _redis_sync_instance = fake
@@ -221,7 +245,10 @@ def get_redis_sync():
                 logger.warning("redis.not_installed_try_fakeredis")
             except _REDIS_ERRORS as e:
                 logger.warning("redis.connect_failed_try_fakeredis error=%s", str(e))
-        # Fallback: fakeredis sync
+        # Fallback: fakeredis sync（仅 development/测试允许；生产 fail-closed 返回 None）
+        if not _require_real_redis_allowed():
+            logger.warning("redis.production_requires_real_redis_no_fakeredis_fallback")
+            return None
         fake = _create_fakeredis_sync_fallback()
         if fake is not None:
             _redis_sync_instance = fake
@@ -254,8 +281,8 @@ def _redact_dsn(dsn: str) -> str:
 async def get_redis():
     """Async Redis getter — returns redis.asyncio.Redis or fakeredis FakeRedis.
 
-    优先 HERO_REDIS_DSN，失败或未配置时回退 fakeredis（保证 tests 不依赖真实 Redis）。
-    调用方若需强依赖可自行判断 get_redis() 是否为 fakeredis。
+    优先 HERO_REDIS_DSN；DSN 缺失/不可达时仅 development/测试回退 fakeredis，
+    生产 fail-closed 返回 None（调用方限流随即拒绝，防无保护超发）。
     中文：async 路径用 per-loop asyncio 锁（同步锁绝不横跨 await，避免阻塞事件循环线程；
     全局单例 asyncio.Lock 会绑定首个 loop，loop 关闭后复用抛 RuntimeError，故按 loop 分发）。
     """
@@ -288,6 +315,10 @@ async def get_redis():
                 logger.warning("redis.async_not_installed_fallback")
             except _REDIS_ERRORS as e:
                 logger.warning("redis.async_connect_failed error=%s", str(e))
+        # 中文：fakeredis 回退仅 development/测试允许；生产 fail-closed 返回 None。
+        if not _require_real_redis_allowed():
+            logger.warning("redis.production_requires_real_redis_no_fakeredis_fallback")
+            return None
         fake = _create_fakeredis()
         if fake is not None:
             _redis_async_instance = fake
@@ -666,9 +697,12 @@ class RateLimiter:
         return (window_key, str(now), str(window_seconds), str(max_requests), member)
 
     async def try_acquire(self, key: str, max_requests: int, window_seconds: int = 60) -> bool:
+        """滑动窗口获取配额 — fail-closed：后端缺失/异常一律拒绝（False），不放行。"""
         redis_client = await get_redis()
         if redis_client is None:
-            return True  # No Redis — allow
+            # 中文：无 Redis（生产 fail-closed / 未配置）→ 拒绝，避免无保护超发。
+            logger.warning("redis.ratelimit_no_backend_reject key=%s", key)
+            return False
         window_key = f"{self.key_prefix}{key}"
         try:
             res = await _eval_or_fallback(redis_client, _RATELIMIT_LUA, 1, *self._lua_args(window_key, max_requests, window_seconds))
@@ -694,14 +728,16 @@ class RateLimiter:
                 logger.warning("redis.ratelimit_fallback_lock_timeout")
                 return False
         except _REDIS_ERRORS as e:
-            logger.debug("redis.ratelimit_failed error=%s", str(e))
-            return True
+            logger.warning("redis.ratelimit_failed_reject error=%s", str(e))
+            return False
 
     def try_acquire_sync(self, key: str, max_requests: int, window_seconds: int = 60) -> bool:
-        """Sync variant for non-async call sites (e.g. FastAPI sync endpoint)."""
+        """Sync variant for non-async call sites (e.g. FastAPI sync endpoint) — fail-closed."""
         redis_client = get_redis_sync()
         if redis_client is None:
-            return True
+            # 中文：无 Redis（生产 fail-closed / 未配置）→ 拒绝，避免无保护超发。
+            logger.warning("redis.ratelimit_no_backend_reject key=%s", key)
+            return False
         window_key = f"{self.key_prefix}{key}"
         try:
             res = redis_client.eval(_RATELIMIT_LUA, 1, *self._lua_args(window_key, max_requests, window_seconds))
@@ -733,11 +769,11 @@ class RateLimiter:
                     redis_client.expire(window_key, window_seconds)
                     return True
             except _REDIS_ERRORS as e:
-                logger.debug("redis.ratelimit_sync_failed error=%s", str(e))
-                return True
+                logger.warning("redis.ratelimit_sync_failed_reject error=%s", str(e))
+                return False
         except _REDIS_ERRORS as e:
-            logger.debug("redis.ratelimit_sync_failed error=%s", str(e))
-            return True
+            logger.warning("redis.ratelimit_sync_failed_reject error=%s", str(e))
+            return False
 
 
 # ── Counter (atomic INCR thin wrapper) ──

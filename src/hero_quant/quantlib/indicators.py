@@ -108,6 +108,11 @@ def rsi(series, period: int = 14, *args, **kwargs) -> pd.Series:
     s = _to_series(series)
     if s.empty:
         return pd.Series(dtype=float)
+    # 窗口不足（有效数据点 < period+1，diff 后不足 period 个差分）时返回全 NaN，
+    # 不得用 50.0 假中性误导策略（T1-PoC7；tool 层 compute_indicator 对 bars<window
+    # 已有 ok:False，此处库层同样诚实）。
+    if int(s.notna().sum()) < n + 1:
+        return pd.Series([float("nan")] * len(s), index=s.index)
     # 涨跌分解：仅保留同向部分
     delta = s.diff()
     gain = delta.where(delta > 0, 0.0)

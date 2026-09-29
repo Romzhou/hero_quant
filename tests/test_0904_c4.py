@@ -11,13 +11,16 @@ import types
 
 import pytest
 
+# 仓库根目录：替代硬编码本机绝对路径（D:/...），保证 CI/Linux 可运行
+_REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
+
 
 # ============================================================
 # rate_limiter.py:50-51 三档共用 bucket
 # ============================================================
 def test_c4_rl_shared_bucket_tier_isolation():
     """三档不得共用裸 key：chat/tool/session 应带 endpoint 前缀隔离。"""
-    src = pathlib.Path("D:/kaipanla-data/hero-quant/src/hero_quant/api/rate_limiter.py").read_text(encoding="utf-8")
+    src = (_REPO_ROOT / "src/hero_quant/api/rate_limiter.py").read_text(encoding="utf-8")
     # 修复后 try_acquire 的 key 应包含 endpoint/tier 区分
     assert "endpoint" in src, "rate_limiter 未引入 endpoint 区分"
     # 关键：try_acquire 调用处应为 f\"{endpoint}:...\" 或类似带 endpoint
@@ -66,7 +69,7 @@ def test_c4_rl_shared_bucket_runtime(monkeypatch):
 # ============================================================
 def test_c4_rl_fail_closed_on_redis_error(monkeypatch):
     """Redis 异常不得 fail-open 放行，应 fail-closed 抛 503 且 warning 级别。"""
-    src = pathlib.Path("D:/kaipanla-data/hero-quant/src/hero_quant/api/rate_limiter.py").read_text(encoding="utf-8")
+    src = (_REPO_ROOT / "src/hero_quant/api/rate_limiter.py").read_text(encoding="utf-8")
     # 修复后不应有 return True 的 fail-open
     # 允许注释中的 return True，但 except 块内不应直接 return True
     import re
@@ -102,7 +105,7 @@ def test_c4_rl_fail_closed_runtime(monkeypatch):
 # ============================================================
 def test_c4_rl_falsy_id_not_anonymous():
     """falsy id 如 0/\"\" 不得当匿名：应显式 is not None 判定。"""
-    src = pathlib.Path("D:/kaipanla-data/hero-quant/src/hero_quant/api/rate_limiter.py").read_text(encoding="utf-8")
+    src = (_REPO_ROOT / "src/hero_quant/api/rate_limiter.py").read_text(encoding="utf-8")
     # 修复后应为 is not None 而非 if uid:
     assert "is not None" in src, "未用 is not None 显式判定"
     # 不应再有裸 if uid: 当限流 key 判断
@@ -134,7 +137,7 @@ def test_c4_rl_falsy_id_runtime():
 # ============================================================
 def test_c4_rl_top_level_import():
     """RateLimiter 应顶层导入，不在函数内每请求导入。"""
-    src = pathlib.Path("D:/kaipanla-data/hero-quant/src/hero_quant/api/rate_limiter.py").read_text(encoding="utf-8")
+    src = (_REPO_ROOT / "src/hero_quant/api/rate_limiter.py").read_text(encoding="utf-8")
     # 顶层（def _check 之前）应有 import RateLimiter
     pre_check = src.split("def _check")[0]
     assert "RateLimiter" in pre_check, "顶层未导入 RateLimiter"
@@ -171,7 +174,7 @@ def test_c4_server_backgroundtasks_injected_by_fastapi():
 
 def test_c4_server_backgroundtasks_no_mutable_default():
     """query/query_stream 不得用 BackgroundTasks([]) 可变默认，且不得退回 union 注解。"""
-    src = pathlib.Path("D:/kaipanla-data/hero-quant/src/hero_quant/api/server.py").read_text(encoding="utf-8")
+    src = (_REPO_ROOT / "src/hero_quant/api/server.py").read_text(encoding="utf-8")
     assert "BackgroundTasks([])" not in src, "仍有可变默认 BackgroundTasks([])"
     # 中文：BackgroundTasks | None 会让该参数退化成普通字段，模块 import 即失败（服务起不来）。
     # 只在路由签名上比对——注释里出现该字面量属正常说明性文字，不应误伤。
@@ -192,7 +195,7 @@ def test_c4_server_backgroundtasks_no_mutable_default():
 
 def test_c4_server_backgroundtasks_signature():
     """签名应为裸 BackgroundTasks（无可变默认、无 union），由 FastAPI 注入。"""
-    src = pathlib.Path("D:/kaipanla-data/hero-quant/src/hero_quant/api/server.py").read_text(encoding="utf-8")
+    src = (_REPO_ROOT / "src/hero_quant/api/server.py").read_text(encoding="utf-8")
     assert (
         "background_tasks: BackgroundTasks," in src or "background_tasks: BackgroundTasks)" in src
     ), "未找到裸 BackgroundTasks 注解"
@@ -204,7 +207,7 @@ def test_c4_server_backgroundtasks_signature():
 # ============================================================
 def test_c4_server_narrow_except_around_to_thread():
     """await asyncio.to_thread(loop.run) 的 except 不得为宽 Exception 吞业务错并同步重试阻塞 loop。"""
-    src = pathlib.Path("D:/kaipanla-data/hero-quant/src/hero_quant/api/server.py").read_text(encoding="utf-8")
+    src = (_REPO_ROOT / "src/hero_quant/api/server.py").read_text(encoding="utf-8")
     import re
     # 紧邻 to_thread 的 except（5 行内）不得为宽 Exception
     lines = src.splitlines()
@@ -222,7 +225,7 @@ def test_c4_server_narrow_except_around_to_thread():
 # ============================================================
 def test_c4_server_shutdown_is_async_and_awaits():
     """shutdown 需为 async 且 await 取消的任务，带超时。"""
-    src = pathlib.Path("D:/kaipanla-data/hero-quant/src/hero_quant/api/server.py").read_text(encoding="utf-8")
+    src = (_REPO_ROOT / "src/hero_quant/api/server.py").read_text(encoding="utf-8")
     assert "async def _stop_trace_consumer" in src, "shutdown 未改为 async def"
     # 应包含 await 且处理 CancelledError/TimeoutError
     assert "await" in src.split("async def _stop_trace_consumer")[1].split("\n\n")[0] or "await" in src.split("async def _stop_trace_consumer")[1][:1200]
@@ -235,7 +238,7 @@ def test_c4_server_shutdown_is_async_and_awaits():
 # ============================================================
 def test_c4_server_ready_has_timeout():
     """checkpoint/billing 的 SELECT 1 探测必须带超时，避免阻塞 /ready。"""
-    src = pathlib.Path("D:/kaipanla-data/hero-quant/src/hero_quant/api/server.py").read_text(encoding="utf-8")
+    src = (_REPO_ROOT / "src/hero_quant/api/server.py").read_text(encoding="utf-8")
     # 检查两处探活是否含 timeout 关键字
     # 找到 _check_checkpoint_pg 与 _check_billing_pg 段
     assert src.count("timeout") >= 2, "ready 探活未添加 timeout"
@@ -250,7 +253,7 @@ def test_c4_server_ready_has_timeout():
 # ============================================================
 def test_c4_server_backtest_l1_atomic():
     """_get_backtest_bundle 首检应在锁内，且分布式锁用 token+Lua 安全释放。"""
-    src = pathlib.Path("D:/kaipanla-data/hero-quant/src/hero_quant/api/server.py").read_text(encoding="utf-8")
+    src = (_REPO_ROOT / "src/hero_quant/api/server.py").read_text(encoding="utf-8")
     import re
     # 修复后 global 后在 5 行内即 with 锁（允许中间有中文注释行），且首检在锁内
     lines = src.splitlines()
@@ -277,7 +280,7 @@ def test_c4_server_backtest_l1_atomic():
 # ============================================================
 def test_c4_server_no_private_registry():
     """不得依赖 prometheus_client.REGISTRY._names_to_collectors 私有 API。"""
-    src = pathlib.Path("D:/kaipanla-data/hero-quant/src/hero_quant/api/server.py").read_text(encoding="utf-8")
+    src = (_REPO_ROOT / "src/hero_quant/api/server.py").read_text(encoding="utf-8")
     assert "_names_to_collectors" not in src, "仍依赖私有 _names_to_collectors"
     assert "_collector_to_names" not in src, "仍依赖私有 _collector_to_names"
 
@@ -287,7 +290,7 @@ def test_c4_server_no_private_registry():
 # ============================================================
 def test_c4_router_bm25_snapshot_not_torn():
     """BM25 语料发布应在锁内，避免 torn snapshot。"""
-    src = pathlib.Path("D:/kaipanla-data/hero-quant/src/hero_quant/mcp/router.py").read_text(encoding="utf-8")
+    src = (_REPO_ROOT / "src/hero_quant/mcp/router.py").read_text(encoding="utf-8")
     # 修复后 _IDF/_AVG_DL/_N/_DOC_TOKENS 赋值应在 with _CORPUS_LOCK: 内
     import re
     # 找到赋值段并确认其前有 with _CORPUS_LOCK
@@ -303,7 +306,7 @@ def test_c4_router_bm25_snapshot_not_torn():
 # ============================================================
 def test_c4_router_singleton_double_checked_lock():
     """_get_router_circuit/_get_rate_limiter 需双重检查锁，避免竞态。"""
-    src = pathlib.Path("D:/kaipanla-data/hero-quant/src/hero_quant/mcp/router.py").read_text(encoding="utf-8")
+    src = (_REPO_ROOT / "src/hero_quant/mcp/router.py").read_text(encoding="utf-8")
     # 两函数内应有 with _LIMITER_LOCK 或 with _CORPUS_LOCK 包裹创建
     circ_seg = src.split("def _get_router_circuit")[1].split("def _get_rate_limiter")[0] if "def _get_router_circuit" in src else ""
     assert "with _LIMITER_LOCK" in circ_seg or "with _CORPUS_LOCK" in circ_seg, "_get_router_circuit 未加锁 DCL"
@@ -319,7 +322,7 @@ def test_c4_router_singleton_double_checked_lock():
 # ============================================================
 def test_c4_router_circuit_open_preserves_compute_factor():
     """熔断 OPEN 短路返回也必须保证 compute_factor 含 momentum/factor 查询的首位不变量。"""
-    src = pathlib.Path("D:/kaipanla-data/hero-quant/src/hero_quant/mcp/router.py").read_text(encoding="utf-8")
+    src = (_REPO_ROOT / "src/hero_quant/mcp/router.py").read_text(encoding="utf-8")
     import re
     # OPEN 分支内应包含 momentum/factor 处理
     re.search(r"if circ is not None and not circ\.allow\(\):.*?return.*?\[.*?curated.*?\]?.*?\n", src, re.DOTALL)
@@ -360,7 +363,7 @@ def test_c4_router_circuit_open_runtime(monkeypatch):
 # ============================================================
 def test_c4_router_cache_hit_not_hold_lock_for_cosine():
     """缓存命中时不得持 _DESC_VEC_LOCK 做 cosine/import。"""
-    src = pathlib.Path("D:/kaipanla-data/hero-quant/src/hero_quant/mcp/router.py").read_text(encoding="utf-8")
+    src = (_REPO_ROOT / "src/hero_quant/mcp/router.py").read_text(encoding="utf-8")
     # 修复后 with _DESC_VEC_LOCK 块内不应有 return _cosine
     import re
     # 找到 _vector_score_for_tool 内的 with 块
@@ -380,7 +383,7 @@ def test_c4_router_cache_hit_not_hold_lock_for_cosine():
 # ============================================================
 def test_c4_router_vector_except_is_broad():
     """_vector_score_for_tool 的 except 应为宽 Exception，保证回退 BM25。"""
-    src = pathlib.Path("D:/kaipanla-data/hero-quant/src/hero_quant/mcp/router.py").read_text(encoding="utf-8")
+    src = (_REPO_ROOT / "src/hero_quant/mcp/router.py").read_text(encoding="utf-8")
     seg = src.split("def _vector_score_for_tool")[1].split("def is_pgvector_router_configured")[0] if "def _vector_score_for_tool" in src else ""
     # 不应再仅捕 (ImportError, ValueError, TypeError)
     assert "except (ImportError, ValueError, TypeError)" not in seg, "仍为窄 except 致网络/超时逃逸"

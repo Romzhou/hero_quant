@@ -73,3 +73,7 @@ interview-*.md
 # runtime artifacts: memory db + external memory files, regenerated on every test run
 # 必须带前导斜杠：裸 data/ 会连带匹配 src/hero_quant/data/ 源码目录
 /data/
+# local eval artifacts (keep files locally, just ignore in git)
+eval_*.json
+all_issues.txt
+ocr_*.log

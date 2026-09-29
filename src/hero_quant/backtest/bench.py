@@ -3,6 +3,8 @@
 职责：按后缀映射为每只 ticker 解析区域基准，并批量驱动 BacktestEngine，计算 alpha 等对比指标。
 架构位置：backtest 上层编排，复用 BacktestEngine；基准映射与配置中心 Settings 联动。
 关键设计：显式 benchmark_ticker 优先于后缀映射；后缀按长度降序匹配避免部分命中；单日输入自动扩展为 5 日以保证收益可计算。
+合成路径诚实化：run_batch 为 synthetic-only，所有产出 metrics 均带 non_pit=True，
+并在 run_batch docstring 与 enriched["not_for_live_thresholds"] 中明示禁用于实盘阈值。
 """
 
 from __future__ import annotations
@@ -288,7 +290,14 @@ def run_batch(
     allow_synthetic: bool = False,
     **kwargs,
 ) -> dict:
-    """批量执行回测并计算相对基准的 alpha：为每只 ticker 合成价格、运行引擎、对比基准收益。"""
+    """批量执行回测并计算相对基准的 alpha：为每只 ticker 合成价格、运行引擎、对比基准收益。
+
+    合成路径诚实化：本函数为 synthetic-only（合成价格演示/批量对比），
+    所有产出 metrics 均带 non_pit=True 标记（顶层与 metrics 内各一份），
+    且禁用于实盘阈值（禁用于任何 live/production 阈值、仓位或信号决策），
+    仅可用于离线对比与演示。PIT 旁路契约字符串全局冻结为
+    hero_quant.backtest.validation.PIT_ACK（"I_KNOW_THIS_IS_NON_PIT"）。
+    """
     # 中文：fail-closed 前置——合成价必须显式 opt-in，空输入也不静默返回 {}
     # NOTE: this harness is synthetic-only by design; real-price runs belong to
     # BacktestEngine/tools with market provenance, not to this batch helper.
@@ -388,6 +397,13 @@ def run_batch(
         enriched["pit_disclosure"] = disclosure_text
         enriched["news_disclosure"] = disclosure_text
         enriched["non_pit_disclosure"] = disclosure_text
+        # 合成路径诚实化：bench 为 synthetic-only，metrics 强制带 non_pit=True，
+        # 并明示禁用于实盘阈值（禁用于 live/production 阈值与仓位决策）。
+        enriched["non_pit"] = True
+        enriched["synthetic"] = True
+        enriched["not_for_live_thresholds"] = (
+            "synthetic/non-PIT result: MUST NOT be used for live trading thresholds"
+        )
         # 额外诚实字段：无 PIT 源时明确 unavailable
         if news_records:
             try:

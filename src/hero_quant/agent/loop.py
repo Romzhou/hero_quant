@@ -1598,6 +1598,17 @@ class AgentLoop:
                     break
             else:
                 # 本轮无工具调用
+                # 修复（评测驱动）：纯文本完成不得绕过接地校验——工具全失败后模型凭
+                # 记忆给出未验证价格断言时，旧逻辑"有文本输出即 completed"会静默放行
+                # 幻觉数字。现 fail-visible：未验证则进入纠正轮，轮次耗尽以
+                # grounding_failed 终止。无数字断言的纯文本仍直接通过（nums 为空时
+                # 校验层视为无幻觉）。
+                if self.grounding is not None and not grounding_verified and buffer.strip():
+                    if iterations >= self.max_iterations:
+                        terminated = True
+                        reason = "grounding_failed"
+                        break
+                    continue
                 if buffer.strip():
                     # 有文本输出即视为完成
                     terminated = True

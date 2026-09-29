@@ -5,8 +5,12 @@ NaN 不填 0 冒充（标记 insufficient_data）；深拷贝；窄化捕获。
 """
 import copy
 import inspect
+import pathlib
 
 import pytest
+
+# 仓库根目录：替代硬编码本机绝对路径（D:/...），保证 CI/Linux 可运行
+_REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 
 # ============ tools/backtest.py ×5 ============
@@ -197,9 +201,7 @@ def test_b3b_registry_registration_copies_caller_dicts():
 
 def test_b3b_registry_required_check_no_dead_code():
     """required 检查 no-op 死分支应删除，重复校验循环应合并为一处。"""
-    import pathlib
-
-    src = pathlib.Path("D:/kaipanla-data/hero-quant/src/hero_quant/tools/registry.py").read_text(encoding="utf-8")
+    src = (_REPO_ROOT / "src/hero_quant/tools/registry.py").read_text(encoding="utf-8")
     assert "if isinstance(props, dict) and req not in props" not in src
     loops = src.count("for idx, req in enumerate") + src.count("for r in schema[\"required\"]")
     assert loops == 1, f"required 校验循环应只剩一处，实有 {loops}"

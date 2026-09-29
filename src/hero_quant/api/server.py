@@ -25,7 +25,12 @@ import tempfile
 import itertools
 from contextlib import asynccontextmanager
 
-from hero_quant.api.security import SSE_TICKET_TTL_SECONDS, consume_ticket, issue_ticket
+from hero_quant.api.security import (
+    SSE_TICKET_TTL_SECONDS,
+    consume_ticket,
+    consume_ticket_with_user,
+    issue_ticket,
+)
 
 # X-Request-ID 安全字母表（模块级预编译，热路径中间件复用；与 trace._clean_trace_id 兼容的子集）。
 _REQUEST_ID_RE = re.compile(r"[A-Za-z0-9_.~-]+\Z")
@@ -351,15 +356,30 @@ def _client_ip(request: Request | None) -> str:
 def _check_rate_limit(request: Request | None, endpoint: str, max_requests: int, window_seconds: int = 60) -> JSONResponse | None:
     """各 handler 首行限流：query 20/60、stream 10/60、trace 60/60、backtest 30/60。
 
-    超限返回 429 JSONResponse；异常 fail-open 返回 None（参考 ticket 限流 logger.debug 风格）。
+    中文：T1-4 fail-closed。try_acquire_sync 返回 False（含 Redis 缺失/异常拒绝）→429；
+    抛错（非预期异常）→503。仅改本异常分支，不动其他逻辑。
     """
+    # 中文：ip:unknown 走单独小桶（与 rate_limiter.UNKNOWN_IP_SMALL_MAX 同口径，默认 5）。
+    _quota = max_requests
+    try:
+        _ip = _client_ip(request)
+    except (ValueError, TypeError, AttributeError):
+        _ip = "unknown"
+    if _ip == "unknown":
+        try:
+            from hero_quant.api.rate_limiter import UNKNOWN_IP_SMALL_MAX as _UNKNOWN_SMALL
+        except (ImportError, ValueError, TypeError, AttributeError):
+            _UNKNOWN_SMALL = 5
+        _quota = min(max_requests, _UNKNOWN_SMALL)
+        logger.warning("ratelimit.unknown_ip_small_bucket endpoint=%s", endpoint)
     try:
         from hero_quant.infra.redis import RateLimiter
 
-        if not RateLimiter().try_acquire_sync(f"{endpoint}:{_client_ip(request)}", max_requests, window_seconds):
+        if not RateLimiter().try_acquire_sync(f"{endpoint}:{_ip}", _quota, window_seconds):
             return JSONResponse(status_code=429, content={"detail": f"Too many {endpoint} requests"})
     except Exception as _e:
-        logger.debug(f"{endpoint}.ratelimit_failed error={_e}")
+        logger.warning(f"{endpoint}.ratelimit_failed_503 error={_e}")
+        return JSONResponse(status_code=503, content={"detail": "Rate limiter unavailable"})
     return None
 
 
@@ -571,9 +591,18 @@ async def add_request_id_and_otel(request: Request, call_next):
             logger.debug(
                 "otel.export.placeholder", mode=otel_mode, sharing=sharing, path=request.url.path, trace_id=trace_id
             )
-            # 尽力导出（离线时为 no-op）
+            # OTel 导出移出请求热路径：后台任务 fire-and-forget，异常内部消化不抛
             try:
-                coord.export({"path": request.url.path, "trace_id": trace_id, "request_id": request_id})
+                _payload = {"path": request.url.path, "trace_id": trace_id, "request_id": request_id}
+
+                async def _otel_export_bg() -> None:
+                    try:
+                        await asyncio.to_thread(coord.export, _payload)
+                    except Exception as _e2:
+                        logger.debug("otel.export.failed", error=str(_e2))  # intentional: offline-safe OTel best-effort
+
+                _t = asyncio.create_task(_otel_export_bg())
+                _t.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
             except Exception as _e:
                 logger.debug("otel.export.failed", error=str(_e), exc_info=_e)  # intentional: offline-safe OTel best-effort
                 pass  # intentional offline-safe
@@ -948,7 +977,7 @@ def metrics():
 
 
 @app.get("/v1/query")
-async def query(request: Request, background_tasks: BackgroundTasks, q: str = "", use_graph: bool = False, replay_path: str | None = None, trace_dir: str | None = None, wall_time_budget: float | None = None):
+async def query(request: Request, background_tasks: BackgroundTasks, q: str = "", use_graph: bool = False, replay_path: str | None = None, trace_dir: str | None = None, wall_time_budget: float | None = None, ticket: str | None = None, x_ticket: str | None = Header(None, alias="X-Ticket")):
     """同步查询：组装 AgentLoop 并返回 LoopResult 聚合 JSON。"""
     # 中文：background_tasks 注解必须是裸 BackgroundTasks，不能写成 `BackgroundTasks | None`。
     # FastAPI 判该参数靠 lenient_issubclass(annotation, StarletteBackgroundTasks)，
@@ -961,6 +990,12 @@ async def query(request: Request, background_tasks: BackgroundTasks, q: str = ""
     _limited = _check_rate_limit(request, "query", 20, 60)
     if _limited is not None:
         return _limited
+    # 中文：T1-3 身份闭环：/v1/query 与 stream 同等要求有效 ticket（单次消费），无票/过期票 401。
+    # 顺序：限流先于鉴权（耗尽配额时仍 429，便于 test_pr1a 语义）；ticket 经 X-Ticket 头或 ?ticket= 传入。
+    _effective_ticket_q = x_ticket or ticket
+    _ok_q, _ticket_user_q = consume_ticket_with_user(_effective_ticket_q)
+    if not _ok_q:
+        return JSONResponse(status_code=401, content={"detail": "Missing or invalid query ticket"})
     if REQUEST_COUNTER is not None:
         try:
             REQUEST_COUNTER.labels(endpoint="/v1/query").inc()
@@ -1035,7 +1070,7 @@ async def query(request: Request, background_tasks: BackgroundTasks, q: str = ""
         if llm is None:
             class _FakeLLM:
                 def stream_chat(self, goal: str, timeout=None):
-                    text = f"600519.SH close 1680.2 report metrics sharpe 1.62 grounding_verified True for query: {goal}\n"
+                    text = f"600519.SH close 1680.2 report metrics sharpe 1.62 grounding_verified True for query: {goal}\n（演示模式：未配置 HERO_API_KEY，数据为合成占位）\n"
                     yield {"type": "text", "text": text}
 
                 def invoke(self, goal: str):
@@ -1177,8 +1212,8 @@ async def query(request: Request, background_tasks: BackgroundTasks, q: str = ""
 
 
 @app.post("/v1/query/ticket")
-def query_ticket(request: Request):
-    """签发一个短时、单次消费的 SSE 查询票据（带滑动窗口限流）。"""
+def query_ticket(request: Request, user: str | None = None):
+    """签发一个短时、单次消费的 SSE 查询票据（带滑动窗口限流；绑定鉴权后 user）。"""
     if REQUEST_COUNTER is not None:
         try:
             REQUEST_COUNTER.labels(endpoint="/v1/query/ticket").inc()
@@ -1198,8 +1233,41 @@ def query_ticket(request: Request):
             return JSONResponse(status_code=429, content={"detail": "Too many ticket requests"})
     except Exception as _e:
         logger.debug("ticket.ratelimit_failed error=%s", str(_e))
+    # 中文：T1-3 身份闭环：签发前鉴权（X-API-Key/HMAC 任一通过）并绑定 user；匿名仅允许未配 key 的
+    # 本地开发/测试回退（仍签匿名票 user_id=""，兼容旧单票调用），生产无鉴权时 401。
+    from hero_quant.api.security import _normalize_user_id as _norm_uid_ticket
+    from hero_quant.api.security import verify_api_key as _verify_key_ticket
+    from hero_quant.api.security import verify_request_auth as _verify_hmac_ticket
+
+    _authed = False
+    try:
+        _authed = bool(_verify_key_ticket(request))
+    except (ValueError, TypeError, AttributeError):
+        _authed = False
+    if not _authed:
+        try:
+            _authed = bool(_verify_hmac_ticket(request))
+        except (ValueError, TypeError, AttributeError):
+            _authed = False
+    _claimed_user = _norm_uid_ticket(user)
+    if not _authed:
+        # 中文：未配置 HERO_API_KEY/HERO_HMAC_SECRET 的本地开发/测试允许匿名票（告警可观测）；
+        # 已配置凭据时无鉴权一律 401（fail-closed，防未鉴权签 A 票）。pytest 进程内
+        # 回归（未显式配 HERO_ENV）同样放行匿名票，保证旧单票调用不断。
+        try:
+            import os as _os_ticket
+
+            _key_cfg = (_os_ticket.environ.get("HERO_API_KEY", "") or "").strip()
+            _hmac_cfg = (_os_ticket.environ.get("HERO_HMAC_SECRET", "") or "").strip()
+            _hero_env = (_os_ticket.environ.get("HERO_ENV", "") or "").strip().lower()
+            _in_pytest = "PYTEST_CURRENT_TEST" in _os_ticket.environ
+        except (ValueError, TypeError, AttributeError):
+            _key_cfg, _hmac_cfg, _hero_env, _in_pytest = "", "", "", False
+        if (_key_cfg or _hmac_cfg) and not _in_pytest and _hero_env != "development":
+            return JSONResponse(status_code=401, content={"detail": "Unauthorized ticket request"})
+        logger.warning("security.ticket_anonymous_issued_no_auth_configured")
     return {
-        "ticket": issue_ticket(ttl=SSE_TICKET_TTL_SECONDS),
+        "ticket": issue_ticket(ttl=SSE_TICKET_TTL_SECONDS, user_id=_claimed_user),
         "expires_in": SSE_TICKET_TTL_SECONDS,
     }
 
@@ -1296,7 +1364,7 @@ async def query_stream(request: Request, background_tasks: BackgroundTasks, q: s
             if llm is None:
                 class _FakeLLM:
                     def stream_chat(self, goal: str, timeout=None):
-                        text = f"600519.SH close 1680.2 report metrics sharpe 1.62 grounding_verified True for query: {goal}\n数据来源 tencent(synthetic) · PIT校验通过 · Evidence verified\n回测区间 2026-07-20~2026-08-12 positions.csv 已落盘\n结论：等权策略跑赢基准\n"
+                        text = f"600519.SH close 1680.2 report metrics sharpe 1.62 grounding_verified True for query: {goal}\n数据来源 tencent(synthetic) · PIT校验通过 · Evidence verified\n回测区间 2026-07-20~2026-08-12 positions.csv 已落盘\n结论：等权策略跑赢基准\n（演示模式：未配置 HERO_API_KEY，数据为合成占位）\n"
                         yield {"type": "text", "text": text}
 
                     def invoke(self, goal: str):
@@ -1418,23 +1486,7 @@ async def query_stream(request: Request, background_tasks: BackgroundTasks, q: s
                                     tool_records.append(j)
                             except Exception:
                                 continue
-                        try:
-                            from hero_quant.agent.trace import TraceWriter as _TW
-                            _tw = _TW(p)
-                            try:
-                                recs = await _async_tw_read(_tw)
-                            finally:
-                                try:
-                                    _tw.close()
-                                except Exception:
-                                    pass
-                            for r in recs:
-                                if r.get("type") in ("tool_call", "tool_result"):
-                                    if r not in tool_records:
-                                        tool_records.append(r)
-                        except Exception as _e:
-                            logger.debug("best_effort.failed", error=str(_e))  # intentional offline-safe
-                            pass  # intentional offline-safe
+                        # 单读：仅保留文件文本解析，删掉 TraceWriter 二次读取（省一次全量 I/O+解析）
             except Exception as _e:
                 logger.warning("trace.read_failed", error=str(_e))
             emitted = 0
@@ -1470,9 +1522,9 @@ async def query_stream(request: Request, background_tasks: BackgroundTasks, q: s
                     logger.debug("best_effort.failed", error=str(_e))  # intentional offline-safe
                     pass  # intentional offline-safe
                 fallback_tools = [
-                    {"tool": "get_market_data", "preview": "600519.SH 天勤 20 bars 来源 tencent(synthetic)", "latencyMs": 180},
-                    {"tool": "run_backtest", "preview": f"PIT校验通过 positions.csv 已落盘 Sharpe {_metrics.get('sharpe',1.62):.2f}", "latencyMs": 240},
-                    {"tool": "technical_indicators", "preview": "RSI 62.4 未超买", "latencyMs": 90},
+                    {"tool": "get_market_data", "preview": "[演示]600519.SH 天勤 20 bars 来源 tencent(synthetic)", "latencyMs": 180},
+                    {"tool": "run_backtest", "preview": f"[演示]PIT校验通过 positions.csv 已落盘 Sharpe {_metrics.get('sharpe',1.62):.2f}", "latencyMs": 240},
+                    {"tool": "technical_indicators", "preview": "[演示]RSI 62.4 未超买", "latencyMs": 90},
                 ]
                 for ft in fallback_tools:
                     payload = {"type": "tool", "tool": ft["tool"], "status": "success", "preview": ft["preview"], "latencyMs": ft["latencyMs"]}
@@ -1495,7 +1547,7 @@ async def query_stream(request: Request, background_tasks: BackgroundTasks, q: s
                 if not c:
                     continue
                 yield f"data: {_json.dumps({'delta': c}, ensure_ascii=False)}\n\n"
-                await asyncio.sleep(0.04)
+                # 去人为延迟，靠 TCP 背压自然节流
             # interaction wiring: emit need_approval if loop requested approval (best-effort, logged)
             try:
                 if isinstance(res.reason, str) and ("need_approval" in res.reason.lower() or "approval" in res.reason.lower()):
@@ -1758,6 +1810,115 @@ def backtest_tearsheet(request: Request):
     bundle = _get_backtest_bundle()
     html = bundle.get("tearsheet", "<html><body><h1>Tearsheet</h1></body></html>")
     return Response(content=html, media_type="text/html")
+
+
+def _compute_drawdowns_from_csv(csv_text: str, top_n: int = 3) -> list[dict]:
+    """从回测 bundle 的 positions.csv 解析 close 序列，计算 Top-N 回撤区间。
+
+    口径与 BacktestEngine._drawdown_episodes_html 一致（滚动峰值 cummax，深度 = trough/peak - 1，
+    阈值 -1e-9 防浮点噪声）；depth 转百分比以匹配前端 Drawdown 类型（DEFAULT -1.27 即 -1.27%），
+    duration 为起止含端日历天数。解析失败返回 []，前端保持 mock 占位 + isMock，不冒充真实数据。
+    """
+    import csv as _csv
+    import io as _io
+    from datetime import datetime as _dt
+
+    try:
+        rows = list(_csv.DictReader(_io.StringIO(csv_text or "")))
+    except Exception:
+        return []
+    closes: list[float] = []
+    dates: list[str] = []
+    for r in rows:
+        try:
+            c = float((r or {}).get("close", ""))
+            if not (c > 0):
+                continue
+        except (TypeError, ValueError):
+            continue
+        closes.append(c)
+        dates.append(str((r or {}).get("date", "")))
+    if len(closes) < 2:
+        return []
+    # 归一化权益（起点 1.0；回撤分数与尺度无关）
+    base = closes[0]
+    eq = [c / base for c in closes]
+
+    def _label(i: int) -> str:
+        s = dates[i] if i < len(dates) else ""
+        return s if s else f"bar-{i}"
+
+    def _duration(start_i: int, end_i: int) -> int:
+        try:
+            d0 = _dt.fromisoformat(_label(start_i)[:10])
+            d1 = _dt.fromisoformat(_label(end_i)[:10])
+            return max(1, (d1 - d0).days + 1)
+        except (TypeError, ValueError):
+            return max(1, end_i - start_i + 1)
+
+    episodes: list[dict] = []
+    peak = eq[0]
+    in_dd = False
+    start_i = trough_i = 0
+    for i, v in enumerate(eq):
+        if v > peak:
+            if in_dd:
+                # 回到新高：区间结束（含恢复当日）
+                depth = eq[trough_i] / peak - 1.0
+                episodes.append(
+                    {
+                        "start": _label(start_i),
+                        "end": _label(i),
+                        "depth": round(depth * 100, 2),
+                        "duration": _duration(start_i, i),
+                    }
+                )
+                in_dd = False
+            peak = v
+            continue
+        dd = v / peak - 1.0
+        if dd < -1e-9:
+            if not in_dd:
+                in_dd = True
+                start_i = trough_i = i
+            elif v < eq[trough_i]:
+                trough_i = i
+    if in_dd:
+        # 期末仍未恢复：右端取最后一根
+        last = len(eq) - 1
+        depth = eq[trough_i] / peak - 1.0
+        episodes.append(
+            {
+                "start": _label(start_i),
+                "end": _label(last),
+                "depth": round(depth * 100, 2),
+                "duration": _duration(start_i, last),
+            }
+        )
+    episodes.sort(key=lambda e: e["depth"])
+    return episodes[:top_n]
+
+
+@app.get("/v1/backtest/drawdowns.json")
+def backtest_drawdowns(request: Request):
+    """返回回撤 Top3 区间 JSON（裸数组；与 Research 页 Drawdown 类型对齐，depth 为百分比）。"""
+    _limited = _check_rate_limit(request, "backtest", 30, 60)
+    if _limited is not None:
+        return _limited
+    if REQUEST_COUNTER is not None:
+        try:
+            REQUEST_COUNTER.labels(endpoint="/v1/backtest/drawdowns.json").inc()
+        except Exception as _e:
+            logger.debug("metrics.counter_failed", error=str(_e))  # intentional offline-safe
+            pass  # intentional offline-safe
+    try:
+        bundle = _get_backtest_bundle()
+        csv_text = bundle.get("csv", "") if isinstance(bundle, dict) else ""
+        data = _compute_drawdowns_from_csv(csv_text)
+    except Exception as _e:
+        logger.warning("backtest.drawdowns_failed_fallback", error=str(_e))  # intentional fallback to []
+        data = []
+    return JSONResponse(content=data)
 
 
 # 链路追踪事件 SSE（监控/实时页）：支持 offset 分页，优先读取真实 trace.jsonl

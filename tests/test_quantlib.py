@@ -1,10 +1,15 @@
 # tests/test_quantlib.py
 def test_sma_rsi():
     from hero_quant.quantlib.indicators import sma, rsi
+    import math
     import pandas as pd
     s = pd.Series([1,2,3,4,5])
     assert sma(s, 3).iloc[-1] == 4.0
-    assert 0 <= rsi(s, 14).iloc[-1] <= 100
+    # 窗口不足 (5 bars < period 14 + 1) 时必须返回 NaN，不得用 50.0 假中性
+    assert all(math.isnan(v) for v in rsi(s, 14).values)
+    # 足量数据时 RSI 落在 [0, 100]
+    s30 = pd.Series(range(1, 31))
+    assert 0 <= rsi(s30, 14).iloc[-1] <= 100
 
 import pytest
 

@@ -19,6 +19,8 @@ CHAT_MAX = 10
 SESSION_MAX = 30
 TOOL_MAX = 60
 WINDOW_SECONDS = 60
+# 中文：T1-4：ip:unknown 单独小桶配额（缺失 IP/代理未透传时收敛，避免共享大桶误伤或被单 actor 打穿）。
+UNKNOWN_IP_SMALL_MAX = 5
 
 try:
     from slowapi import Limiter as _SlowLimiter  # type: ignore
@@ -52,16 +54,27 @@ limiter = _SlowLimiter(key_func=limit_key) if SLOWAPI_AVAILABLE and _SlowLimiter
 
 
 async def _check(request: Request, quota: int, endpoint: str) -> bool:
-    """按 endpoint 隔离 bucket；注意：infra RateLimiter 当前 fail-open（后端异常返回 True），此处 503 仅覆盖非预期异常。"""
+    """按 endpoint 隔离 bucket；fail-closed：后端缺失/异常一律 429/503，不放行。
+
+    中文：T1-4 起 infra RateLimiter 缺后端/异常返回 False（拒绝），此处 False→429；
+    抛错（非预期异常）→503。ip:unknown 走单独小桶（UNKNOWN_IP_SMALL_MAX），防单 actor
+    耗尽大桶误伤他人。
+    """
     # key 构造在 try 之外：limit_key 自身的程序错误不得被误标为 503
     # 'Rate limiter unavailable'（三档隔离：key 含 endpoint 前缀，避免共用同一桶）。
-    key = f"{endpoint}:{limit_key(request)}"
+    raw_key = limit_key(request)
+    if raw_key == "ip:unknown":
+        # 中文：告警可观测（代理未透传真实 IP/缺失 IP 时暴露配置问题），配额收敛到小桶。
+        logger.warning("ratelimiter.unknown_ip_small_bucket endpoint=%s", endpoint)
+        quota = min(quota, UNKNOWN_IP_SMALL_MAX)
+    key = f"{endpoint}:{raw_key}"
     try:
         ok = await RateLimiter().try_acquire(key, quota, WINDOW_SECONDS)
     except Exception as e:
         logger.warning("ratelimiter.check_failed endpoint=%s error=%s", endpoint, str(e))
         raise HTTPException(status_code=503, detail="Rate limiter unavailable") from e
     if not ok:
+        # 中文：False 语义收敛为“配额耗尽或后端不可用”，一律 429（server 网关异常分支才区分 503）。
         raise HTTPException(status_code=429, detail=f"Too many {endpoint} requests")
     return True
 
@@ -85,6 +98,7 @@ __all__ = [
     "CHAT_MAX",
     "SESSION_MAX",
     "TOOL_MAX",
+    "UNKNOWN_IP_SMALL_MAX",
     "WINDOW_SECONDS",
     "SLOWAPI_AVAILABLE",
     "limit_key",

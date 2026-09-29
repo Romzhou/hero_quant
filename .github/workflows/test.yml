@@ -41,6 +41,13 @@ jobs:
           pip install pytest pytest-cov ruff pip-audit
       - name: Lint with ruff
         run: ruff check src
+      - name: Frontend typecheck + build + unit tests (blocking)
+        # 中文：先构建 frontend/dist，供 pytest 中 SPA 静态资源用例（test_frontend_spa）使用
+        run: |
+          npm ci --prefix frontend
+          npm run typecheck --prefix frontend
+          npm run build --prefix frontend
+          npm run test:run --prefix frontend
       - name: Run tests
         # Coverage gate: Wave5 收口 50% (48.99% -> 50)；低频 retrieval_eval 标记为 retrieval 仅周跑，不计入此门
         run: pytest -q --cov=src --cov-report=term --cov-fail-under=50
@@ -52,12 +59,6 @@ jobs:
         uses: gitleaks/gitleaks-action@v2 # pin: sha256:2a65dd62a8f8b5afedd072f3e2aa1c8a3b6c7a0e7d0a9c
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - name: Frontend typecheck + build + unit tests (blocking)
-        run: |
-          npm ci --prefix frontend
-          npm run typecheck --prefix frontend
-          npm run build --prefix frontend
-          npm run test:run --prefix frontend
       - name: Install Playwright browsers
         continue-on-error: true
         run: npx playwright install --with-deps

@@ -117,10 +117,15 @@ def test_pit_guard_default_on():
     res = engine.run(prices, weights=[1.0], allow_synthetic=True)
     assert "equity" in res
     # Explicit opt-out should allow violation to pass
-    res2 = engine.run(prices, weights=[1.0], weights_on="2026-08-10", price_date="2026-08-01", skip_pit=True)
+    # T1-5 新契约：旁路需 pit_ack 二次确认，否则抛 PITViolation；通过后打 non_pit=True
+    with pytest.raises(Exception):
+        engine.run(prices, weights=[1.0], weights_on="2026-08-10", price_date="2026-08-01", skip_pit=True)
+    res2 = engine.run(prices, weights=[1.0], weights_on="2026-08-10", price_date="2026-08-01", skip_pit=True, pit_ack="I_KNOW_THIS_IS_NON_PIT")
     assert "equity" in res2
-    res3 = engine.run(prices, weights=[1.0], weights_on="2026-08-10", price_date="2026-08-01", enforce_pit=False)
+    assert res2.get("non_pit") is True
+    res3 = engine.run(prices, weights=[1.0], weights_on="2026-08-10", price_date="2026-08-01", enforce_pit=False, pit_ack="I_KNOW_THIS_IS_NON_PIT")
     assert "equity" in res3
+    assert res3.get("non_pit") is True
 
 
 def test_leverage_isclose_and_bear_not_overridden():
@@ -282,3 +287,24 @@ def test_metrics_turnover_single_source_and_docstring():
     src_compute = inspect.getsource(m.compute_metrics)
     # compute_metrics 成本为 additive per-bar drag，与 engine 的 turnover-scaled 区分但文档化单一口径
     assert "turnover" in src_compute.lower() or "cost" in src_compute.lower()
+
+
+def test_compute_drawdowns_from_csv_basic():
+    """drawdowns.json 算法：1680.2→1692.5→1671.0→1701.3 唯一回撤 -1.27%，与前端 DEFAULT 指纹同口径。"""
+    from hero_quant.api.server import _compute_drawdowns_from_csv
+
+    csv = "date,symbol,weight,close\n2026-08-12,600519.SH,0.5,1680.2\n2026-08-13,600519.SH,0.5,1692.5\n2026-08-14,600519.SH,0.5,1671.0\n2026-08-15,600519.SH,0.5,1701.3\n"
+    out = _compute_drawdowns_from_csv(csv)
+    assert len(out) == 1
+    assert out[0]["start"] == "2026-08-14" and out[0]["end"] == "2026-08-15"
+    assert out[0]["depth"] == -1.27
+    assert out[0]["duration"] == 2
+
+
+def test_compute_drawdowns_from_csv_degraded():
+    """降级语义：空/不足 2 行/单调上涨一律返回 []，前端保持 mock 占位不冒充真实。"""
+    from hero_quant.api.server import _compute_drawdowns_from_csv
+
+    assert _compute_drawdowns_from_csv("") == []
+    assert _compute_drawdowns_from_csv("date,symbol,weight,close\n2026-08-12,a,0.5,100\n") == []
+    assert _compute_drawdowns_from_csv("date,symbol,weight,close\n2026-08-12,a,0.5,100\n2026-08-13,a,0.5,101\n") == []

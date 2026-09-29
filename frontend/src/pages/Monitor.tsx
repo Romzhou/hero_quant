@@ -1,7 +1,9 @@
 /**
  * Monitor 运行态监控页（与 Live 同源，布局备份）
  * - 职责：展示 events.jsonl 增量 tail、OTel 成本熔断、心跳与熔断双桶状态
- * - 数据流：轮询 /v1/trace/events 等候选地址的 SSE 流，按 offset 增量追加；失败回退 EventSource，附带重试与日志
+ * - 数据流：订阅 /v1/trace/events?offset 单一有效地址的 SSE 流，按 offset 增量追加；失败回退 EventSource，附带重试与日志
+ *   （曾有的 /v1/events、/v1/query/stream?offset= 候选已被删除：后端不存在 /v1/events，
+ *   /v1/query/stream 也不支持 offset 参数且缺 ticket 必 403，保留它们只会浪费一次票据+一次失败请求）
  * - 修复：effect 去重连风暴 — refs 镜像 offset/cost，deps 仅 [paused]；reader/abort 完整清理；无空心跳泄漏
  */
 import { useEffect, useRef, useState } from "react"
@@ -17,7 +19,9 @@ export default function Monitor() {
   ])
   const [offset, setOffset] = useState(4)
   const [paused, setPaused] = useState(false)
-  const [cost, setCost] = useState(3.2)
+  const [cost, setCost] = useState(0)
+  // isDemo：初始 mock 为演示数据，收到第一条真实 SSE 事件后置 false
+  const [isDemo, setIsDemo] = useState(true)
   const [errorMsg, setErrorMsg] = useState<string | null>(null)
   const costLimit = 5.0
   const ratio = Math.min(cost / costLimit, 1)
@@ -43,53 +47,22 @@ export default function Monitor() {
     let curOffset = offsetRef.current
 
     async function streamFetch() {
-      const candidates = [
-        `/v1/trace/events?offset=${curOffset}`,
-        `/v1/events?offset=${curOffset}`,
-        `/v1/query/stream?offset=${curOffset}`,
-      ]
-      for (const candidate of candidates) {
+      // 唯一有效候选：/v1/trace/events?offset（后端 server.py trace_events，支持 offset 分页与 SSE/JSON 双协议）
+      const candidate = `/v1/trace/events?offset=${curOffset}`
+      {
         if (abortRef.current) {
           try { abortRef.current.abort() } catch {}
         }
         let reader: ReadableStreamDefaultReader<Uint8Array> | null = null
-        let controller: AbortController | null = null
-        let ticketHeader: string | null = null
         try {
-          let url = candidate
-          if (candidate.startsWith("/v1/query/stream")) {
-            controller = new AbortController()
-            abortRef.current = controller
-            const ticketResp = await fetch("/v1/query/ticket", {
-              method: "POST",
-              headers: { Accept: "application/json" },
-              signal: controller.signal,
-            })
-            if (!ticketResp.ok) {
-              console.warn(`[Monitor] SSE candidate failed: ${candidate} ticket status ${ticketResp.status}`)
-              continue
-            }
-            const payload = await ticketResp.json() as { ticket?: unknown }
-            // 票据格式校验（token_urlsafe(32) ≈ 43 字符 URL-safe base64），非空且形态合法才放行
-            if (typeof payload.ticket !== "string" || !/^[A-Za-z0-9_-]{32,64}$/.test(payload.ticket)) {
-              console.warn(`[Monitor] SSE candidate failed: ${candidate} missing/invalid ticket`)
-              continue
-            }
-            if (aborted) return
-            // 票据经 X-Ticket header 传递，避免暴露在 URL/browser history/server logs/referer
-            ticketHeader = payload.ticket
-          }
-          if (!controller) {
-            controller = new AbortController()
-            abortRef.current = controller
-          }
+          const url = candidate
+          const controller = new AbortController()
+          abortRef.current = controller
           const headers: Record<string, string> = { Accept: "text/event-stream" }
-          if (ticketHeader) headers["X-Ticket"] = ticketHeader
           const resp = await fetch(url, { headers, signal: controller.signal })
           if (!resp.ok || !resp.body) {
             console.warn(`[Monitor] SSE candidate failed: ${candidate} status ${resp.status}`)
-            continue
-          }
+          } else {
           reader = resp.body.getReader()
           readerRef.current = reader
           const decoder = new TextDecoder()
@@ -117,6 +90,7 @@ export default function Monitor() {
                   cost: j.cost
                 }
                 setEvents(prev => [...prev.slice(-199), ev])
+                setIsDemo(false)
                 if (typeof j.cost === "number" && Number.isFinite(j.cost)) {
                   costRef.current = j.cost
                   setCost(j.cost)
@@ -128,6 +102,7 @@ export default function Monitor() {
                 const next = curOffset
                 curOffset++
                 offsetRef.current = curOffset
+                setIsDemo(false)
                 setEvents(prev => [...prev.slice(-199), { ts: new Date().toISOString(), offset: next, type: "raw", msg: raw.slice(0, 160) }])
                 setOffset(curOffset)
               }
@@ -138,6 +113,7 @@ export default function Monitor() {
           retryCountRef.current = 0
           setErrorMsg(null)
           return
+          }
         } catch (err) {
           console.warn(`[Monitor] SSE candidate failed: ${candidate}`, err)
           setErrorMsg(`连接 ${candidate} 失败，正在重试…`)
@@ -158,6 +134,7 @@ export default function Monitor() {
               const j = JSON.parse(e.data)
               const nextOffset = j.offset ?? curOffset
               setEvents(prev => [...prev.slice(-199), { ts: j.ts || new Date().toISOString(), offset: nextOffset, type: j.type || "event", msg: j.msg || e.data.slice(0, 120) }])
+              setIsDemo(false)
               curOffset = nextOffset + 1
               offsetRef.current = curOffset
               setOffset(curOffset)
@@ -167,6 +144,7 @@ export default function Monitor() {
               const next = curOffset
               curOffset++
               offsetRef.current = curOffset
+              setIsDemo(false)
               setEvents(prev => [...prev.slice(-199), { ts: new Date().toISOString(), offset: next, type: "sse", msg: e.data.slice(0, 140) }])
               setOffset(curOffset)
             }
@@ -218,14 +196,14 @@ export default function Monitor() {
     <div className="mx-auto max-w-7xl px-6 py-6">
       <div className="flex flex-wrap items-start justify-between gap-4">
         <div>
-          <h1 className="font-display text-xl font-semibold text-mist">Live 监控 · 运行态</h1>
+          <h1 className="font-display text-xl font-semibold text-mist">Live 监控 · 运行态{isDemo && <span className="ml-2 rounded-full border px-3 py-1 text-xs font-medium border-amber-400/20 bg-amber-400/10 text-amber-300 align-middle">演示数据</span>}</h1>
           <p className="mt-1 text-sm text-slate-400">events.jsonl offset 实时 SSE · OTel 三档遥测 · 成本熔断</p>
         </div>
         <div className="flex items-center gap-2">
           <span className="rounded-full border border-white/10 bg-white/5 px-3 py-1 font-mono text-xs text-slate-300">offset: {offset}</span>
           <span className={"rounded-full border px-3 py-1 text-xs font-semibold " + (breakerState==="OPEN" ? "border-red-400/30 bg-red-400/15 text-red-300" : breakerState==="HALF_OPEN" ? "border-amber-400/30 bg-amber-400/15 text-amber-300" : "border-emerald-400/20 bg-emerald-400/10 text-emerald-300")}>{breakerState}</span>
           <button onClick={() => setPaused(p=>!p)} className={"rounded-xl px-3.5 py-1.5 text-xs font-semibold transition " + (paused ? "bg-white text-ink-900" : "bg-white/10 text-mist hover:bg-white/15")}>{paused ? "▶ 恢复" : "⏸ 暂停"}</button>
-          <button onClick={() => setEvents([])} className="rounded-xl border border-white/10 bg-white/5 px-3 py-1.5 text-xs text-slate-300 hover:bg-white/10">清空</button>
+          <button onClick={() => { setEvents([]); setIsDemo(false) }} className="rounded-xl border border-white/10 bg-white/5 px-3 py-1.5 text-xs text-slate-300 hover:bg-white/10">清空</button>
         </div>
       </div>
 
@@ -235,7 +213,7 @@ export default function Monitor() {
       <div className="mt-6 rounded-2xl border border-white/10 bg-ink-800/60 p-4 backdrop-blur">
         <div className="flex items-center justify-between">
           <h2 className="text-sm font-semibold text-mist">OTel cost 熔断条</h2>
-          <span className="font-mono text-xs text-slate-400">daily {cost.toFixed(3)} / {costLimit.toFixed(1)} USD · {breakerState}</span>
+          <span className="font-mono text-xs text-slate-400">daily {cost.toFixed(3)} / {costLimit.toFixed(1)} USD · {breakerState}{isDemo ? " · 等待真实事件" : ""}</span>
         </div>
         <div className="mt-3 h-3 w-full overflow-hidden rounded-full bg-ink-900 border border-white/5">
           <div

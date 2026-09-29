@@ -29,7 +29,8 @@ def test_health_and_metrics_and_wall_time():
     body = ready.json()
     if ready.status_code == 503:
         assert body.get("status") == "degraded"
-        assert body.get("checkpoint") == "memory"
+        # 中文：降级时 checkpoint 标签可能是 memory（未配置 PG）或 pg（已配置但探活失败）——均为诚实降级
+        assert body.get("checkpoint") in ("memory", "pg")
     else:
         assert body.get("status") == "ok"
     # /metrics contains wall_time
@@ -54,6 +55,15 @@ def test_backtest_artifacts_and_trace_events():
         r = c.get(p)
         assert r.status_code == 200, f"{p} {r.status_code} {r.text[:200]}"
         assert expect.lower() in r.text.lower(), f"{p} missing {expect}: {r.text[:200]}"
+    # drawdowns.json：Research 页回撤 TopN（裸数组；depth 为百分比，与前端 Drawdown 类型对齐）。
+    # 注意：无 pandas 时 bundle 走静态兜底（2 行单调 CSV，无回撤），故只断状态码+裸数组+条目形状，不强制非空。
+    r = c.get("/v1/backtest/drawdowns.json")
+    assert r.status_code == 200, f"/v1/backtest/drawdowns.json {r.status_code} {r.text[:200]}"
+    data = r.json()
+    assert isinstance(data, list), f"drawdowns must be a bare list, got {type(data)}"
+    for item in data:
+        assert isinstance(item.get("start"), str) and isinstance(item.get("end"), str)
+        assert isinstance(item.get("depth"), (int, float)) and isinstance(item.get("duration"), (int, float))
     # trace events SSE or JSON
     r = c.get("/v1/trace/events?offset=0", headers={"Accept": "text/event-stream"})
     assert r.status_code == 200

@@ -1,13 +1,7 @@
-import {render, waitFor, cleanup, act} from "@testing-library/react"
+import {render, screen, waitFor, cleanup, act} from "@testing-library/react"
 import Monitor from "../pages/Monitor"
 import Live from "../pages/Live"
 
-const unavailable = {ok: false, status: 404, body: null}
-const ticketResponse = {
-  ok: true,
-  status: 200,
-  json: async () => ({ticket: "monitor-ticket", expires_in: 60}),
-}
 const emptyStream = {
   ok: true,
   status: 200,
@@ -20,22 +14,21 @@ afterEach(() => {
   cleanup()
 })
 
-test("query stream candidate gets a ticket before connecting", async () => {
-  const fetchMock = vi.fn()
-    .mockResolvedValueOnce(unavailable)
-    .mockResolvedValueOnce(unavailable)
-    .mockResolvedValueOnce(ticketResponse)
-    .mockResolvedValueOnce(emptyStream)
+test("single valid candidate connects to trace events directly (no dead /v1/events or query/stream fallbacks)", async () => {
+  // Monitor 只用唯一有效候选 /v1/trace/events?offset：无效的 /v1/events、/v1/query/stream?offset=
+  // 已删除（后端前者不存在，后者不支持 offset 且缺 ticket 必 403），不得再为它们取票据
+  const fetchMock = vi.fn().mockResolvedValueOnce(emptyStream)
   vi.stubGlobal("fetch", fetchMock)
   Object.defineProperty(HTMLElement.prototype, "scrollTo", {configurable: true, value: vi.fn()})
   vi.spyOn(Math, "random").mockReturnValue(1)
 
   render(<Monitor />)
 
-  await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(4))
-  expect(fetchMock.mock.calls[2][0]).toBe("/v1/query/ticket")
-  expect(fetchMock.mock.calls[2][1]).toEqual(expect.objectContaining({method: "POST"}))
-  expect(fetchMock.mock.calls[3][0]).toBe("/v1/query/stream?offset=4&ticket=monitor-ticket")
+  await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
+  expect(fetchMock.mock.calls[0][0]).toBe("/v1/trace/events?offset=4")
+  expect(JSON.stringify(fetchMock.mock.calls)).not.toContain("/v1/query/ticket")
+  expect(JSON.stringify(fetchMock.mock.calls)).not.toContain("/v1/events?")
+  expect(JSON.stringify(fetchMock.mock.calls)).not.toContain("/v1/query/stream")
 })
 
 test("Monitor effect deps stable - offset/cost change does not trigger reconnect storm", async () => {
@@ -45,8 +38,8 @@ test("Monitor effect deps stable - offset/cost change does not trigger reconnect
   const stream = new ReadableStream<Uint8Array>({
     start(controller) { controllerRef = controller },
   })
-  const fetchMock = vi.fn().mockImplementation(async (url: string) => {
-    if (typeof url === "string" && url.includes("/v1/query/ticket")) return ticketResponse
+  // Monitor 直连 /v1/trace/events，无需票据：任何 URL 一律返回长连接流
+  const fetchMock = vi.fn().mockImplementation(async () => {
     return { ok: true, status: 200, body: stream }
   })
   vi.stubGlobal("fetch", fetchMock)
@@ -220,4 +213,33 @@ test("dead heartbeat interval removed - no timer leak", async () => {
   // If fix is correct, setInterval not called at all, so clear not needed
   setIntervalSpy.mockRestore()
   clearIntervalSpy.mockRestore()
+})
+
+test("isDemo badge shown initially and hidden after first real event", async () => {
+  const encoder = new TextEncoder()
+  let controllerRef: ReadableStreamDefaultController<Uint8Array> | null = null
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) { controllerRef = controller },
+  })
+  const fetchMock = vi.fn().mockImplementation(async () => {
+    return { ok: true, status: 200, body: stream }
+  })
+  vi.stubGlobal("fetch", fetchMock)
+  Object.defineProperty(HTMLElement.prototype, "scrollTo", { configurable: true, value: vi.fn() })
+  class FakeES { onmessage: any=null; onerror: any=null; close=vi.fn(); constructor(public url:string){} }
+  vi.stubGlobal("EventSource", FakeES as any)
+
+  render(<Monitor />)
+  // isDemo 初始徽标存在、cost 从 0 起并提示等待真实事件
+  expect(screen.getByText("演示数据")).toBeInTheDocument()
+  expect(document.body.textContent).toContain("0.000")
+  expect(document.body.textContent).toContain("等待真实事件")
+  await waitFor(() => expect(fetchMock).toHaveBeenCalled())
+  act(() => {
+    controllerRef?.enqueue(encoder.encode('data: {"offset":10,"type":"tool","msg":"real","cost":1.5}\n\n'))
+  })
+  await waitFor(() => {
+    expect(screen.queryByText("演示数据")).toBeNull()
+  })
+  expect(document.body.textContent).toContain("1.500")
 })

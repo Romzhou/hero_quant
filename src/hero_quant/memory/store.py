@@ -53,6 +53,11 @@ def _content_bigrams(content: str) -> str:
     )
 
 
+def _escape_like(value: str) -> str:
+    """转义 LIKE 通配符（%、_ 及转义符自身），配合 ESCAPE '\\' 使用。"""
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 # pgvector sidecar 的 DSN 前缀白名单；鉴权与解析统一收口到 Settings，此处仅做轻量委托。
 _PG_PREFIXES = ("postgresql://", "postgres://", "postgresql+psycopg://")
 
@@ -810,7 +815,12 @@ class MemoryStore:
             logger.debug("startup reconcile failed: %s", _exc)
 
     def _reconcile_orphan_files(self) -> int:
-        """Scan base/**/*.md vs notes keys, re-index missing files. Returns count."""
+        """Scan base/**/*.md vs notes keys, re-index missing files. Returns count.
+
+        T1-7 ns 隔离：只处理 key 已带本 ns 前缀或无 ns 归属的文件；归属他户
+        （文件名/候选 key 明确带其他 ns 前缀）的文件跳过并 logger.warning，
+        不得索引进本 store。
+        """
         count = 0
         try:
             with self._lock:
@@ -830,6 +840,22 @@ class MemoryStore:
                         continue
                     files.append(p)
             for fp in files:
+                # T1-7 ns 隔离：先做归属判定——文件名若明确归属他户 ns
+                # （_matches_safe_prefix 失败但解码 key 含 ":" 前缀），跳过 + warning。
+                try:
+                    decoded_stem = self._parse_safe_stem(fp.stem)
+                except Exception:
+                    decoded_stem = ""
+                if self.namespace is not None:
+                    if not self._matches_safe_prefix(fp.name):
+                        if ":" in (decoded_stem or ""):
+                            logger.warning(
+                                "reconcile skip foreign-ns file %s (decoded=%r) for ns=%r",
+                                fp.name, decoded_stem, self.namespace,
+                            )
+                            continue
+                        # 无 ns 归属文件：允许处理（归属本 ns 索引）
+                        pass
                 # candidate keys: safe-stem decode AND base-relative path forms,
                 # so hierarchy/category layouts and external-style keys both match
                 candidates: set[str] = set()
@@ -853,6 +879,18 @@ class MemoryStore:
                     continue
                 if candidates & known:
                     continue
+                # T1-7 ns 隔离第二道：候选 key 若全部明确归属他户 ns（"other:" 前缀），
+                # 说明是他户文件（即使文件名碰巧通过前缀检查），同样跳过 + warning。
+                if self.namespace is not None:
+                    _mine = f"{self.namespace}:"
+                    _foreign = [c for c in candidates if ":" in c and not c.startswith(_mine)]
+                    _own_or_plain = [c for c in candidates if c in known or c.startswith(_mine) or ":" not in c]
+                    if _foreign and not _own_or_plain:
+                        logger.warning(
+                            "reconcile skip foreign-ns file %s (candidates=%r) for ns=%r",
+                            fp.name, sorted(candidates), self.namespace,
+                        )
+                        continue
                 try:
                     content = fp.read_text(encoding="utf-8")
                 except Exception:
@@ -1674,18 +1712,18 @@ class MemoryStore:
         bigram_result = self._search_bigram_raw(query)
         if bigram_result:
             return bigram_result
-        # 回退到 LIKE 模糊匹配
+        # 回退到 LIKE 模糊匹配（T1-7：ESCAPE 转义 %/_，防通配符注入串扰他户）
         try:
             with self._lock:  # 中文注释：SQLite 共享连接需加锁
                 cur = self._conn.cursor()
-                pattern = f"%{query}%"
+                pattern = f"%{_escape_like(query)}%"
                 if prefix is not None:
                     cur.execute(
-                        "SELECT key, content FROM notes WHERE key LIKE ? AND content LIKE ?",
-                        (f"{prefix}%", pattern),
+                        "SELECT key, content FROM notes WHERE key LIKE ? ESCAPE '\\' AND content LIKE ? ESCAPE '\\'",
+                        (f"{_escape_like(prefix)}%", pattern),
                     )
                 else:
-                    cur.execute("SELECT key, content FROM notes WHERE content LIKE ?", (pattern,))
+                    cur.execute("SELECT key, content FROM notes WHERE content LIKE ? ESCAPE '\\'", (pattern,))
                 rows = cur.fetchall()
                 result = [{"key": k, "content": c} for k, c in rows]
                 if prefix is not None:

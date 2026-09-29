@@ -24,6 +24,12 @@ logger = logging.getLogger(__name__)
 # explicitly whenever present — they must NOT be listed here.
 NON_PRICE_COLS: frozenset[str] = frozenset({"volume", "currency", "ccy"})
 
+# PIT 旁路二次确认契约字符串（全局冻结）：
+# skip_pit=True 或 enforce_pit=False 时，调用方必须显式传入
+# pit_ack 与此常量全等（"I_KNOW_THIS_IS_NON_PIT"），否则 BacktestEngine.run 抛 PITViolation。
+# 此字符串一经冻结不得修改，任何位置不得另行定义/拼写变体；engine/bench 均复用此单一来源。
+PIT_ACK: str = "I_KNOW_THIS_IS_NON_PIT"
+
 
 class ValidationError(Exception):
     """输入违反 PIT/价格/币种任一正确性约束时抛出。"""

@@ -32,7 +32,9 @@ export default function Live() {
   ])
   const [offset, setOffset] = useState(4)
   const [paused, setPaused] = useState(false)
-  const [cost, setCost] = useState(3.2)
+  const [cost, setCost] = useState(0)
+  // isDemo：初始 mock 为演示数据，收到第一条真实 SSE 事件后置 false
+  const [isDemo, setIsDemo] = useState(true)
   const costLimit = COST_LIMIT_USD
   const ratio = Math.min(cost / costLimit, 1)
   const breakerState = getBreakerState(ratio)
@@ -98,6 +100,7 @@ export default function Live() {
                   cost: j.cost
                 }
                 setEvents(prev => [...prev.slice(-(MAX_EVENTS - 1)), ev])
+                setIsDemo(false)
                 if (typeof j.cost === "number" && Number.isFinite(j.cost)) {
                   costRef.current = j.cost
                   setCost(j.cost)
@@ -108,6 +111,7 @@ export default function Live() {
               } catch {
                 const next = curOffset++
                 offsetRef.current = curOffset
+                setIsDemo(false)
                 setEvents(prev => [...prev.slice(-(MAX_EVENTS - 1)), { ts: new Date().toISOString(), offset: next, type: "raw", msg: raw.slice(0, MAX_RAW_LEN) }])
               }
             }
@@ -131,6 +135,7 @@ export default function Live() {
             const nextOffset = j.offset ?? curOffset
             const ev: LiveEvent = { ts: j.ts || new Date().toISOString(), offset: nextOffset, type: j.type || "event", msg: j.msg || e.data.slice(0, MAX_MSG_LEN), cost: j.cost }
             setEvents(prev => [...prev.slice(-(MAX_EVENTS - 1)), ev])
+            setIsDemo(false)
             if (typeof j.cost === "number" && Number.isFinite(j.cost)) {
               costRef.current = j.cost
               setCost(j.cost)
@@ -141,6 +146,7 @@ export default function Live() {
           } catch {
             const next = curOffset++
             offsetRef.current = curOffset
+            setIsDemo(false)
             setEvents(prev => [...prev.slice(-(MAX_EVENTS - 1)), { ts: new Date().toISOString(), offset: next, type: "sse", msg: e.data.slice(0, MAX_SSE_LEN) }])
           }
         }
@@ -173,6 +179,7 @@ export default function Live() {
     setEvents([])
     setOffset(0)
     setCost(0)
+    setIsDemo(false)
     offsetRef.current = 0
     costRef.current = 0
   }
@@ -181,7 +188,7 @@ export default function Live() {
     <div className="mx-auto max-w-7xl px-6 py-6">
       <div className="flex flex-wrap items-start justify-between gap-4">
         <div>
-          <h1 className="font-display text-xl font-semibold text-mist">Live 监控 · 实盘</h1>
+          <h1 className="font-display text-xl font-semibold text-mist">Live 监控 · 实盘{isDemo && <span className="ml-2 rounded-full border px-3 py-1 text-xs font-medium border-amber-400/20 bg-amber-400/10 text-amber-300 align-middle">演示数据</span>}</h1>
           <p className="mt-1 text-sm text-slate-400">events.jsonl offset 实时 SSE · OTel 三档遥测 · 成本熔断</p>
         </div>
         <div className="flex items-center gap-2">
@@ -196,7 +203,7 @@ export default function Live() {
       <div className="mt-6 rounded-2xl border border-white/10 bg-ink-800/60 p-4 backdrop-blur">
         <div className="flex items-center justify-between">
           <h2 className="text-sm font-semibold text-mist">OTel cost 熔断条</h2>
-          <span className="font-mono text-xs text-slate-400">daily {cost.toFixed(3)} / {costLimit.toFixed(1)} USD · {breakerState}</span>
+          <span className="font-mono text-xs text-slate-400">daily {cost.toFixed(3)} / {costLimit.toFixed(1)} USD · {breakerState}{isDemo ? " · 等待真实事件" : ""}</span>
         </div>
         <div className="mt-3 h-3 w-full overflow-hidden rounded-full bg-ink-900 border border-white/5">
           <div className={"h-full rounded-full transition-all duration-700 " + (ratio >= BREAKER_OPEN_RATIO ? "bg-gradient-to-r from-red-500 to-red-600" : ratio >= BREAKER_HALF_OPEN_RATIO ? "bg-gradient-to-r from-amber-400 to-orange-500" : "bg-gradient-to-r from-emerald-400 to-teal-500")} style={{ width: `${Math.min(ratio * 100, 100)}%` }} />

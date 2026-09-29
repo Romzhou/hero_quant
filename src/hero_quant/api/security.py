@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import inspect
+import json
 import logging
 import os
 import secrets
@@ -24,7 +25,8 @@ logger = logging.getLogger(__name__)
 
 SSE_TICKET_TTL_SECONDS = 60
 _MAX_TICKETS = 10000
-_tickets: dict[str, float] = {}
+# ticket -> (expires_at_monotonic, user_id字符串；契约冻结键名"user_id"，匿名票存"")
+_tickets: dict[str, tuple[float, str]] = {}
 _ticket_lock = threading.Lock()
 # NOTE: threading.Lock fallback only — primary store is Redis (SET NX EX + GET+DEL atomic).
 # 本地 _tickets 仅作为 Redis 不可用时的内存回退（仍受单进程限制）；生产为 Redis 强依赖。
@@ -57,13 +59,58 @@ def _get_redis_for_ticket():
 
 def _purge_expired_tickets(now: float) -> None:
     """清理已过期票据；在票据读写时惰性执行，避免后台清理线程。"""
-    for ticket, expires_at in list(_tickets.items()):
-        if expires_at <= now:
+    for ticket, (_expires_at, _uid) in list(_tickets.items()):
+        if _expires_at <= now:
             del _tickets[ticket]
 
 
-def _issue_ticket_memory(ttl: float) -> str:
-    """Memory fallback for ticket issue."""
+def _normalize_user_id(user: Any | None) -> str:
+    """归一化 user_id：None→""；余者 str 化后去首尾空白（契约：payload user_id 恒为字符串）。"""
+    if user is None:
+        return ""
+    try:
+        s = user if isinstance(user, str) else str(user)
+    except (ValueError, TypeError, AttributeError):
+        return ""
+    return s.strip()
+
+
+def _ticket_payload(user_id: str) -> str:
+    """ticket 载荷：JSON {"user_id": str}（契约冻结键名"user_id"；匿名票存""）。"""
+    try:
+        return json.dumps({"user_id": user_id}, separators=(",", ":"), ensure_ascii=False)
+    except (ValueError, TypeError, AttributeError):
+        return '{"user_id":""}'
+
+
+def _parse_ticket_user(raw: Any | None) -> str | None:
+    """解析票据载荷中的 user_id：缺失返回 None；遗留纯"1"票按匿名""兼容；解析失败按""收敛。"""
+    if raw is None:
+        return None
+    try:
+        if isinstance(raw, (bytes, bytearray)):
+            raw = bytes(raw).decode("utf-8", errors="ignore")
+        if not isinstance(raw, str):
+            raw = str(raw)
+    except (ValueError, TypeError, AttributeError):
+        return ""
+    if raw == "1":
+        return ""
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError, AttributeError):
+        return ""
+    try:
+        if isinstance(data, dict) and "user_id" in data:
+            uid = data["user_id"]
+            return uid if isinstance(uid, str) else _normalize_user_id(uid)
+        return ""
+    except (ValueError, TypeError, AttributeError):
+        return ""
+
+
+def _issue_ticket_memory(ttl: float, user_id: str = "") -> str:
+    """Memory fallback for ticket issue（绑定 user_id；默认匿名兼容旧调用）。"""
     now = time.monotonic()
     with _ticket_lock:
         _purge_expired_tickets(now)
@@ -75,22 +122,40 @@ def _issue_ticket_memory(ttl: float) -> str:
             except (RuntimeError, StopIteration, ValueError, TypeError) as e:
                 logger.warning("security.ticket_evict_failed error=%s", str(e))
         ticket = secrets.token_urlsafe(32)
-        _tickets[ticket] = now + ttl
+        _tickets[ticket] = (now + ttl, user_id)
         return ticket
 
 
-def _consume_ticket_memory(ticket: str | None) -> bool:
+def _consume_ticket_memory_with_user(ticket: str | None) -> tuple[bool, str | None]:
+    """内存消费（带 user）：成功返回 (True, user_id)；过期/缺失返回 (False, None)。"""
     if not ticket:
-        return False
+        return False, None
     now = time.monotonic()
     with _ticket_lock:
         _purge_expired_tickets(now)
-        expires_at = _tickets.pop(ticket, None)
-        return expires_at is not None and expires_at > now
+        entry = _tickets.pop(ticket, None)
+        if entry is None:
+            return False, None
+        try:
+            expires_at, uid = entry
+        except (ValueError, TypeError):
+            return False, None
+        if expires_at is not None and expires_at > now:
+            return True, (uid if isinstance(uid, str) else _normalize_user_id(uid))
+        return False, None
 
 
-def issue_ticket(ttl: float = SSE_TICKET_TTL_SECONDS) -> str:
-    """生成一个带 TTL 的随机单次票据 — 优先 Redis SET NX EX，原子且分布式。"""
+def _consume_ticket_memory(ticket: str | None) -> bool:
+    ok, _uid = _consume_ticket_memory_with_user(ticket)
+    return ok
+
+
+def issue_ticket(ttl: float = SSE_TICKET_TTL_SECONDS, user: Any | None = None, user_id: Any | None = None) -> str:
+    """生成一个带 TTL 的随机单次票据 — 优先 Redis SET NX EX，原子且分布式。
+
+    中文：签发前由调用方完成鉴权，本函数只做 user 绑定。user/user_id 任一显式传入即绑定
+    （user_id 优先）；均未传入视为匿名票 user_id=""（兼容旧单票调用）。
+    """
     # 中文：TTL 有界 fail-closed：非数值回退默认 60s；>3600 收敛 3600（防常驻票据）。
     try:
         ttl_int = int(ttl)
@@ -98,6 +163,12 @@ def issue_ticket(ttl: float = SSE_TICKET_TTL_SECONDS) -> str:
         ttl_int = SSE_TICKET_TTL_SECONDS
     if ttl_int > 3600:
         ttl_int = 3600
+    # 中文：绑定 user（user_id 优先于 user；缺省匿名""；恒归一为字符串）。
+    try:
+        bound_user = _normalize_user_id(user_id) if user_id is not None else _normalize_user_id(user)
+    except (ValueError, TypeError, AttributeError):
+        bound_user = ""
+    payload = _ticket_payload(bound_user)
     # 中文：ttl<=0 语义为立即过期（签发即不可消费；兼容旧契约，不落 Redis 避免 EX 非法）。
     if ttl_int <= 0:
         ticket = secrets.token_urlsafe(32)
@@ -108,20 +179,59 @@ def issue_ticket(ttl: float = SSE_TICKET_TTL_SECONDS) -> str:
         try:
             key = f"{_REDIS_TICKET_PREFIX}{ticket}"
             # Use SET with NX+EX — fakeredis supports this; ensure decoded responses not needed for SET
-            ok = r.set(key, "1", nx=True, ex=ttl_int)
+            ok = r.set(key, payload, nx=True, ex=ttl_int)
             if ok:
                 return ticket
             # Extremely unlikely collision — retry once with new ticket
             ticket2 = secrets.token_urlsafe(32)
             key2 = f"{_REDIS_TICKET_PREFIX}{ticket2}"
-            ok2 = r.set(key2, "1", nx=True, ex=ttl_int)
+            ok2 = r.set(key2, payload, nx=True, ex=ttl_int)
             if ok2:
                 return ticket2
-            return _issue_ticket_memory(ttl_int)
+            return _issue_ticket_memory(ttl_int, bound_user)
         except _REDIS_ERRORS as e:
             logger.warning("security.redis_issue_fallback_memory error=%s", str(e))
     # Fallback to memory
-    return _issue_ticket_memory(ttl_int)
+    return _issue_ticket_memory(ttl_int, bound_user)
+
+
+def consume_ticket_with_user(ticket: str | None) -> tuple[bool, str | None]:
+    """校验并消费票据（带 user 绑定返回）— 成功返回 (True, user_id 字符串)；失败返回 (False, None)。
+
+    中文：fail-closed 且原子。与 consume_ticket 同路径（GETDEL 优先，Lua 兜底，
+    Redis 未命中回查内存）；遗留纯"1"票按匿名""兼容，保证旧单测不断。
+    """
+    if not ticket:
+        return False, None
+    r = _get_redis_for_ticket()
+    if r is not None:
+        try:
+            key = f"{_REDIS_TICKET_PREFIX}{ticket}"
+            # 中文：原子 GETDEL（Redis>=6.2 语义，单 round-trip 防重放）。
+            try:
+                val = r.getdel(key)
+                if val is not None:
+                    return True, _parse_ticket_user(val)
+            except _REDIS_ERRORS:
+                # 中文：无 getdel 的旧客户端走 Lua 原子比较删除。
+                try:
+                    # 中文：Lua 一次取走旧值并删除（老客户端无 GETDEL 时的原子等价）。
+                    result = r.eval(
+                        "local v = redis.call('get', KEYS[1]); "
+                        "if v then redis.call('del', KEYS[1]); return v; "
+                        "else return false; end",
+                        1,
+                        key,
+                    )
+                    if result:
+                        return True, _parse_ticket_user(result)
+                except _REDIS_ERRORS:
+                    pass
+            # 中文：Redis 未命中回查内存（签发时 Redis 不可用→内存，恢复后仍可消费）。
+            return _consume_ticket_memory_with_user(ticket)
+        except _REDIS_ERRORS as e:
+            logger.warning("security.redis_consume_fallback_memory error=%s", str(e))
+    return _consume_ticket_memory_with_user(ticket)
 
 
 def consume_ticket(ticket: str | None) -> bool:

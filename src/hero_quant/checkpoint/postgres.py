@@ -287,7 +287,15 @@ def get_run_text(tenant: str, thread: str, seq: int, dsn: str | None = None) -> 
                         return val
                 except Exception:
                     pass
-            return _PG_RUN_BY_SEQ.get(f"{tenant}::{thread}::{int(seq)}")
+            _suffix = f"{tenant}::{thread}::{int(seq)}"
+            val = _PG_RUN_BY_SEQ.get(_suffix)
+            if val is not None:
+                return val
+            # 中文：warm 写入的键带 DSN-hash 前缀；调用方未传 dsn 时按后缀匹配兜底
+            for _k, _v in _PG_RUN_BY_SEQ.items():
+                if _k.endswith(_suffix):
+                    return _v
+            return None
     except Exception:
         return None
 

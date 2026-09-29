@@ -11,6 +11,9 @@ import types
 
 import pytest
 
+# 仓库根目录：替代硬编码本机绝对路径（D:/...），保证 CI/Linux 可运行
+_REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
+
 # ============================================================
 # market_data.py :132-134 宽 except 回退合成 K 线
 # ============================================================
@@ -150,14 +153,14 @@ def test_b3a_market_shared_registry_has_lock():
     assert hasattr(lk, "acquire") and hasattr(lk, "release")
 
     # 进一步：源码应含 with _shared_lock 路径（防止实现漂移）
-    src = pathlib.Path("D:/kaipanla-data/hero-quant/src/hero_quant/tools/market_data.py").read_text(encoding="utf-8")
+    src = (_REPO_ROOT / "src/hero_quant/tools/market_data.py").read_text(encoding="utf-8")
     assert "_shared_lock" in src and "with _shared_lock" in src
 
 
 def test_b3a_market_get_market_data_reuses_shared_registry(monkeypatch):
     """get_market_data 不应每调用新建 registry（浪费且规避 shared lock 契约）；应复用 _get_shared_registry。"""
 
-    src = pathlib.Path("D:/kaipanla-data/hero-quant/src/hero_quant/tools/market_data.py").read_text(encoding="utf-8")
+    src = (_REPO_ROOT / "src/hero_quant/tools/market_data.py").read_text(encoding="utf-8")
     # 关键修复：get_market_data 内应调用 _get_shared_registry 而非 _make_registry
     # 允许同时存在 _make_registry 定义，但函数体内不得直接调用 _make_registry
     # 简化断言：文件中存在 _get_shared_registry 且在 get_market_data 定义附近被调用
@@ -175,7 +178,7 @@ def test_b3a_market_get_market_data_reuses_shared_registry(monkeypatch):
 
 def test_b3a_market_no_dead_len_probe():
     """MarketDataRegistry 无 __len__ 时不得用 len(reg)==0 探测空；应删 dead len 分支。"""
-    src = pathlib.Path("D:/kaipanla-data/hero-quant/src/hero_quant/tools/market_data.py").read_text(encoding="utf-8")
+    src = (_REPO_ROOT / "src/hero_quant/tools/market_data.py").read_text(encoding="utf-8")
     assert "len(reg) == 0" not in src, "死 len 探测仍存在且必抛 TypeError"
     assert "getattr(reg, \"_loaders\"" not in src and "getattr(reg, '_loaders'" not in src, "仍触私有 _loaders，违背 public API 契约"
 
@@ -186,7 +189,7 @@ def test_b3a_market_no_dead_len_probe():
 
 def test_b3a_market_synthetic_no_dead_try():
     """_synthetic_fallback 中 list 字面量外层死 try 应删除（构造不可能抛）。"""
-    src = pathlib.Path("D:/kaipanla-data/hero-quant/src/hero_quant/tools/market_data.py").read_text(encoding="utf-8")
+    src = (_REPO_ROOT / "src/hero_quant/tools/market_data.py").read_text(encoding="utf-8")
     assert "# try to produce two bars" not in src
     import re
 
@@ -272,7 +275,7 @@ def test_b3a_corr_date_join_not_positional(monkeypatch):
 def test_b3a_corr_date_join_misaligned_would_differ():
     """补充：若退化为位置对齐，上述用例的 correlation 数值会与日期对齐显著不同；验证修复后 не回归到位置截断。"""
     # 此用例不依赖外部状态，仅文档化不变量：由上一用例的 points 已覆盖，此处仅占位保证 11 条齐全
-    src = pathlib.Path("D:/kaipanla-data/hero-quant/src/hero_quant/tools/correlation.py").read_text(encoding="utf-8")
+    src = (_REPO_ROOT / "src/hero_quant/tools/correlation.py").read_text(encoding="utf-8")
     # 修复后应出现日期抽取/合并逻辑（date/time/datetime 键或 join/merge）
     assert any(k in src for k in ["inner", "join", "merge", "date", "trade_date"]), "correlation 未引入日期对齐逻辑"
 
@@ -380,7 +383,7 @@ def test_b3a_presentation_parameters_deepcopy_dict_spec():
 
 def test_b3a_presentation_holds_rlock_when_iterating():
     """TOOL_REGISTRY 遍历应持 RLock，否则并发注册会抛 RuntimeError/KeyError。"""
-    src = pathlib.Path("D:/kaipanla-data/hero-quant/src/hero_quant/tools/presentation.py").read_text(encoding="utf-8")
+    src = (_REPO_ROOT / "src/hero_quant/tools/presentation.py").read_text(encoding="utf-8")
     assert "_REGISTRY_LOCK" in src, "presentation 未引入 _REGISTRY_LOCK"
     assert "with _REGISTRY_LOCK" in src, "present_definitions 未持 RLock 遍历"
     # 排除仅注释提及

@@ -24,10 +24,56 @@ from typing import Any
 
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
 
-from hero_quant.api.security import consume_ticket
+from hero_quant.api.security import consume_ticket, consume_ticket_with_user
 from hero_quant.infra.redis import RedisStream, get_redis
 
 logger = logging.getLogger(__name__)
+
+
+def _consume_ticket_identity(ticket: str | None) -> tuple[bool, str | None]:
+    """消费票据并返回 (ok, user_id)：优先带绑定的原子消费，兼容仅桩 consume_ticket 的旧测试替身。
+
+    中文：正常路径走 consume_ticket_with_user（单次原子消费，返回绑定 user_id 字符串，
+    匿名票为""）；当其失败时再探 consume_ticket——仅测试替身将其桩为 True 时才视为匿名
+    通过（生产真实失败时两者皆 False，无放行缺口）。
+    """
+    try:
+        ok, uid = consume_ticket_with_user(ticket)
+    except (ValueError, TypeError, AttributeError, RuntimeError, OSError):
+        ok, uid = False, None
+    if ok:
+        return True, (uid if isinstance(uid, str) else "")
+    try:
+        if consume_ticket(ticket):
+            return True, ""
+    except (ValueError, TypeError, AttributeError, RuntimeError, OSError):
+        pass
+    return False, None
+
+
+def _resolve_identity_channel(
+    ticket_user: str | None, claimed_user: str | None, ws: Any | None = None, kind: str = "trace"
+) -> tuple[str | None, str]:
+    """由服务端身份派生 channel：绑定票优先 ticket_user；匿名票兼容 claimed_user。
+
+    中文：ticket_user 非空时 claimed_user 为空则直接派生，声明不一致视为冒充返回 (None, reason)；
+    匿名票（""）时沿用旧语义由 claimed_user 决定频道（兼容 Monitor/旧单测），无声明则回退单机频道。
+    返回 (channel, "") 成功；失败返回 (None, reason)。
+    """
+    try:
+        t_user = (ticket_user or "").strip()
+    except (ValueError, TypeError, AttributeError):
+        t_user = ""
+    try:
+        claimed = (claimed_user or "").strip()
+    except (ValueError, TypeError, AttributeError):
+        claimed = ""
+    if t_user:
+        if claimed and claimed != t_user:
+            return None, f"Ticket user mismatch (ticket={t_user!r} claimed={claimed!r})"
+        return resolve_user_channel(t_user, ws, kind=kind), ""
+    # 匿名票：兼容旧 ?user= 频道语义（ticket 仍必填，仅防无票冒充）
+    return resolve_user_channel(claimed or None, ws, kind=kind), ""
 
 router = APIRouter()
 
@@ -294,17 +340,24 @@ async def ws_trace(
     """WebSocket 进度推送 — 订阅 trace 事件流。
 
     连接：ws://host/ws/trace?ticket=<ticket>&user=<userId，可选>
-    票据单次有效，需先 POST /v1/query/ticket 获取。ticket 保持纯随机语义，
-    user 仅决定频道归属（同 user 双连接共享 ws:channel:{user}，跨 user 隔离）。
+    票据单次有效，需先 POST /v1/query/ticket 获取。channel 由服务端票据身份派生：
+    绑定票（user_id 非空）以 ticket.user 为准，?user= 声明不一致视为冒充关闭 4001；
+    匿名票（user_id=""）兼容旧语义由 ?user= 决定频道（仍要求有效票据）。
     任何消息(ping/chat)均视为心跳，60s 无消息断开(4002)。
     """
-    if not ticket or not consume_ticket(ticket):
+    ok, ticket_user = _consume_ticket_identity(ticket)
+    if not ticket or not ok:
         await websocket.accept()
         await websocket.send_json({"type": "error", "code": -1002, "message": "Invalid or expired ticket"})
         await websocket.close(code=4001, reason="Invalid ticket")
         return
 
-    channel = resolve_user_channel(user, websocket, kind="trace")
+    channel, _mismatch = _resolve_identity_channel(ticket_user, user, websocket, kind="trace")
+    if channel is None:
+        await websocket.accept()
+        await websocket.send_json({"type": "error", "code": -1002, "message": "Ticket user mismatch"})
+        await websocket.close(code=4001, reason="Ticket user mismatch")
+        return
     await manager.connect(channel, websocket)
     heartbeat.record(channel)
     await mark_online(channel)
@@ -349,14 +402,20 @@ async def ws_query(
     ticket: str = Query(default="", description="SSE ticket"),
     user: str = Query(default="", description="R3 可选 userId：非空则频道为 ws:channel:{user}"),
 ):
-    """WebSocket for query stream — alternative to /v1/query/stream SSE."""
-    if not ticket or not consume_ticket(ticket):
+    """WebSocket for query stream — alternative to /v1/query/stream SSE（身份闭环同 ws_trace）。"""
+    ok, ticket_user = _consume_ticket_identity(ticket)
+    if not ticket or not ok:
         await websocket.accept()
         await websocket.send_json({"type": "error", "code": -1002, "message": "Invalid or expired ticket"})
         await websocket.close(code=4001, reason="Invalid ticket")
         return
 
-    channel = resolve_user_channel(user, websocket, kind="query")
+    channel, _mismatch = _resolve_identity_channel(ticket_user, user, websocket, kind="query")
+    if channel is None:
+        await websocket.accept()
+        await websocket.send_json({"type": "error", "code": -1002, "message": "Ticket user mismatch"})
+        await websocket.close(code=4001, reason="Ticket user mismatch")
+        return
     await manager.connect(channel, websocket)
     heartbeat.record(channel)
     await mark_online(channel)

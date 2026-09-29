@@ -54,10 +54,13 @@ def _clear_dsn_globals(pg, dsn):
             pg._PG_GLOBAL_META.pop(k, None)
 
 
-def test_warm_restores_run_mapping_after_restart():
+def test_warm_restores_run_mapping_after_restart(monkeypatch):
     """含 run_text 的行 -> 清映射 -> warm 后 list_thread_ids 恢复原始 run 且 run_text 可查。"""
     import hero_quant.checkpoint.postgres as pg
     from hero_quant.checkpoint.postgres import _thread_to_keys, get_saver
+
+    # 中文：禁用真实池创建（CI 有可达 PG service 时会误建真池），保证本测恒走注入的 fake pool
+    monkeypatch.setattr(pg, "ConnectionPool", None)
 
     dsn = "postgresql://postgres:postgres@localhost:5432/hero_quant_test_pr2d_warm"
     _clear_dsn_globals(pg, dsn)
@@ -95,10 +98,13 @@ def test_warm_restores_run_mapping_after_restart():
     pg._PG_RUN_BY_SEQ.clear()
 
 
-def test_no_real_pg_falls_back_to_memory_str_seq():
+def test_no_real_pg_falls_back_to_memory_str_seq(monkeypatch):
     """真 PG 缺席（pool=None）时 list_thread_ids 不抛；真 PG 路径无映射回退内存 str(seq)。"""
     import hero_quant.checkpoint.postgres as pg
     from hero_quant.checkpoint.postgres import _thread_to_keys, get_saver
+
+    # 中文：禁用真实池创建——CI 中 psycopg_pool 已安装且 PG service 可达，不隔离会误建真池
+    monkeypatch.setattr(pg, "ConnectionPool", None)
 
     dsn = "postgresql://postgres:postgres@localhost:5432/hero_quant_test_pr2d_nopg"
     _clear_dsn_globals(pg, dsn)
