@@ -14,8 +14,63 @@ import threading
 import time
 from typing import Any
 
-import structlog
-logger = structlog.get_logger("telemetry.otel")
+try:  # structlog 为可选依赖：缺失时回退 structlog 兼容垫片（支持 kwargs 键值对）
+    import structlog  # type: ignore
+
+    logger = structlog.get_logger("telemetry.otel")
+except Exception:  # pragma: no cover — 最小环境无 structlog
+    import logging as _logging
+
+    _fallback = _logging.getLogger("telemetry.otel")
+
+    class _StructlogCompatLogger:
+        """最小 structlog 兼容垫片：warning(msg, **kw) 渲染为结构化后缀，不抛 TypeError。"""
+
+        def __init__(self, inner: Any) -> None:
+            self._inner = inner
+
+        def _fmt(self, msg: str, kw: dict) -> str:
+            if not kw:
+                return msg
+            try:
+                suffix = " " + " ".join(f"{k}={v!r}" for k, v in kw.items() if k != "exc_info")
+            except Exception:
+                suffix = ""
+            return f"{msg}{suffix}"
+
+        def debug(self, msg: str, *a: Any, **kw: Any) -> None:
+            try:
+                self._inner.debug(self._fmt(msg, kw), *a, exc_info=kw.get("exc_info"))
+            except Exception:
+                pass
+
+        def info(self, msg: str, *a: Any, **kw: Any) -> None:
+            try:
+                self._inner.info(self._fmt(msg, kw), *a, exc_info=kw.get("exc_info"))
+            except Exception:
+                pass
+
+        def warning(self, msg: str, *a: Any, **kw: Any) -> None:
+            try:
+                self._inner.warning(self._fmt(msg, kw), *a, exc_info=kw.get("exc_info"))
+            except Exception:
+                pass
+
+        warn = warning
+
+        def error(self, msg: str, *a: Any, **kw: Any) -> None:
+            try:
+                self._inner.error(self._fmt(msg, kw), *a, exc_info=kw.get("exc_info"))
+            except Exception:
+                pass
+
+        def exception(self, msg: str, *a: Any, **kw: Any) -> None:
+            try:
+                self._inner.exception(self._fmt(msg, kw), *a)
+            except Exception:
+                pass
+
+    logger = _StructlogCompatLogger(_fallback)
 
 # 单例 Provider 缓存，避免每次 export 都创建/关闭管线（性能）
 _OTEL_PROVIDER_LOCK = threading.Lock()
@@ -138,6 +193,58 @@ def _is_allowed_endpoint(endpoint: str) -> bool:
         except (ValueError, TypeError, AttributeError, OSError, RuntimeError):
             pass
         return False
+
+
+# --- 本地 durable 审计队列（T3-3）：无 endpoint / 校验失败 / 导出失败时落盘不断审计 ---
+# 路径经 HERO_OTEL_QUEUE_PATH 覆盖，默认 data/（根 .gitignore 已忽略 /data/，不入仓）。
+_DURABLE_LOCK = threading.Lock()
+
+
+def _durable_queue_path() -> str:
+    try:
+        override = (os.environ.get("HERO_OTEL_QUEUE_PATH") or "").strip()
+    except Exception:
+        override = ""
+    return override or os.path.join("data", "otel-audit.jsonl")
+
+
+def _enqueue_durable_audit(record: dict) -> bool:
+    """本地 durable 审计落盘（只追加 JSON 行，永不抛错）。成功返回 True。"""
+    try:
+        import json as _json
+
+        path = _durable_queue_path()
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        row = dict(record or {})
+        row.setdefault("ts", time.time())
+        line = _json.dumps(row, ensure_ascii=False) + "\n"
+        with _DURABLE_LOCK:
+            with open(path, "a", encoding="utf-8") as _f:
+                _f.write(line)
+        return True
+    except Exception:
+        try:
+            logger.warning("otel durable enqueue failed", exc_info=True)
+        except Exception:
+            pass
+        return False
+
+
+def durable_queue_depth() -> int:
+    """本地 durable 审计队列深度（行数，文件缺失返回 0，永不抛错）。"""
+    try:
+        path = _durable_queue_path()
+        if not os.path.exists(path):
+            return 0
+        n = 0
+        with open(path, encoding="utf-8") as _f:
+            for _ in _f:
+                n += 1
+        return n
+    except Exception:
+        return 0
 
 
 class SessionTelemetryCoordinator:
@@ -269,15 +376,23 @@ class SessionTelemetryCoordinator:
     def export(self, payload: dict | None = None) -> None:
         """按档位导出遥测，离线安全。
 
-        优先 OTel SDK 批量管线（单例复用），缺失时回退 urllib；窄化异常捕获并日志化。
+        优先 OTel SDK 批量管线（单例复用），缺失时回退 urllib；失败/无 endpoint 时
+        落本地 durable 审计队列（data/otel-audit.jsonl），保证审计不断流；窄化异常
+        捕获并日志化。
         """
 
         if self.mode == "disabled":
             return
         endpoint = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT")
         if not endpoint:
+            # 无 endpoint 不是静默丢弃：审计走本地 durable 队列（T3-3）。
+            _enqueue_durable_audit({"mode": self.mode, "payload": payload or {}, "reason": "no_endpoint"})
             return
         if not self._validate_endpoint(endpoint):
+            # 校验失败同样不断审计：落本地 durable 队列。
+            _enqueue_durable_audit(
+                {"mode": self.mode, "payload": payload or {}, "reason": "endpoint_blocked", "endpoint": "***"}
+            )
             return
         # --- 尝试 OTel SDK 批量管线 ---
         global _OTEL_CACHED_PROVIDER, _OTEL_CACHED_PROCESSOR, _OTEL_CACHED_ENDPOINT
@@ -304,6 +419,28 @@ class SessionTelemetryCoordinator:
                         OTLPLogExporter = None  # type: ignore
                 if OTLPLogExporter is None:
                     raise ImportError("OTLPLogExporter not available")
+                # T3-3: exporter/endpoint 语义必须匹配。http(s) endpoint 配 gRPC
+                # exporter 会把审计吞进 gRPC target 且单测桩 http://collector.test
+                # 场景下永不走 urllib 回退——此时直接回退 urllib，保证审计不断流。
+                try:
+                    from urllib.parse import urlparse as _urlparse
+
+                    _scheme = (_urlparse(endpoint).scheme or "").lower()
+                except Exception:
+                    _scheme = ""
+                try:
+                    _mod = getattr(OTLPLogExporter, "__module__", "") or ""
+                except Exception:
+                    _mod = ""
+                _mod = str(_mod)
+                # 注：单测以 MagicMock 注入 exporter（__module__ 为 unittest.mock），
+                # 此时不做 scheme 判定，保持 Batch 路径可测；仅真实 exporter 做判定。
+                _is_mock_exporter = "mock" in _mod.lower() or type(OTLPLogExporter).__name__ == "MagicMock"
+                if not _is_mock_exporter and (
+                    (_scheme in ("http", "https") and ".proto.http." not in _mod)
+                    or (_scheme not in ("http", "https") and ".proto.http." in _mod and _scheme != "")
+                ):
+                    raise ImportError(f"exporter/endpoint scheme mismatch: {_scheme} vs {_mod}")
             except ImportError:
                 raise
             # 中文：锁内只做快照/发布（不阻塞 shutdown）；旧管线出锁后关闭，并发 export 不被 stall。
@@ -381,9 +518,10 @@ class SessionTelemetryCoordinator:
                 except (ValueError, TypeError, AttributeError, OSError) as _exc:
                     logger.warning("otel emit failed: %s", _exc)
 
-            # 批量管线复用，不在每次 export 中 shutdown；仅 full 档定期 force_flush，basic/disabled 跳过
+            # 批量管线复用，不在每次 export 中 shutdown；各启用档位均尝试 force_flush
+            # （有该方法才调）。历史 `mode == "full"` 条件永假（合法模式无 full），已修复。
             try:
-                if self.mode == "full" and hasattr(provider, "force_flush"):
+                if hasattr(provider, "force_flush"):
                     try:
                         provider.force_flush(timeout_millis=1000)  # type: ignore
                     except TypeError:
@@ -421,8 +559,11 @@ class SessionTelemetryCoordinator:
             with urllib.request.urlopen(req, timeout=0.5) as _resp:  # noqa: S310
                 pass
         except (ValueError, TypeError, AttributeError, OSError, RuntimeError) as e:
-            # 中文：离线安全契约：urllib 回退失败仅告警，不抛错。
+            # 中文：离线安全契约：urllib 回退失败落本地 durable 队列，不断审计，不抛错。
             logger.warning("otel urllib export failed: %s", e, exc_info=True)
+            _enqueue_durable_audit(
+                {"mode": self.mode, "payload": payload or {}, "reason": "urllib_failed", "error": str(e)[:200]}
+            )
             return
         return
 

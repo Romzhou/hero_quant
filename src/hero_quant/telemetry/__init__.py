@@ -9,12 +9,15 @@ from .circuit import CircuitBreaker, DualBucketRateLimiter, TokenBucket
 from .heartbeat import (
     HeartbeatTimer,
     _set_emitter,
+    clear_probe_override,
     get_temporal_heartbeat_details,
+    mark_probe_downstream_down,
     probe_temporal_sidecar,
+    probe_temporal_sidecar_v2,
     sidecar_heartbeat_probe,
     temporal_heartbeat,
 )
-from .otel import SessionTelemetryCoordinator, get_otel_mode
+from .otel import SessionTelemetryCoordinator, durable_queue_depth, get_otel_mode
 
 __all__ = [
     "SessionTelemetryCoordinator",
@@ -27,5 +30,9 @@ __all__ = [
     "temporal_heartbeat",
     "get_temporal_heartbeat_details",
     "probe_temporal_sidecar",
+    "probe_temporal_sidecar_v2",
+    "mark_probe_downstream_down",
+    "clear_probe_override",
+    "durable_queue_depth",
     "sidecar_heartbeat_probe",
 ]

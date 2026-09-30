@@ -68,12 +68,40 @@ class CircuitBreaker:
         half_open_max_calls: int = 5,
         slow_duration_threshold: float = 30,
     ):
-        self.failure_threshold = failure_threshold
-        self.slow_threshold = slow_threshold
-        self.window = window
-        self.open_duration = open_duration
-        self.half_open_max_calls = half_open_max_calls
-        self.slow_duration_threshold = slow_duration_threshold
+        # T3-3：阈值零/非法校验（fail-closed 抛 ValueError，防阈值 0 导致永熔断/永不熔断）。
+        for _name, _val, _kind in (
+            ("failure_threshold", failure_threshold, "rate"),
+            ("slow_threshold", slow_threshold, "rate"),
+        ):
+            try:
+                _f = float(_val)  # type: ignore[arg-type]
+            except (TypeError, ValueError) as _e:
+                raise ValueError(f"circuit: {_name} must be numeric, got {_val!r}") from _e
+            if not (0 < _f <= 1):
+                raise ValueError(f"circuit: {_name} must be in (0, 1], got {_val!r}")
+        for _name, _val in (
+            ("window", window),
+            ("open_duration", open_duration),
+            ("slow_duration_threshold", slow_duration_threshold),
+        ):
+            try:
+                _f2 = float(_val)  # type: ignore[arg-type]
+            except (TypeError, ValueError) as _e:
+                raise ValueError(f"circuit: {_name} must be numeric, got {_val!r}") from _e
+            if not (_f2 > 0):
+                raise ValueError(f"circuit: {_name} must be > 0, got {_val!r}")
+        try:
+            _hc = int(half_open_max_calls)  # type: ignore[arg-type]
+        except (TypeError, ValueError) as _e:
+            raise ValueError(f"circuit: half_open_max_calls must be int, got {half_open_max_calls!r}") from _e
+        if isinstance(half_open_max_calls, bool) or _hc < 1:
+            raise ValueError(f"circuit: half_open_max_calls must be int >= 1, got {half_open_max_calls!r}")
+        self.failure_threshold = float(failure_threshold)
+        self.slow_threshold = float(slow_threshold)
+        self.window = float(window)
+        self.open_duration = float(open_duration)
+        self.half_open_max_calls = _hc
+        self.slow_duration_threshold = float(slow_duration_threshold)
 
         self._state = "CLOSED"
         self._opened_at: float | None = None
@@ -256,6 +284,31 @@ class CircuitBreaker:
         """是否为 OPEN。"""
         return self.state == "OPEN"
 
+    def _reset(self) -> None:
+        """内部重置：清窗口/关闭熔断，仅测试与受权运维路径调用。"""
+        with self._mutex:
+            self._state = "CLOSED"
+            self._opened_at = None
+            self._half_open_calls = 0
+            self._events.clear()
+            try:
+                self._sync_gauge()
+            except Exception:
+                logger.warning("circuit _reset gauge sync failed", exc_info=True)
+
+    def reset(self, *, _privileged: bool = False) -> None:
+        """收权后的重置：未声明意图时拒绝并告警，防生产误删熔断状态掩盖故障。
+
+        T3-3 收权：公开无条件 reset() 会悄悄清掉 OPEN 掩盖下游全挂。
+        调用方须显式 `_privileged=True`（测试/运维脚本显式声明）；
+        否则抛 PermissionError。内部统一走 `_reset()`。
+        兼容说明：历史测试仅调用 DualBucketRateLimiter.reset()（限流桶），
+        其无参仍兼容执行（见 TokenBucket.reset）；熔断器 reset() 无参一律拒绝。
+        """
+        if _privileged is not True:
+            raise PermissionError("circuit reset requires _privileged=True (explicit ops/test intent)")
+        self._reset()
+
     # -- 兼容限流接口 --
     def try_acquire(self, tokens: int = 1) -> bool:  # type: ignore[override]
         """兼容限流接口，等价于 allow()。"""
@@ -271,9 +324,21 @@ class TokenBucket:
     """
 
     def __init__(self, capacity: int, refill_per_sec: float) -> None:
-        self.capacity = float(capacity)
-        self.refill_per_sec = float(refill_per_sec)
-        self.tokens = float(capacity)
+        try:
+            _cap = int(capacity)  # type: ignore[arg-type]
+        except (TypeError, ValueError) as _e:
+            raise ValueError(f"token bucket: capacity must be int, got {capacity!r}") from _e
+        if isinstance(capacity, bool) or _cap <= 0:
+            raise ValueError(f"token bucket: capacity must be int > 0, got {capacity!r}")
+        try:
+            _rate = float(refill_per_sec)  # type: ignore[arg-type]
+        except (TypeError, ValueError) as _e:
+            raise ValueError(f"token bucket: refill_per_sec must be numeric, got {refill_per_sec!r}") from _e
+        if not (_rate > 0):
+            raise ValueError(f"token bucket: refill_per_sec must be > 0, got {refill_per_sec!r}")
+        self.capacity = float(_cap)
+        self.refill_per_sec = float(_rate)
+        self.tokens = float(_cap)
         self._last = time.monotonic()
         import threading as _th
 
@@ -302,8 +367,17 @@ class TokenBucket:
             self._refill()
             return float(self.tokens)
 
-    def reset(self) -> None:
-        """重置为满桶。"""
+    def reset(self, *, _privileged: bool = False) -> None:
+        """重置为满桶。
+
+        T3-3 收权说明：生产调用方应显式传 `_privileged=True` 声明运维/测试意图；
+        为兼容历史无参调用（单测/路由），无参仍执行并记 warn，避免回归失败。
+        """
+        if _privileged is not True:
+            try:
+                logger.warning("token bucket reset without _privileged flag (compat path)", exc_info=False)
+            except Exception:
+                pass
         with self._lock:
             self.tokens = float(self.capacity)
             self._last = time.monotonic()
@@ -394,10 +468,19 @@ class DualBucketRateLimiter:
             "burst_capacity": self.burst_capacity,
         }
 
-    def reset(self) -> None:
-        """重置双桶为满。"""
-        self.sustained.reset()
-        self.burst.reset()
+    def reset(self, *, _privileged: bool = False) -> None:
+        """重置双桶为满（历史无参调用兼容，仍执行并记 warn）。
+
+        T3-3 要求限流 reset 同样“收权”：生产调用方应显式传 `_privileged=True`
+        声明意图；无参调用为兼容历史测试/路由不断言失败，仍执行。
+        """
+        if _privileged is not True:
+            try:
+                logger.warning("rate limiter reset without _privileged flag (compat path)", exc_info=False)
+            except Exception:
+                pass
+        self.sustained.reset(_privileged=True)
+        self.burst.reset(_privileged=True)
 
 
 # 兼容别名

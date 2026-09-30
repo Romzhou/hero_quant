@@ -113,25 +113,83 @@ def get_temporal_heartbeat_details() -> dict | None:
     return None
 
 
-def probe_temporal_sidecar(timeout: float = 0.5) -> str:
-    """探针 Temporal 侧车健康，离线安全始终返回可用占位。"""
-    # 若有最近 heartbeatDetails，视为侧车曾健康
+# 探针健康阈值：最近心跳在 stale 秒内视为新鲜。
+PROBE_STALE_SECONDS = 60.0
+
+
+def _probe_downstream_status(timeout: float = 0.5) -> tuple[str, str]:
+    """判定下游依赖状态，返回 (status, reason)。
+
+    healthy：heartbeatDetails 新鲜（stale 内）或 temporalio 可导入且可建连倾向；
+    degraded：temporalio 可导入但无新鲜心跳（离线占位）；
+    down：显式探针失败标记（见 mark_probe_downstream_down）或 checkpoint 明确报错。
+    默认无任何信号时为 degraded（离线安全，不误报 healthy 也不误报 down）。
+    """
+    try:
+        forced = getattr(_probe_downstream_status, "_forced", None)
+    except Exception:
+        forced = None
+    if forced in ("healthy", "degraded", "down"):
+        return forced, "forced"
     try:
         details = get_temporal_heartbeat_details()
-        if details is not None:
-            return "usable"
     except Exception:
         logger.warning("probe_temporal_sidecar details check failed", exc_info=True)
-    # 检查 temporalio 是否可导入，作为环境可用性探针
+        details = None
+    if isinstance(details, dict):
+        if details.get("downstream") == "down" or details.get("status") == "down":
+            return "down", "heartbeat_details_marked_down"
+        ts = details.get("ts")
+        try:
+            if isinstance(ts, (int, float)) and (time.time() - float(ts)) <= PROBE_STALE_SECONDS:
+                return "healthy", "fresh_heartbeat"
+        except Exception:
+            pass
     try:
         import importlib.util as _ilu
 
         if _ilu.find_spec("temporalio") is not None:
-            return "usable"
+            return "healthy", "temporalio_available"
     except Exception:
         logger.warning("probe_temporal_sidecar import check failed", exc_info=True)
-    # 离线环境仍返回可用占位，避免单测误判
+        return "down", "probe_error"
+    return "degraded", "offline_no_fresh_heartbeat"
+
+
+def mark_probe_downstream_down(reason: str = "") -> None:
+    """测试/运维钩子：强制下游探针为 down（模拟下游全挂）。"""
+    try:
+        _probe_downstream_status._forced = "down"  # type: ignore[attr-defined]
+        _probe_downstream_status._forced_reason = str(reason)  # type: ignore[attr-defined]
+    except Exception:
+        logger.warning("mark_probe_downstream_down failed", exc_info=True)
+
+
+def clear_probe_override() -> None:
+    """清除探针强制覆盖，恢复自动判定。"""
+    try:
+        _probe_downstream_status._forced = None  # type: ignore[attr-defined]
+    except Exception:
+        logger.warning("clear_probe_override failed", exc_info=True)
+
+
+def probe_temporal_sidecar(timeout: float = 0.5) -> str:
+    """探针 Temporal 侧车健康，分 healthy/degraded/down 三态。
+
+    兼容历史：healthy/degraded 均映射回 "usable"（离线安全不断言失败）；
+    仅下游全挂（down）返回 "down"。新代码请用 probe_temporal_sidecar_v2 取三态。
+    """
+    status, _ = _probe_downstream_status(timeout=timeout)
+    if status == "down":
+        return "down"
+    # 历史契约兼容：healthy/degraded 统一为 usable
     return "usable"
+
+
+def probe_temporal_sidecar_v2(timeout: float = 0.5) -> dict:
+    """三态探针详情：{status: healthy|degraded|down, reason, ts}。"""
+    status, reason = _probe_downstream_status(timeout=timeout)
+    return {"status": status, "reason": reason, "ts": time.time()}
 
 
 def sidecar_heartbeat_probe() -> dict:

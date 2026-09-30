@@ -11,7 +11,7 @@ import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 logger = logging.getLogger("hero_quant.scheduled.service")
 
@@ -352,6 +352,99 @@ def get_playbook(name: str) -> ScheduledPlaybook:
     return _PLAYBOOK_MAP[name]
 
 
+# ---------- T3-3 分布式单飞：SET NX PX + 幂等键 + 指数退避 ----------
+# 锁键：sched:lock:{name}:{date}；幂等键：{name}:{date}（date 取触发日触发时区）。
+# 无 Redis 时退化为进程内锁（单副本正确；多副本仍需 Redis，拿不到锁直接报 singleflight）。
+_DISPATCH_LOCAL_LOCKS: Dict[str, object] = {}
+_DISPATCH_LOCAL_LOCKS_GUARD = None
+_DISPATCH_SEEN_KEYS: Dict[str, Dict[str, str]] = {}
+_DISPATCH_TTL_SECONDS = 24 * 3600
+
+
+def _local_guard() -> object:
+    """进程内锁字典守卫（延迟建 threading.Lock，避免导入期开销）。"""
+    global _DISPATCH_LOCAL_LOCKS_GUARD
+    if _DISPATCH_LOCAL_LOCKS_GUARD is None:
+        import threading as _th
+
+        _DISPATCH_LOCAL_LOCKS_GUARD = _th.Lock()
+    return _DISPATCH_LOCAL_LOCKS_GUARD
+
+
+def _dispatch_redis() -> Any:
+    """取同步 Redis（无则 None；失败 fail-closed 走本地锁，不抛错）。"""
+    try:
+        from hero_quant.infra.redis import get_redis_sync as _get
+    except Exception:
+        return None
+    try:
+        return _get()
+    except Exception:
+        logger.warning("scheduled dispatch redis unavailable", exc_info=True)
+        return None
+
+
+def _try_acquire_singleflight(lock_key: str, px_ms: int = 60_000, retries: int = 4) -> tuple[bool, str]:
+    """SET NX PX 单飞获取，带指数退避。返回 (acquired, backend)。
+
+    backend: redis（分布式）/ local（进程内退化）。本地退化仅防同进程并发，
+    多副本场景必须配置 Redis 否则第二副本返回 duplicate（fail-closed 不重复执行）。
+    """
+    import random as _rand
+    import time as _time
+
+    delay = 0.02
+    for attempt in range(max(1, retries + 1)):
+        # 1) 优先 Redis SET NX PX（原子单飞）
+        client = _dispatch_redis()
+        if client is not None:
+            try:
+                ok = client.set(lock_key, "1", nx=True, px=px_ms)
+                if ok:
+                    return True, "redis"
+                return False, "redis"
+            except Exception:
+                logger.warning("scheduled singleflight redis error, fallback local", exc_info=True)
+        # 2) 本地退化：进程内 setnx 语义
+        try:
+            with _local_guard():  # type: ignore[attr-defined]
+                if lock_key not in _DISPATCH_LOCAL_LOCKS:
+                    import threading as _th
+
+                    _DISPATCH_LOCAL_LOCKS[lock_key] = _th.Lock()
+                _lk = _DISPATCH_LOCAL_LOCKS[lock_key]
+            got = _lk.acquire(blocking=False)  # type: ignore[union-attr]
+            if got:
+                return True, "local"
+            return False, "local"
+        except Exception:
+            logger.warning("scheduled singleflight local error", exc_info=True)
+            return False, "local"
+        # 指数退避 + 抖动（仅在需要重试抢锁时；幂等命中不走这里）
+        if attempt < retries:
+            try:
+                _time.sleep(delay + _rand.uniform(0, delay))
+            except Exception:
+                pass
+            delay = min(delay * 2, 0.5)
+    return False, "local"
+
+
+def _release_singleflight(lock_key: str, backend: str) -> None:
+    """释放单飞锁（本地锁才需释放；Redis 靠 PX 自过期，不主动 DEL 防误删续期者）。"""
+    if backend != "local":
+        return
+    try:
+        lk = _DISPATCH_LOCAL_LOCKS.get(lock_key)
+        if lk is not None:
+            try:
+                lk.release()  # type: ignore[union-attr]
+            except Exception:
+                pass
+    except Exception:
+        logger.warning("scheduled singleflight release failed", exc_info=True)
+
+
 class ScheduledService:
     """时区感知调度服务 — Temporal Cron 占位。
 
@@ -395,10 +488,26 @@ class ScheduledService:
         return name_or_cron
 
     def dispatch(self, name: str, after: Optional[datetime] = None) -> Dict[str, str]:
-        """时区感知分发 — 尝试 Temporal 入队，失败回退本地调度（离线安全）。"""
+        """时区感知分发 — SET NX PX 单飞 + 幂等键，去重多副本同 cron 重复下单。
+
+        幂等键 idempotency_key={name}:{date}（date 取下次触发日的触发时区日期）。
+        同一键第二次起返回 duplicate=True（含首次结果快照），不再重复执行入队；
+        锁竞争失败同样 duplicate=True（singleflight）。返回保持旧字段兼容。
+        """
 
         p = self.get_playbook(name)
         nxt = p.next_trigger(after=after)
+        idem_key = f"{p.name}:{nxt.date().isoformat()}"
+        # 幂等命中：直接回放首次结果（duplicate），不重复入队/下单
+        try:
+            seen = _DISPATCH_SEEN_KEYS.get(idem_key)
+        except Exception:
+            seen = None
+        if seen is not None:
+            dup = dict(seen)
+            dup["duplicate"] = "true"
+            dup["idempotency_key"] = idem_key
+            return dup
         result: Dict[str, str] = {
             "playbook": p.name,
             "cron": p.cron,
@@ -406,38 +515,67 @@ class ScheduledService:
             "next_trigger": nxt.isoformat(),
             "next_trigger_utc": nxt.astimezone(timezone.utc).isoformat(),
             "title_cn": p.title_cn,
+            "idempotency_key": idem_key,
+            "duplicate": "false",
         }
-        # Temporal client scaffold — try import temporalio, if available enqueue, else fallback
+        lock_key = f"sched:lock:{idem_key}"
+        acquired, backend = _try_acquire_singleflight(lock_key)
+        # 双重检查：抢锁期间已有副本完成，同样去重
         try:
-            import importlib.util as _ilu
+            seen2 = _DISPATCH_SEEN_KEYS.get(idem_key)
+        except Exception:
+            seen2 = None
+        if seen2 is not None:
+            _release_singleflight(lock_key, backend)
+            dup2 = dict(seen2)
+            dup2["duplicate"] = "true"
+            dup2["idempotency_key"] = idem_key
+            return dup2
+        if not acquired:
+            result["duplicate"] = "true"
+            result["singleflight"] = f"duplicate-{backend}"
+            result["temporal"] = "duplicate"
+            result["dispatch_mode"] = "duplicate"
+            return result
+        try:
+            # Temporal client scaffold — try import temporalio, if available enqueue, else fallback
+            try:
+                import importlib.util as _ilu
 
-            spec = _ilu.find_spec("temporalio")
-            if spec is not None:
-                try:
-                    # scaffold: real enqueue would use temporalio.client.Client
-                    # keep backward compat: log scaffold and mark enqueued
-                    logger.info(
-                        "temporal enqueue scaffold playbook=%s cron=%s tz=%s next=%s",
-                        p.name,
-                        p.cron,
-                        p.timezone,
-                        nxt.isoformat(),
-                    )
-                    result["temporal"] = "enqueued"
-                    result["dispatch_mode"] = "temporal"
-                except Exception as _e:
-                    logger.info("temporal unavailable -> scheduled fallback: %s", _e)
+                spec = _ilu.find_spec("temporalio")
+                if spec is not None:
+                    try:
+                        # scaffold: real enqueue would use temporalio.client.Client
+                        # keep backward compat: log scaffold and mark enqueued
+                        logger.info(
+                            "temporal enqueue scaffold playbook=%s cron=%s tz=%s next=%s",
+                            p.name,
+                            p.cron,
+                            p.timezone,
+                            nxt.isoformat(),
+                        )
+                        result["temporal"] = "enqueued"
+                        result["dispatch_mode"] = "temporal"
+                    except Exception as _e:
+                        logger.info("temporal unavailable -> scheduled fallback: %s", _e)
+                        result["temporal"] = "fallback"
+                        result["dispatch_mode"] = "scheduled"
+                else:
+                    logger.info("temporal unavailable -> scheduled fallback")
                     result["temporal"] = "fallback"
                     result["dispatch_mode"] = "scheduled"
-            else:
-                logger.info("temporal unavailable -> scheduled fallback")
+            except Exception as _e:  # pragma: no cover — offline-safe
+                logger.debug("silent handled: offline-safe: temporal dispatch", exc_info=_e)  # intentional
                 result["temporal"] = "fallback"
                 result["dispatch_mode"] = "scheduled"
-        except Exception as _e:  # pragma: no cover — offline-safe
-            logger.debug("silent handled: offline-safe: temporal dispatch", exc_info=_e)  # intentional
-            result["temporal"] = "fallback"
-            result["dispatch_mode"] = "scheduled"
-        return result
+            result["singleflight"] = f"executed-{backend}"
+            try:
+                _DISPATCH_SEEN_KEYS[idem_key] = dict(result)
+            except Exception:
+                logger.warning("scheduled dispatch memo store failed", exc_info=True)
+            return result
+        finally:
+            _release_singleflight(lock_key, backend)
 
 
 # 兼容别名
