@@ -457,20 +457,20 @@ class MarketDataRegistry:
         旧 close 口径（不静默放行）。
         """
         compared = 0
-        for field in ("open", "high", "low", "close", "volume"):
-            ref_v = self._first_field(ref_bars, field)
-            other_v = self._first_field(other_bars, field)
+        for ohlcv_field in ("open", "high", "low", "close", "volume"):
+            ref_v = self._first_field(ref_bars, ohlcv_field)
+            other_v = self._first_field(other_bars, ohlcv_field)
             if ref_v is None or other_v is None or ref_v == 0 or other_v == 0:
                 continue
             compared += 1
             try:
                 diff = abs(ref_v - other_v) / abs(ref_v)
             except (ValueError, TypeError, ArithmeticError) as e:
-                logger.warning("cross_source compare error for %s field=%s: %s", symbol, field, e, exc_info=e)
+                logger.warning("cross_source compare error for %s field=%s: %s", symbol, ohlcv_field, e, exc_info=e)
                 continue
             if diff > 0.01:
                 raise CrossSourceError(
-                    f"cross-source 1% check failed for {symbol} field={field}: "
+                    f"cross-source 1% check failed for {symbol} field={ohlcv_field}: "
                     f"{ref_label}={ref_v:.4f} vs {other_label}={other_v:.4f} diff={diff*100:.2f}%"
                 )
         if compared == 0:
@@ -513,16 +513,16 @@ class MarketDataRegistry:
                 f"cross-source unit mismatch for {symbol}: {ua} vs {ub} (board_lots vs shares is 100x, fail-closed)"
             )
         compared = 0
-        for field in ("open", "high", "low", "close", "volume"):
-            ref_v = self._first_field(bars_a, field)
-            other_v = self._first_field(bars_b, field)
+        for ohlcv_field in ("open", "high", "low", "close", "volume"):
+            ref_v = self._first_field(bars_a, ohlcv_field)
+            other_v = self._first_field(bars_b, ohlcv_field)
             if ref_v is None or other_v is None or ref_v == 0 or other_v == 0:
                 continue
             compared += 1
             diff = abs(ref_v - other_v) / abs(ref_v)
             if diff > 0.01:
                 raise CrossSourceError(
-                    f"cross-source 1% check failed for {symbol} field={field}: {ref_v:.4f} vs {other_v:.4f} diff={diff*100:.2f}%"
+                    f"cross-source 1% check failed for {symbol} field={ohlcv_field}: {ref_v:.4f} vs {other_v:.4f} diff={diff*100:.2f}%"
                 )
         if compared == 0:
             # 全字段缺失/不可比时退化为旧 close 口径（保持向后兼容，不静默放行）
