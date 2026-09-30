@@ -145,6 +145,8 @@ class TencentLoader:
             else:
                 tencent_symbol = code
             # Force https and sanitize symbol to prevent injection (MITM protection)
+            # 复权口径：fqkline qfq 硬编码前复权（provenance 由 registry 统一补
+            # adjust="qfq"+factor_asof=end，不得静默当未复权用）。
             tencent_symbol = urllib.parse.quote(tencent_symbol, safe="")
             url = (
                 f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={tencent_symbol},day,"

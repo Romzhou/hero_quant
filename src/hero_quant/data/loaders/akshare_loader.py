@@ -99,9 +99,12 @@ class AKShareLoader:
                 # 窄化捕获，禁止裸 except pass 静默错位
                 logger.warning("akshare date parse failed: %s", e, exc_info=True)
                 raise DataValidationError(f"akshare invalid date index: {e}") from e
-        # 成交量归一到 board_lots（A股 1 手=100股）；缺失则 fail-closed
-        # NOTE: akshare 东财成交量单位未经确认是否为股；确认前不做 /100 静默换算，
-        # 以免在单位未明时引入 100x 系统性偏差（见 detail log board_lots 项）。
+        # 成交量口径（fail-closed，不静默换算）：本 loader 声明 unit="board_lots"（A股手）。
+        # 但 akshare 东财成交量原始单位未经确认是否为股——确认前不做 /100 静默换算，
+        # 以免在单位未明时引入 100x 系统性偏差。registry 跨源 unit 校验 + provenance
+        # unit 透传会把手/股混用直接阻断（board_lots vs shares），调用方不得自行换算。
+        # 复权口径：live 经 stock_zh_a_hist(adjust="qfq") 硬编码前复权，provenance 由
+        # registry._provenance_adjust 统一补 adjust="qfq"+factor_asof=end。
         # TODO: confirm akshare unit; if in shares: vol = vol / 100.0
         if "volume" in df.columns:
             vol = pd.to_numeric(df["volume"], errors="coerce")

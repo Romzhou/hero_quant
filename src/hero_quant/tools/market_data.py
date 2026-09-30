@@ -73,6 +73,40 @@ def _synthetic_fallback(symbol: str, start: str, end: str):
     ]
 
 
+def _provenance_dict(prov) -> dict:
+    """provenance 强校验导出：source 非空 str + unit∈{board_lots,shares}，补 adjust/factor_asof。
+
+    中文：缺 unit 直接抛（CN 手/股 100x 口径，不做 shares 静默默认）；
+    adjust 缺省 'unknown'（tencent/akshare live 经 registry 补为 qfq）。
+    与 agent.grounding 的冻结 provenance schema 对齐。
+    """
+    source = getattr(prov, "source", None)
+    if not isinstance(source, str) or not source.strip():
+        raise ValueError(f"provenance.source must be non-empty str, got {source!r} (fail-closed)")
+    unit = getattr(prov, "unit", None)
+    if unit not in ("board_lots", "shares"):
+        raise ValueError(
+            f"provenance.unit must be 'board_lots' or 'shares', got {unit!r} (fail-closed, no silent default)"
+        )
+    out = {"source": source.strip(), "unit": unit}
+    adjust = getattr(prov, "adjust", None) or "unknown"
+    out["adjust"] = adjust
+    try:
+        asof = getattr(prov, "factor_asof", None)
+    except (AttributeError, TypeError, ValueError):
+        asof = None
+    if asof is not None:
+        out["factor_asof"] = asof
+    # 透传 provenance 额外字段，便于上游追踪来源细节
+    try:
+        extra = getattr(prov, "extra", None)
+    except (AttributeError, TypeError, ValueError):
+        extra = None
+    if extra:
+        out["extra"] = extra
+    return out
+
+
 @tool(
     name="get_market_data",
     description="Fetch OHLCV bars for a symbol via MarketDataRegistry (Tencent + Yahoo, synthetic fallback).",
@@ -83,6 +117,7 @@ def _synthetic_fallback(symbol: str, start: str, end: str):
             "interval": {"type": "string"},
             "start": {"type": "string"},
             "end": {"type": "string"},
+            "allow_synthetic": {"type": "boolean"},
         },
         "required": ["symbol"],
         "additionalProperties": False,
@@ -106,8 +141,14 @@ def get_market_data(
     interval: str = "1d",
     start: str = "2026-08-01",
     end: str = "2026-08-03",
+    allow_synthetic: bool = True,
 ) -> Dict[str, Any]:
-    """通过 Registry 拉取行情，含并发安全审计与双源回退；失败回退合成数据。"""
+    """通过 Registry 拉取行情，含并发安全审计与双源回退；合成需显式 allow_synthetic=True。
+
+    中文：合成自动回退仅靠 ok:False 标记不阻断——调用方忽略 ok 仍会把合成当 live
+    用。修复后瞬时/网络错误默认直接抛错，仅当显式 allow_synthetic=True 才回退
+    合成（且仍标记 ok:False + provenance synthetic）。
+    """
     spec = TOOL_REGISTRY.get("get_market_data")
     is_safe = False
     if spec is not None:
@@ -121,10 +162,7 @@ def get_market_data(
         reg = _get_shared_registry()
         # MarketDataRegistry.get_bars 已在无 loader 时抛 ImportError，无需 len(reg) 私有探测
         bars, prov = reg.get_bars(symbol, start, end, interval=interval)
-        provenance = {"source": getattr(prov, "source", "unknown"), "unit": getattr(prov, "unit", "shares")}
-        # 透传 provenance 额外字段，便于上游追踪来源细节
-        if hasattr(prov, "extra") and prov.extra:
-            provenance["extra"] = prov.extra
+        provenance = _provenance_dict(prov)
         return {"bars": bars, "provenance": provenance, "ok": True, "concurrency_safe": is_safe}
     except Exception as e:  # 中文：集中分发，需窄化后再决定合成或透传
         from hero_quant.data.registry import CrossSourceError as _CSE
@@ -139,12 +177,21 @@ def get_market_data(
         if isinstance(e, ImportError):
             raise RuntimeError("market data misconfigured: no loader available") from e
         if isinstance(e, (TimeoutError, ConnectionError, OSError, RuntimeError)):
-            # 仅瞬时/网络/运行时错误回退合成，且标记 ok:False + provenance synthetic 不可用作 live
+            # 合成回退需显式 allow_synthetic=True：默认直接抛，防调用方忽略 ok 拿合成当 live
+            if not allow_synthetic:
+                _logger.warning(
+                    "get_market_data refused synthetic fallback for %s (allow_synthetic=False): %s",
+                    symbol, e, exc_info=True,
+                )
+                raise RuntimeError(
+                    f"market data unavailable for {symbol}: {e} (synthetic fallback requires allow_synthetic=True)"
+                ) from e
+            # 显式 opt-in 后才回退合成，且标记 ok:False + provenance synthetic 不可用作 live
             _logger.warning("get_market_data fallback to synthetic for %s: %s", symbol, e, exc_info=True)
             bars = _synthetic_fallback(symbol, start, end)
             return {
                 "bars": bars,
-                "provenance": {"source": "synthetic", "unit": "shares"},
+                "provenance": {"source": "synthetic", "unit": "shares", "adjust": "none"},
                 "ok": False,
                 "error": str(e),
                 "concurrency_safe": is_safe,
@@ -277,6 +324,7 @@ def search_symbol(keyword: str) -> Dict[str, Any]:
             "interval": {"type": "string"},
             "start": {"type": "string"},
             "end": {"type": "string"},
+            "allow_synthetic": {"type": "boolean"},
         },
         "required": ["symbols"],
         "additionalProperties": False,
@@ -294,14 +342,19 @@ def get_bars_range(
     interval: str = "1d",
     start: str = "2026-08-01",
     end: str = "2026-08-03",
+    allow_synthetic: bool = True,
 ) -> Dict[str, Any]:
-    """批量拉取多标的行情，逐个调用 get_market_data 并聚合结果 — reuse shared registry."""
+    """批量拉取多标的行情，逐个调用 get_market_data 并聚合结果 — reuse shared registry.
+
+    中文：合成回退需显式 allow_synthetic=True（默认 True 保持存量离线可用，
+    但回退仍标记 ok:False + provenance synthetic；显式 False 时直接抛错）。
+    """
     data: Dict[str, Any] = {}
     reg = _get_shared_registry()
     for sym in symbols or []:
         try:
             bars, prov = reg.get_bars(sym, start, end, interval=interval)
-            provenance = {"source": getattr(prov, "source", "unknown"), "unit": getattr(prov, "unit", "shares")}
+            provenance = _provenance_dict(prov)
             data[sym] = {"bars": bars, "provenance": provenance, "ok": True}
         except Exception as e:
             from hero_quant.data.registry import CrossSourceError as _CSE
@@ -314,10 +367,14 @@ def get_bars_range(
                 raise
             if isinstance(e, ImportError):
                 raise RuntimeError("market data misconfigured: no loader available") from e
-            # 非 CrossSource 场景按 symbol 回退合成，但标记 ok:False + provenance synthetic
+            if not allow_synthetic:
+                raise RuntimeError(
+                    f"market data unavailable for {sym}: {e} (synthetic fallback requires allow_synthetic=True)"
+                ) from e
+            # 显式 opt-in 后按 symbol 回退合成，但标记 ok:False + provenance synthetic
             try:
                 bars_fb = _synthetic_fallback(sym, start, end)
-                data[sym] = {"bars": bars_fb, "provenance": {"source": "synthetic", "unit": "shares"}, "ok": False, "error": str(e)}
+                data[sym] = {"bars": bars_fb, "provenance": {"source": "synthetic", "unit": "shares", "adjust": "none"}, "ok": False, "error": str(e)}
             except (OSError, RuntimeError, ValueError, TypeError) as e2:  # 中文：窄化捕获
                 _logger.warning("synthetic fallback failed for %s: %s", sym, e2, exc_info=True)
                 data[sym] = {"bars": [], "ok": False, "error": str(e2)}

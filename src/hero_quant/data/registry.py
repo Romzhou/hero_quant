@@ -89,11 +89,16 @@ VALID_SOURCES = _VALID_SOURCES
 
 @dataclass
 class Provenance:
-    """数据血缘：记录每批 bars 的来源与单位，供上游校验与展示。"""
+    """数据血缘：记录每批 bars 的来源、单位、复权口径，供上游校验与展示。"""
 
     source: str
     unit: str  # board_lots（A股手）或 shares（股/合约），单位差异影响数量解读
     symbol: str
+    # 中文：复权口径显式化——hard-coded qfq 不得静默。tencent/akshare live 均为 qfq
+    # 前复权，synthetic 记为 "none"。factor_asof 为复权因子截止日（YYYY-MM-DD），
+    # 未知时为 None。老代码仅 {source,unit} 时，adjust 缺省为 "unknown"。
+    adjust: str = "unknown"
+    factor_asof: str | None = None
     extra: dict = field(default_factory=dict)
 
 
@@ -134,6 +139,8 @@ class MarketDataRegistry:
         """注册 loader 实例，需满足 markets/unit/get_bars 最小协议。
 
         会调用 trait.validate_loader 做签名与类型校验（若可用），保留 runtime_checkable 浅层检查。
+        中文：缺 unit 直接 fail-closed 抛错——CN 手/股 100x 混用是最危险口径，
+        getattr 静默默认 shares 会把手当股读，必须显式阻断。
         """
         # lightweight validate_loader if available (trait helper)
         try:
@@ -144,7 +151,11 @@ class MarketDataRegistry:
         except (ValueError, TypeError, AttributeError) as e:  # 中文：窄化契约异常，exc_info 链
             # validate_loader raises ValueError/TypeError on contract violation
             raise ValueError(f"loader trait validation failed: {e}") from e
-        if not (hasattr(loader, "markets") and hasattr(loader, "unit") and hasattr(loader, "get_bars")):
+        if not hasattr(loader, "unit"):
+            raise ValueError(f"loader {loader.__class__.__name__} missing unit: must declare 'board_lots' or 'shares' (fail-closed, no silent default)")
+        if getattr(loader, "unit") not in ("board_lots", "shares"):
+            raise ValueError(f"loader {loader.__class__.__name__}.unit must be 'board_lots' or 'shares', got {getattr(loader, 'unit')!r}")
+        if not (hasattr(loader, "markets") and hasattr(loader, "get_bars")):
             raise ValueError("loader must have markets, unit, get_bars")
         with self._loaders_lock:
             self._loaders.append(loader)
@@ -189,6 +200,117 @@ class MarketDataRegistry:
                 return not bool(bars)
             except (TypeError, ValueError, AttributeError):
                 return True
+
+    @staticmethod
+    def _first_field(bars, field: str) -> float | None:
+        """提取首根 bar 的指定数值字段（open/high/low/close/volume），缺列/NaN 返回 None。
+
+        与 _first_close 同口径的显式列检查 + NaN/None 归一，仅字段名参数化，
+        供跨源 OHLCV 全口径对比复用。
+        """
+        if bars is None:
+            return None
+        if hasattr(bars, "iloc") and hasattr(bars, "columns"):
+            try:
+                if hasattr(bars, "empty") and bars.empty:
+                    return None
+                try:
+                    if len(bars) == 0:
+                        return None
+                except (TypeError, ValueError, AttributeError) as e:
+                    logger.warning("_first_field len check failed: %s", e, exc_info=e)
+                    return None
+                try:
+                    has_col = field in bars.columns
+                except (TypeError, ValueError, AttributeError) as e:
+                    logger.warning("_first_field columns check failed: %s", e, exc_info=e)
+                    return None
+                if not has_col:
+                    return None
+                try:
+                    val = bars.iloc[0][field]
+                except (IndexError, KeyError, ValueError, TypeError, AttributeError) as e:
+                    logger.warning("_first_field DataFrame iloc access failed: %s", e, exc_info=e)
+                    return None
+                try:
+                    import pandas as pd
+                    if pd.isna(val):
+                        return None
+                except (ValueError, TypeError, AttributeError):
+                    pass
+                if val is None:
+                    return None
+                try:
+                    f = float(val)
+                except (ValueError, TypeError) as e:
+                    logger.warning("_first_field DataFrame conversion failed: %s val=%r", e, val, exc_info=e)
+                    return None
+                if math.isnan(f):
+                    return None
+                return f
+            except (ValueError, TypeError, AttributeError, IndexError, KeyError, RuntimeError) as e:
+                logger.warning("_first_field DataFrame branch error: %s", e, exc_info=e)
+                return None
+        try:
+            first = None
+            try:
+                for b in bars[:1]:  # type: ignore[index]
+                    first = b
+                    break
+                else:
+                    return None
+            except (TypeError, ValueError, AttributeError) as e:
+                logger.warning("_first_field list slice failed: %s", e, exc_info=e)
+                return None
+            if first is None:
+                return None
+            if isinstance(first, dict):
+                if field not in first:
+                    return None
+                v = first.get(field)
+                if v is None:
+                    return None
+                try:
+                    import pandas as pd
+                    if pd.isna(v):
+                        return None
+                except (ValueError, TypeError, AttributeError):
+                    pass
+                try:
+                    f = float(v)
+                except (ValueError, TypeError) as e:
+                    logger.warning("_first_field dict conversion failed: %s val=%r", e, v, exc_info=e)
+                    return None
+                if math.isnan(f):
+                    return None
+                return f
+            else:
+                logger.warning("_first_field unsupported bar type: %r", type(first))
+                return None
+        except (ValueError, TypeError, AttributeError) as e:
+            logger.warning("_first_field list branch error: %s", e, exc_info=e)
+            return None
+        return None
+
+    @staticmethod
+    def _bar_unit(bars) -> str | None:
+        """提取 bars 自带的单位标注（DataFrame.attrs['unit'] 或首 bar dict['unit']），无标注返回 None。"""
+        try:
+            attrs = getattr(bars, "attrs", None)
+            if isinstance(attrs, dict) and attrs.get("unit") in ("board_lots", "shares"):
+                return attrs["unit"]
+        except (TypeError, ValueError, AttributeError):
+            pass
+        try:
+            first = None
+            for b in (bars[:1] if hasattr(bars, "__getitem__") else []):  # type: ignore[index]
+                first = b
+                break
+            if isinstance(first, dict) and first.get("unit") in ("board_lots", "shares"):
+                return first["unit"]
+        except (TypeError, ValueError, AttributeError):
+            pass
+        return None
 
     @staticmethod
     def _first_close(bars) -> float | None:
@@ -292,6 +414,76 @@ class MarketDataRegistry:
         return None
 
     @staticmethod
+    def _require_loader_unit(loader) -> str:
+        """运行时 unit 强校验：缺失/非法直接抛，不做 shares 静默默认。
+
+        中文：CN 手/股 100x 混用是最危险口径，getattr(loader,'unit','shares')
+        会把手当股读。register 与 get_bars 均经此统一收口。
+        """
+        unit = getattr(loader, "unit", None)
+        if unit not in ("board_lots", "shares"):
+            raise ValueError(
+                f"loader {loader.__class__.__name__} missing/invalid unit: must declare "
+                f"'board_lots' or 'shares', got {unit!r} (fail-closed, no silent default)"
+            )
+        return unit
+
+    @staticmethod
+    def _provenance_adjust(loader, source: str, end=None) -> tuple[str, str | None]:
+        """复权口径显式化：硬编码 qfq 不得静默。
+
+        中文：tencent fqkline qfq / akshare adjust='qfq' 均为硬编码前复权，
+        provenance 必须带 adjust='qfq' + factor_asof=查询end；synthetic/yahoo/ccxt
+        未复权记 'none'；未知记 'unknown'。
+        """
+        if source == "synthetic":
+            return "none", None
+        lname = loader.__class__.__name__.lower()
+        lsrc = str(getattr(loader, "source", "") or "").lower()
+        lnm = str(getattr(loader, "name", "") or "").lower()
+        blob = f"{lname} {lsrc} {lnm}"
+        if "tencent" in blob or "akshare" in blob:
+            asof = str(end)[:10] if end else None
+            return "qfq", asof
+        if "yahoo" in blob or "ccxt" in blob:
+            return "none", None
+        return "unknown", None
+
+    def _compare_ohlcv_or_raise(self, symbol: str, ref_bars, other_bars, ref_label: str, other_label: str) -> None:
+        """OHLCV 全口径 1% 对比：任一字段首根偏差超阈值即阻断。
+
+        中文：只比首根 close 会漏掉 volume/unit/OHLC 口径差（tencent 手 vs yahoo 股
+        100x 即此类）。缺字段/NaN/零值的字段跳过该字段；全字段不可比时退化为
+        旧 close 口径（不静默放行）。
+        """
+        compared = 0
+        for field in ("open", "high", "low", "close", "volume"):
+            ref_v = self._first_field(ref_bars, field)
+            other_v = self._first_field(other_bars, field)
+            if ref_v is None or other_v is None or ref_v == 0 or other_v == 0:
+                continue
+            compared += 1
+            try:
+                diff = abs(ref_v - other_v) / abs(ref_v)
+            except (ValueError, TypeError, ArithmeticError) as e:
+                logger.warning("cross_source compare error for %s field=%s: %s", symbol, field, e, exc_info=e)
+                continue
+            if diff > 0.01:
+                raise CrossSourceError(
+                    f"cross-source 1% check failed for {symbol} field={field}: "
+                    f"{ref_label}={ref_v:.4f} vs {other_label}={other_v:.4f} diff={diff*100:.2f}%"
+                )
+        if compared == 0:
+            ref_close = self._first_close(ref_bars)
+            other_close = self._first_close(other_bars)
+            if ref_close not in (None, 0) and other_close not in (None, 0):
+                diff = abs(ref_close - other_close) / abs(ref_close)
+                if diff > 0.01:
+                    raise CrossSourceError(
+                        f"cross-source 1% check failed for {symbol}: {ref_label}={ref_close:.2f} vs {other_label}={other_close:.2f} diff={diff*100:.2f}%"
+                    )
+
+    @staticmethod
     def _infer_loader_source(loader) -> str:
         """按类名推断来源，兜底读 loader.source/name。"""
         cls_name = loader.__class__.__name__.lower()
@@ -304,18 +496,44 @@ class MarketDataRegistry:
         else:
             return getattr(loader, "source", getattr(loader, "name", cls_name))
 
-    def _cross_source_check_bars(self, symbol: str, bars_a, bars_b) -> None:
-        """显式双 bars 对比口径 — 中文：避免与 prov 嗅探重载混淆。"""
+    def _cross_source_check_bars(self, symbol: str, bars_a, bars_b, unit_a: str | None = None, unit_b: str | None = None) -> None:
+        """显式双 bars 对比口径 — 中文：OHLCV 全口径 + unit，避免与 prov 嗅探重载混淆。
+
+        对比规则（任一命中即 CrossSourceError 阻断）：
+        - unit 不一致（board_lots vs shares，100x 口径差）直接阻断；
+        - OHLCV 任一字段首根值偏差超 1% 阻断（缺字段/NaN 的字段跳过该字段，
+          全缺时退化为旧 close 口径）。
+        """
         if self._bars_empty(bars_a) or self._bars_empty(bars_b):
             return
-        ref_close = self._first_close(bars_a)
-        other_close = self._first_close(bars_b)
-        if ref_close not in (None, 0) and other_close not in (None, 0):
-            diff = abs(ref_close - other_close) / abs(ref_close)
+        ua = unit_a or self._bar_unit(bars_a)
+        ub = unit_b or self._bar_unit(bars_b)
+        if ua is not None and ub is not None and ua != ub:
+            raise CrossSourceError(
+                f"cross-source unit mismatch for {symbol}: {ua} vs {ub} (board_lots vs shares is 100x, fail-closed)"
+            )
+        compared = 0
+        for field in ("open", "high", "low", "close", "volume"):
+            ref_v = self._first_field(bars_a, field)
+            other_v = self._first_field(bars_b, field)
+            if ref_v is None or other_v is None or ref_v == 0 or other_v == 0:
+                continue
+            compared += 1
+            diff = abs(ref_v - other_v) / abs(ref_v)
             if diff > 0.01:
                 raise CrossSourceError(
-                    f"cross-source 1% check failed for {symbol}: {ref_close:.2f} vs {other_close:.2f} diff={diff*100:.2f}%"
+                    f"cross-source 1% check failed for {symbol} field={field}: {ref_v:.4f} vs {other_v:.4f} diff={diff*100:.2f}%"
                 )
+        if compared == 0:
+            # 全字段缺失/不可比时退化为旧 close 口径（保持向后兼容，不静默放行）
+            ref_close = self._first_close(bars_a)
+            other_close = self._first_close(bars_b)
+            if ref_close not in (None, 0) and other_close not in (None, 0):
+                diff = abs(ref_close - other_close) / abs(ref_close)
+                if diff > 0.01:
+                    raise CrossSourceError(
+                        f"cross-source 1% check failed for {symbol}: {ref_close:.2f} vs {other_close:.2f} diff={diff*100:.2f}%"
+                    )
 
     def _cross_source_check(self, symbol: str, bars, prov=None, interval="1d", start=None, end=None) -> None:
         """跨源 1% 一致性校验，超阈值阻断。
@@ -334,18 +552,19 @@ class MarketDataRegistry:
             logger.warning("cross_source check skipped for %s: missing start/end", symbol)
             return
         # 模式二：以主数据源为基准，遍历其他 loader 做对照
-
-        try:
-            ref_close = self._first_close(bars)
-            if ref_close is None or ref_close == 0:
-                return
-            # NaN already normalized to None in _first_close, but guard
-            if isinstance(ref_close, float) and math.isnan(ref_close):
-                return
-        except (ValueError, TypeError, ArithmeticError) as e:
-            logger.warning("cross_source check _first_close error for %s: %s", symbol, e, exc_info=e)
-            return
         current_source = getattr(prov, "source", "") if prov else ""  # 跳过自身避免自比
+        # 主数据源 unit：provenance 优先，缺失则经运行时强校验取 loader unit
+        current_unit = getattr(prov, "unit", None) if prov else None
+        if current_unit not in ("board_lots", "shares"):
+            with self._loaders_lock:
+                _all = list(self._loaders)
+            for _cand in _all:
+                if self._infer_loader_source(_cand) == current_source:
+                    try:
+                        current_unit = self._require_loader_unit(_cand)
+                        break
+                    except (ValueError, TypeError, AttributeError):
+                        continue
         with self._loaders_lock:
             loaders_snapshot = list(self._loaders)
         for loader in loaders_snapshot:
@@ -356,16 +575,39 @@ class MarketDataRegistry:
             market = self._detect_market(symbol)
             if markets and market not in markets:
                 continue
+            # comparator 缺 unit 直接 fail-closed：禁止静默跳过（此前 continue 会漏掉手/股混用）
+            try:
+                other_unit_declared = self._require_loader_unit(loader)
+            except (ValueError, TypeError, AttributeError) as e:
+                logger.warning("cross_source comparator %s missing unit for %s: %s", loader_source, symbol, e, exc_info=e)
+                raise CrossSourceError(
+                    f"cross-source unit unknown for {symbol}: comparator {loader_source} missing unit (fail-closed)"
+                ) from e
+            # 手/股混用直接阻断：tencent 手 vs yahoo 股 100x，不得换算放行
+            if current_unit in ("board_lots", "shares") and other_unit_declared != current_unit:
+                raise CrossSourceError(
+                    f"cross-source unit mismatch for {symbol}: {current_source}={current_unit} vs "
+                    f"{loader_source}={other_unit_declared} (board_lots vs shares is 100x, fail-closed)"
+                )
             try:
                 result = loader.get_bars(symbol, start, end, interval)
+            except CrossSourceError:
+                raise
             except Exception as e:
+                # comparator 异常 fail-closed：禁止静默跳过（此前 continue 会漏掉口径差）
                 logger.warning("cross_source comparator %s failed for %s: %s", loader_source, symbol, e, exc_info=e)
-                continue
+                raise CrossSourceError(
+                    f"cross-source comparator {loader_source} failed for {symbol}: {e} (fail-closed)"
+                ) from e
             if result is None:
-                continue
+                raise CrossSourceError(
+                    f"cross-source comparator {loader_source} returned None for {symbol} (fail-closed)"
+                )
             other_bars = result[0] if isinstance(result, tuple) and len(result)==2 else result
             if self._bars_empty(other_bars):
-                continue
+                raise CrossSourceError(
+                    f"cross-source comparator {loader_source} returned empty bars for {symbol} (fail-closed)"
+                )
             # synthetic 参与时不再静默跳过：混合 synthetic/live 为 fail-closed，需显式 opt-in 才能放行
             this_is_synthetic = (current_source == "synthetic")
             other_prov = result[1] if isinstance(result, tuple) and len(result) == 2 else None
@@ -376,21 +618,18 @@ class MarketDataRegistry:
                     raise CrossSourceError(
                         f"cross-source synthetic mix rejected for {symbol}: {current_source} vs {other_source} (use synthetic-aware prov to opt-in)"
                     )
-                # 中文：opt-in 仅放行混合标记，仍需执行后续 1% 对比，禁止直接 continue 跳过校验
+                # 中文：opt-in 仅放行混合标记，仍需执行后续 OHLCV 对比，禁止直接 continue 跳过校验
                 logger.warning("cross_source synthetic mix allowed via opt-in for %s: %s vs %s", symbol, current_source, other_source)
             try:
-                other_close = self._first_close(other_bars)
-                if ref_close not in (None, 0) and other_close not in (None, 0):
-                    diff = abs(ref_close - other_close) / abs(ref_close)
-                    if diff > 0.01:
-                        raise CrossSourceError(
-                            f"cross-source 1% check failed for {symbol}: {current_source}={ref_close:.2f} vs {loader_source}={other_close:.2f} diff={diff*100:.2f}%"
-                        )
+                # OHLCV 全口径对比（close/volume/OHLC 任一超 1% 即阻断）
+                self._compare_ohlcv_or_raise(symbol, bars, other_bars, current_source, loader_source)
             except CrossSourceError:
                 raise
             except (ValueError, TypeError, ArithmeticError) as e:
                 logger.warning("cross_source compare error for %s: %s vs %s: %s", symbol, current_source, loader_source, e, exc_info=e)
-                continue
+                raise CrossSourceError(
+                    f"cross-source compare failed for {symbol}: {current_source} vs {loader_source}: {e} (fail-closed)"
+                ) from e
         return
 
     def get_bars(self, symbol: str, start: str, end: str, interval: str = "1d") -> tuple[Any, "Provenance"]:
@@ -428,21 +667,42 @@ class MarketDataRegistry:
             # 兼容 (bars, provenance) 二元组与纯 bars 两种返回
             bars = None
             prov = None
+            loader_unit = self._require_loader_unit(loader)
             if isinstance(result, tuple) and len(result) == 2:
                 bars, prov = result
                 if prov is None:
-                    prov = Provenance(source=_resolve_provenance(loader, result, prov), unit=getattr(loader, "unit", "shares"), symbol=symbol)
+                    _src0 = _resolve_provenance(loader, result, prov)
+                    _adj0, _asof0 = self._provenance_adjust(loader, _src0, end)
+                    prov = Provenance(source=_src0, unit=loader_unit, symbol=symbol, adjust=_adj0, factor_asof=_asof0)
+                else:
+                    # loader 自带 prov 时仍强校验 unit，并补齐 adjust/factor_asof 复权口径
+                    if getattr(prov, "unit", None) not in ("board_lots", "shares"):
+                        raise ValueError(
+                            f"loader {loader.__class__.__name__} provenance unit invalid: "
+                            f"got {getattr(prov, 'unit', None)!r} (fail-closed, no silent default)"
+                        )
+                    if getattr(prov, "adjust", "unknown") in (None, "", "unknown"):
+                        try:
+                            _adj1, _asof1 = self._provenance_adjust(loader, getattr(prov, "source", "") or "", end)
+                            prov.adjust = _adj1
+                            if prov.factor_asof is None:
+                                prov.factor_asof = _asof1
+                        except (ValueError, TypeError, AttributeError) as e:
+                            logger.warning("provenance adjust fill failed for %s: %s", symbol, e, exc_info=e)
             else:
                 bars = result
-                unit = getattr(loader, "unit", "shares")
                 source = _resolve_provenance(loader, result, None)
-                prov = Provenance(source=source, unit=unit, symbol=symbol)
+                _adj2, _asof2 = self._provenance_adjust(loader, source, end)
+                prov = Provenance(source=source, unit=loader_unit, symbol=symbol, adjust=_adj2, factor_asof=_asof2)
             if self._bars_empty(bars):
                 continue
             if not getattr(prov, "source", None):
                 prov.source = _resolve_provenance(loader, result, prov)
-            if not getattr(prov, "unit", None):
-                prov.unit = getattr(loader, "unit", "shares")
+            if getattr(prov, "unit", None) not in ("board_lots", "shares"):
+                raise ValueError(
+                    f"loader {loader.__class__.__name__} provenance unit invalid: "
+                    f"got {getattr(prov, 'unit', None)!r} (fail-closed, no silent default)"
+                )
             # 记录审计日志：用于追踪每次成功取数的来源与单位（有界环形缓冲，线程安全）
             audit_entry = {
                 "symbol": symbol,
