@@ -33,8 +33,12 @@ def test_health_and_metrics_and_wall_time():
         assert body.get("checkpoint") in ("memory", "pg")
     else:
         assert body.get("status") == "ok"
-    # /metrics contains wall_time
-    m = c.get("/metrics")
+    # /metrics contains wall_time（T4-1 需 X-Ticket 鉴权；匿名 401 为预期）
+    from hero_quant.api import security as _sec_front_spa
+
+    m_anon = c.get("/metrics")
+    assert m_anon.status_code == 401
+    m = c.get("/metrics", headers={"X-Ticket": _sec_front_spa.issue_ticket(ttl=60)})
     assert m.status_code == 200
     txt = m.text
     assert "wall_time" in txt.lower() or "wall-time" in txt.lower(), f"wall_time missing in metrics: {txt[:500]}"

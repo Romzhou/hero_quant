@@ -17,7 +17,7 @@ def test_e2e_query_to_report(monkeypatch):
     bars, prov = reg.get_bars("600519.SH", "1d", "2026-08-01", "2026-08-10")
     # grounding
     ledger = GroundingLedger()
-    ledger.ingest("600519.SH", [{"close": b["close"], "date": b.get("date","2026-08-10")} for b in bars[:1]])
+    ledger.ingest("600519.SH", [{"close": b["close"], "date": b.get("date","2026-08-10")} for b in bars[:1]], provenance=dict(prov) if isinstance(prov, dict) else {"source": "test", "unit": "board_lots"})
     ledger.assert_price("600519.SH", bars[0]["close"])
 
     # backtest

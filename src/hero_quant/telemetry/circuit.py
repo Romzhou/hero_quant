@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 import logging
+import math
 
 import collections
 import time
@@ -334,8 +335,14 @@ class TokenBucket:
             _rate = float(refill_per_sec)  # type: ignore[arg-type]
         except (TypeError, ValueError) as _e:
             raise ValueError(f"token bucket: refill_per_sec must be numeric, got {refill_per_sec!r}") from _e
-        if not (_rate > 0):
-            raise ValueError(f"token bucket: refill_per_sec must be > 0, got {refill_per_sec!r}")
+        # 中文：refill_per_sec=0 语义为“永不补充”（单测一次性耗尽桶，如 router 熔断测试）；
+        # 负数/NaN 仍拒绝。_refill 中 rate<=0 时跳过补充，避免 0 速率误加 token。
+        try:
+            _bad = not (_rate >= 0) or math.isnan(_rate)
+        except (TypeError, ValueError):
+            _bad = True
+        if _bad:
+            raise ValueError(f"token bucket: refill_per_sec must be >= 0, got {refill_per_sec!r}")
         self.capacity = float(_cap)
         self.refill_per_sec = float(_rate)
         self.tokens = float(_cap)

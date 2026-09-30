@@ -100,7 +100,7 @@ def test_batch_frozen_identity():
 
     @tool(name="get_market_data", description="ingest", is_concurrency_safe=True, parameters={"type":"object","properties":{"symbol":{"type":"string"}},"required":["symbol"]}, output={"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"]})
     def get_market_data(symbol: str):
-        ledger.ingest(symbol, [{"close": 150.0, "low": 140.0, "high": 160.0, "date": "2026-08-19"}])
+        ledger.ingest(symbol, [{"close": 150.0, "low": 140.0, "high": 160.0, "date": "2026-08-19"}], provenance={"source": "test", "unit": ("board_lots" if str(symbol).endswith(".SH") else "shares")})
         return {"ok": True, "symbol": symbol}
 
     @tool(name="assert_price", description="assert", is_concurrency_safe=False, parameters={"type":"object","properties":{"symbol":{"type":"string"},"price":{"type":"number"}},"required":["symbol","price"]}, output={"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"]})
@@ -123,14 +123,14 @@ def test_batch_frozen_identity():
 
     # Scenario 2: prior ingest then batch should pass (authorized snapshot contains TSLA, and price valid)
     ledger2 = GroundingLedger()
-    ledger2.ingest("TSLA", [{"close": 150.0, "low": 140.0, "high": 160.0, "date": "2026-08-19"}])
+    ledger2.ingest("TSLA", [{"close": 150.0, "low": 140.0, "high": 160.0, "date": "2026-08-19"}], provenance={"source": "test", "unit": "shares"})
     # rewire tools to use ledger2
     TOOL_REGISTRY.pop("get_market_data", None)
     TOOL_REGISTRY.pop("assert_price", None)
 
     @tool(name="get_market_data", description="ingest", is_concurrency_safe=True, parameters={"type":"object","properties":{"symbol":{"type":"string"}},"required":["symbol"]}, output={"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"]})
     def get_market_data2(symbol: str):
-        ledger2.ingest(symbol, [{"close": 150.0, "low": 140.0, "high": 160.0, "date": "2026-08-19"}])
+        ledger2.ingest(symbol, [{"close": 150.0, "low": 140.0, "high": 160.0, "date": "2026-08-19"}], provenance={"source": "test", "unit": ("board_lots" if str(symbol).endswith(".SH") else "shares")})
         return {"ok": True, "symbol": symbol}
 
     @tool(name="assert_price", description="assert", is_concurrency_safe=False, parameters={"type":"object","properties":{"symbol":{"type":"string"},"price":{"type":"number"}},"required":["symbol","price"]}, output={"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"]})
@@ -177,7 +177,7 @@ def test_grounding_percent_only_does_not_trigger_failure():
     for n in ["dummy_ok"]:
         TOOL_REGISTRY.pop(n, None)
     ledger = GroundingLedger()
-    ledger.ingest("AAPL", [{"close": 150.0, "low": 140.0, "high": 160.0, "date": "2026-08-19"}])
+    ledger.ingest("AAPL", [{"close": 150.0, "low": 140.0, "high": 160.0, "date": "2026-08-19"}], provenance={"source": "test", "unit": "shares"})
 
     @tool(name="dummy_ok", description="ok", is_concurrency_safe=True, parameters={"type": "object", "properties": {}}, output={"type": "object", "properties": {"ok": {"type": "boolean"}}})
     def dummy_ok():
@@ -207,7 +207,7 @@ def test_grounding_quantity_only_pure_text_verified():
     from hero_quant.agent.grounding import GroundingLedger
 
     ledger = GroundingLedger()
-    ledger.ingest("AAPL", [{"close": 150.0, "low": 140.0, "high": 160.0}])
+    ledger.ingest("AAPL", [{"close": 150.0, "low": 140.0, "high": 160.0}], provenance={"source": "test", "unit": "shares"})
 
     class FakeLLM:
         def stream_chat(self, goal):
@@ -224,7 +224,7 @@ def test_grounding_percent_pure_text_no_false_positive():
     from hero_quant.agent.grounding import GroundingLedger
 
     ledger = GroundingLedger()
-    ledger.ingest("600519.SH", [{"close": 1500.0, "low": 1400.0, "high": 1600.0}])
+    ledger.ingest("600519.SH", [{"close": 1500.0, "low": 1400.0, "high": 1600.0}], provenance={"source": "test", "unit": "board_lots"})
 
     class FakeLLM:
         def stream_chat(self, goal):

@@ -24,7 +24,7 @@ def test_extract_claims_basic():
 def test_assert_price_normalizes_thousand():
     from hero_quant.agent.grounding import GroundingLedger
     ledger = GroundingLedger()
-    ledger.ingest("600519.SH", [{"close": 1500.0, "low": 1400.0, "high": 1600.0, "date": "2026-08-19"}])
+    ledger.ingest("600519.SH", [{"close": 1500.0, "low": 1400.0, "high": 1600.0, "date": "2026-08-19"}], provenance={"source": "test", "unit": "board_lots"})
     # string "1,500" should normalize to 1500
     ledger.assert_price("600519.SH", "1,500")
     # also with currency
@@ -64,7 +64,7 @@ def test_loop_claim_extraction_uses_extract_claims():
     from hero_quant.agent.loop import AgentLoop
     from hero_quant.agent.grounding import GroundingLedger
     ledger = GroundingLedger()
-    ledger.ingest("AAPL", [{"close": 1234.56, "low": 1200.0, "high": 1300.0, "date": "2026-08-19"}])
+    ledger.ingest("AAPL", [{"close": 1234.56, "low": 1200.0, "high": 1300.0, "date": "2026-08-19"}], provenance={"source": "test", "unit": "shares"})
 
     class FakeLLM:
         def stream_chat(self, goal):
@@ -82,7 +82,7 @@ def test_loop_grounding_ignores_percent_quantity_date_range():
     from hero_quant.agent.loop import AgentLoop
     from hero_quant.agent.grounding import GroundingLedger
     ledger = GroundingLedger()
-    ledger.ingest("AAPL", [{"close": 150.0, "low": 140.0, "high": 160.0}])
+    ledger.ingest("AAPL", [{"close": 150.0, "low": 140.0, "high": 160.0}], provenance={"source": "test", "unit": "shares"})
 
     class FakeLLM:
         def stream_chat(self, goal):
@@ -98,7 +98,7 @@ def test_graph_path_uses_same_extract_claims_rule():
     from hero_quant.agent.loop import AgentLoop
     from hero_quant.agent.grounding import GroundingLedger
     ledger = GroundingLedger()
-    ledger.ingest("AAPL", [{"close": 150.0, "low": 140.0, "high": 160.0, "date": "2026-08-19"}])
+    ledger.ingest("AAPL", [{"close": 150.0, "low": 140.0, "high": 160.0, "date": "2026-08-19"}], provenance={"source": "test", "unit": "shares"})
 
     class FakeGraph:
         def invoke(self, state):
@@ -120,7 +120,7 @@ def test_graph_path_percent_only_not_false_negative():
     from hero_quant.agent.loop import AgentLoop
     from hero_quant.agent.grounding import GroundingLedger
     ledger = GroundingLedger()
-    ledger.ingest("AAPL", [{"close": 1234.56, "low": 1200.0, "high": 1300.0}])
+    ledger.ingest("AAPL", [{"close": 1234.56, "low": 1200.0, "high": 1300.0}], provenance={"source": "test", "unit": "shares"})
 
     class FakeGraph2:
         def invoke(self, state):
