@@ -1,0 +1,16 @@
+# gitleaks allowlist：测试假密钥放行（脱敏测试固定假值，无真实密钥）
+# CI 日志 DBG: "no gitleaks config found in path .gitleaks.toml, using default" —— 建此文件即被默认加载
+title = "hero-quant gitleaks config"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "测试假密钥（脱敏/扫描单测固定假值）"
+paths = [
+  '''tests/test_security_stress.py''',
+  '''tests/test_0904_a3b.py''',
+  '''tests/test_redaction_auto.py''',
+  '''tests/test_scanner.py''',
+  '''tests/test_retest271_lane_b.py''',
+]
