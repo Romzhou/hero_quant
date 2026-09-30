@@ -29,11 +29,17 @@ except ImportError:  # pragma: no cover - POSIX
 
 logger = logging.getLogger(__name__)
 
+# T2-2: legacy豁免告警计数（进程内单调，用于可观测；verify命中旧式hash时+1并warning）
+LEGACY_HASH_WARNING = "legacy hash accepted via explicit exemption"
+
 GENESIS_PREV_HASH = "sha256:genesis"
 _LEGACY_GENESIS = "0" * 64
 EXPORT_FORMAT = "hero-quant-governance-ledger-export/v1"
 DEFAULT_ROTATE_BYTES: int = 64 * 1024 * 1024
 ARCHIVE_SUFFIX_WIDTH: int = 4
+# T2-2: 新链 hash 版本标记；verify 默认仅接受新式 envelope hash（tenant/price 全字段），
+# 旧式 hash 须调用方显式 allow_legacy=True 豁免（历史区间）并记 warning 告警。
+HASH_VERSION: int = 2
 _CHAIN_FIELDS = frozenset({"seq", "tenant_seq", "tenant", "prev_hash", "record_hash", "record"})
 
 _fsync_warned = False
@@ -47,6 +53,8 @@ __all__ = [
     "EXPORT_FORMAT",
     "DEFAULT_ROTATE_BYTES",
     "ARCHIVE_SUFFIX_WIDTH",
+    "HASH_VERSION",
+    "LEGACY_HASH_WARNING",
     "ChainBreak",
     "ChainVerificationResult",
     "LedgerCorruptionError",
@@ -120,10 +128,41 @@ def compute_record_hash(
     return f"sha256:{hex_part}"
 
 
+def _check_hash(
+    stored: Any, tenant_seq: int, prev_hash: str, record: Mapping[str, Any], tenant: str, price: float | None, *, allow_legacy: bool
+) -> tuple[bool, bool]:
+    """T2-2: 按版本严格匹配。新链（allow_legacy=False）仅接受全字段 envelope hash；
+    allow_legacy=True 时旧式 hash 亦可（历史区间显式豁免，命中记 warning）。返回 (ok, used_legacy)。"""
+    new_hex = _tenant_payload_hash(tenant_seq, prev_hash, record, tenant=tenant, price=price)
+    if stored in (new_hex, f"sha256:{new_hex}"):
+        return True, False
+    if allow_legacy:
+        leg_hex = _tenant_payload_hash_legacy(tenant_seq, prev_hash, record)
+        if stored in (leg_hex, f"sha256:{leg_hex}"):
+            logger.warning("%s tenant=%r tenant_seq=%r", LEGACY_HASH_WARNING, tenant, tenant_seq)
+            return True, True
+    return False, False
+
+
+def _check_hash_alt_genesis(
+    stored: Any, tenant_seq: int, alt_prev: str, record: Mapping[str, Any], tenant: str, price: float | None, *, allow_legacy: bool
+) -> bool:
+    """T2-2: 首条 GENESIS/legacy-genesis 等价形态的严格版本匹配。"""
+    alt_new_hex = _tenant_payload_hash(tenant_seq, alt_prev, record, tenant=tenant, price=price)
+    if stored in (alt_new_hex, f"sha256:{alt_new_hex}"):
+        return True
+    if allow_legacy:
+        alt_leg_hex = _tenant_payload_hash_legacy(tenant_seq, alt_prev, record)
+        if stored in (alt_leg_hex, f"sha256:{alt_leg_hex}"):
+            logger.warning("%s tenant=%r tenant_seq=%r (alt-genesis)", LEGACY_HASH_WARNING, tenant, tenant_seq)
+            return True
+    return False
+
+
 def _expected_hashes(
     tenant_seq: int, prev_hash: str, record: Mapping[str, Any], tenant: str, price: float | None
 ) -> tuple[str, str, str, str]:
-    """返回 (new_hex, new_prefixed, legacy_hex, legacy_prefixed) 供校验双试。"""
+    """返回 (new_hex, new_prefixed, legacy_hex, legacy_prefixed) 供校验双试（遗留调用兼容；新路径经 _check_hash 严格匹配）。"""
     new_hex = _tenant_payload_hash(tenant_seq, prev_hash, record, tenant=tenant, price=price)
     leg_hex = _tenant_payload_hash_legacy(tenant_seq, prev_hash, record)
     return new_hex, f"sha256:{new_hex}", leg_hex, f"sha256:{leg_hex}"
@@ -162,8 +201,12 @@ class ChainVerificationResult:
         return {"ok": self.ok, "record_count": self.record_count, "first_break": None if self.first_break is None else self.first_break.to_dict()}
 
 
-class LedgerCorruptionError(RuntimeError):
-    """追加时发现历史已断裂，拒绝扩展以防止分叉污染。"""
+class LedgerCorruptionError(RuntimeError, ValueError):
+    """追加/对账时发现历史已断裂，拒绝扩展与误导性 zero_diff 以防止分叉污染。
+
+    中文：T2-2 同时继承 ValueError——伪造/坏 JSONL 路径旧调用方多按 ValueError 捕获（如坏行 fail-closed），
+    新调用方按 LedgerCorruptionError 捕获；双重身份保持两边兼容。
+    """
 
     def __init__(self, chain_break: ChainBreak) -> None:
         super().__init__(f"ledger chain broken at index={chain_break.index} seq={chain_break.seq} reason={chain_break.reason}: {chain_break.detail}")
@@ -293,8 +336,54 @@ def archive_segments(path: Path) -> list[Path]:
     return sorted(path.parent.glob(f"{path.stem}.[0-9]" + "[0-9]" * (ARCHIVE_SUFFIX_WIDTH - 1) + path.suffix))
 
 
-def rotate_if_needed(path: Path, max_bytes: int = DEFAULT_ROTATE_BYTES, *, fsync: bool = True) -> Path | None:
-    """大小超过阈值时轮转归档；轮转前先全链 verify，断链则拒绝归档。"""
+def _create_secure(path: Path):
+    """T2-2: 原子安全创建（O_CREAT|O_EXCL, 0o600）消除 0644 窗口；已存在则返回 None。
+
+    中文：创建后 chmod 有 TOCTOU 窗口（umask 022 下短暂 0644 可读）；必须 os.open 原子指定 mode。
+    Windows 下 chmod 无 ACL 意义，此处额外经 os.open 指定权限 + 后续 chmod best-effort 收紧。
+    """
+    try:
+        fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        return None
+    except OSError:
+        return None
+    try:
+        try:
+            os.fchmod(fd, 0o600)
+        except (OSError, AttributeError):
+            pass
+        f = os.fdopen(fd, "w", encoding="utf-8")
+    except Exception:
+        try:
+            os.close(fd)
+        except Exception:
+            pass
+        raise
+    try:
+        f.write("")
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except OSError as exc:
+            _warn_fsync_failure(exc, path)
+    finally:
+        try:
+            f.close()
+        except Exception:
+            pass
+    try:
+        _fsync_dir(path.parent)
+    except Exception:
+        pass
+    return path
+
+
+def rotate_if_needed(path: Path, max_bytes: int = DEFAULT_ROTATE_BYTES, *, fsync: bool = True, allow_legacy: bool = False) -> Path | None:
+    """大小超过阈值时轮转归档；轮转前先全链 verify，断链则拒绝归档。
+
+    中文：T2-2 全程持排他锁（verify→rename 不提前解锁），消除并发 append 丢失窗口；默认拒绝旧式 hash。
+    """
     if max_bytes <= 0:
         raise ValueError(f"max_bytes must be positive, got {max_bytes}")
     if not path.exists() or path.stat().st_size < max_bytes:
@@ -338,7 +427,7 @@ def rotate_if_needed(path: Path, max_bytes: int = DEFAULT_ROTATE_BYTES, *, fsync
                     _rot_entries.append(json.loads(_s))
                 except json.JSONDecodeError:
                     _rot_entries.append({"_raw": _s})
-            _rot_ok, _rot_brk = tmp._verify_entries(_rot_entries)
+            _rot_ok, _rot_brk = tmp._verify_entries(_rot_entries, allow_legacy=allow_legacy)
             if not _rot_ok:
                 for _idx, _e in enumerate(_rot_entries):
                     if "_raw" in _e:
@@ -367,35 +456,45 @@ def rotate_if_needed(path: Path, max_bytes: int = DEFAULT_ROTATE_BYTES, *, fsync
                         _warn_fsync_failure(exc, path)
                 except Exception:
                     pass
-                if _locked:
+                # T2-2: 全程持排他锁直至 rename 完成（POSIX 原子 rename），消除先解锁后 rename 的并发 append 丢失窗口。
+                # Windows 上 rename 需无打开句柄：改为 dup 句柄后关闭原句柄前保持锁语义——
+                # POSIX 直接锁内 rename；Windows 先刷盘、解锁、关闭再 rename（强制锁下 rename 需关闭）。
+                if os.name == "nt":
+                    if _locked:
+                        try:
+                            _unlock(_locked_h)
+                            _locked = False
+                        except Exception:
+                            pass
+                    # Windows: 解锁后关闭再 rename，避免 WinError 32
                     try:
-                        _unlock(_locked_h)
-                        _locked = False
+                        _locked_h.close()
+                        _locked_h = None
                     except Exception:
                         pass
-                # Windows: 解锁后关闭再 rename，避免 WinError 32
-                try:
-                    _locked_h.close()
-                    _locked_h = None
-                except Exception:
-                    pass
-                try:
-                    path.rename(archive)
-                except OSError as e:
-                    _rename_err = e
-                    # Windows 上可能因残留句柄（如 Ledger 实例未关闭）导致共享冲突，改为关闭后重试一次
-                    try:
-                        if _locked_h is not None:
-                            _locked_h.close()
-                            _locked_h = None
-                    except Exception:
-                        pass
-                    # 再次尝试 rename
                     try:
                         path.rename(archive)
-                        _rename_err = None
-                    except OSError as e2:
-                        _rename_err = e2
+                    except OSError as e:
+                        _rename_err = e
+                        # Windows 上可能因残留句柄（如 Ledger 实例未关闭）导致共享冲突，改为关闭后重试一次
+                        try:
+                            if _locked_h is not None:
+                                _locked_h.close()
+                                _locked_h = None
+                        except Exception:
+                            pass
+                        # 再次尝试 rename
+                        try:
+                            path.rename(archive)
+                            _rename_err = None
+                        except OSError as e2:
+                            _rename_err = e2
+                else:
+                    # POSIX: 锁内原子 rename，并发 append 被排他锁挡在临界区外，不丢失
+                    try:
+                        os.rename(path, archive)
+                    except OSError as e:
+                        _rename_err = e
             finally:
                 if _locked:
                     try:
@@ -501,10 +600,11 @@ def export_chain_to_file(path: Path, dest: Path) -> Path:
     return dest
 
 
-def verify_chain(path: Path) -> ChainVerificationResult:
+def verify_chain(path: Path, *, allow_legacy: bool = False) -> ChainVerificationResult:
     """校验单文件链的完整性（seq 连续与 hash 链）— 加共享锁防 TOCTOU。
 
     锁获取失败必须 LOUD（抛错），绝不静默回退到无锁读（否则重引入 TOCTOU/半写竞态）。
+    中文：T2-2 默认拒绝旧式 hash；历史区间须显式 allow_legacy=True 豁免并记 warning。
     """
     ledger = Ledger(path)
     # 读经共享锁保护的 _read_raw_records，失败 LOUD（锁/IO 错误直接抛，不无锁重读）
@@ -516,12 +616,34 @@ def verify_chain(path: Path) -> ChainVerificationResult:
         if not _CHAIN_FIELDS.issubset(e.keys()):
             missing = sorted(_CHAIN_FIELDS - set(e.keys()))
             return ChainVerificationResult(ok=False, record_count=_ln, first_break=ChainBreak(_ln, e.get("seq"), "missing_chain_fields", f"missing {missing}"))
-    ok, brk = ledger._verify_entries(entries)
+    # T2-2: 透传 allow_legacy；兼容 monkeypatch 旧签名（无 allow_legacy 形参）/Ledger 替身（无 _verify_entries，回退其 verify()，异常 LOUD 透出）
+    _ve = getattr(ledger, "_verify_entries", None)
+    if _ve is None:
+        # 替身 Ledger（如 FakeLedger）无 _verify_entries：回退其 verify() 语义，异常 LOUD 透出
+        _vv = getattr(ledger, "verify", None)
+        if _vv is None:
+            raise TypeError("ledger double lacks _verify_entries/verify")
+        try:
+            _ok2 = _vv(allow_legacy=allow_legacy)
+        except TypeError:
+            _ok2 = _vv()
+        if _ok2:
+            return ChainVerificationResult(ok=True, record_count=len(entries), first_break=None)
+        return ChainVerificationResult(
+            ok=False, record_count=0, first_break=ChainBreak(0, None, "record_hash_mismatch", f"ledger verify failed for {path}")
+        )
+    try:
+        ok, brk = _ve(entries, allow_legacy=allow_legacy)
+    except TypeError:
+        ok, brk = _ve(entries)
     return ChainVerificationResult(ok=ok, record_count=len(entries) if ok else (brk.index if brk else 0), first_break=brk)
 
 
-def verify_chain_with_archives(path: Path) -> ChainVerificationResult:
-    """校验包含归档分段的完整历史，拼接 archive_segments + 当前文件后统一 verify。"""
+def verify_chain_with_archives(path: Path, *, allow_legacy: bool = False) -> ChainVerificationResult:
+    """校验包含归档分段的完整历史，拼接 archive_segments + 当前文件后统一 verify。
+
+    中文：T2-2 默认拒绝旧式 hash；历史区间须显式 allow_legacy=True 豁免并记 warning。
+    """
     records: list[dict[str, Any]] = []
     for seg in [*archive_segments(path), path]:
         if not seg.exists():
@@ -563,13 +685,53 @@ def verify_chain_with_archives(path: Path) -> ChainVerificationResult:
     if not records:
         return ChainVerificationResult(ok=True, record_count=0, first_break=None)
     # reuse Ledger._verify_entries logic on concatenated records
+    # T2-2: 透传 allow_legacy；仅 allow_legacy 旧签名 TypeError 做回退；替身 verify 异常 LOUD 透出。
+    # 中文：verify 自身抛错（锁/IO/篡改 LOUD）必须包成 LedgerCorruptionError 透出，不得让 RuntimeError 直透
+    # （b2b_06 契约同步：调用方只捕获 LedgerCorruptionError）。
     tmp = Ledger(path)
-    ok, brk = tmp._verify_entries(records)
+    _tve = getattr(tmp, "_verify_entries", None)
+    if _tve is None:
+        _tvv = getattr(tmp, "verify", None)
+        if _tvv is None:
+            raise TypeError("ledger double lacks _verify_entries/verify")
+        try:
+            try:
+                _tok = _tvv(allow_legacy=allow_legacy)
+            except TypeError as _tte:
+                if "allow_legacy" in str(_tte):
+                    _tok = _tvv()
+                else:
+                    raise
+        except LedgerCorruptionError:
+            raise
+        except Exception as _ve:
+            raise LedgerCorruptionError(
+                ChainBreak(0, None, "record_hash_mismatch", f"ledger verify raised: {_ve}")
+            ) from _ve
+        if _tok:
+            return ChainVerificationResult(ok=True, record_count=len(records), first_break=None)
+        return ChainVerificationResult(
+            ok=False, record_count=0, first_break=ChainBreak(0, None, "record_hash_mismatch", f"ledger verify failed for {path}")
+        )
+    try:
+        try:
+            ok, brk = _tve(records, allow_legacy=allow_legacy)
+        except TypeError:
+            ok, brk = _tve(records)
+    except LedgerCorruptionError:
+        raise
+    except Exception as _ve2:
+        raise LedgerCorruptionError(
+            ChainBreak(0, None, "record_hash_mismatch", f"ledger verify raised: {_ve2}")
+        ) from _ve2
     return ChainVerificationResult(ok=ok, record_count=len(records), first_break=brk)
 
 
-def verify_export(export: Mapping[str, Any] | str | Path) -> ChainVerificationResult:
-    """校验导出包：先比对 export_hash，再按租户链逐条重算 record_hash。"""
+def verify_export(export: Mapping[str, Any] | str | Path, *, allow_legacy: bool = False) -> ChainVerificationResult:
+    """校验导出包：先比对 export_hash，再按租户链逐条重算 record_hash。
+
+    中文：默认仅接受新式全字段 hash（tenant/price 防篡改）；历史区间须显式 allow_legacy=True 豁免并记 warning。
+    """
     if isinstance(export, Path):
         data: Mapping[str, Any] = json.loads(export.read_text(encoding="utf-8"))
     elif isinstance(export, str):
@@ -604,23 +766,20 @@ def verify_export(export: Mapping[str, Any] | str | Path) -> ChainVerificationRe
             record = entry.get("record")
             if record is None:
                 return ChainVerificationResult(ok=False, record_count=len(records), first_break=ChainBreak(index=idx-1, seq=eff, reason="missing_chain_fields", detail="missing record"))
-            # 统一使用全字段 hash，兼容历史旧式 hash
+            # T2-2: 严格版本匹配，默认拒绝旧式 hash（防 tenant/price 篡改后按旧式重算过 verify）
             tenant_v = entry.get("tenant", "default")
             price_v = entry.get("price")
-            new_hex, new_pref, leg_hex, leg_pref = _expected_hashes(eff, prev, record, tenant_v, price_v)
+            ok_h, _used_leg = _check_hash(entry.get("record_hash"), eff, prev, record, tenant_v, price_v, allow_legacy=allow_legacy)
             stored = entry.get("record_hash")
-            if stored not in (new_hex, new_pref, leg_hex, leg_pref):
+            if not ok_h:
                 # try legacy genesis alternative if first entry
                 if idx == 1 and _is_genesis(prev) and _is_genesis(ph):
                     alt_prev = _LEGACY_GENESIS if prev == GENESIS_PREV_HASH else GENESIS_PREV_HASH
-                    # try both new and legacy with alt_prev
-                    alt_new_hex = _tenant_payload_hash(eff, alt_prev, record, tenant=tenant_v, price=price_v)
-                    alt_new_pref = f"sha256:{alt_new_hex}"
-                    alt_leg_hex = _tenant_payload_hash_legacy(eff, alt_prev, record)
-                    alt_leg_pref = f"sha256:{alt_leg_hex}"
-                    if stored in (alt_new_hex, alt_new_pref, alt_leg_hex, alt_leg_pref):
+                    # T2-2: alt-genesis 同样严格版本匹配
+                    if _check_hash_alt_genesis(stored, eff, alt_prev, record, tenant_v, price_v, allow_legacy=allow_legacy):
                         prev = entry.get("record_hash")
                         continue
+                new_hex = _tenant_payload_hash(eff, prev, record, tenant=tenant_v, price=price_v)
                 return ChainVerificationResult(ok=False, record_count=len(records), first_break=ChainBreak(index=idx-1, seq=eff, reason="record_hash_mismatch", detail=f"stored {stored!r} recomputed {new_hex!r}"))
             prev = entry.get("record_hash")
     return ChainVerificationResult(ok=True, record_count=len(records), first_break=None)
@@ -657,14 +816,13 @@ def _tail_self_check(entry: dict[str, Any]) -> bool:
     record = entry.get("record")
     if record is None:
         return False
-    new_hex, new_pref, leg_hex, leg_pref = _expected_hashes(ts, prev, record, t, entry.get("price"))
-    if entry.get("record_hash") in (new_hex, new_pref, leg_hex, leg_pref):
+    # T2-2: 尾自检同样严格版本匹配（默认拒绝 legacy）
+    ok_h, _ = _check_hash(entry.get("record_hash"), ts, prev, record, t, entry.get("price"), allow_legacy=False)
+    if ok_h:
         return True
     if _is_genesis(prev):
         alt_prev = _LEGACY_GENESIS if prev == GENESIS_PREV_HASH else GENESIS_PREV_HASH
-        alt_new_hex = _tenant_payload_hash(ts, alt_prev, record, tenant=t, price=entry.get("price"))
-        alt_leg_hex = _tenant_payload_hash_legacy(ts, alt_prev, record)
-        if entry.get("record_hash") in (alt_new_hex, f"sha256:{alt_new_hex}", alt_leg_hex, f"sha256:{alt_leg_hex}"):
+        if _check_hash_alt_genesis(entry.get("record_hash"), ts, alt_prev, record, t, entry.get("price"), allow_legacy=False):
             return True
     return False
 
@@ -701,16 +859,16 @@ def _verify_suffix_incremental(
         record = entry.get("record")
         if record is None:
             return False, ChainBreak(gidx, ts, "missing_chain_fields", "missing record"), state
-        new_hex, new_pref, leg_hex, leg_pref = _expected_hashes(ts, prev, record, t, entry.get("price"))
+        # T2-2: 后缀增量同样严格版本匹配（默认拒绝 legacy）
+        ok_h, _ = _check_hash(entry.get("record_hash"), ts, prev, record, t, entry.get("price"), allow_legacy=False)
         stored = entry.get("record_hash")
-        if stored not in (new_hex, new_pref, leg_hex, leg_pref):
+        if not ok_h:
             if first_of_tenant and _is_genesis(prev) and _is_genesis(ph):
                 alt_prev = _LEGACY_GENESIS if prev == GENESIS_PREV_HASH else GENESIS_PREV_HASH
-                alt_new_hex = _tenant_payload_hash(ts, alt_prev, record, tenant=t, price=entry.get("price"))
-                alt_leg_hex = _tenant_payload_hash_legacy(ts, alt_prev, record)
-                if stored in (alt_new_hex, f"sha256:{alt_new_hex}", alt_leg_hex, f"sha256:{alt_leg_hex}"):
+                if _check_hash_alt_genesis(stored, ts, alt_prev, record, t, entry.get("price"), allow_legacy=False):
                     state[t] = [exp_ts, entry.get("record_hash")]
                     continue
+            new_hex = _tenant_payload_hash(ts, prev, record, tenant=t, price=entry.get("price"))
             return False, ChainBreak(gidx, ts, "record_hash_mismatch", f"stored {stored!r} recomputed {new_hex!r}"), state
         state[t] = [exp_ts, entry.get("record_hash")]
     return True, None, state
@@ -725,10 +883,15 @@ class Ledger:
     def __init__(self, path: Path):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        # Do not pre-create empty file with touch — let append's a+b create it.
-        # This avoids a race where flock sentinel \x00 would pollute the ledger.
-        # Ensure perms if file already exists.
-        if self.path.exists():
+        # T2-2: 原子安全创建 O_CREAT|O_EXCL 0o600，消除创建后 chmod 的 0644 窗口；
+        # 已存在文件 best-effort 收紧权限（Windows 下 chmod 无 ACL 意义，仅尽力）。
+        if not self.path.exists():
+            try:
+                _create_secure(self.path)
+            except Exception as _exc:
+                logger.warning("silent handled: governance: ledger secure-create best-effort", exc_info=_exc)  # intentional: governance: ledger secure-create best-effort
+                pass  # intentional governance: ledger secure-create best-effort
+        else:
             try:
                 os.chmod(self.path, 0o600)
             except Exception as _exc:
@@ -790,8 +953,13 @@ class Ledger:
                 entries.append({"_raw": line})
         return entries
 
-    def _verify_entries(self, entries: list[dict[str, Any]]) -> tuple[bool, ChainBreak | None]:
-        """O(n) 全链校验：全局 seq 连续 + 每租户 prev_hash/record_hash 链。增量优化：按租户分组后顺序校验，尾部缓存（_tail_verify_cache）可用于下次增量校验。"""
+    def _verify_entries(
+        self, entries: list[dict[str, Any]], *, allow_legacy: bool = False
+    ) -> tuple[bool, ChainBreak | None]:
+        """O(n) 全链校验：全局 seq 连续 + 每租户 prev_hash/record_hash 链。增量优化：按租户分组后顺序校验，尾部缓存（_tail_verify_cache）可用于下次增量校验。
+
+        中文：T2-2 默认拒绝旧式 hash；历史区间须显式 allow_legacy=True 豁免并记 warning 告警。
+        """
         for e in entries:
             if "_raw" in e:
                 # 中文：用全局下标（enumerate），不用 list.index（O(n²)+重复行错位）
@@ -826,22 +994,19 @@ class Ledger:
                 record = entry.get("record")
                 if record is None:
                     return False, ChainBreak(gidx, eff, "missing_chain_fields", "missing record")
-                # 哈希校验：优先全字段（tenant/price），回退旧式以兼容存量
+                # T2-2：严格版本匹配，默认拒绝旧式 hash（防 tenant/price 篡改后按旧式重算过 verify）
                 tenant_v = entry.get("tenant", "default")
                 price_v = entry.get("price")
-                new_hex, new_pref, leg_hex, leg_pref = _expected_hashes(eff, prev, record, tenant_v, price_v)
+                ok_h, _used_leg = _check_hash(entry.get("record_hash"), eff, prev, record, tenant_v, price_v, allow_legacy=allow_legacy)
                 stored = entry.get("record_hash")
-                if stored not in (new_hex, new_pref, leg_hex, leg_pref):
-                    # 首条兼容 legacy GENESIS 形态 — 双试 alt_prev
+                if not ok_h:
+                    # 首条兼容 legacy GENESIS 形态 — alt_prev 同样严格版本匹配
                     if idx == 1 and _is_genesis(prev) and _is_genesis(ph):
                         alt_prev = _LEGACY_GENESIS if prev == GENESIS_PREV_HASH else GENESIS_PREV_HASH
-                        alt_new_hex = _tenant_payload_hash(eff, alt_prev, record, tenant=tenant_v, price=price_v)
-                        alt_new_pref = f"sha256:{alt_new_hex}"
-                        alt_leg_hex = _tenant_payload_hash_legacy(eff, alt_prev, record)
-                        alt_leg_pref = f"sha256:{alt_leg_hex}"
-                        if stored in (alt_new_hex, alt_new_pref, alt_leg_hex, alt_leg_pref):
+                        if _check_hash_alt_genesis(stored, eff, alt_prev, record, tenant_v, price_v, allow_legacy=allow_legacy):
                             prev = entry.get("record_hash")
                             continue
+                    new_hex = _tenant_payload_hash(eff, prev, record, tenant=tenant_v, price=price_v)
                     return False, ChainBreak(gidx, eff, "record_hash_mismatch", f"stored {stored!r} recomputed {new_hex!r}")
                 prev = entry.get("record_hash")
         return True, None
@@ -878,10 +1043,23 @@ class Ledger:
             logger.error("ledger redact_payload failed, fail-closed for tenant=%s", tenant, exc_info=_exc)
             raise RuntimeError(f"ledger redact_payload failed: {_exc}") from _exc
         # 锁保护 read-verify-append 临界区，防止并发分叉；使用 with open + finally _unlock 保证释放
+        # T2-2: 新文件原子 O_CREAT|O_EXCL 0o600 创建（无 0644 窗口）；open 失败回退 secure-create 后重试
         # 记录是否新建文件，用于目录 fsync
         created = not self.path.exists()
+        if created:
+            try:
+                _create_secure(self.path)
+                created = True
+            except Exception:
+                pass
         # 以 a+b 打开以便加锁后回读历史；发生异常时确保解锁
-        handle = open(self.path, "a+b")
+        try:
+            handle = open(self.path, "a+b")
+        except FileNotFoundError:
+            # 并发 rotate 刚搬走文件：安全重建后重试一次
+            _create_secure(self.path)
+            handle = open(self.path, "a+b")
+            created = True
         try:
             _lock_exclusive(handle)
             try:
@@ -1110,10 +1288,11 @@ class Ledger:
         import copy
         return copy.deepcopy(obj)
 
-    def verify(self, tenant: str | None = None, *, lock: bool = True) -> bool:
+    def verify(self, tenant: str | None = None, *, lock: bool = True, allow_legacy: bool = False) -> bool:
         """校验链完整性；指定 tenant 时仅校验该租户子链。共享锁读防 TOCTOU。
 
         lock=False 跳过读锁，仅供外层已持排他锁时使用（rotate 内 verify）。
+        中文：T2-2 默认拒绝旧式 hash；历史区间须显式 allow_legacy=True 豁免并记 warning。
         """
         entries = self._read_all(lock=lock)
         for e in entries:
@@ -1139,23 +1318,24 @@ class Ledger:
                     return False
                 tenant_v = entry.get("tenant", "default")
                 price_v = entry.get("price")
-                new_hex, new_pref, leg_hex, leg_pref = _expected_hashes(eff, prev, record, tenant_v, price_v)
+                # T2-2: 租户子链同样严格版本匹配（默认拒绝 legacy）
+                ok_h, _ = _check_hash(entry.get("record_hash"), eff, prev, record, tenant_v, price_v, allow_legacy=allow_legacy)
                 stored = entry.get("record_hash")
-                if stored not in (new_hex, new_pref, leg_hex, leg_pref):
+                if not ok_h:
                     if idx == 1 and _is_genesis(prev) and _is_genesis(ph):
                         alt_prev = _LEGACY_GENESIS if prev == GENESIS_PREV_HASH else GENESIS_PREV_HASH
-                        alt_new_hex = _tenant_payload_hash(eff, alt_prev, record, tenant=tenant_v, price=price_v)
-                        alt_new_pref = f"sha256:{alt_new_hex}"
-                        alt_leg_hex = _tenant_payload_hash_legacy(eff, alt_prev, record)
-                        alt_leg_pref = f"sha256:{alt_leg_hex}"
-                        if stored in (alt_new_hex, alt_new_pref, alt_leg_hex, alt_leg_pref):
+                        if _check_hash_alt_genesis(stored, eff, alt_prev, record, tenant_v, price_v, allow_legacy=allow_legacy):
                             prev = entry.get("record_hash")
                             continue
                     return False
                 prev = entry.get("record_hash")
             return True
         else:
-            ok, _ = self._verify_entries(entries)
+            # T2-2: 透传 allow_legacy；兼容 monkeypatch 旧签名 counting(self, entries)（无 allow_legacy 形参）
+            try:
+                ok, _ = self._verify_entries(entries, allow_legacy=allow_legacy)
+            except TypeError:
+                ok, _ = self._verify_entries(entries)
             return ok
 
     def query(self, tenant: str):

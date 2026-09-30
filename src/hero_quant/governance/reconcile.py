@@ -127,8 +127,15 @@ def aggregate_shadow(
     journal: Any | None = None,
     ledger_path: str | Path | None = None,
     ledger: Any | None = None,
+    *,
+    verify: bool = True,
+    allow_legacy: bool = False,
 ) -> Dict[str, float]:
-    """聚合影子持仓：优先 journal.records，其次 Ledger/文件中的 shadow_record，自动去重共用账本的重复计数。"""
+    """聚合影子持仓：优先 journal.records，其次 Ledger/文件中的 shadow_record，自动去重共用账本的重复计数。
+
+    中文：T2-2 文件/对象路径默认先 verify_chain_with_archives（共享锁读防半写），失败抛 LedgerCorruptionError，
+    不再静默聚合伪造 JSONL；历史区间须显式 allow_legacy=True 豁免旧式 hash。
+    """
     out: Dict[str, float] = {}
 
     def add(sym: str, q: float):
@@ -214,8 +221,28 @@ def aggregate_shadow(
             pass
         else:
             try:
+                # T2-2: 先 verify（对象路径经共享锁读），失败直接抛 LedgerCorruptionError，不聚合脏数据
+                # 中文：仅 allow_legacy 旧签名 TypeError 回退；verify 自身抛错 LOUD 透出
+                if verify and hasattr(ledger, "verify"):
+                    try:
+                        _ok = ledger.verify(allow_legacy=allow_legacy)
+                    except TypeError as _vte:
+                        if "allow_legacy" in str(_vte):
+                            _ok = ledger.verify()
+                        else:
+                            raise
+                    if not _ok:
+                        from hero_quant.governance.ledger import ChainBreak, LedgerCorruptionError
+
+                        logger.warning("aggregate_shadow ledger verify failed for %s", getattr(ledger, "path", ledger))
+                        raise LedgerCorruptionError(ChainBreak(0, None, "record_hash_mismatch", f"ledger verify failed for {getattr(ledger, 'path', ledger)}"))
                 entries = ledger._read_all()
                 for e in entries:
+                    if isinstance(e, dict) and "_raw" in e:
+                        from hero_quant.governance.ledger import ChainBreak, LedgerCorruptionError
+
+                        logger.warning("aggregate_shadow ledger corrupt line: %r", str(e.get("_raw"))[:200])
+                        raise LedgerCorruptionError(ChainBreak(0, None, "malformed_json", str(e.get("_raw"))))
                     rec = e.get("record", {}) if isinstance(e, dict) else {}
                     if rec.get("action") == "shadow_record":
                         trade = rec.get("trade", {})
@@ -231,7 +258,55 @@ def aggregate_shadow(
     elif lp is not None:
         if lp.exists():
             try:
-                text = lp.read_text(encoding="utf-8")
+                # T2-2: 先 verify_chain_with_archives（共享锁读防半写），失败抛 LedgerCorruptionError，不出聚合
+                # 中文：仅 allow_legacy 旧签名 TypeError 回退；verify 自身抛错 LOUD 透出
+                if verify:
+                    from hero_quant.governance.ledger import ChainBreak, LedgerCorruptionError, verify_chain_with_archives
+
+                    try:
+                        _vr = verify_chain_with_archives(lp, allow_legacy=allow_legacy)
+                    except TypeError as _ate:
+                        if "allow_legacy" in str(_ate):
+                            _vr = verify_chain_with_archives(lp)
+                        else:
+                            raise
+                    if not _vr.ok:
+                        brk = _vr.first_break
+                        logger.warning("aggregate_shadow ledger verify failed for %s: %s", lp, brk)
+                        raise LedgerCorruptionError(
+                            ChainBreak(
+                                brk.index if brk else 0,
+                                brk.seq if brk else None,
+                                brk.reason if brk else "record_hash_mismatch",
+                                brk.detail if brk else f"ledger verify failed for {lp}",
+                            )
+                        )
+                # T2-2: 对账用共享锁读（防半写），不用裸 read_text
+                from hero_quant.governance.ledger import _lock_shared as _rec_lock_shared
+                from hero_quant.governance.ledger import _unlock as _rec_unlock
+
+                with open(lp, "rb") as _h:
+                    try:
+                        _rec_lock_shared(_h)
+                        _h.seek(0)
+                        _raw = _h.read()
+                    finally:
+                        try:
+                            _rec_unlock(_h)
+                        except Exception:
+                            pass
+                try:
+                    text = _raw.decode("utf-8")
+                except UnicodeDecodeError as exc:
+                    from hero_quant.governance.ledger import ChainBreak, LedgerCorruptionError
+
+                    logger.warning("aggregate_shadow ledger decode failed for %s: %s", lp, exc)
+                    raise LedgerCorruptionError(ChainBreak(0, None, "malformed_json", f"decode_error: {exc}")) from exc
+                if "\x00" in text:
+                    from hero_quant.governance.ledger import ChainBreak, LedgerCorruptionError
+
+                    logger.warning("aggregate_shadow ledger NUL byte for %s", lp)
+                    raise LedgerCorruptionError(ChainBreak(0, None, "malformed_json", "NUL byte in ledger"))
                 for line in text.splitlines():
                     line = line.strip()
                     if not line:
@@ -330,8 +405,14 @@ def reconcile_files(
     tolerance: float = 1e-6,
     journal: Any | None = None,
     wall_time_budget: float | None = None,
+    *,
+    allow_legacy: bool = False,
 ) -> ReconcileResult:
-    """文件级对账：ledger.jsonl（或 journal） vs positions.csv，超时受 wall-time budget 约束。"""
+    """文件级对账：ledger.jsonl（或 journal） vs positions.csv，超时受 wall-time budget 约束。
+
+    中文：T2-2 先 verify_chain_with_archives（含归档，共享锁读），失败抛 LedgerCorruptionError，
+    不出 zero_diff 聚合结果；历史区间须显式 allow_legacy=True 豁免。
+    """
     import time as _t
 
     _start = _t.monotonic()
@@ -349,7 +430,35 @@ def reconcile_files(
                 except Exception:
                     _budget = None
         broker = load_positions_csv(positions_csv)
-        shadow = aggregate_shadow(journal=journal, ledger_path=ledger_path)
+        # T2-2: 先 verify（含归档全历史），失败直接抛 LedgerCorruptionError，不出 zero_diff
+        # 中文：verify 自身抛错（锁/IO/替身 verify 抛错）LOUD 透出；仅 TypeError 做旧签名回退
+        if journal is None:
+            from hero_quant.governance.ledger import ChainBreak as _CB
+            from hero_quant.governance.ledger import LedgerCorruptionError as _LCE
+            from hero_quant.governance.ledger import verify_chain_with_archives as _vca
+
+            try:
+                _vr = _vca(Path(ledger_path), allow_legacy=allow_legacy)
+            except TypeError as _te:
+                # 仅旧签名无 allow_legacy 形参时回退；其他 TypeError（如替身内部错误）不吞
+                if "allow_legacy" in str(_te):
+                    _vr = _vca(Path(ledger_path))
+                else:
+                    raise
+            if not _vr.ok:
+                _brk = _vr.first_break
+                logger.warning("reconcile_files ledger verify failed for %s: %s", ledger_path, _brk)
+                raise _LCE(
+                    _CB(
+                        _brk.index if _brk else 0,
+                        _brk.seq if _brk else None,
+                        _brk.reason if _brk else "record_hash_mismatch",
+                        _brk.detail if _brk else f"ledger verify failed for {ledger_path}",
+                    )
+                )
+            shadow = aggregate_shadow(journal=journal, ledger_path=ledger_path, allow_legacy=allow_legacy)
+        else:
+            shadow = aggregate_shadow(journal=journal, ledger_path=None, allow_legacy=allow_legacy)
         res = reconcile(shadow, broker, tolerance=tolerance)
         # check budget after work
         if _budget is not None and _budget > 0:
@@ -389,16 +498,48 @@ def daily_reconciliation(
     tolerance: float = 1e-6,
     journal: Any | None = None,
     wall_time_budget: float | None = None,
+    *,
+    allow_legacy: bool = False,
 ) -> Dict[str, Any]:
-    """日终对账作业：返回含 date/zero_diff/diffs/verified 的报告，并校验账本完整性。"""
+    """日终对账作业：返回含 date/zero_diff/diffs/verified 的报告，并校验账本完整性。
+
+    中文：T2-2 先 verify_chain_with_archives（含归档），失败抛 LedgerCorruptionError，
+    不再返回 verified=False + zero_diff=True 的误导报告；历史区间须显式 allow_legacy=True 豁免。
+    """
     import time as _t
 
     _start = _t.monotonic()
     _status = "success"
     result: ReconcileResult | None = None
     try:
+        # T2-2: 先 verify（含归档全历史，共享锁读），失败直接抛 LedgerCorruptionError，不出 zero_diff 报告
+        # 中文：verify 自身抛错（锁/IO/替身 verify 抛错）必须 LOUD 透出，不吞成 ok/false
+        # 中文：仅 allow_legacy 旧签名 TypeError 做回退；其他 TypeError（如替身内部错误）不吞
+        if journal is None:
+            from hero_quant.governance.ledger import ChainBreak as _DCB
+            from hero_quant.governance.ledger import LedgerCorruptionError as _DLCE
+            from hero_quant.governance.ledger import verify_chain_with_archives as _dvca
+
+            try:
+                _dvr = _dvca(Path(ledger_path), allow_legacy=allow_legacy)
+            except TypeError as _dte:
+                if "allow_legacy" in str(_dte):
+                    _dvr = _dvca(Path(ledger_path))
+                else:
+                    raise
+            if not _dvr.ok:
+                _dbrk = _dvr.first_break
+                logger.warning("daily_reconciliation ledger verify failed for %s: %s", ledger_path, _dbrk)
+                raise _DLCE(
+                    _DCB(
+                        _dbrk.index if _dbrk else 0,
+                        _dbrk.seq if _dbrk else None,
+                        _dbrk.reason if _dbrk else "record_hash_mismatch",
+                        _dbrk.detail if _dbrk else f"ledger verify failed for {ledger_path}",
+                    )
+                )
         # 单次 budget：不在此处双重委托给 reconcile_files，避免双 observe/双计数
-        result = reconcile_files(ledger_path, positions_csv, tolerance=tolerance, journal=journal, wall_time_budget=None)
+        result = reconcile_files(ledger_path, positions_csv, tolerance=tolerance, journal=journal, wall_time_budget=None, allow_legacy=allow_legacy)
         # check budget once here
         _budget = wall_time_budget
         if _budget is None:
@@ -437,16 +578,37 @@ def daily_reconciliation(
             logger.warning("observe_wall_time failed: %s", exc)
     if result is None:
         raise RuntimeError("daily_reconciliation: missing result")
-    # optional ledger verify — 中文：失败置 False 并 warning，避免与 skip 混淆
-    verified = None
-    try:
-        from hero_quant.governance.ledger import Ledger
+    # T2-2: verify 已在入口先行（失败已抛 LedgerCorruptionError）；journal=None 路径 verified=True（已验过）。
+    # 中文：保持 verified=False 语义（verify 异常置 False 并 warning，避免与 skip 混淆），供 journal/替身 Ledger 路径兼容。
+    verified: bool | None = True
+    if journal is not None:
+        try:
+            from hero_quant.governance.ledger import Ledger as _DLedger
 
-        ledger = Ledger(Path(ledger_path))
-        verified = ledger.verify()
-    except Exception as exc:
-        logger.warning("ledger verify failed for %s: %s", ledger_path, exc, exc_info=exc)
-        verified = False
+            _ledger_obj = _DLedger(Path(ledger_path))
+            try:
+                _vok = _ledger_obj.verify(allow_legacy=allow_legacy)
+            except TypeError as _vte:
+                if "allow_legacy" in str(_vte):
+                    _vok = _ledger_obj.verify()
+                else:
+                    raise
+            if not _vok:
+                verified = False
+                logger.warning("daily_reconciliation ledger re-verify failed for %s", ledger_path)
+                from hero_quant.governance.ledger import ChainBreak as _JCB
+                from hero_quant.governance.ledger import LedgerCorruptionError as _JLCE
+
+                raise _JLCE(_JCB(0, None, "record_hash_mismatch", f"ledger verify failed for {ledger_path}"))
+            verified = True
+        except Exception as exc:
+            from hero_quant.governance.ledger import LedgerCorruptionError as _JLCE2
+
+            if isinstance(exc, _JLCE2):
+                raise
+            logger.warning("ledger verify failed for %s: %s", ledger_path, exc, exc_info=exc)
+            verified = False
+            raise
 
     report: Dict[str, Any] = {
         "date": date,

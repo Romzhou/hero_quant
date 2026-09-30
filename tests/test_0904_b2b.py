@@ -179,12 +179,18 @@ def test_b2b_05_publish_factor_check_then_act_atomic():
 # ---------------------------------------------------------------------------
 
 def test_b2b_06_verify_failed_not_swallowed(caplog, tmp_path, monkeypatch):
-    """397-405 ledger.verify 失败不得吞成 verified=None, 必须置 False 并 warning."""
+    """T2-2 新契约：verify 失败直接抛 LedgerCorruptionError，不出 zero_diff 误导报告。
+
+    旧契约（verified=False 报告）已被 T2-2 fail-closed 替代：daily_reconciliation 入口先
+    verify_chain_with_archives（含归档），失败即抛，不再返回 verified=False + zero_diff=True。
+    此处断言：源码不再吞 verify 异常（warning/raise 任一可观测），功能上抛 LedgerCorruptionError。
+    """
+    import hero_quant.governance.ledger as lm
     import hero_quant.governance.reconcile as rec
     src = inspect.getsource(rec.daily_reconciliation)
-    assert "verified = False" in src or "verified=False" in src, "verify 异常应置 verified=False 而非 None"
-    assert "logger.warning" in src or "logger.exception" in src, "verify 失败必须 warning 日志"
-    # 功能验证: mock Ledger.verify 抛错时 report verified 应为 False
+    assert "LedgerCorruptionError" in src, "daily_reconciliation 失败必须抛 LedgerCorruptionError，不出 zero_diff"
+    assert "logger.warning" in src or "logger.exception" in src or "raise" in src, "verify 失败必须可观测（warning/raise）"
+    # 功能验证: mock Ledger.verify 抛错时 daily_reconciliation 直接抛 LedgerCorruptionError
     class FakeLedger:
         def __init__(self, path): self.path = path
         def verify(self): raise RuntimeError("tampered ledger")
@@ -195,9 +201,9 @@ def test_b2b_06_verify_failed_not_swallowed(caplog, tmp_path, monkeypatch):
     csv_path = tmp_path / "positions.csv"
     csv_path.write_text("symbol,qty\nAAPL,1\n", encoding="utf-8")
     caplog.set_level(logging.WARNING)
-    report = rec.daily_reconciliation(date="2026-09-04", ledger_path=ledger_path, positions_csv=csv_path)
-    assert report["verified"] is False, f"verify 抛错时 verified 必须为 False, 实际 {report['verified']!r}"
-    assert any("verify" in r.message.lower() for r in caplog.records), "verify 失败必须记录 warning"
+    import pytest as _pt
+    with _pt.raises(lm.LedgerCorruptionError):
+        rec.daily_reconciliation(date="2026-09-04", ledger_path=ledger_path, positions_csv=csv_path)
 
 
 def test_b2b_07_blank_symbol_csv_warns(caplog, tmp_path):
