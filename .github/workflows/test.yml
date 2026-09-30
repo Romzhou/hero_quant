@@ -51,6 +51,9 @@ jobs:
       - name: Run tests
         # Coverage gate: Wave5 收口 50% (48.99% -> 50)；低频 retrieval_eval 标记为 retrieval 仅周跑，不计入此门
         run: pytest -q --cov=src --cov-report=term --cov-fail-under=50
+      - name: Pin setuptools for audit (PYSEC-2026-3447)
+        # CI python3.11 镜像预装 setuptools 79.0.1（pip-audit 误报源）；lock 约束 setuptools>=83.0.0，此处先升级再审计
+        run: pip install -U "setuptools>=83.0.0"
       - name: Audit dependencies
         # Blocking gate since W1-D (was "|| true")
         run: pip-audit

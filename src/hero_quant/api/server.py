@@ -2090,10 +2090,10 @@ if _dist_path is not None:
         # SPA 始终在 GET / 返回 index.html（测试以 Accept: text/html 校验）
         if "application/json" in accept and "text/html" not in accept:
             return JSONResponse(content={"status": "ok", "frontend": "mounted", "path": "/"})
-        # 尝试返回 index.html
+        # 尝试返回 index.html；缺失时 200 占位（与 serve_spa 回退一致；CI 部分构建/卷挂载下 dist 在但 index 缺失时 / 也不 404）
         if _index_path.is_file():
             return _serve_index()
-        return JSONResponse(status_code=404, content={"detail": "frontend index not found"})
+        return _serve_spa_placeholder()
 
     # SPA 回退：未命中 API 的路径优先尝试静态文件，否则返回 index.html 以支持前端路由
     @app.get("/{full_path:path}", include_in_schema=False)
