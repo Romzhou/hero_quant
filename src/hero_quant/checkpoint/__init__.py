@@ -5,7 +5,7 @@
 关键设计：`memory://` 离线兜底 + 真实 Postgres 双路径；`thread_id` 三段式主键 + TTL 过期保障可恢复窗口。
 """
 
-from .postgres import AsyncPostgresSaver, PostgresSaver, get_saver
+from .postgres import AsyncPostgresSaver, MissingRunMapping, PostgresSaver, get_saver
 from .temporal import (
     DEFAULT_HEARTBEAT_TIMEOUT,
     HEARTBEAT_INTERVAL,
@@ -19,6 +19,7 @@ from .temporal import (
 
 __all__ = [
     "AsyncPostgresSaver",
+    "MissingRunMapping",
     "PostgresSaver",
     "get_saver",
     "DEFAULT_HEARTBEAT_TIMEOUT",

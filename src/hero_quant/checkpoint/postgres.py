@@ -49,6 +49,8 @@ CREATE TABLE IF NOT EXISTS checkpoints (
   PRIMARY KEY (tenant, thread, seq)
 );
 ALTER TABLE checkpoints ADD COLUMN IF NOT EXISTS run_text TEXT;
+-- T2-3 乐观锁：version 单调递增，UPSERT 用 WHERE version<=EXCLUDED.version 防并发丢进度
+ALTER TABLE checkpoints ADD COLUMN IF NOT EXISTS version BIGINT NOT NULL DEFAULT 0;
 -- partial index：仅索引非空 expires_at，提升清理扫描选择性（expires_at NULL 表示永不过期）
 CREATE INDEX IF NOT EXISTS idx_checkpoints_expires_at ON checkpoints (expires_at) WHERE expires_at IS NOT NULL;
 -- 清理机制（外部 reaper，未在本 DDL 内建 cron）：pg_cron / 定时任务执行
@@ -78,6 +80,7 @@ _PG_PREFIXES = ("postgresql://", "postgres://", "postgresql+psycopg://")
 _PG_GLOBAL_STORE: Dict[str, Dict[str, Any]] = {}
 _PG_GLOBAL_META: Dict[str, Dict[str, Any]] = {}
 _PG_GLOBAL_TS: Dict[str, float] = {}
+_PG_GLOBAL_VER: Dict[str, int] = {}  # T2-3: emulated 乐观锁版本（与 checkpoint.version 同构）
 _PG_MAXSIZE = 10000  # LRU bound for emulated store; 0 = unbounded (legacy)
 
 # Persist run-string -> seq mapping for deterministic seq and collision disambiguation.
@@ -165,8 +168,35 @@ def _evict_if_needed() -> None:
             _PG_GLOBAL_STORE.pop(k, None)
             _PG_GLOBAL_META.pop(k, None)
             _PG_GLOBAL_TS.pop(k, None)
+            _PG_GLOBAL_VER.pop(k, None)
     except Exception:
         pass
+
+
+def _ckpt_version(checkpoint: Dict[str, Any]) -> int:
+    """T2-3: 提取 checkpoint 乐观锁版本（缺省 0，非法值按 0）。"""
+    try:
+        v = checkpoint.get("version")
+        if v is None:
+            return 0
+        iv = int(v)
+        return iv if iv >= 0 else 0
+    except Exception:
+        return 0
+
+
+def _pg_lock_key(tenant: str, thread: str, seq: int) -> int:
+    """T2-3: pg_advisory_xact_lock 的 64-bit key（租户/线程/seq 哈希取模 2^63-1）。"""
+    try:
+        raw = f"{tenant}::{thread}::{int(seq)}".encode()
+        return int(hashlib.sha256(raw).hexdigest()[:15], 16) % (2**63 - 1)
+    except Exception:
+        return 0
+
+
+# T2-3: 同步/异步统一读序 — 新表 checkpoints 优先，legacy 其次。
+_READ_ORDER_SQL_NEW = "SELECT checkpoint, version FROM checkpoints WHERE tenant=%s AND thread=%s AND seq=%s AND (expires_at IS NULL OR expires_at > now())"
+_READ_ORDER_SQL_LEGACY = "SELECT checkpoint, config FROM checkpoints_legacy WHERE thread_id=%s AND (expires_at IS NULL OR expires_at > now())"
 
 
 def _redact_dsn(dsn: str) -> str:
@@ -183,15 +213,39 @@ def _is_postgres_dsn(dsn: str) -> bool:
     return isinstance(dsn, str) and dsn.startswith(_PG_PREFIXES)
 
 
+# T2-3: run 缺映射时抛错，禁止用 seq 冒充 run 伪造 thread_id（会覆盖他人 checkpoint）。
+class MissingRunMapping(RuntimeError):
+    """run 原串缺失：PG 行只有 seq 而 seq<->run 映射丢失，拒绝伪造 thread_id（fail-closed）。"""
+
+    pass
+
+
 def _default_pg_dsn() -> str:
-    """PG default (not memory://) for Task7."""
+    """PG default (not memory://) for Task7.
+
+    T2-3: 绝不硬编码口令。优先显式 env（HERO_CHECKPOINT_DSN / HERO_PG_DSN），
+    兜底委托 settings._checkpoint_dsn_from_env()（无口令本地 PG 默认；
+    settings 已改无口令，此处同步），缺配 fail-closed（FileNotFoundError/空则抛，
+    不再返回带口令 DSN）。
+    """
     raw = os.environ.get("HERO_CHECKPOINT_DSN", "")
-    if raw and raw.strip():
+    if raw and raw.strip() and raw.strip().lower().startswith(_PG_PREFIXES):
         return raw.strip()
     alt = os.environ.get("HERO_PG_DSN", "")
-    if alt and alt.strip() and alt.strip().startswith(_PG_PREFIXES):
+    if alt and alt.strip() and alt.strip().lower().startswith(_PG_PREFIXES):
         return alt.strip()
-    return "postgresql://postgres:postgres@localhost:5432/hero_quant"
+    try:
+        from hero_quant.config.settings import _checkpoint_dsn_from_env as _settings_default
+        eff = _settings_default()
+        if isinstance(eff, str) and eff.strip().lower().startswith(_PG_PREFIXES):
+            if "postgres:postgres" in eff:
+                raise RuntimeError("checkpoint default DSN embeds hardcoded credential")
+            return eff.strip()
+    except (ImportError, AttributeError, ValueError) as _exc:
+        logger.warning("checkpoint 默认 DSN 解析失败，fail-closed: %s", _exc)
+    raise RuntimeError(
+        "checkpoint PG DSN 缺配：请设置 HERO_CHECKPOINT_DSN（fail-closed，无硬编码口令默认）"
+    )
 
 
 def _resolve_ttl(ttl_seconds: int | None) -> int:
@@ -298,6 +352,16 @@ def get_run_text(tenant: str, thread: str, seq: int, dsn: str | None = None) -> 
             return None
     except Exception:
         return None
+
+
+def _resolve_run_strict(tenant_r: Any, thread_r: Any, seq_r: Any, dsn: str | None = None) -> str:
+    """T2-3: run 严格解析，缺映射抛 MissingRunMapping（禁 seq 冒充 run）。"""
+    run_str = get_run_text(str(tenant_r), str(thread_r), seq_r, dsn=dsn)
+    if run_str is None:
+        raise MissingRunMapping(
+            f"no run mapping for seq {seq_r!r} (tenant={tenant_r!r} thread={thread_r!r})"
+        )
+    return run_str
 
 
 def _dsn_seq_prefix(dsn: str | None) -> str:
@@ -510,13 +574,13 @@ class AsyncPostgresSaver:
                                     # 中文：timeout=5 —— 无 PG 环境快速失败（默认 30s 空等曾拖慢全量 28 分钟）；
                                     # CI/本地有 PG service 时毫秒级连上，不受影响。
                                     self.pool.open(timeout=5)  # type: ignore
-                                except (OSError, ConnectionError, ValueError) as _exc:  # noqa: BLE001 窄化
+                                except (OSError, ConnectionError, ValueError) as _exc:
                                     logger.warning("PG 池创建失败（%s）: %s", _redact_dsn(self.dsn), _exc)  # type: ignore
-                                except Exception as _exc:  # noqa: BLE001 兜底窄化日志
+                                except Exception as _exc:
                                     logger.warning("PG 池 open 异常（%s）: %s", _redact_dsn(self.dsn), _exc, exc_info=True)  # type: ignore
-                        except Exception as _exc:  # noqa: BLE001
+                        except Exception as _exc:
                             logger.warning("PG 池 open 分支异常（%s）: %s", _redact_dsn(self.dsn), _exc, exc_info=True)  # type: ignore
-                    except (ValueError, TypeError, OSError) as _exc:  # noqa: BLE001 窄化捕获
+                    except (ValueError, TypeError, OSError) as _exc:
                         logger.warning("PG 池创建失败（%s）: %s", _redact_dsn(self.dsn), _exc)
                         self.pool = None
                     except Exception as _exc:  # 兜底
@@ -560,7 +624,7 @@ class AsyncPostgresSaver:
                         with self.pool.connection() as conn:  # type: ignore
                             try:
                                 conn.execute(DDL_CHECKPOINTS)  # type: ignore
-                            except (OSError, ValueError, RuntimeError) as _exc:  # noqa: 窄化
+                            except (OSError, ValueError, RuntimeError) as _exc:
                                 logger.warning("checkpoint DDL execute 失败（%s）: %s", _redact_dsn(self.dsn), _exc)
                                 with conn.cursor() as cur:  # type: ignore
                                     cur.execute(DDL_CHECKPOINTS)
@@ -570,7 +634,7 @@ class AsyncPostgresSaver:
                                     cur.execute(DDL_CHECKPOINTS)
                             try:
                                 conn.commit()  # type: ignore
-                            except (OSError, RuntimeError) as _exc:  # noqa: 窄化
+                            except (OSError, RuntimeError) as _exc:
                                 logger.warning("checkpoint DDL commit 失败（%s）: %s", _redact_dsn(self.dsn), _exc)
                             except Exception as _exc:  # 兜底
                                 logger.warning("checkpoint DDL commit 异常（%s）: %s", _redact_dsn(self.dsn), _exc, exc_info=True)
@@ -583,11 +647,11 @@ class AsyncPostgresSaver:
                         finally:
                             try:
                                 self.pool.putconn(conn)  # type: ignore
-                            except (OSError, RuntimeError) as _exc:  # noqa: 窄化
+                            except (OSError, RuntimeError) as _exc:
                                 logger.warning("checkpoint putconn 失败（%s）: %s", _redact_dsn(self.dsn), _exc)
                             except Exception as _exc:  # 兜底
                                 logger.warning("checkpoint putconn 异常（%s）: %s", _redact_dsn(self.dsn), _exc, exc_info=True)
-                except (OSError, RuntimeError, ValueError) as _exc:  # noqa: 窄化
+                except (OSError, RuntimeError, ValueError) as _exc:
                     logger.warning("checkpoint setup 失败（%s）: %s", _redact_dsn(self.dsn), _exc)
                 except Exception as _exc:  # 兜底窄化
                     logger.warning("checkpoint setup 异常（%s）: %s", _redact_dsn(self.dsn), _exc, exc_info=True)
@@ -606,7 +670,7 @@ class AsyncPostgresSaver:
                 if self.pool is not None and hasattr(self.pool, "open"):
                     try:
                         await self.pool.open()  # type: ignore
-                    except (OSError, RuntimeError, ValueError) as _exc:  # noqa: 窄化
+                    except (OSError, RuntimeError, ValueError) as _exc:
                         logger.warning("checkpoint asetup open 失败（%s）: %s", _redact_dsn(self.dsn), _exc)
                     except Exception as _exc:  # 兜底
                         logger.warning("checkpoint asetup open 异常（%s）: %s", _redact_dsn(self.dsn), _exc, exc_info=True)
@@ -614,13 +678,13 @@ class AsyncPostgresSaver:
                     try:
                         async with self.pool.connection() as conn:  # type: ignore
                             await conn.execute(DDL_CHECKPOINTS)  # type: ignore
-                    except (OSError, RuntimeError, ValueError) as _exc:  # noqa: 窄化
+                    except (OSError, RuntimeError, ValueError) as _exc:
                         logger.warning("checkpoint asetup DDL 失败（%s）: %s", _redact_dsn(self.dsn), _exc)
                         try:
                             async with self.pool.connection() as conn:  # type: ignore
                                 async with conn.cursor() as cur:  # type: ignore
                                     await cur.execute(DDL_CHECKPOINTS)
-                        except Exception as _exc2:  # noqa: 兜底
+                        except Exception as _exc2:
                             logger.warning("checkpoint asetup DDL 重试失败（%s）: %s", _redact_dsn(self.dsn), _exc2, exc_info=True)
                     except Exception as _exc:  # 兜底
                         logger.warning("checkpoint asetup DDL 异常（%s）: %s", _redact_dsn(self.dsn), _exc, exc_info=True)
@@ -628,7 +692,7 @@ class AsyncPostgresSaver:
                             async with self.pool.connection() as conn:  # type: ignore
                                 async with conn.cursor() as cur:  # type: ignore
                                     await cur.execute(DDL_CHECKPOINTS)
-                        except Exception as _exc2:  # noqa: 兜底
+                        except Exception as _exc2:
                             logger.warning("checkpoint asetup DDL 重试失败（%s）: %s", _redact_dsn(self.dsn), _exc2, exc_info=True)
                 self._setup_done = True
             return
@@ -638,7 +702,12 @@ class AsyncPostgresSaver:
 
     # ---- internal PG ops ----
     def _pg_put_sync(self, thread_id: str, checkpoint: Dict[str, Any], config: Dict[str, Any]) -> bool:
-        """同步 UPSERT 到 Postgres（幂等，带 expires_at）。Task7 tenant/thread/seq schema。"""
+        """同步 UPSERT 到 Postgres（幂等，带 expires_at）。
+
+        T2-3: version 乐观锁 + pg_advisory_xact_lock 串行化。UPSERT 用
+        WHERE checkpoints.version <= EXCLUDED.version，旧版本写入被忽略不覆盖；
+        无 version 列的旧库回退无锁 UPSERT（尽力兼容）。Task7 tenant/thread/seq schema。
+        """
         if not self._is_pg_mode() or self._pool_is_async():
             return False
         if self._is_real_pg_pool() and not self._pool_is_async():
@@ -654,15 +723,30 @@ class AsyncPostgresSaver:
                 use_ttl = ttl_val is not None and ttl_val > 0
                 wf, run, _tenant_raw = _validate_thread_id(thread_id)
                 run_text = run
+                ck_ver = _ckpt_version(checkpoint)
+                lock_key = _pg_lock_key(tenant, thread, seq)
                 if use_ttl:
                     expires_at_expr = "now() + (%s * interval '1 second')"
                     sql_new = f"""
+                        INSERT INTO checkpoints (tenant, thread, seq, checkpoint, run_text, expires_at, version)
+                        VALUES (%s, %s, %s, %s::jsonb, %s, {expires_at_expr}, %s)
+                        ON CONFLICT (tenant, thread, seq) DO UPDATE SET checkpoint=EXCLUDED.checkpoint, run_text=EXCLUDED.run_text, expires_at=EXCLUDED.expires_at, version=EXCLUDED.version
+                        WHERE checkpoints.version <= EXCLUDED.version
+                    """
+                    # try with run_text, fallback without if column missing
+                    sql_new_no_run = f"""
+                        INSERT INTO checkpoints (tenant, thread, seq, checkpoint, expires_at, version)
+                        VALUES (%s, %s, %s, %s::jsonb, {expires_at_expr}, %s)
+                        ON CONFLICT (tenant, thread, seq) DO UPDATE SET checkpoint=EXCLUDED.checkpoint, expires_at=EXCLUDED.expires_at, version=EXCLUDED.version
+                        WHERE checkpoints.version <= EXCLUDED.version
+                    """
+                    # 旧库无 version 列的兼容回退（无锁）。
+                    sql_new_no_ver = f"""
                         INSERT INTO checkpoints (tenant, thread, seq, checkpoint, run_text, expires_at)
                         VALUES (%s, %s, %s, %s::jsonb, %s, {expires_at_expr})
                         ON CONFLICT (tenant, thread, seq) DO UPDATE SET checkpoint=EXCLUDED.checkpoint, run_text=EXCLUDED.run_text, expires_at=EXCLUDED.expires_at
                     """
-                    # try with run_text, fallback without if column missing
-                    sql_new_no_run = f"""
+                    sql_new_no_run_no_ver = f"""
                         INSERT INTO checkpoints (tenant, thread, seq, checkpoint, expires_at)
                         VALUES (%s, %s, %s, %s::jsonb, {expires_at_expr})
                         ON CONFLICT (tenant, thread, seq) DO UPDATE SET checkpoint=EXCLUDED.checkpoint, expires_at=EXCLUDED.expires_at
@@ -672,17 +756,31 @@ class AsyncPostgresSaver:
                         VALUES (%s, %s::jsonb, %s::jsonb, {expires_at_expr})
                         ON CONFLICT (thread_id) DO UPDATE SET checkpoint=EXCLUDED.checkpoint, config=EXCLUDED.config, expires_at=EXCLUDED.expires_at
                     """
-                    params_new = (tenant, thread, seq, ck_json, run_text, ttl_val)
-                    params_new_no_run = (tenant, thread, seq, ck_json, ttl_val)
+                    params_new = (tenant, thread, seq, ck_json, run_text, ttl_val, ck_ver)
+                    params_new_no_run = (tenant, thread, seq, ck_json, ttl_val, ck_ver)
+                    params_new_no_ver = (tenant, thread, seq, ck_json, run_text, ttl_val)
+                    params_new_no_run_no_ver = (tenant, thread, seq, ck_json, ttl_val)
                     params_legacy = (thread_id, ck_json, cfg_json, ttl_val)
                 else:
                     expires_at_expr = "NULL"
                     sql_new = f"""
+                        INSERT INTO checkpoints (tenant, thread, seq, checkpoint, run_text, expires_at, version)
+                        VALUES (%s, %s, %s, %s::jsonb, %s, {expires_at_expr}, %s)
+                        ON CONFLICT (tenant, thread, seq) DO UPDATE SET checkpoint=EXCLUDED.checkpoint, run_text=EXCLUDED.run_text, expires_at=EXCLUDED.expires_at, version=EXCLUDED.version
+                        WHERE checkpoints.version <= EXCLUDED.version
+                    """
+                    sql_new_no_run = f"""
+                        INSERT INTO checkpoints (tenant, thread, seq, checkpoint, expires_at, version)
+                        VALUES (%s, %s, %s, %s::jsonb, {expires_at_expr}, %s)
+                        ON CONFLICT (tenant, thread, seq) DO UPDATE SET checkpoint=EXCLUDED.checkpoint, expires_at=EXCLUDED.expires_at, version=EXCLUDED.version
+                        WHERE checkpoints.version <= EXCLUDED.version
+                    """
+                    sql_new_no_ver = f"""
                         INSERT INTO checkpoints (tenant, thread, seq, checkpoint, run_text, expires_at)
                         VALUES (%s, %s, %s, %s::jsonb, %s, {expires_at_expr})
                         ON CONFLICT (tenant, thread, seq) DO UPDATE SET checkpoint=EXCLUDED.checkpoint, run_text=EXCLUDED.run_text, expires_at=EXCLUDED.expires_at
                     """
-                    sql_new_no_run = f"""
+                    sql_new_no_run_no_ver = f"""
                         INSERT INTO checkpoints (tenant, thread, seq, checkpoint, expires_at)
                         VALUES (%s, %s, %s, %s::jsonb, {expires_at_expr})
                         ON CONFLICT (tenant, thread, seq) DO UPDATE SET checkpoint=EXCLUDED.checkpoint, expires_at=EXCLUDED.expires_at
@@ -692,16 +790,40 @@ class AsyncPostgresSaver:
                         VALUES (%s, %s::jsonb, %s::jsonb, {expires_at_expr})
                         ON CONFLICT (thread_id) DO UPDATE SET checkpoint=EXCLUDED.checkpoint, config=EXCLUDED.config, expires_at=EXCLUDED.expires_at
                     """
-                    params_new = (tenant, thread, seq, ck_json, run_text)
-                    params_new_no_run = (tenant, thread, seq, ck_json)
+                    params_new = (tenant, thread, seq, ck_json, run_text, ck_ver)
+                    params_new_no_run = (tenant, thread, seq, ck_json, ck_ver)
+                    params_new_no_ver = (tenant, thread, seq, ck_json, run_text)
+                    params_new_no_run_no_ver = (tenant, thread, seq, ck_json)
                     params_legacy = (thread_id, ck_json, cfg_json)
                 if hasattr(self.pool, "connection"):
                     with self.pool.connection() as conn:  # type: ignore
                         try:
                             try:
-                                conn.execute(sql_new, params_new)  # type: ignore
+                                # T2-3: 同 key 串行化（事务级 advisory 锁，commit 自动释放）
+                                try:
+                                    _lock_exec = getattr(conn, "execute", None)
+                                    if callable(_lock_exec):
+                                        _lock_exec("SELECT pg_advisory_xact_lock(%s)", (lock_key,))  # type: ignore
+                                except Exception:
+                                    pass
+                                try:
+                                    conn.execute(sql_new, params_new)  # type: ignore
+                                except Exception:
+                                    try:
+                                        conn.execute(sql_new_no_run, params_new_no_run)  # type: ignore
+                                    except Exception:
+                                        try:
+                                            conn.execute(sql_new_no_ver, params_new_no_ver)  # type: ignore
+                                        except Exception:
+                                            conn.execute(sql_new_no_run_no_ver, params_new_no_run_no_ver)  # type: ignore
                             except Exception:
-                                conn.execute(sql_new_no_run, params_new_no_run)  # type: ignore
+                                try:
+                                    try:
+                                        conn.execute(sql_new_no_ver, params_new_no_ver)  # type: ignore
+                                    except Exception:
+                                        conn.execute(sql_new_no_run_no_ver, params_new_no_run_no_ver)  # type: ignore
+                                except Exception:
+                                    pass
                             # also maintain legacy for compatibility
                             try:
                                 conn.execute(sql_legacy, params_legacy)  # type: ignore
@@ -714,7 +836,13 @@ class AsyncPostgresSaver:
                                     try:
                                         cur.execute(sql_new, params_new)
                                     except Exception:
-                                        cur.execute(sql_new_no_run, params_new_no_run)
+                                        try:
+                                            cur.execute(sql_new_no_run, params_new_no_run)
+                                        except Exception:
+                                            try:
+                                                cur.execute(sql_new_no_ver, params_new_no_ver)
+                                            except Exception:
+                                                cur.execute(sql_new_no_run_no_ver, params_new_no_run_no_ver)
                                 except Exception:
                                     cur.execute(sql_legacy, params_legacy)
                         try:
@@ -726,11 +854,22 @@ class AsyncPostgresSaver:
                     conn = self.pool.getconn()  # type: ignore
                     try:
                         with conn.cursor() as cur:
+                            # T2-3: 同 key 串行化（事务级 advisory 锁，无 version 列回退同序）
+                            try:
+                                cur.execute("SELECT pg_advisory_xact_lock(%s)", (lock_key,))
+                            except Exception:
+                                pass
                             try:
                                 try:
                                     cur.execute(sql_new, params_new)
                                 except Exception:
-                                    cur.execute(sql_new_no_run, params_new_no_run)
+                                    try:
+                                        cur.execute(sql_new_no_run, params_new_no_run)
+                                    except Exception:
+                                        try:
+                                            cur.execute(sql_new_no_ver, params_new_no_ver)
+                                        except Exception:
+                                            cur.execute(sql_new_no_run_no_ver, params_new_no_run_no_ver)
                             except Exception:
                                 cur.execute(sql_legacy, params_legacy)
                         conn.commit()
@@ -743,7 +882,7 @@ class AsyncPostgresSaver:
                 else:
                     return False
                 return True
-            except (OSError, RuntimeError, ValueError) as _exc:  # noqa: 窄化
+            except (OSError, RuntimeError, ValueError) as _exc:
                 logger.warning("PG _pg_put_sync 失败（%s）: %s", _redact_dsn(self.dsn), _exc)
                 return False
             except Exception as _exc:  # 兜底
@@ -753,7 +892,10 @@ class AsyncPostgresSaver:
         return False
 
     async def _pg_put_async(self, thread_id: str, checkpoint: Dict[str, Any], config: Dict[str, Any]) -> bool:
-        """异步 UPSERT 到 Postgres；同步池回退经 to_thread 卸载，不阻塞事件循环。"""
+        """异步 UPSERT 到 Postgres；同步池回退经 to_thread 卸载，不阻塞事件循环。
+
+        T2-3: 与 _pg_put_sync 同构的 version 乐观锁 + pg_advisory_xact_lock 串行化。
+        """
         if not self._is_pg_mode():
             return False
         if self._is_real_pg_pool() and self._pool_is_async():
@@ -762,6 +904,8 @@ class AsyncPostgresSaver:
                 ck_json = json.dumps(checkpoint, ensure_ascii=False)
                 wf2, run2, _t2 = _validate_thread_id(thread_id)
                 run_text2 = run2
+                ck_ver2 = _ckpt_version(checkpoint)
+                lock_key2 = _pg_lock_key(tenant, thread, seq)
                 try:
                     ttl_val = int(self.ttl_seconds) if self.ttl_seconds is not None else 0
                 except Exception:
@@ -770,42 +914,92 @@ class AsyncPostgresSaver:
                 if use_ttl:
                     expires_at_expr = "now() + (%s * interval '1 second')"
                     sql_new = f"""
+                        INSERT INTO checkpoints (tenant, thread, seq, checkpoint, run_text, expires_at, version)
+                        VALUES (%s, %s, %s, %s::jsonb, %s, {expires_at_expr}, %s)
+                        ON CONFLICT (tenant, thread, seq) DO UPDATE SET checkpoint=EXCLUDED.checkpoint, run_text=EXCLUDED.run_text, expires_at=EXCLUDED.expires_at, version=EXCLUDED.version
+                        WHERE checkpoints.version <= EXCLUDED.version
+                    """
+                    params_new = (tenant, thread, seq, ck_json, run_text2, ttl_val, ck_ver2)
+                    sql_new_no_run = f"""
+                        INSERT INTO checkpoints (tenant, thread, seq, checkpoint, expires_at, version)
+                        VALUES (%s, %s, %s, %s::jsonb, {expires_at_expr}, %s)
+                        ON CONFLICT (tenant, thread, seq) DO UPDATE SET checkpoint=EXCLUDED.checkpoint, expires_at=EXCLUDED.expires_at, version=EXCLUDED.version
+                        WHERE checkpoints.version <= EXCLUDED.version
+                    """
+                    params_new_no_run = (tenant, thread, seq, ck_json, ttl_val, ck_ver2)
+                    sql_new_no_ver = f"""
                         INSERT INTO checkpoints (tenant, thread, seq, checkpoint, run_text, expires_at)
                         VALUES (%s, %s, %s, %s::jsonb, %s, {expires_at_expr})
                         ON CONFLICT (tenant, thread, seq) DO UPDATE SET checkpoint=EXCLUDED.checkpoint, run_text=EXCLUDED.run_text, expires_at=EXCLUDED.expires_at
                     """
-                    params_new = (tenant, thread, seq, ck_json, run_text2, ttl_val)
-                    sql_new_no_run = f"""
+                    params_new_no_ver = (tenant, thread, seq, ck_json, run_text2, ttl_val)
+                    sql_new_no_run_no_ver = f"""
                         INSERT INTO checkpoints (tenant, thread, seq, checkpoint, expires_at)
                         VALUES (%s, %s, %s, %s::jsonb, {expires_at_expr})
                         ON CONFLICT (tenant, thread, seq) DO UPDATE SET checkpoint=EXCLUDED.checkpoint, expires_at=EXCLUDED.expires_at
                     """
-                    params_new_no_run = (tenant, thread, seq, ck_json, ttl_val)
+                    params_new_no_run_no_ver = (tenant, thread, seq, ck_json, ttl_val)
                 else:
                     expires_at_expr = "NULL"
                     sql_new = f"""
+                        INSERT INTO checkpoints (tenant, thread, seq, checkpoint, run_text, expires_at, version)
+                        VALUES (%s, %s, %s, %s::jsonb, %s, {expires_at_expr}, %s)
+                        ON CONFLICT (tenant, thread, seq) DO UPDATE SET checkpoint=EXCLUDED.checkpoint, run_text=EXCLUDED.run_text, expires_at=EXCLUDED.expires_at, version=EXCLUDED.version
+                        WHERE checkpoints.version <= EXCLUDED.version
+                    """
+                    params_new = (tenant, thread, seq, ck_json, run_text2, ck_ver2)
+                    sql_new_no_run = f"""
+                        INSERT INTO checkpoints (tenant, thread, seq, checkpoint, expires_at, version)
+                        VALUES (%s, %s, %s, %s::jsonb, {expires_at_expr}, %s)
+                        ON CONFLICT (tenant, thread, seq) DO UPDATE SET checkpoint=EXCLUDED.checkpoint, expires_at=EXCLUDED.expires_at, version=EXCLUDED.version
+                        WHERE checkpoints.version <= EXCLUDED.version
+                    """
+                    params_new_no_run = (tenant, thread, seq, ck_json, ck_ver2)
+                    sql_new_no_ver = f"""
                         INSERT INTO checkpoints (tenant, thread, seq, checkpoint, run_text, expires_at)
                         VALUES (%s, %s, %s, %s::jsonb, %s, {expires_at_expr})
                         ON CONFLICT (tenant, thread, seq) DO UPDATE SET checkpoint=EXCLUDED.checkpoint, run_text=EXCLUDED.run_text, expires_at=EXCLUDED.expires_at
                     """
-                    params_new = (tenant, thread, seq, ck_json, run_text2)
-                    sql_new_no_run = f"""
+                    params_new_no_ver = (tenant, thread, seq, ck_json, run_text2)
+                    sql_new_no_run_no_ver = f"""
                         INSERT INTO checkpoints (tenant, thread, seq, checkpoint, expires_at)
                         VALUES (%s, %s, %s, %s::jsonb, {expires_at_expr})
                         ON CONFLICT (tenant, thread, seq) DO UPDATE SET checkpoint=EXCLUDED.checkpoint, expires_at=EXCLUDED.expires_at
                     """
-                    params_new_no_run = (tenant, thread, seq, ck_json)
+                    params_new_no_run_no_ver = (tenant, thread, seq, ck_json)
                 async with self.pool.connection() as conn:  # type: ignore
                     try:
-                        await conn.execute(sql_new, params_new)  # type: ignore
-                    except (OSError, RuntimeError, ValueError) as _exc:  # noqa: 窄化
-                        logger.warning("PG _pg_put_async 回退到 no_run（%s）: %s", _redact_dsn(self.dsn), _exc)
-                        await conn.execute(sql_new_no_run, params_new_no_run)  # type: ignore
+                        # T2-3: 同 key 串行化（事务级 advisory 锁）
+                        try:
+                            await conn.execute("SELECT pg_advisory_xact_lock(%s)", (lock_key2,))  # type: ignore
+                        except Exception:
+                            pass
+                        try:
+                            await conn.execute(sql_new, params_new)  # type: ignore
+                        except (OSError, RuntimeError, ValueError) as _exc:
+                            logger.warning("PG _pg_put_async 回退到 no_run（%s）: %s", _redact_dsn(self.dsn), _exc)
+                            try:
+                                await conn.execute(sql_new_no_run, params_new_no_run)  # type: ignore
+                            except Exception:
+                                try:
+                                    await conn.execute(sql_new_no_ver, params_new_no_ver)  # type: ignore
+                                except Exception:
+                                    await conn.execute(sql_new_no_run_no_ver, params_new_no_run_no_ver)  # type: ignore
+                        except Exception as _exc:  # 兜底
+                            logger.warning("PG _pg_put_async 异常回退（%s）: %s", _redact_dsn(self.dsn), _exc, exc_info=True)
+                            try:
+                                await conn.execute(sql_new_no_run, params_new_no_run)  # type: ignore
+                            except Exception:
+                                try:
+                                    await conn.execute(sql_new_no_ver, params_new_no_ver)  # type: ignore
+                                except Exception:
+                                    await conn.execute(sql_new_no_run_no_ver, params_new_no_run_no_ver)  # type: ignore
+                    except (OSError, RuntimeError, ValueError) as _exc:
+                        logger.warning("PG _pg_put_async 顶层回退（%s）: %s", _redact_dsn(self.dsn), _exc)
                     except Exception as _exc:  # 兜底
-                        logger.warning("PG _pg_put_async 异常回退（%s）: %s", _redact_dsn(self.dsn), _exc, exc_info=True)
-                        await conn.execute(sql_new_no_run, params_new_no_run)  # type: ignore
+                        logger.warning("PG _pg_put_async 顶层异常（%s）: %s", _redact_dsn(self.dsn), _exc, exc_info=True)
                 return True
-            except (OSError, RuntimeError, ValueError) as _exc:  # noqa: 窄化
+            except (OSError, RuntimeError, ValueError) as _exc:
                 logger.warning("PG _pg_put_async 失败（%s）: %s", _redact_dsn(self.dsn), _exc)
                 return False
             except Exception as _exc:  # 兜底
@@ -817,20 +1011,31 @@ class AsyncPostgresSaver:
         return False
 
     def _pg_get_sync(self, thread_id: str) -> Optional[Dict[str, Any]]:
-        """同步从 Postgres 读取未过期 checkpoint。"""
+        """同步从 Postgres 读取未过期 checkpoint。
+
+        T2-3: 双表读包单事务 REPEATABLE READ（set_config + 单 connection 内两次 SELECT），
+        读序与异步路径统一：新表 checkpoints 优先，legacy 其次。
+        """
         if self._is_real_pg_pool() and not self._pool_is_async():
             try:
                 tenant, thread, seq = _thread_to_keys(thread_id, dsn=self.dsn)
-                sql_new = "SELECT checkpoint FROM checkpoints WHERE tenant=%s AND thread=%s AND seq=%s AND (expires_at IS NULL OR expires_at > now())"
-                sql_legacy = "SELECT checkpoint, config FROM checkpoints_legacy WHERE thread_id=%s AND (expires_at IS NULL OR expires_at > now())"
                 row = None
                 if hasattr(self.pool, "connection"):
                     with self.pool.connection() as conn:  # type: ignore
                         try:
-                            cur = conn.execute(sql_new, (tenant, thread, seq))  # type: ignore
+                            # T2-3: 单事务 REPEATABLE READ，避免双表两次 SELECT 读偏
+                            try:
+                                conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")  # type: ignore
+                            except Exception:
+                                try:
+                                    with conn.cursor() as _c:  # type: ignore
+                                        _c.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+                                except Exception:
+                                    pass
+                            cur = conn.execute(_READ_ORDER_SQL_NEW, (tenant, thread, seq))  # type: ignore
                             row = cur.fetchone()  # type: ignore
                             if row is None:
-                                cur = conn.execute(sql_legacy, (thread_id,))  # type: ignore
+                                cur = conn.execute(_READ_ORDER_SQL_LEGACY, (thread_id,))  # type: ignore
                                 row = cur.fetchone()  # type: ignore
                                 if row is not None:
                                     chk = row[0] if isinstance(row, (list, tuple)) else row.get("checkpoint")  # type: ignore
@@ -842,10 +1047,10 @@ class AsyncPostgresSaver:
                                     return copy.deepcopy(chk) if isinstance(chk, dict) else chk  # type: ignore
                         except Exception:
                             with conn.cursor() as cur:  # type: ignore
-                                cur.execute(sql_new, (tenant, thread, seq))
+                                cur.execute(_READ_ORDER_SQL_NEW, (tenant, thread, seq))
                                 row = cur.fetchone()
                                 if row is None:
-                                    cur.execute(sql_legacy, (thread_id,))
+                                    cur.execute(_READ_ORDER_SQL_LEGACY, (thread_id,))
                                     row = cur.fetchone()
                                     if row is not None:
                                         chk = row[0] if isinstance(row, (list, tuple)) else row.get("checkpoint")  # type: ignore
@@ -859,10 +1064,14 @@ class AsyncPostgresSaver:
                     conn = self.pool.getconn()  # type: ignore
                     try:
                         with conn.cursor() as cur:
-                            cur.execute(sql_new, (tenant, thread, seq))
+                            try:
+                                cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+                            except Exception:
+                                pass
+                            cur.execute(_READ_ORDER_SQL_NEW, (tenant, thread, seq))
                             row = cur.fetchone()
                             if row is None:
-                                cur.execute(sql_legacy, (thread_id,))
+                                cur.execute(_READ_ORDER_SQL_LEGACY, (thread_id,))
                                 row = cur.fetchone()
                     finally:
                         try:
@@ -879,7 +1088,7 @@ class AsyncPostgresSaver:
                     except Exception:
                         pass
                 return copy.deepcopy(chk) if isinstance(chk, dict) else chk  # type: ignore
-            except (OSError, RuntimeError, ValueError) as _exc:  # noqa: 窄化
+            except (OSError, RuntimeError, ValueError) as _exc:
                 logger.warning("PG _pg_get_sync 失败（%s）: %s", _redact_dsn(self.dsn), _exc)
                 return None
             except Exception as _exc:  # 兜底
@@ -888,20 +1097,26 @@ class AsyncPostgresSaver:
         return None
 
     async def _pg_get_async(self, thread_id: str) -> Optional[Dict[str, Any]]:
-        """异步从 Postgres 读取未过期 checkpoint；同步池回退经 to_thread 卸载。"""
+        """异步从 Postgres 读取未过期 checkpoint；同步池回退经 to_thread 卸载。
+
+        T2-3: 与同步路径统一读序（新表 checkpoints 优先，legacy 其次），
+        双表两次 SELECT 包同一 connection（事务级一致读）。
+        """
         if not self._is_pg_mode():
             return None
         if self._is_real_pg_pool() and self._pool_is_async():
             try:
                 tenant, thread, seq = _thread_to_keys(thread_id, dsn=self.dsn)
-                sql_new = "SELECT checkpoint FROM checkpoints WHERE tenant=%s AND thread=%s AND seq=%s AND (expires_at IS NULL OR expires_at > now())"
                 async with self.pool.connection() as conn:  # type: ignore
-                    cur = await conn.execute(sql_new, (tenant, thread, seq))  # type: ignore
+                    try:
+                        await conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")  # type: ignore
+                    except Exception:
+                        pass
+                    cur = await conn.execute(_READ_ORDER_SQL_NEW, (tenant, thread, seq))  # type: ignore
                     row = await cur.fetchone()  # type: ignore
                     if row is None:
-                        # try legacy
-                        sql_legacy = "SELECT checkpoint FROM checkpoints_legacy WHERE thread_id=%s AND (expires_at IS NULL OR expires_at > now())"
-                        cur = await conn.execute(sql_legacy, (thread_id,))  # type: ignore
+                        # try legacy (same connection — 与同步路径统一读序)
+                        cur = await conn.execute(_READ_ORDER_SQL_LEGACY, (thread_id,))  # type: ignore
                         row = await cur.fetchone()  # type: ignore
                     if row is None:
                         return None
@@ -912,7 +1127,7 @@ class AsyncPostgresSaver:
                         except Exception:
                             pass
                     return copy.deepcopy(chk) if isinstance(chk, dict) else chk  # type: ignore
-            except (OSError, RuntimeError, ValueError) as _exc:  # noqa: 窄化
+            except (OSError, RuntimeError, ValueError) as _exc:
                 logger.warning("PG _pg_get_async 失败（%s）: %s", _redact_dsn(self.dsn), _exc)
                 return None
             except Exception as _exc:  # 兜底
@@ -926,7 +1141,11 @@ class AsyncPostgresSaver:
     # ---- put / get ----
 
     def put(self, thread_id: str, checkpoint: Dict[str, Any], config: Dict[str, Any] | None = None) -> None:
-        """写入 checkpoint，thread_id 须为三段式，自动记录 TTL 时间戳。"""
+        """写入 checkpoint，thread_id 须为三段式，自动记录 TTL 时间戳。
+
+        T2-3: emulated 侧 version 乐观锁——同 key 旧版本写入被忽略（last-writer-wins
+        按版本裁决），保证并发同 thread 不丢进度。
+        """
         _validate_thread_id(thread_id)
         if not isinstance(checkpoint, dict):
             raise ValueError("checkpoint must be dict")
@@ -937,17 +1156,27 @@ class AsyncPostgresSaver:
             # ensure deterministic seq mapping is persisted (collision disambiguation)
             try:
                 _thread_to_keys(thread_id, dsn=self.dsn)
-            except (ValueError, TypeError, RuntimeError) as _exc:  # noqa: 窄化
+            except (ValueError, TypeError, RuntimeError) as _exc:
                 logger.warning("thread_id 映射失败（%s）: %s", _redact_dsn(self.dsn), _exc)
             except Exception as _exc:  # 兜底
                 logger.warning("thread_id 映射异常（%s）: %s", _redact_dsn(self.dsn), _exc, exc_info=True)
             # emulated PG global store (ensures restart not lost even without real PG)
+            # T2-3: version 乐观锁 — 旧版本写入忽略，不覆盖新版本（并发不丢进度）
             key = _pg_store_key(self.dsn, thread_id)
+            ck_ver_put = _ckpt_version(checkpoint)
             with _PG_GLOBAL_LOCK:
-                _PG_GLOBAL_STORE[key] = copy.deepcopy(checkpoint)
-                _PG_GLOBAL_META[key] = copy.deepcopy(cfg)
-                _PG_GLOBAL_TS[key] = now
-                _evict_if_needed()
+                cur_ver = _PG_GLOBAL_VER.get(key, -1)
+                if ck_ver_put < cur_ver:
+                    logger.warning(
+                        "checkpoint emulated 忽略旧版本写入（%s）: incoming=%s current=%s",
+                        _redact_dsn(self.dsn), ck_ver_put, cur_ver,
+                    )
+                else:
+                    _PG_GLOBAL_STORE[key] = copy.deepcopy(checkpoint)
+                    _PG_GLOBAL_META[key] = copy.deepcopy(cfg)
+                    _PG_GLOBAL_TS[key] = now
+                    _PG_GLOBAL_VER[key] = ck_ver_put
+                    _evict_if_needed()
             # also keep instance store for immediate access
             self._store[thread_id] = copy.deepcopy(checkpoint)
             self._meta[thread_id] = cfg
@@ -968,6 +1197,7 @@ class AsyncPostgresSaver:
 
         并发：与同步 put 统一以 _PG_GLOBAL_LOCK 保护同一 dict（绝不分裂两套锁）；
         临界区内仅做非阻塞 dict 读写拷贝，不跨 await，不阻塞事件循环。
+        T2-3: emulated 侧 version 乐观锁（与 put 同构）。
         """
         _validate_thread_id(thread_id)
         if not isinstance(checkpoint, dict):
@@ -977,16 +1207,25 @@ class AsyncPostgresSaver:
         if self._is_pg_mode():
             try:
                 _thread_to_keys(thread_id, dsn=self.dsn)
-            except (ValueError, TypeError, RuntimeError) as _exc:  # noqa: 窄化
+            except (ValueError, TypeError, RuntimeError) as _exc:
                 logger.warning("thread_id 映射失败（%s）: %s", _redact_dsn(self.dsn), _exc)
             except Exception as _exc:  # 兜底
                 logger.warning("thread_id 映射异常（%s）: %s", _redact_dsn(self.dsn), _exc, exc_info=True)
             key = _pg_store_key(self.dsn, thread_id)
+            ck_ver_aput = _ckpt_version(checkpoint)
             with _PG_GLOBAL_LOCK:
-                _PG_GLOBAL_STORE[key] = copy.deepcopy(checkpoint)
-                _PG_GLOBAL_META[key] = copy.deepcopy(cfg)
-                _PG_GLOBAL_TS[key] = now
-                _evict_if_needed()
+                cur_ver = _PG_GLOBAL_VER.get(key, -1)
+                if ck_ver_aput < cur_ver:
+                    logger.warning(
+                        "checkpoint emulated 忽略旧版本写入（%s）: incoming=%s current=%s",
+                        _redact_dsn(self.dsn), ck_ver_aput, cur_ver,
+                    )
+                else:
+                    _PG_GLOBAL_STORE[key] = copy.deepcopy(checkpoint)
+                    _PG_GLOBAL_META[key] = copy.deepcopy(cfg)
+                    _PG_GLOBAL_TS[key] = now
+                    _PG_GLOBAL_VER[key] = ck_ver_aput
+                    _evict_if_needed()
             self._store[thread_id] = copy.deepcopy(checkpoint)
             self._meta[thread_id] = cfg
             self._timestamps[thread_id] = now
@@ -1009,7 +1248,7 @@ class AsyncPostgresSaver:
                     pg_val = self._pg_get_sync(thread_id)
                     if pg_val is not None:
                         return copy.deepcopy(pg_val)
-                except (OSError, RuntimeError, ValueError) as _exc:  # noqa: 窄化
+                except (OSError, RuntimeError, ValueError) as _exc:
                     logger.warning("PG get 失败回退 emulated（%s）: %s", _redact_dsn(self.dsn), _exc)
                 except Exception as _exc:  # 兜底
                     logger.warning("PG get 异常回退 emulated（%s）: %s", _redact_dsn(self.dsn), _exc, exc_info=True)
@@ -1020,6 +1259,7 @@ class AsyncPostgresSaver:
                     _PG_GLOBAL_STORE.pop(key, None)
                     _PG_GLOBAL_META.pop(key, None)
                     _PG_GLOBAL_TS.pop(key, None)
+                    _PG_GLOBAL_VER.pop(key, None)
                 else:
                     val = _PG_GLOBAL_STORE.get(key)
                     if val is not None:
@@ -1049,7 +1289,7 @@ class AsyncPostgresSaver:
                 pg_val = await self._pg_get_async(thread_id)
                 if pg_val is not None:
                     return copy.deepcopy(pg_val)
-            except (OSError, RuntimeError, ValueError) as _exc:  # noqa: 窄化
+            except (OSError, RuntimeError, ValueError) as _exc:
                 logger.warning("PG aget 失败回退 emulated（%s）: %s", _redact_dsn(self.dsn), _exc)
             except Exception as _exc:  # 兜底
                 logger.warning("PG aget 异常回退 emulated（%s）: %s", _redact_dsn(self.dsn), _exc, exc_info=True)
@@ -1060,6 +1300,7 @@ class AsyncPostgresSaver:
                     _PG_GLOBAL_STORE.pop(key, None)
                     _PG_GLOBAL_META.pop(key, None)
                     _PG_GLOBAL_TS.pop(key, None)
+                    _PG_GLOBAL_VER.pop(key, None)
                 else:
                     val = _PG_GLOBAL_STORE.get(key)
                     if val is not None:
@@ -1084,6 +1325,7 @@ class AsyncPostgresSaver:
                     _PG_GLOBAL_STORE.pop(key, None)
                     _PG_GLOBAL_META.pop(key, None)
                     _PG_GLOBAL_TS.pop(key, None)
+                    _PG_GLOBAL_VER.pop(key, None)
                     expired = True
                 else:
                     chk = _PG_GLOBAL_STORE.get(key)
@@ -1106,58 +1348,61 @@ class AsyncPostgresSaver:
                 else:
                     try:
                         tenant, thread, seq = _thread_to_keys(thread_id, dsn=self.dsn)
-                        sql_new = "SELECT checkpoint FROM checkpoints WHERE tenant=%s AND thread=%s AND seq=%s AND (expires_at IS NULL OR expires_at > now())"
-                        sql_legacy = "SELECT checkpoint, config FROM checkpoints_legacy WHERE thread_id=%s AND (expires_at IS NULL OR expires_at > now())"
                         row = None
                         cfg: Dict[str, Any] = {}
                         if hasattr(self.pool, "connection"):
                             with self.pool.connection() as conn:  # type: ignore
                                 try:
-                                    cur = conn.execute(sql_new, (tenant, thread, seq))  # type: ignore
+                                    # T2-3: 单事务 REPEATABLE READ（与 _pg_get_sync 同构）
+                                    try:
+                                        conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")  # type: ignore
+                                    except Exception:
+                                        pass
+                                    cur = conn.execute(_READ_ORDER_SQL_NEW, (tenant, thread, seq))  # type: ignore
                                     row = cur.fetchone()  # type: ignore
                                     if row is None:
                                         # 中文：新表无 config 列时回退 legacy（config 真实持久处）
-                                        cur = conn.execute(sql_legacy, (thread_id,))  # type: ignore
+                                        cur = conn.execute(_READ_ORDER_SQL_LEGACY, (thread_id,))  # type: ignore
                                         row = cur.fetchone()  # type: ignore
-                                except (OSError, RuntimeError, ValueError) as _exc:  # noqa: 窄化
+                                except (OSError, RuntimeError, ValueError) as _exc:
                                     logger.warning("get_with_config 回退到 cursor（%s）: %s", _redact_dsn(self.dsn), _exc)
                                     with conn.cursor() as cur:  # type: ignore
-                                        cur.execute(sql_new, (tenant, thread, seq))
+                                        cur.execute(_READ_ORDER_SQL_NEW, (tenant, thread, seq))
                                         row = cur.fetchone()
                                         if row is None:
-                                            cur.execute(sql_legacy, (thread_id,))
+                                            cur.execute(_READ_ORDER_SQL_LEGACY, (thread_id,))
                                             row = cur.fetchone()
                                 except Exception as _exc:  # 兜底
                                     logger.warning("get_with_config 异常回退（%s）: %s", _redact_dsn(self.dsn), _exc, exc_info=True)
                                     with conn.cursor() as cur:  # type: ignore
-                                        cur.execute(sql_new, (tenant, thread, seq))
+                                        cur.execute(_READ_ORDER_SQL_NEW, (tenant, thread, seq))
                                         row = cur.fetchone()
                                         if row is None:
-                                            cur.execute(sql_legacy, (thread_id,))
+                                            cur.execute(_READ_ORDER_SQL_LEGACY, (thread_id,))
                                             row = cur.fetchone()
                         if row is not None:
                             if isinstance(row, (list, tuple)) and len(row) > 1 and row[1] is not None:
                                 try:
                                     cfg = row[1] if isinstance(row[1], dict) else json.loads(row[1])
-                                except (json.JSONDecodeError, ValueError, TypeError) as _exc:  # noqa: 窄化
+                                except (json.JSONDecodeError, ValueError, TypeError) as _exc:
                                     logger.warning("get_with_config legacy config 解析失败（%s）: %s", _redact_dsn(self.dsn), _exc)
                                     cfg = {}
                             elif isinstance(row, dict) and row.get("config") is not None:
                                 try:
                                     _c = row.get("config")
                                     cfg = _c if isinstance(_c, dict) else json.loads(_c)
-                                except (json.JSONDecodeError, ValueError, TypeError, AttributeError) as _exc:  # noqa: 窄化
+                                except (json.JSONDecodeError, ValueError, TypeError, AttributeError) as _exc:
                                     logger.warning("get_with_config legacy config 解析失败（%s）: %s", _redact_dsn(self.dsn), _exc)
                                     cfg = {}
                             chk = row[0] if isinstance(row, (list, tuple)) else row.get("checkpoint")  # type: ignore
                             if isinstance(chk, str):
                                 try:
                                     chk = json.loads(chk)
-                                except (json.JSONDecodeError, ValueError, TypeError) as _exc:  # noqa: 窄化
+                                except (json.JSONDecodeError, ValueError, TypeError) as _exc:
                                     logger.warning("get_with_config json 解析失败（%s）: %s", _redact_dsn(self.dsn), _exc)
                             if chk is not None:
                                 return copy.deepcopy(chk if isinstance(chk, dict) else {}), copy.deepcopy(cfg)
-                    except (OSError, RuntimeError, ValueError) as _exc:  # noqa: 窄化
+                    except (OSError, RuntimeError, ValueError) as _exc:
                         logger.warning("get_with_config PG 查询失败（%s）: %s", _redact_dsn(self.dsn), _exc)
                     except Exception as _exc:  # 兜底
                         logger.warning("get_with_config 异常（%s）: %s", _redact_dsn(self.dsn), _exc, exc_info=True)
@@ -1171,36 +1416,39 @@ class AsyncPostgresSaver:
 
         新表 checkpoints 无 config 列时回退 checkpoints_legacy（config 真实持久处），
         不可静默返回 {} 丢失跨重启 config。
+        T2-3: 与同步路径统一读序，同一 connection 内两次 SELECT。
         """
-        sql_new = "SELECT checkpoint FROM checkpoints WHERE tenant=%s AND thread=%s AND seq=%s AND (expires_at IS NULL OR expires_at > now())"
-        sql_legacy = "SELECT checkpoint, config FROM checkpoints_legacy WHERE thread_id=%s AND (expires_at IS NULL OR expires_at > now())"
         async with self.pool.connection() as conn:  # type: ignore
-            cur = await conn.execute(sql_new, (tenant, thread, seq))  # type: ignore
+            try:
+                await conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")  # type: ignore
+            except Exception:
+                pass
+            cur = await conn.execute(_READ_ORDER_SQL_NEW, (tenant, thread, seq))  # type: ignore
             row = await cur.fetchone()  # type: ignore
             cfg: Dict[str, Any] = {}
             if row is None:
-                cur = await conn.execute(sql_legacy, (thread_id,))  # type: ignore
+                cur = await conn.execute(_READ_ORDER_SQL_LEGACY, (thread_id,))  # type: ignore
                 row = await cur.fetchone()  # type: ignore
                 if row is None:
                     return None
                 if isinstance(row, (list, tuple)) and len(row) > 1 and row[1] is not None:
                     try:
                         cfg = row[1] if isinstance(row[1], dict) else json.loads(row[1])
-                    except (json.JSONDecodeError, ValueError, TypeError) as _exc:  # noqa: 窄化
+                    except (json.JSONDecodeError, ValueError, TypeError) as _exc:
                         logger.warning("aget_with_config legacy config 解析失败（%s）: %s", _redact_dsn(self.dsn), _exc)
                         cfg = {}
                 elif isinstance(row, dict) and row.get("config") is not None:
                     try:
                         _c = row.get("config")
                         cfg = _c if isinstance(_c, dict) else json.loads(_c)
-                    except (json.JSONDecodeError, ValueError, TypeError, AttributeError) as _exc:  # noqa: 窄化
+                    except (json.JSONDecodeError, ValueError, TypeError, AttributeError) as _exc:
                         logger.warning("aget_with_config legacy config 解析失败（%s）: %s", _redact_dsn(self.dsn), _exc)
                         cfg = {}
             chk = row[0] if isinstance(row, (list, tuple)) else row.get("checkpoint")  # type: ignore
         if isinstance(chk, str):
             try:
                 chk = json.loads(chk)
-            except (json.JSONDecodeError, ValueError, TypeError) as _exc:  # noqa: 窄化
+            except (json.JSONDecodeError, ValueError, TypeError) as _exc:
                 logger.warning("aget_with_config json 解析失败（%s）: %s", _redact_dsn(self.dsn), _exc)
         if chk is None:
             return None
@@ -1217,6 +1465,7 @@ class AsyncPostgresSaver:
                     _PG_GLOBAL_STORE.pop(key, None)
                     _PG_GLOBAL_META.pop(key, None)
                     _PG_GLOBAL_TS.pop(key, None)
+                    _PG_GLOBAL_VER.pop(key, None)
                 else:
                     chk = _PG_GLOBAL_STORE.get(key)
                     if chk is not None:
@@ -1227,7 +1476,7 @@ class AsyncPostgresSaver:
                     try:
                         tenant, thread, seq = _thread_to_keys(thread_id, dsn=self.dsn)
                         row = await self._pg_get_config_row_async(tenant, thread, seq, thread_id)
-                    except (OSError, RuntimeError, ValueError) as _exc:  # noqa: 窄化
+                    except (OSError, RuntimeError, ValueError) as _exc:
                         logger.warning("aget_with_config 异步 PG 查询失败（%s）: %s", _redact_dsn(self.dsn), _exc)
                         row = None
                     except Exception as _exc:  # 兜底
@@ -1251,7 +1500,7 @@ class AsyncPostgresSaver:
             try:
                 await conn.execute(sql_new, (tenant, thread, seq))  # type: ignore
                 await conn.execute(sql_legacy, (thread_id,))  # type: ignore
-            except (OSError, RuntimeError, ValueError) as _exc:  # noqa: 窄化
+            except (OSError, RuntimeError, ValueError) as _exc:
                 logger.warning("adelete 回退语义（%s）: %s", _redact_dsn(self.dsn), _exc)
                 raise
             except Exception as _exc:  # 兜底
@@ -1270,6 +1519,7 @@ class AsyncPostgresSaver:
             _PG_GLOBAL_STORE.pop(key, None)
             _PG_GLOBAL_META.pop(key, None)
             _PG_GLOBAL_TS.pop(key, None)
+            _PG_GLOBAL_VER.pop(key, None)
         self._store.pop(thread_id, None)
         self._meta.pop(thread_id, None)
         self._timestamps.pop(thread_id, None)
@@ -1293,7 +1543,7 @@ class AsyncPostgresSaver:
                         try:
                             conn.execute(sql_new, (tenant, thread, seq))  # type: ignore
                             conn.execute(sql_legacy, (thread_id,))  # type: ignore
-                        except (OSError, RuntimeError, ValueError) as _exc:  # noqa: 窄化
+                        except (OSError, RuntimeError, ValueError) as _exc:
                             logger.warning("delete 回退到 cursor（%s）: %s", _redact_dsn(self.dsn), _exc)
                             with conn.cursor() as cur:  # type: ignore
                                 cur.execute(sql_new, (tenant, thread, seq))
@@ -1305,11 +1555,11 @@ class AsyncPostgresSaver:
                                 cur.execute(sql_legacy, (thread_id,))
                         try:
                             conn.commit()  # type: ignore
-                        except (OSError, RuntimeError) as _exc:  # noqa: 窄化
+                        except (OSError, RuntimeError) as _exc:
                             logger.warning("delete commit 失败（%s）: %s", _redact_dsn(self.dsn), _exc)
                         except Exception as _exc:  # 兜底
                             logger.warning("delete commit 异常（%s）: %s", _redact_dsn(self.dsn), _exc, exc_info=True)
-            except (OSError, RuntimeError, ValueError) as _exc:  # noqa: 窄化
+            except (OSError, RuntimeError, ValueError) as _exc:
                 logger.warning("delete 失败（%s）: %s", _redact_dsn(self.dsn), _exc)
             except Exception as _exc:  # 兜底
                 logger.warning("delete 异常（%s）: %s", _redact_dsn(self.dsn), _exc, exc_info=True)
@@ -1330,6 +1580,7 @@ class AsyncPostgresSaver:
                         _PG_GLOBAL_STORE.pop(k, None)
                         _PG_GLOBAL_META.pop(k, None)
                         _PG_GLOBAL_TS.pop(k, None)
+                        _PG_GLOBAL_VER.pop(k, None)
                     else:
                         alive.append(tid)
             # 有真实池时合并 PG 行（去重）
@@ -1353,18 +1604,21 @@ class AsyncPostgresSaver:
                                 if not isinstance(r, (list, tuple)) or len(r) < 3:
                                     continue
                                 tenant_r, thread_r, seq_r = r[0], r[1], r[2]
-                                run_text = r[3] if len(r) > 3 and isinstance(r[3], str) and r[3] else None
-                                run_str = run_text or get_run_text(str(tenant_r), str(thread_r), seq_r, dsn=self.dsn)
-                                if run_str is not None:
-                                    pg_ids.append(f"{thread_r}:{run_str}:{tenant_r}")
-                                else:
-                                    logger.warning(
-                                        "checkpoint list_thread_ids: no run mapping for seq %s (tenant=%s thread=%s); "
-                                        "returning seq as run (memory-only fallback).",
-                                        seq_r, tenant_r, thread_r,
+                                # T2-3: 4列行（有 run_text 列）缺映射抛 MissingRunMapping
+                                # 不伪造；3列旧行（无 run_text 列）查映射，缺失回退 str(seq) 兼容旧库形态。
+                                if isinstance(r, (list, tuple)) and len(r) > 3:
+                                    run_text = r[3] if isinstance(r[3], str) and r[3] else None
+                                    run_str = run_text or _resolve_run_strict(
+                                        tenant_r, thread_r, seq_r, dsn=self.dsn
                                     )
-                                    pg_ids.append(f"{thread_r}:{seq_r}:{tenant_r}")
-                    except (OSError, RuntimeError, ValueError) as _exc:  # noqa: 窄化
+                                else:
+                                    run_str = get_run_text(
+                                        str(tenant_r), str(thread_r), seq_r, dsn=self.dsn
+                                    ) or str(seq_r)
+                                pg_ids.append(f"{thread_r}:{run_str}:{tenant_r}")
+                    except MissingRunMapping:
+                        raise
+                    except (OSError, RuntimeError, ValueError) as _exc:
                         logger.warning("list_thread_ids PG 查询失败（%s）: %s", _redact_dsn(self.dsn), _exc)
                     except Exception as _exc:  # 兜底
                         logger.warning("list_thread_ids 异常（%s）: %s", _redact_dsn(self.dsn), _exc, exc_info=True)
@@ -1397,6 +1651,7 @@ class AsyncPostgresSaver:
             _PG_GLOBAL_STORE.pop(key, None)
             _PG_GLOBAL_META.pop(key, None)
             _PG_GLOBAL_TS.pop(key, None)
+            _PG_GLOBAL_VER.pop(key, None)
         self._store.pop(thread_id, None)
         self._meta.pop(thread_id, None)
         self._timestamps.pop(thread_id, None)
@@ -1423,6 +1678,7 @@ class AsyncPostgresSaver:
                         _PG_GLOBAL_STORE.pop(k, None)
                         _PG_GLOBAL_META.pop(k, None)
                         _PG_GLOBAL_TS.pop(k, None)
+                        _PG_GLOBAL_VER.pop(k, None)
                     else:
                         alive.append(tid)
             pg_ids: list[str] = []
@@ -1440,13 +1696,20 @@ class AsyncPostgresSaver:
                             if not isinstance(r, (list, tuple)) or len(r) < 3:
                                 continue
                             tenant_r, thread_r, seq_r = r[0], r[1], r[2]
-                            run_text = r[3] if len(r) > 3 and isinstance(r[3], str) and r[3] else None
-                            run_str = run_text or get_run_text(str(tenant_r), str(thread_r), seq_r, dsn=self.dsn)
-                            if run_str is not None:
-                                pg_ids.append(f"{thread_r}:{run_str}:{tenant_r}")
+                            # T2-3: 与 list_thread_ids 同构（4列严格 / 3列映射回退str(seq)兼容）
+                            if isinstance(r, (list, tuple)) and len(r) > 3:
+                                run_text = r[3] if isinstance(r[3], str) and r[3] else None
+                                run_str = run_text or _resolve_run_strict(
+                                    tenant_r, thread_r, seq_r, dsn=self.dsn
+                                )
                             else:
-                                pg_ids.append(f"{thread_r}:{seq_r}:{tenant_r}")
-                    except (OSError, RuntimeError, ValueError) as _exc:  # noqa: 窄化
+                                run_str = get_run_text(
+                                    str(tenant_r), str(thread_r), seq_r, dsn=self.dsn
+                                ) or str(seq_r)
+                            pg_ids.append(f"{thread_r}:{run_str}:{tenant_r}")
+                    except MissingRunMapping:
+                        raise
+                    except (OSError, RuntimeError, ValueError) as _exc:
                         logger.warning("alist_thread_ids 异步 PG 查询失败（%s）: %s", _redact_dsn(self.dsn), _exc)
                     except Exception as _exc:  # 兜底
                         logger.warning("alist_thread_ids 异步异常（%s）: %s", _redact_dsn(self.dsn), _exc, exc_info=True)
