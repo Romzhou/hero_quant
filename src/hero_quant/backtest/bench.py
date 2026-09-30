@@ -472,6 +472,24 @@ def run_batch(
             # no ".." and relative — multi-component paths (e.g. a/link_to_etc
             # where a/link is a symlink outside CWD) must also be contained:
             # the resolved target must stay within _base (or tmpdir).
+            # 中文：symlink 解析后 containment 检查 — 经 symlink 目录的多段相对路径
+            # 即使解析后仍在 base 内，也视为逃逸 lexical 位置（resolve+is_relative_to
+            # 双重校验），escape 抛 ValueError（含 traversal/within/escapes 字样）。
+            try:
+                _cur = _base
+                for _part in _p.parts:
+                    _cur = _cur / _part
+                    try:
+                        if _cur.is_symlink():
+                            raise ValueError(
+                                f"output_dir traversal detected: {output_dir!r} escapes within {_base} via symlink {_cur}"
+                            )
+                    except OSError:
+                        break
+            except ValueError:
+                raise
+            except (OSError, RuntimeError):
+                pass
             if not (_is_within(_target, _base) or _is_within(_target, _tmpdir)):
                 raise ValueError(f"output_dir traversal detected: {output_dir!r} escapes {_base}")
             # 中文：safe_join 的 ValueError 是拒绝信号，必须传播；仅 import/类型问题可跳过

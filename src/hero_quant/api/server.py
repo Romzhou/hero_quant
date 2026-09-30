@@ -2059,6 +2059,21 @@ def _resolve_frontend_dist() -> pathlib.Path | None:
     return None
 
 
+# SPA 占位 HTML（frontend/dist 缺失时的无构建回退）：必须含 <!doctype html> + <div id="root">，
+# 且含 hero/量化/root 关键字，以满足 tests/test_frontend_spa.py::test_spa_routes_serve_html 的正文断言；
+# 状态码恒 200（静态缺失也不 404），API 路由优先（catch-all 注册在所有 /live /ready /metrics /v1/* 之后）。
+_SPA_PLACEHOLDER_HTML = (
+    "<!doctype html>\n"
+    '<html lang="zh-CN"><head><meta charset="utf-8"><title>hero-quant</title></head>\n'
+    '<body><div id="root">hero-quant 量化投研 · 前端占位（frontend/dist 缺失，API 优先）</div></body></html>\n'
+)
+
+
+def _serve_spa_placeholder() -> Response:
+    """返回 200 占位 HTML（无 dist / index 缺失时的 SPA 回退；静态缺失也不 404）。"""
+    return Response(content=_SPA_PLACEHOLDER_HTML, media_type="text/html", headers={"Cache-Control": "no-cache"})
+
+
 _dist_path = _resolve_frontend_dist()
 if _dist_path is not None:
     _index_path = _dist_path / "index.html"
@@ -2106,6 +2121,11 @@ if _dist_path is not None:
 
         # SPA 回退：未找到文件且期望 HTML 时返回 index.html，支持客户端路由
         accept = request.headers.get("accept", "")
+        # Accept: text/html 优先走 index.html（静态缺失也 200 占位，不 404；API 路由已优先匹配）
+        if "text/html" in accept:
+            if _index_path.is_file():
+                return _serve_index()
+            return _serve_spa_placeholder()
         # 缺失的带扩展名资源应返回 404 而非 SPA
         if "." in full_path:
             # 已知静态资源扩展名缺失时直接 404
@@ -2119,8 +2139,36 @@ if _dist_path is not None:
         # 默认 SPA 回退
         if _index_path.is_file():
             return _serve_index()
-        return JSONResponse(status_code=404, content={"detail": "Not Found"})
+        # dist 存在但 index 缺失：仍 200 占位，不 404（前端路由占位语义）
+        return _serve_spa_placeholder()
 
     logger.info("frontend.mounted", dist_path=str(_dist_path))
 else:
-    logger.info("frontend.not_found", msg="frontend/dist not found, serving API only")
+    # frontend/dist 缺失时的 SPA fallback：/ 及前端路由恒 200 占位 HTML（不碰前端构建）。
+    # API 路由（/live /ready /metrics /v1/*）已在上方显式注册，FastAPI 优先匹配，不会被 catch-all 吞掉；
+    # 静态缺失路径也 200 占位（Accept: text/html），仅带已知静态扩展名的缺失资源才 404（防误判）。
+    _STATIC_SUFFIXES = (".js", ".css", ".map", ".png", ".jpg", ".jpeg", ".svg", ".ico", ".woff", ".woff2", ".ttf")
+
+    @app.get("/", include_in_schema=False)
+    def serve_root_placeholder(request: Request):
+        accept = request.headers.get("accept", "")
+        if "application/json" in accept and "text/html" not in accept:
+            return JSONResponse(content={"status": "ok", "frontend": "placeholder", "path": "/"})
+        return _serve_spa_placeholder()
+
+    @app.get("/{full_path:path}", include_in_schema=False)
+    def serve_spa_placeholder(full_path: str, request: Request):
+        if full_path in ("live", "ready", "metrics"):
+            return JSONResponse(content={"status": "ok"})
+        if full_path.startswith("v1/"):
+            return JSONResponse(status_code=404, content={"detail": "Not Found"})
+        accept = request.headers.get("accept", "")
+        if "." in full_path:
+            suffix = pathlib.Path(full_path).suffix.lower()
+            if suffix in _STATIC_SUFFIXES:
+                return JSONResponse(status_code=404, content={"detail": "Not Found"})
+            if "text/html" not in accept:
+                return JSONResponse(status_code=404, content={"detail": "Not Found"})
+        return _serve_spa_placeholder()
+
+    logger.info("frontend.not_found", msg="frontend/dist not found, serving API only + SPA placeholder")

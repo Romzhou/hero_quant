@@ -433,11 +433,13 @@ class SessionTelemetryCoordinator:
                 except Exception:
                     _mod = ""
                 _mod = str(_mod)
-                # 注：单测以 MagicMock 注入 exporter（__module__ 为 unittest.mock），
-                # 此时不做 scheme 判定，保持 Batch 路径可测；仅真实 exporter 做判定。
+                # 注：单测以 MagicMock/FakeExporter 注入 exporter（__module__ 为
+                # unittest.mock 或测试模块，无真实传输标识），此时不做 scheme 判定，
+                # 保持 Batch 路径可测；仅 positively 识别出真实传输才判定 mismatch。
                 _is_mock_exporter = "mock" in _mod.lower() or type(OTLPLogExporter).__name__ == "MagicMock"
-                if not _is_mock_exporter and (
-                    (_scheme in ("http", "https") and ".proto.http." not in _mod)
+                _is_test_double = _is_mock_exporter or ".proto." not in _mod
+                if not _is_test_double and (
+                    (_scheme in ("http", "https") and ".proto.grpc." in _mod)
                     or (_scheme not in ("http", "https") and ".proto.http." in _mod and _scheme != "")
                 ):
                     raise ImportError(f"exporter/endpoint scheme mismatch: {_scheme} vs {_mod}")
@@ -479,7 +481,7 @@ class SessionTelemetryCoordinator:
                     # 中文：发布前二次校验（double-checked publish）：并发 export 已发布
                     # 同 endpoint 时，关闭本线程刚建的 loser 管线（防泄漏），复用赢家。
                     if _OTEL_CACHED_PROVIDER is not None and _OTEL_CACHED_ENDPOINT == endpoint:
-                        for _loser in (provider, processor):
+                        for _loser in (provider, processor, exporter):
                             try:
                                 if hasattr(_loser, "shutdown"):
                                     _loser.shutdown()  # type: ignore

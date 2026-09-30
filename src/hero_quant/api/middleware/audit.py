@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 import reprlib
 from datetime import datetime, timezone
 
@@ -56,7 +57,12 @@ def _sanitize_token(value: object, limit: int = _MAX_TOOL_NAME_LEN) -> str:
 
 
 def _hash_args(args: dict) -> str:
-    """对参数名+类型+值摘要做 SHA256（哈希值不暴露明文，值不同则哈希不同）。"""
+    """对参数名+类型+值摘要做 SHA256（哈希值不暴露明文，值不同则哈希不同）。
+
+    确定性 fail-open 契约：hostile __repr__（抛错）统一归一化为固定占位
+    "<unrepresentable>" 再哈希，绝不混入 id()/内存地址等非确定性成分；
+    同一输入两次调用结果相等，且永不抛错。
+    """
     try:
         parts = []
         for k, v in (args or {}).items():
@@ -64,7 +70,15 @@ def _hash_args(args: dict) -> str:
                 parts.append((_sanitize_token(k), type(v).__name__, _bounded_repr(v)))
             except Exception:
                 parts.append(("<unrepresentable-key>", "unknown", "<unrepresentable>"))
-        items = sorted(parts)
+        # 确定性归一化：剥离 repr 中偶发的内存地址（0x...）等非确定性片段。
+        normed: list[tuple[str, str, str]] = []
+        for kk, tt, vv in parts:
+            try:
+                vv = re.sub(r"0x[0-9a-fA-F]+", "0xADDR", vv)
+            except Exception:
+                vv = "<unrepresentable>"
+            normed.append((kk, tt, vv))
+        items = sorted(normed)
         raw = str(items).encode(errors="ignore")
         return hashlib.sha256(raw).hexdigest()[:16]
     except Exception:

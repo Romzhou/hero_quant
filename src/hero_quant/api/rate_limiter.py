@@ -54,10 +54,11 @@ limiter = _SlowLimiter(key_func=limit_key) if SLOWAPI_AVAILABLE and _SlowLimiter
 
 
 async def _check(request: Request, quota: int, endpoint: str) -> bool:
-    """按 endpoint 隔离 bucket；fail-closed：后端缺失/异常一律 429/503，不放行。
+    """按 endpoint 隔离 bucket；fail-open 契约：后端异常放行语义由 infra 层决定。
 
-    中文：T1-4 起 infra RateLimiter 缺后端/异常返回 False（拒绝），此处 False→429；
-    抛错（非预期异常）→503。ip:unknown 走单独小桶（UNKNOWN_IP_SMALL_MAX），防单 actor
+    中文：infra RateLimiter 缺后端/异常时按 fail-open 放行（返回 True），本层仅映射
+    429/503 边界——False（配额耗尽）→429；try_acquire 抛错（非预期后端异常）→503。
+    ip:unknown 走单独小桶（UNKNOWN_IP_SMALL_MAX），防单 actor
     耗尽大桶误伤他人。
     """
     # key 构造在 try 之外：limit_key 自身的程序错误不得被误标为 503

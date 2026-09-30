@@ -79,6 +79,11 @@ def _read_credential_file(path: Path) -> str:
                 raise
             except OSError as e:
                 raise PermissionError(f"credential symlink validation failed for {path}: {e}") from e
+    except FileNotFoundError:
+        # 中文：悬空 symlink 的 ENOENT 是“缺失”而非“无权限”，直透以便调用方
+        # 区分 fail-closed（权限）与回落/缺失（未找到），不误包为 PermissionError
+        # （FileNotFoundError 是 OSError 子类，必须在 OSError 前直透）
+        raise
     except PermissionError:
         raise
     except OSError as e:
