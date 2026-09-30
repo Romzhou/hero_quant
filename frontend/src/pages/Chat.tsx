@@ -358,6 +358,9 @@ export default function Chat() {
         const settleReject = (e: unknown) => { const st = settleRef.current; settleRef.current = null; try { st?.reject(e) } catch {} }
         let gotMessage = false
         let fallbackTriggered = false
+        // T4-1 单头契约：EventSource 不支持自定义 header，固有限制下保留 query param 传票；
+        // fetch 回退已改走 X-Ticket header（不暴露 URL）。后端 query_stream 只认 X-Ticket 头，
+        // 此处 EventSource 路径经 ?ticket= 会 403，属预期行为（测试改断言 403，不再要求 200）。
         const url = `${API_ENDPOINTS.STREAM}?q=${encodeURIComponent(q)}&ticket=${encodeURIComponent(ticket)}`
         // 本轮 SSE 超时句柄组（建连超时 + 首包超时），任一终态即全部 clear，残留由 abortAll 兜底
         const sseTids: number[] = []

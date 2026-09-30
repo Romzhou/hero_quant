@@ -48,10 +48,12 @@ test("requests a ticket before opening EventSource", async () => {
   await waitFor(() => expect(TestEventSource.instances).toHaveLength(1))
   expect(fetchMock).toHaveBeenCalledWith("/v1/query/ticket", expect.objectContaining({method: "POST"}))
   expect(TestEventSource.instances[0].url).toContain("q=%E6%9F%A5%E8%AF%A2%E8%A1%8C%E6%83%85")
+  // T4-1 单头契约：后端 query_stream 只认 X-Ticket 头；EventSource 固有限制（不支持自定义
+  // header）仍经 ?ticket= 传票，实机对新后端会 403（预期行为），此处只断言 URL 仍携带票据。
   expect(TestEventSource.instances[0].url).toContain("ticket=event-ticket")
 })
 
-test("requests a fresh ticket before fetch fallback", async () => {
+test("requests a fresh ticket before fetch fallback (header-only ticket)", async () => {
   const fetchMock = vi.fn()
     .mockResolvedValueOnce(ticketResponse("event-ticket"))
     .mockResolvedValueOnce(ticketResponse("fetch-ticket"))
@@ -70,7 +72,10 @@ test("requests a fresh ticket before fetch fallback", async () => {
   await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3))
   expect(fetchMock.mock.calls[0][0]).toBe("/v1/query/ticket")
   expect(fetchMock.mock.calls[1][0]).toBe("/v1/query/ticket")
-  expect(fetchMock.mock.calls[2][0]).toContain("/v1/query/stream?q=%E6%9F%A5%E8%AF%A2%E8%A1%8C%E6%83%85&ticket=fetch-ticket")
+  // T4-1 单头契约：fetch 回退票据走 X-Ticket header，不再拼 ?ticket=（不暴露 URL/history/logs）。
+  expect(fetchMock.mock.calls[2][0]).toBe("/v1/query/stream?q=%E6%9F%A5%E8%AF%A2%E8%A1%8C%E6%83%85")
+  expect(fetchMock.mock.calls[2][1]).toMatchObject({headers: expect.objectContaining({"X-Ticket": "fetch-ticket"})})
+  expect(fetchMock.mock.calls[2][0]).not.toContain("ticket=fetch-ticket")
 })
 
 // --- TDD new tests for scan_remain fixes ---
