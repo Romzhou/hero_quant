@@ -287,7 +287,8 @@ def _get_shadow_stub():
         return {"attribution": attr, "coverage": cov, "records": len(j.records)}
     except Exception as _e:
         logger.warning("shadow.stub_failed", error=str(_e), exc_info=_e)  # intentional: best-effort
-        return {"attribution": {}, "coverage": 0.0, "error": str(_e)}
+        # 中文：T4-1 MR3：对外脱敏——不返回原始异常文本，只给通用标记。
+        return {"attribution": {}, "coverage": 0.0, "error": "unavailable"}
 
 
 def _log_mcp_status():
@@ -971,13 +972,31 @@ def ready():
 
 
 @app.get("/metrics")
-def metrics():
-    """暴露 Prometheus 指标（CONTENT_TYPE_LATEST）。"""
+def metrics(request: Request, x_ticket: str | None = Header(None, alias="X-Ticket")):
+    """暴露 Prometheus 指标（需鉴权：X-Ticket 单次票据或 API Key/HMAC，缺票据 401）。"""
+    # 中文：T4-1 MR1：/metrics 不再匿名暴露；复用 query 的 X-Ticket 票据逻辑 + API Key/HMAC。
+    _ok_m = False
+    if x_ticket:
+        try:
+            _ok_m, _ = consume_ticket_with_user(x_ticket)
+        except (ValueError, TypeError, AttributeError):
+            _ok_m = False
+    if not _ok_m:
+        try:
+            from hero_quant.api.security import verify_api_key as _verify_key_m
+            from hero_quant.api.security import verify_request_auth as _verify_hmac_m
+
+            if bool(_verify_key_m(request)) or bool(_verify_hmac_m(request)):
+                _ok_m = True
+        except (ValueError, TypeError, AttributeError):
+            _ok_m = False
+    if not _ok_m:
+        return JSONResponse(status_code=401, content={"detail": "Missing or invalid metrics ticket"})
     return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 @app.get("/v1/query")
-async def query(request: Request, background_tasks: BackgroundTasks, q: str = "", use_graph: bool = False, replay_path: str | None = None, trace_dir: str | None = None, wall_time_budget: float | None = None, ticket: str | None = None, x_ticket: str | None = Header(None, alias="X-Ticket")):
+async def query(request: Request, background_tasks: BackgroundTasks, q: str = "", use_graph: bool = False, replay_path: str | None = None, trace_dir: str | None = None, wall_time_budget: float | None = None, x_ticket: str | None = Header(None, alias="X-Ticket")):
     """同步查询：组装 AgentLoop 并返回 LoopResult 聚合 JSON。"""
     # 中文：background_tasks 注解必须是裸 BackgroundTasks，不能写成 `BackgroundTasks | None`。
     # FastAPI 判该参数靠 lenient_issubclass(annotation, StarletteBackgroundTasks)，
@@ -991,9 +1010,8 @@ async def query(request: Request, background_tasks: BackgroundTasks, q: str = ""
     if _limited is not None:
         return _limited
     # 中文：T1-3 身份闭环：/v1/query 与 stream 同等要求有效 ticket（单次消费），无票/过期票 401。
-    # 顺序：限流先于鉴权（耗尽配额时仍 429，便于 test_pr1a 语义）；ticket 经 X-Ticket 头或 ?ticket= 传入。
-    _effective_ticket_q = x_ticket or ticket
-    _ok_q, _ticket_user_q = consume_ticket_with_user(_effective_ticket_q)
+    # 顺序：限流先于鉴权（耗尽配额时仍 429，便于 test_pr1a 语义）；ticket 只走 X-Ticket 头（已移除 ?ticket= 回退）。
+    _ok_q, _ticket_user_q = consume_ticket_with_user(x_ticket)
     if not _ok_q:
         return JSONResponse(status_code=401, content={"detail": "Missing or invalid query ticket"})
     if REQUEST_COUNTER is not None:
@@ -1011,7 +1029,8 @@ async def query(request: Request, background_tasks: BackgroundTasks, q: str = ""
         except HTTPException:
             raise
         except Exception as _e:
-            raise HTTPException(status_code=400, detail=f"invalid trace_dir: {_e}")
+            logger.warning("query.trace_dir_invalid", error=str(_e))
+            raise HTTPException(status_code=400, detail="invalid trace_dir")
     if replay_path is not None:
         try:
             _rp = pathlib.Path(replay_path).resolve()
@@ -1022,7 +1041,8 @@ async def query(request: Request, background_tasks: BackgroundTasks, q: str = ""
         except HTTPException:
             raise
         except Exception as _e:
-            raise HTTPException(status_code=400, detail=f"invalid replay_path: {_e}")
+            logger.warning("query.replay_path_invalid", error=str(_e))
+            raise HTTPException(status_code=400, detail="invalid replay_path")
     try:
         from hero_quant.config.settings import Settings
         s = Settings()
@@ -1207,8 +1227,9 @@ async def query(request: Request, background_tasks: BackgroundTasks, q: str = ""
     except HTTPException:
         raise
     except Exception as _e:
-        logger.error("query.failed", error=str(_e), query=q)
-        return JSONResponse(status_code=500, content={"detail": str(_e), "query": q})
+        # 中文：T4-1 MR3：对外脱敏——只返通用 code+message，内部细节只记日志。
+        logger.error("query.failed", error=str(_e), exc_info=_e)
+        return JSONResponse(status_code=500, content={"code": "internal_error", "message": "Query failed"})
 
 
 @app.post("/v1/query/ticket")
@@ -1273,7 +1294,7 @@ def query_ticket(request: Request, user: str | None = None):
 
 
 @app.get("/v1/query/stream")
-async def query_stream(request: Request, background_tasks: BackgroundTasks, q: str = "", ticket: str | None = None, x_ticket: str | None = Header(None, alias="X-Ticket"), use_graph: bool = False, replay_path: str | None = None, trace_dir: str | None = None, wall_time_budget: float | None = None):
+async def query_stream(request: Request, background_tasks: BackgroundTasks, q: str = "", x_ticket: str | None = Header(None, alias="X-Ticket"), use_graph: bool = False, replay_path: str | None = None, trace_dir: str | None = None, wall_time_budget: float | None = None):
     """SSE 查询流：真实 AgentLoop 驱动，产出 tool 轨迹 + 流式 delta + [DONE]。"""
     # 中文：同 query()，注解必须是裸 BackgroundTasks（union 写法会让模块 import 失败）。
     if background_tasks is None:
@@ -1296,7 +1317,8 @@ async def query_stream(request: Request, background_tasks: BackgroundTasks, q: s
         except HTTPException:
             raise
         except Exception as _e:
-            raise HTTPException(status_code=400, detail=f"invalid trace_dir: {_e}")
+            logger.warning("query_stream.trace_dir_invalid", error=str(_e))
+            raise HTTPException(status_code=400, detail="invalid trace_dir")
     if replay_path is not None:
         try:
             _rp_s = pathlib.Path(replay_path).resolve()
@@ -1307,10 +1329,10 @@ async def query_stream(request: Request, background_tasks: BackgroundTasks, q: s
         except HTTPException:
             raise
         except Exception as _e:
-            raise HTTPException(status_code=400, detail=f"invalid replay_path: {_e}")
-    # 中文：优先 X-Ticket header（避免票据暴露在 URL/history/logs/referer），回退 query param 兼容旧前端
-    _effective_ticket = x_ticket or ticket
-    if not consume_ticket(_effective_ticket):
+            logger.warning("query_stream.replay_path_invalid", error=str(_e))
+            raise HTTPException(status_code=400, detail="invalid replay_path")
+    # 中文：ticket 只走 X-Ticket header（不再从 ?ticket= 读，避免票据暴露在 URL/history/logs/referer）。
+    if not consume_ticket(x_ticket):
         return JSONResponse(status_code=403, content={"detail": "Invalid or expired SSE ticket"})
 
     async def event_generator():
@@ -1565,10 +1587,11 @@ async def query_stream(request: Request, background_tasks: BackgroundTasks, q: s
                 logger.debug("shadow.stream_emit_failed", error=str(_e))
             yield "data: [DONE]\n\n"
         except Exception as _e:
-            logger.error("query_stream.failed", error=str(_e), query=q)
+            # 中文：T4-1 MR3：SSE 对外脱敏——只发通用 code+message，内部细节只记日志。
+            logger.error("query_stream.failed", error=str(_e), exc_info=_e)
             try:
                 import json as _json2
-                yield f"data: {_json2.dumps({'type': 'error', 'msg': str(_e)[:500]}, ensure_ascii=False)}\n\n"
+                yield f"data: {_json2.dumps({'type': 'error', 'code': 'internal_error', 'message': 'Stream failed'}, ensure_ascii=False)}\n\n"
             except Exception as _e:
                 logger.debug("best_effort.failed", error=str(_e))  # intentional offline-safe
                 pass  # intentional offline-safe

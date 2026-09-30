@@ -17,7 +17,10 @@ def test_query_ticket_endpoint_issues_ticket_for_one_stream():
     assert isinstance(payload["ticket"], str) and payload["ticket"]
     assert payload["expires_in"] == 60
 
-    stream = client.get("/v1/query/stream", params={"ticket": payload["ticket"]})
+    # T4-1 契约同步：ticket 只走 X-Ticket header，?ticket= 不再生效
+    via_query_param = client.get("/v1/query/stream", params={"ticket": payload["ticket"]})
+    assert via_query_param.status_code == 403
+    stream = client.get("/v1/query/stream", headers={"X-Ticket": payload["ticket"]})
     assert stream.status_code == 200
 
 
@@ -25,11 +28,11 @@ def test_query_stream_ticket_is_single_use():
     client = TestClient(app)
     ticket = security.issue_ticket(ttl=60)
 
-    first = client.get("/v1/query/stream", params={"q": "600519.SH", "ticket": ticket})
+    first = client.get("/v1/query/stream", params={"q": "600519.SH"}, headers={"X-Ticket": ticket})
     assert first.status_code == 200
     assert "text/event-stream" in first.headers["content-type"]
 
-    replay = client.get("/v1/query/stream", params={"q": "600519.SH", "ticket": ticket})
+    replay = client.get("/v1/query/stream", params={"q": "600519.SH"}, headers={"X-Ticket": ticket})
     assert replay.status_code == 403
 
 
@@ -45,7 +48,8 @@ def test_expired_ticket_is_rejected_and_cleaned(monkeypatch):
         assert redis_client.exists(key) == 1
         # Redis TTL走真实时间，显式删除模拟过期后的清理语义
         redis_client.delete(key)
-        response = TestClient(app).get("/v1/query/stream", params={"ticket": ticket})
+        # T4-1 契约同步：ticket 只走 X-Ticket header
+        response = TestClient(app).get("/v1/query/stream", headers={"X-Ticket": ticket})
 
         assert response.status_code == 403
         assert redis_client.exists(key) == 0
@@ -54,7 +58,8 @@ def test_expired_ticket_is_rejected_and_cleaned(monkeypatch):
         assert ticket in security._tickets
 
         clock[0] = 161.0
-        response = TestClient(app).get("/v1/query/stream", params={"ticket": ticket})
+        # T4-1 契约同步：ticket 只走 X-Ticket header
+        response = TestClient(app).get("/v1/query/stream", headers={"X-Ticket": ticket})
 
         assert response.status_code == 403
         assert ticket not in security._tickets
