@@ -15,6 +15,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import threading
 import time
 from pathlib import Path
@@ -23,6 +24,101 @@ from typing import Any, Dict, List
 from hero_quant.security.redaction import ARGUMENTS_SINK, RESULT_SINK, redact_payload
 
 logger = logging.getLogger(__name__)
+
+# trace默认回灌（T4-2）：默认开启落盘；显式关闭才不写
+# 关闭语义（任一命中即关闭）：trace=False / trace=None+"HERO_TRACE_ENABLED=0"
+#   / enable_trace=False / trace_enabled=False / HERO_TRACE_ENABLED=0|false|no|off
+TRACE_DISABLED_VALUES = {"0", "false", "no", "off", "none", "disabled"}
+
+
+def is_trace_disabled(explicit: Any = None) -> bool:
+    """显式关闭开关判定：只有显式关闭才停写，默认回灌。"""
+    if explicit is False:
+        return True
+    # bool True 显式开启：本身不关闭，仍受 HERO_TRACE_ENABLED 全局开关约束
+    if isinstance(explicit, bool):
+        pass
+    elif isinstance(explicit, (int, float)) and explicit == 0:
+        return True
+    if isinstance(explicit, str) and explicit.strip().lower() in TRACE_DISABLED_VALUES:
+        return True
+    raw = os.environ.get("HERO_TRACE_ENABLED", "")
+    if isinstance(raw, str) and raw.strip().lower() in TRACE_DISABLED_VALUES:
+        return True
+    return False
+
+
+def default_trace_dir() -> Path:
+    """默认trace落盘目录：HERO_TRACE_DIR > ./traces > 系统临时目录。"""
+    raw = os.environ.get("HERO_TRACE_DIR", "").strip()
+    if raw:
+        try:
+            p = Path(raw).expanduser()
+            p.mkdir(parents=True, exist_ok=True)
+            return p
+        except Exception as exc:
+            logger.warning("HERO_TRACE_DIR %r unusable, fallback: %s", raw, exc)
+    try:
+        local = Path.cwd() / "traces"
+        local.mkdir(parents=True, exist_ok=True)
+        return local
+    except Exception as exc:
+        logger.warning("local traces dir unusable, fallback tempdir: %s", exc)
+        import tempfile
+
+        fallback = Path(tempfile.gettempdir()) / "hero_traces"
+        try:
+            fallback.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        return fallback
+
+
+# cookie/secret 脱敏：TraceWriter.append 已按 sink 经 redact_payload 脱敏，
+# 此处补一层 cookie 形态兜底（redaction 当前无 cookie 键），回灌失败只告警。
+_COOKIE_KEY_RE = re.compile(r"cookie", re.IGNORECASE)
+_COOKIE_PAIR_RE = re.compile(r"(cookie\s*[:=]\s*)([^\s;,\n]+)", re.IGNORECASE)
+
+
+def _scrub_cookie(value: Any) -> Any:
+    """递归脱敏 cookie 明文：键含 cookie 则整值替换；字符串中 cookie=xxx 只留键名。"""
+    if isinstance(value, dict):
+        out: Dict[str, Any] = {}
+        for k, v in value.items():
+            if isinstance(k, str) and _COOKIE_KEY_RE.search(k):
+                out[k] = "***"
+                continue
+            try:
+                out[k] = _scrub_cookie(v)
+            except Exception:
+                out[k] = "***"
+        return out
+    if isinstance(value, (list, tuple, set, frozenset)):
+        if isinstance(value, list):
+            cleaned: List[Any] = []
+            for item in value:
+                try:
+                    cleaned.append(_scrub_cookie(item))
+                except Exception:
+                    cleaned.append("***")
+            return cleaned
+        converted = []
+        for item in value:
+            try:
+                converted.append(_scrub_cookie(item))
+            except Exception:
+                converted.append("***")
+        if isinstance(value, tuple):
+            return tuple(converted)
+        if isinstance(value, set):
+            return set(converted)
+        return frozenset(converted)
+    if isinstance(value, str):
+        try:
+            return _COOKIE_PAIR_RE.sub(r"\1***", value)
+        except Exception:
+            return "***"
+    return value
 
 # 默认阈值：可被环境变量或构造参数覆盖
 DEFAULT_TOOL_RESULT_OFFLOAD = 50000
@@ -184,85 +280,99 @@ class TraceWriter:
             raise
 
     def append(self, obj: Dict[str, Any]) -> None:
-        """追加一条记录，线程安全且尽量保证落盘持久化."""
+        """追加一条记录，线程安全且尽量保证落盘持久化（失败只告警不抛）。"""
         # 按 sink 分流脱敏：tool_result 允许 content 透传，其余严格脱敏
         try:
             if isinstance(obj, dict):
                 sink = RESULT_SINK if obj.get("type") == "tool_result" else ARGUMENTS_SINK
                 obj = redact_payload(obj, sink=sink)
+            try:
+                obj = _scrub_cookie(obj)
+            except Exception as exc:
+                logger.warning("cookie scrub failed (%s), dropping sensitive fields", exc)
+                obj = {"type": obj.get("type", "unknown") if isinstance(obj, dict) else "unknown", "redaction_error": True}
         except Exception as exc:
             logger.warning("redact_payload failed (%s), dropping sensitive fields", exc)
             # fail-closed: do not persist unredacted obj
             obj = {"type": obj.get("type", "unknown") if isinstance(obj, dict) else "unknown", "redaction_error": True}
         with self._lock:
             if getattr(self, "_closed", False):
-                raise ValueError("TraceWriter closed")
-            # 分支1：tool_result 大 content 分流为 result_path + preview
-            if isinstance(obj, dict) and obj.get("type") == "tool_result" and "content" in obj:
-                content = obj["content"]
-                if isinstance(content, str):
-                    content_str = content
-                else:
-                    try:
-                        content_str = json.dumps(content, ensure_ascii=False)
-                    except Exception:
-                        content_str = str(content)
-                if len(content_str) > self.tool_result_offload:
-                    digest = hashlib.sha256(content_str.encode("utf-8")).hexdigest()
-                    sidecar_name = f"{digest}.txt"
-                    sidecar_path = self.dir_path / sidecar_name
-                    if not sidecar_path.exists():
-                        self._write_sidecar_durable(sidecar_path, content_str)
-                    else:
-                        try:
-                            existing = sidecar_path.read_bytes()
-                            if existing != content_str.encode("utf-8"):
-                                sidecar_name = f"{digest}_{os.urandom(4).hex()}.txt"
-                                sidecar_path = self.dir_path / sidecar_name
-                                self._write_sidecar_durable(sidecar_path, content_str)
-                        except Exception:
-                            # read验证失败时用随机后缀避免覆盖
-                            sidecar_name = f"{digest}_{os.urandom(4).hex()}.txt"
-                            sidecar_path = self.dir_path / sidecar_name
-                            self._write_sidecar_durable(sidecar_path, content_str)
-                    preview = content_str[: self.preview_len]
-                    rec: Dict[str, Any] = {k: v for k, v in obj.items() if k != "content"}
-                    rec["result_path"] = sidecar_name
-                    rec["preview"] = preview
-                    line = json.dumps(rec, ensure_ascii=False) + "\n"
-                    self._append_line_locked(line)
-                    return
+                logger.warning("trace append on closed writer %s (warn-only, dropped)", self.path)
+                return
+            try:
+                self._append_locked(obj)
+            except Exception as exc:
+                # 回灌失败只告警不阻断主流程
+                logger.warning("trace append failed on %s (warn-only, dropped): %s", self.path, exc)
 
-            # 分支2：通用大记录分流为 sidecar 引用；否则 inline
-            raw = json.dumps(obj, ensure_ascii=False)
-            if len(raw) > self.text_offload:
-                digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
-                sidecar_name = f"{digest}.json"
+    def _append_locked(self, obj: Dict[str, Any]) -> None:
+        """已持锁的落盘分支（供 append 调用，异常由上层收敛为告警）。"""
+        # 分支1：tool_result 大 content 分流为 result_path + preview
+        if isinstance(obj, dict) and obj.get("type") == "tool_result" and "content" in obj:
+            content = obj["content"]
+            if isinstance(content, str):
+                content_str = content
+            else:
+                try:
+                    content_str = json.dumps(content, ensure_ascii=False)
+                except Exception:
+                    content_str = str(content)
+            if len(content_str) > self.tool_result_offload:
+                digest = hashlib.sha256(content_str.encode("utf-8")).hexdigest()
+                sidecar_name = f"{digest}.txt"
                 sidecar_path = self.dir_path / sidecar_name
                 if not sidecar_path.exists():
-                    self._write_sidecar_durable(sidecar_path, raw)
+                    self._write_sidecar_durable(sidecar_path, content_str)
                 else:
                     try:
                         existing = sidecar_path.read_bytes()
-                        if existing != raw.encode("utf-8"):
-                            sidecar_name = f"{digest}_{os.urandom(4).hex()}.json"
+                        if existing != content_str.encode("utf-8"):
+                            sidecar_name = f"{digest}_{os.urandom(4).hex()}.txt"
                             sidecar_path = self.dir_path / sidecar_name
-                            self._write_sidecar_durable(sidecar_path, raw)
+                            self._write_sidecar_durable(sidecar_path, content_str)
                     except Exception:
+                        # read验证失败时用随机后缀避免覆盖
+                        sidecar_name = f"{digest}_{os.urandom(4).hex()}.txt"
+                        sidecar_path = self.dir_path / sidecar_name
+                        self._write_sidecar_durable(sidecar_path, content_str)
+                preview = content_str[: self.preview_len]
+                rec: Dict[str, Any] = {k: v for k, v in obj.items() if k != "content"}
+                rec["result_path"] = sidecar_name
+                rec["preview"] = preview
+                line = json.dumps(rec, ensure_ascii=False) + "\n"
+                self._append_line_locked(line)
+                return
+
+        # 分支2：通用大记录分流为 sidecar 引用；否则 inline
+        raw = json.dumps(obj, ensure_ascii=False)
+        if len(raw) > self.text_offload:
+            digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+            sidecar_name = f"{digest}.json"
+            sidecar_path = self.dir_path / sidecar_name
+            if not sidecar_path.exists():
+                self._write_sidecar_durable(sidecar_path, raw)
+            else:
+                try:
+                    existing = sidecar_path.read_bytes()
+                    if existing != raw.encode("utf-8"):
                         sidecar_name = f"{digest}_{os.urandom(4).hex()}.json"
                         sidecar_path = self.dir_path / sidecar_name
                         self._write_sidecar_durable(sidecar_path, raw)
-                try:
-                    rel = sidecar_path.relative_to(self.dir_path)
-                    rel_str = rel.as_posix()
-                except ValueError:
-                    rel_str = sidecar_name
-                rec = {"sidecar": rel_str}
-                line = json.dumps(rec, ensure_ascii=False) + "\n"
-            else:
-                line = raw + "\n"
+                except Exception:
+                    sidecar_name = f"{digest}_{os.urandom(4).hex()}.json"
+                    sidecar_path = self.dir_path / sidecar_name
+                    self._write_sidecar_durable(sidecar_path, raw)
+            try:
+                rel = sidecar_path.relative_to(self.dir_path)
+                rel_str = rel.as_posix()
+            except ValueError:
+                rel_str = sidecar_name
+            rec = {"sidecar": rel_str}
+            line = json.dumps(rec, ensure_ascii=False) + "\n"
+        else:
+            line = raw + "\n"
 
-            self._append_line_locked(line)
+        self._append_line_locked(line)
 
     def _append_line(self, line: str) -> None:
         # 对外单条写入入口，内部已加锁

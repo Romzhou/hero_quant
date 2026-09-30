@@ -143,6 +143,27 @@ def _is_pg_dsn(s: str) -> bool:
     return isinstance(s, str) and s.startswith(_PG_PREFIXES)
 
 
+_MEMORY_PATHS = ("", ":memory:")
+
+
+def _is_memory_path(s: str) -> bool:
+    """是否为纯内存去重路径（单进程 dict，多实例不共享）: memory://* / "" / ":memory:"。"""
+    return isinstance(s, str) and (s.startswith("memory://") or s in _MEMORY_PATHS)
+
+
+def _is_memory_allowed(allow_memory: bool = False) -> bool:
+    """memory:// 仅单测可用：显式 allow_memory=True，或 pytest 环境（PYTEST_CURRENT_TEST）才放行。"""
+    try:
+        if bool(allow_memory):
+            return True
+    except Exception:
+        pass
+    try:
+        return "PYTEST_CURRENT_TEST" in os.environ
+    except Exception:
+        return False
+
+
 def _is_async_pool(pool: Any) -> bool:
     if pool is None:
         return False
@@ -173,7 +194,7 @@ class DedupStore:
     不变量：同一 idempotency_key 仅一次从 PENDING 转为终态；TTL 过期后可重建；PG 与本地内存保持最终一致。
     """
 
-    def __init__(self, db_path: str | Path = "memory://dedup", *, ttl_seconds: int | None = None, dsn: str | None = None):
+    def __init__(self, db_path: str | Path = "memory://dedup", *, ttl_seconds: int | None = None, dsn: str | None = None, allow_memory: bool = False):
         # TTL 过期窗口：超时后允许重放，避免僵死 PENDING 永久占位
         self.ttl_seconds = int(ttl_seconds) if ttl_seconds is not None else DEFAULT_TTL_SECONDS
         # 单进程回退存储：无外部 DB 时仍可保证幂等语义
@@ -213,11 +234,22 @@ class DedupStore:
             # try setup (sync if sync pool)
             self._pg_setup_sync()
         else:
-            # SQLite/纯内存路径：memory:// 仅用 dict，真实文件路径则初始化 SQLite 表
-            if raw.startswith("memory://"):
-                # 纯内存模式，不落盘
-                self.db_path = None
-            elif raw in ("", ":memory:"):
+            # SQLite/纯内存路径：memory:// 仅单测可用（pytest 环境或 allow_memory=True），
+            # 生产误用多实例静默重复执行，故 fail-closed 拒绝。真实文件路径则初始化 SQLite 表。
+            if _is_memory_path(raw):
+                if not _is_memory_allowed(allow_memory):
+                    logger.warning(
+                        "dedup memory:// rejected outside pytest without allow_memory=True "
+                        "(multi-instance would silently duplicate); raw=%r",
+                        raw,
+                    )
+                    raise RuntimeError(
+                        "DedupStore memory:// is test-only: pass allow_memory=True "
+                        "or run under pytest (PYTEST_CURRENT_TEST); "
+                        "production must use a sqlite file path or postgres DSN"
+                    )
+                # 纯内存模式，不落盘（单测放行）
+                logger.warning("dedup memory:// in-memory mode (test-only, not shared across instances)")
                 self.db_path = None
             else:
                 self.db_path = Path(raw) if raw else Path("dedup.db")

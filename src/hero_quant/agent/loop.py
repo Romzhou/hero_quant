@@ -157,6 +157,17 @@ class AgentLoop:
                 logging.getLogger(__name__).warning("invalid token_limit %r: %s, using 60000", token_limit, exc, exc_info=True)
                 self.token_limit = 60000
         self.trace = trace
+        # T4-2 trace默认回灌：None 视为未显式关闭，默认落盘；
+        # 显式关闭（trace=False / enable_trace=False / HERO_TRACE_ENABLED=0）才不写。
+        _trace_opt_out = kwargs.pop("enable_trace", None)
+        if _trace_opt_out is None:
+            _trace_opt_out = kwargs.pop("trace_enabled", None)
+        try:
+            from .trace import is_trace_disabled as _is_trace_disabled
+
+            self._trace_opted_out = bool(_is_trace_disabled(self.trace) or _is_trace_disabled(_trace_opt_out))
+        except Exception:
+            self._trace_opted_out = self.trace is False or _trace_opt_out is False
         # 兼容历史别名：context / contextManager
         if context_manager is None and "context" in kwargs:
             context_manager = kwargs.pop("context")
@@ -338,10 +349,24 @@ class AgentLoop:
         self._init_trace_writer()
 
     def _init_trace_writer(self):
-        """初始化轨迹写入器，兼容 TraceWriter 实例、类鸭类型对象及路径字符串。"""
+        """初始化轨迹写入器：默认回灌（trace=None 时建默认writer），显式关闭才不写。
 
-        if self.trace is None:
+        兼容 TraceWriter 实例、类鸭类型对象及路径字符串；回灌失败只告警不阻断。
+        """
+
+        if getattr(self, "_trace_opted_out", False):
             self._trace_writer = None
+            return
+        if self.trace is None:
+            # 默认回灌：本地 trace_dir（HERO_TRACE_DIR > ./traces > tempdir）
+            try:
+                from .trace import TraceWriter, default_trace_dir
+
+                p = default_trace_dir() / "trace.jsonl"
+                self._trace_writer = TraceWriter(p)
+            except Exception as exc:
+                logging.getLogger(__name__).warning("default TraceWriter init failed (warn-only): %s", exc, exc_info=True)
+                self._trace_writer = None
             return
         # 已是具备 append/path 的 TraceWriter
         if hasattr(self.trace, "append") and hasattr(self.trace, "path"):
@@ -350,6 +375,17 @@ class AgentLoop:
         if hasattr(self.trace, "append") and callable(getattr(self.trace, "append")):
             # 仅有 append 的鸭类型写入器
             self._trace_writer = self.trace
+            return
+        if self.trace is True:
+            # trace=True 显式开启：与 None 同走默认回灌
+            try:
+                from .trace import TraceWriter, default_trace_dir
+
+                p = default_trace_dir() / "trace.jsonl"
+                self._trace_writer = TraceWriter(p)
+            except Exception as exc:
+                logging.getLogger(__name__).warning("default TraceWriter init failed (warn-only): %s", exc, exc_info=True)
+                self._trace_writer = None
             return
         # 路径字符串/Path 则构造 TraceWriter
         try:
