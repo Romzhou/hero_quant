@@ -388,7 +388,7 @@ class BillingService:
                     _log_warning("billing: ledger.append publish_factor failed for factor_id=%s", factor_id, exc_info=e)
                     # 中文：真 PG 路径补偿删 PG 已 commit 行+内存（仅回滚内存不够），再入 pending_ledger 重放队列
                     try:
-                        self._pg_delete_factor_sync(factor_id)
+                        self._pg_delete_factor_sync(factor_id, tenant)
                     except Exception as _del_e:
                         _log_warning("billing compensate PG delete failed: %s", _del_e, exc_info=True)
                     with _GLOBAL_LOCK:
@@ -573,14 +573,43 @@ class BillingService:
             _log_warning("billing _pg_publish_sync failed: %s", _e, exc_info=True)
             return False
 
-    def _pg_delete_factor_sync(self, factor_id: str) -> bool:
-        """真 PG 补偿删除：ledger 失败时删已提交 PG 行（最佳努力，不抛错）。中文：无 pool 时返回 False。"""
+    @staticmethod
+    def _set_local_dual_tenant(conn, tenant: str) -> None:
+        """同一连接同一事务内双写 SET LOCAL（app.tenant + app.current_tenant）。
+
+        中文：G-04 收口——FORCE RLS 下 current_tenant() 未设置返回 NULL 会导致补偿 DELETE
+        静默 no-op 留孤儿行；此处与 _pg_insert_purchase_sync 对齐，双键同事务执行。
+        失败只告警不抛错（补偿本身最佳努力），由调用方按原语义返回。
+        """
+        _t = str(tenant)
+        for _sql in ("SET LOCAL app.tenant = %s", "SET LOCAL app.current_tenant = %s"):
+            try:
+                conn.execute(_sql, (_t,))  # type: ignore
+                continue
+            except Exception:
+                pass
+            try:
+                with conn.cursor() as _c:  # type: ignore
+                    _c.execute(_sql, (_t,))
+            except Exception as _e:
+                _log_warning("billing SET LOCAL failed: %s", _e, exc_info=True)
+
+    def _pg_delete_factor_sync(self, factor_id: str, tenant: str | None = None) -> bool:
+        """真 PG 补偿删除：ledger 失败时删已提交 PG 行（最佳努力，不抛错）。中文：无 pool 时返回 False。
+
+        中文：G-04——建连接后先双写 SET LOCAL（与 _pg_insert_purchase_sync 对齐），否则 FORCE RLS
+        下 current_tenant() 为 NULL 导致 DELETE 零行匹配（静默 no-op 留孤儿行）。tenant 缺省时
+        仍按旧语义直删（兼容旧调用），调用方应尽量传入归属租户。
+        """
         pool = getattr(self, "_pool", None)
         if not self._is_real_pg() or pool is None:
             return False
+        _tenant = str(tenant).strip() if isinstance(tenant, str) and tenant.strip() else None
         try:
             if hasattr(pool, "connection"):
                 with pool.connection() as _conn:  # type: ignore[attr-defined]
+                    if _tenant is not None:
+                        self._set_local_dual_tenant(_conn, _tenant)
                     try:
                         _conn.execute("DELETE FROM factors WHERE factor_id = %s", (str(factor_id),))  # type: ignore
                     except Exception:
@@ -595,6 +624,9 @@ class BillingService:
                 _conn2 = pool.getconn()  # type: ignore
                 try:
                     with _conn2.cursor() as _c2:
+                        if _tenant is not None:
+                            _c2.execute("SET LOCAL app.tenant = %s", (_tenant,))
+                            _c2.execute("SET LOCAL app.current_tenant = %s", (_tenant,))
                         _c2.execute("DELETE FROM factors WHERE factor_id = %s", (str(factor_id),))
                     try:
                         _conn2.commit()
@@ -1034,15 +1066,22 @@ class BillingService:
         return False
 
     def _pg_delete_purchase_sync(self, factor_id: str, buyer_tenant: str) -> bool:
-        """真 PG 补偿删除购买行：ledger 失败时删已提交 PG 行（最佳努力，不抛错）。中文：无 pool 时返回 False。"""
+        """真 PG 补偿删除购买行：ledger 失败时删已提交 PG 行（最佳努力，不抛错）。中文：无 pool 时返回 False。
+
+        中文：G-04——建连接后先以 buyer 双写 SET LOCAL（与 _pg_insert_purchase_sync 对齐，
+        满足 purchases_insert 的 buyer_tenant=current_tenant()），否则 FORCE RLS 下 DELETE
+        零行匹配（静默 no-op 留孤儿行）。
+        """
         pool = getattr(self, "_pool", None)
         if not self._is_real_pg() or pool is None:
             return False
+        _buyer = str(buyer_tenant)
         _sql = "DELETE FROM purchases WHERE factor_id = %s AND buyer_tenant = %s"
-        _params = (str(factor_id), str(buyer_tenant))
+        _params = (str(factor_id), _buyer)
         try:
             if hasattr(pool, "connection"):
                 with pool.connection() as _conn:  # type: ignore[attr-defined]
+                    self._set_local_dual_tenant(_conn, _buyer)
                     try:
                         _conn.execute(_sql, _params)  # type: ignore
                     except Exception:
@@ -1057,6 +1096,8 @@ class BillingService:
                 _conn2 = pool.getconn()  # type: ignore
                 try:
                     with _conn2.cursor() as _c2:
+                        _c2.execute("SET LOCAL app.tenant = %s", (_buyer,))
+                        _c2.execute("SET LOCAL app.current_tenant = %s", (_buyer,))
                         _c2.execute(_sql, _params)
                     try:
                         _conn2.commit()
