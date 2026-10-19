@@ -25,8 +25,8 @@ logger = logging.getLogger(__name__)
 
 SSE_TICKET_TTL_SECONDS = 60
 _MAX_TICKETS = 10000
-# ticket -> (expires_at_monotonic, user_id字符串；契约冻结键名"user_id"，匿名票存"")
-_tickets: dict[str, tuple[float, str]] = {}
+# ticket -> (expires_at_monotonic, user_id字符串；契约冻结键名"user_id"，匿名票存""；第三位 scope，None=legacy 未分域)
+_tickets: dict[str, tuple[float, str, str | None]] = {}
 _ticket_lock = threading.Lock()
 # NOTE: threading.Lock fallback only — primary store is Redis (SET NX EX + GET+DEL atomic).
 # 本地 _tickets 仅作为 Redis 不可用时的内存回退（仍受单进程限制）；生产为 Redis 强依赖。
@@ -59,7 +59,12 @@ def _get_redis_for_ticket():
 
 def _purge_expired_tickets(now: float) -> None:
     """清理已过期票据；在票据读写时惰性执行，避免后台清理线程。"""
-    for ticket, (_expires_at, _uid) in list(_tickets.items()):
+    for ticket, _entry in list(_tickets.items()):
+        try:
+            _expires_at = _entry[0]
+        except (ValueError, TypeError, IndexError, AttributeError):
+            _tickets.pop(ticket, None)
+            continue
         if _expires_at <= now:
             del _tickets[ticket]
 
@@ -75,12 +80,75 @@ def _normalize_user_id(user: Any | None) -> str:
     return s.strip()
 
 
-def _ticket_payload(user_id: str) -> str:
-    """ticket 载荷：JSON {"user_id": str}（契约冻结键名"user_id"；匿名票存""）。"""
+def _ticket_payload(user_id: str, scope: str | None = None) -> str:
+    """ticket 载荷：JSON {"user_id": str}（契约冻结键名"user_id"；匿名票存""）。
+
+    中文：G-08——scope 分域（query/metrics/stream）：scope 有效时载荷带 "scope"，
+    消费端按 require_scope 校验；scope=None 时为 legacy 无分域载荷（兼容旧票，消费端放行）。
+    """
     try:
+        if scope is not None and scope in _TICKET_SCOPES:
+            return json.dumps({"user_id": user_id, "scope": scope}, separators=(",", ":"), ensure_ascii=False)
         return json.dumps({"user_id": user_id}, separators=(",", ":"), ensure_ascii=False)
     except (ValueError, TypeError, AttributeError):
         return '{"user_id":""}'
+
+
+# 中文：G-08——票据分域白名单；endpoint 消费时 require_scope 落到此集合，隔离 query/metrics/stream。
+_TICKET_SCOPES = frozenset({"query", "metrics", "stream"})
+
+
+def _normalize_scope(scope: Any | None) -> str | None:
+    """归一化 scope：合法分域返回原值；None/非法返回 None（legacy/拒绝由调用方定）。"""
+    try:
+        if isinstance(scope, str) and scope.strip() in _TICKET_SCOPES:
+            return scope.strip()
+    except (ValueError, TypeError, AttributeError):
+        return None
+    return None
+
+
+def _parse_ticket_scope(raw: Any | None) -> str | None:
+    """解析票据载荷中的 scope：缺失/legacy 返回 None；非法值同样按 None（legacy 兼容，不误杀旧票）。"""
+    if raw is None:
+        return None
+    try:
+        if isinstance(raw, (bytes, bytearray)):
+            raw = bytes(raw).decode("utf-8", errors="ignore")
+        if not isinstance(raw, str):
+            raw = str(raw)
+    except (ValueError, TypeError, AttributeError):
+        return None
+    if raw == "1":
+        return None
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError, AttributeError):
+        return None
+    try:
+        if isinstance(data, dict):
+            _s = data.get("scope")
+            if isinstance(_s, str) and _s in _TICKET_SCOPES:
+                return _s
+            return None
+        return None
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
+def _scope_allowed(ticket_scope: str | None, require_scope: Any | None) -> bool:
+    """分域放行判定：不要求（None）一律放行；legacy 票（scope None）迁移期放行；
+    要求为单值时须相等，要求为集合时须命中其一；余者拒绝。"""
+    if require_scope is None:
+        return True
+    if ticket_scope is None:
+        return True
+    try:
+        if isinstance(require_scope, str):
+            return ticket_scope == require_scope
+        return ticket_scope in set(require_scope)
+    except (ValueError, TypeError, AttributeError):
+        return False
 
 
 def _parse_ticket_user(raw: Any | None) -> str | None:
@@ -109,8 +177,8 @@ def _parse_ticket_user(raw: Any | None) -> str | None:
         return ""
 
 
-def _issue_ticket_memory(ttl: float, user_id: str = "") -> str:
-    """Memory fallback for ticket issue（绑定 user_id；默认匿名兼容旧调用）。"""
+def _issue_ticket_memory(ttl: float, user_id: str = "", scope: str | None = None) -> str:
+    """Memory fallback for ticket issue（绑定 user_id；默认匿名兼容旧调用；scope 分域可选）。"""
     now = time.monotonic()
     with _ticket_lock:
         _purge_expired_tickets(now)
@@ -122,12 +190,16 @@ def _issue_ticket_memory(ttl: float, user_id: str = "") -> str:
             except (RuntimeError, StopIteration, ValueError, TypeError) as e:
                 logger.warning("security.ticket_evict_failed error=%s", str(e))
         ticket = secrets.token_urlsafe(32)
-        _tickets[ticket] = (now + ttl, user_id)
+        _tickets[ticket] = (now + ttl, user_id, scope if scope in _TICKET_SCOPES else None)
         return ticket
 
 
-def _consume_ticket_memory_with_user(ticket: str | None) -> tuple[bool, str | None]:
-    """内存消费（带 user）：成功返回 (True, user_id)；过期/缺失返回 (False, None)。"""
+def _consume_ticket_memory_with_user(ticket: str | None, require_scope: Any | None = None) -> tuple[bool, str | None]:
+    """内存消费（带 user）：成功返回 (True, user_id)；过期/缺失返回 (False, None)。
+
+    中文：G-08——require_scope 非空时校验分域：legacy 票（scope None）迁移期放行，
+    分域不匹配 fail-closed 返回 (False, None)（票据已单次弹出，即行销毀，不可重用）。
+    """
     if not ticket:
         return False, None
     now = time.monotonic()
@@ -137,24 +209,34 @@ def _consume_ticket_memory_with_user(ticket: str | None) -> tuple[bool, str | No
         if entry is None:
             return False, None
         try:
-            expires_at, uid = entry
-        except (ValueError, TypeError):
+            expires_at = entry[0]
+            uid = entry[1] if len(entry) > 1 else ""
+            _scope = entry[2] if len(entry) > 2 else None
+        except (ValueError, TypeError, IndexError, AttributeError):
             return False, None
         if expires_at is not None and expires_at > now:
+            if not _scope_allowed(_scope if isinstance(_scope, str) else None, require_scope):
+                logger.warning(
+                    "security.ticket_scope_mismatch memory_ticket_scope=%s",
+                    str(_scope),
+                )
+                return False, None
             return True, (uid if isinstance(uid, str) else _normalize_user_id(uid))
         return False, None
 
 
-def _consume_ticket_memory(ticket: str | None) -> bool:
-    ok, _uid = _consume_ticket_memory_with_user(ticket)
+def _consume_ticket_memory(ticket: str | None, require_scope: Any | None = None) -> bool:
+    ok, _uid = _consume_ticket_memory_with_user(ticket, require_scope)
     return ok
 
 
-def issue_ticket(ttl: float = SSE_TICKET_TTL_SECONDS, user: Any | None = None, user_id: Any | None = None) -> str:
+def issue_ticket(ttl: float = SSE_TICKET_TTL_SECONDS, user: Any | None = None, user_id: Any | None = None, scope: Any | None = None) -> str:
     """生成一个带 TTL 的随机单次票据 — 优先 Redis SET NX EX，原子且分布式。
 
     中文：签发前由调用方完成鉴权，本函数只做 user 绑定。user/user_id 任一显式传入即绑定
     （user_id 优先）；均未传入视为匿名票 user_id=""（兼容旧单票调用）。
+    中文：G-08——scope 分域可选（query/metrics/stream；None=legacy 无分域，消费端放行）；
+    非法 scope 按 None 收敛（不误杀旧调用）。
     """
     # 中文：TTL 有界 fail-closed：非数值回退默认 60s；>3600 收敛 3600（防常驻票据）。
     try:
@@ -168,7 +250,8 @@ def issue_ticket(ttl: float = SSE_TICKET_TTL_SECONDS, user: Any | None = None, u
         bound_user = _normalize_user_id(user_id) if user_id is not None else _normalize_user_id(user)
     except (ValueError, TypeError, AttributeError):
         bound_user = ""
-    payload = _ticket_payload(bound_user)
+    bound_scope = _normalize_scope(scope)
+    payload = _ticket_payload(bound_user, bound_scope)
     # 中文：ttl<=0 语义为立即过期（签发即不可消费；兼容旧契约，不落 Redis 避免 EX 非法）。
     # M-round2：此分支返回永不可消费的票据，必须 warning 可观测，防调用方把 200 签发误当有效票。
     if ttl_int <= 0:
@@ -190,18 +273,20 @@ def issue_ticket(ttl: float = SSE_TICKET_TTL_SECONDS, user: Any | None = None, u
             ok2 = r.set(key2, payload, nx=True, ex=ttl_int)
             if ok2:
                 return ticket2
-            return _issue_ticket_memory(ttl_int, bound_user)
+            return _issue_ticket_memory(ttl_int, bound_user, bound_scope)
         except _REDIS_ERRORS as e:
             logger.warning("security.redis_issue_fallback_memory error=%s", str(e))
     # Fallback to memory
-    return _issue_ticket_memory(ttl_int, bound_user)
+    return _issue_ticket_memory(ttl_int, bound_user, bound_scope)
 
 
-def consume_ticket_with_user(ticket: str | None) -> tuple[bool, str | None]:
+def consume_ticket_with_user(ticket: str | None, require_scope: Any | None = None) -> tuple[bool, str | None]:
     """校验并消费票据（带 user 绑定返回）— 成功返回 (True, user_id 字符串)；失败返回 (False, None)。
 
     中文：fail-closed 且原子。与 consume_ticket 同路径（GETDEL 优先，Lua 兜底，
     Redis 未命中回查内存）；遗留纯"1"票按匿名""兼容，保证旧单测不断。
+    中文：G-08——require_scope 非空时校验分域：legacy 无分域票迁移期放行，分域不匹配
+    fail-closed 返回 (False, None)（票据已原子弹出，即行销毀）并记 warning（只记 scope，不记票据原值）。
     """
     if not ticket:
         return False, None
@@ -213,6 +298,12 @@ def consume_ticket_with_user(ticket: str | None) -> tuple[bool, str | None]:
             try:
                 val = r.getdel(key)
                 if val is not None:
+                    if not _scope_allowed(_parse_ticket_scope(val), require_scope):
+                        logger.warning(
+                            "security.ticket_scope_mismatch required=%s",
+                            str(require_scope),
+                        )
+                        return False, None
                     return True, _parse_ticket_user(val)
             except _REDIS_ERRORS:
                 # 中文：无 getdel 的旧客户端走 Lua 原子比较删除。
@@ -226,22 +317,29 @@ def consume_ticket_with_user(ticket: str | None) -> tuple[bool, str | None]:
                         key,
                     )
                     if result:
+                        if not _scope_allowed(_parse_ticket_scope(result), require_scope):
+                            logger.warning(
+                                "security.ticket_scope_mismatch required=%s",
+                                str(require_scope),
+                            )
+                            return False, None
                         return True, _parse_ticket_user(result)
                 except _REDIS_ERRORS:
                     pass
             # 中文：Redis 未命中回查内存（签发时 Redis 不可用→内存，恢复后仍可消费）。
-            return _consume_ticket_memory_with_user(ticket)
+            return _consume_ticket_memory_with_user(ticket, require_scope)
         except _REDIS_ERRORS as e:
             logger.warning("security.redis_consume_fallback_memory error=%s", str(e))
-    return _consume_ticket_memory_with_user(ticket)
+    return _consume_ticket_memory_with_user(ticket, require_scope)
 
 
-def consume_ticket(ticket: str | None) -> bool:
+def consume_ticket(ticket: str | None, require_scope: Any | None = None) -> bool:
     """校验并消费票据 — 优先 Redis GETDEL 原子语义，票据单次有效防重放。
 
     中文：fail-closed 且原子。优先服务端原子 GETDEL（fakeredis/redis-py 均支持）；
     GETDEL 不可用才走 Lua；Redis 未命中回查内存（flap 时内存签发的票仍可消费）。
     全程无裸 GET-then-DEL 回退（并发重放缺口）。
+    中文：G-08——require_scope 非空时校验分域（legacy 无分域票迁移期放行，不匹配 fail-closed False）。
     """
     if not ticket:
         return False
@@ -253,24 +351,38 @@ def consume_ticket(ticket: str | None) -> bool:
             try:
                 val = r.getdel(key)
                 if val is not None:
+                    if not _scope_allowed(_parse_ticket_scope(val), require_scope):
+                        logger.warning(
+                            "security.ticket_scope_mismatch required=%s",
+                            str(require_scope),
+                        )
+                        return False
                     return True
             except _REDIS_ERRORS:
                 # 中文：无 getdel 的旧客户端走 Lua 原子比较删除。
                 try:
                     result = r.eval(
-                        "if redis.call('get', KEYS[1]) then return redis.call('del', KEYS[1]) else return 0 end",
+                        "local v = redis.call('get', KEYS[1]); "
+                        "if v then redis.call('del', KEYS[1]); return v; "
+                        "else return false; end",
                         1,
                         key,
                     )
-                    if bool(result):
+                    if result:
+                        if not _scope_allowed(_parse_ticket_scope(result), require_scope):
+                            logger.warning(
+                                "security.ticket_scope_mismatch required=%s",
+                                str(require_scope),
+                            )
+                            return False
                         return True
                 except _REDIS_ERRORS:
                     pass
             # 中文：Redis 未命中回查内存（签发时 Redis 不可用→内存，恢复后仍可消费）。
-            return _consume_ticket_memory(ticket)
+            return _consume_ticket_memory(ticket, require_scope)
         except _REDIS_ERRORS as e:
             logger.warning("security.redis_consume_fallback_memory error=%s", str(e))
-    return _consume_ticket_memory(ticket)
+    return _consume_ticket_memory(ticket, require_scope)
 
 
 def _get_whitelist_from_env() -> list[str]:

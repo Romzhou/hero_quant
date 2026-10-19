@@ -1291,10 +1291,11 @@ def ready(mode: str = "ready"):
 def metrics(request: Request, x_ticket: str | None = Header(None, alias="X-Ticket")):
     """暴露 Prometheus 指标（需鉴权：X-Ticket 单次票据或 API Key/HMAC，缺票据 401）。"""
     # 中文：T4-1 MR1：/metrics 不再匿名暴露；复用 query 的 X-Ticket 票据逻辑 + API Key/HMAC。
+    # 中文：G-08——/metrics 要求 scope=metrics（legacy 无分域票迁移期放行；query/stream 分域票拒绝）。
     _ok_m = False
     if x_ticket:
         try:
-            _ok_m, _ = consume_ticket_with_user(x_ticket)
+            _ok_m, _ = consume_ticket_with_user(x_ticket, require_scope="metrics")
         except (ValueError, TypeError, AttributeError):
             _ok_m = False
     if not _ok_m:
@@ -1327,7 +1328,8 @@ async def query(request: Request, background_tasks: BackgroundTasks, q: str = ""
         return _limited
     # 中文：T1-3 身份闭环：/v1/query 与 stream 同等要求有效 ticket（单次消费），无票/过期票 401。
     # 顺序：限流先于鉴权（耗尽配额时仍 429，便于 test_pr1a 语义）；ticket 只走 X-Ticket 头（已移除 ?ticket= 回退）。
-    _ok_q, _ticket_user_q = consume_ticket_with_user(x_ticket)
+    # 中文：G-08——query 要求 scope=query（legacy 无分域票迁移期放行；metrics 分域票拒绝）。
+    _ok_q, _ticket_user_q = consume_ticket_with_user(x_ticket, require_scope="query")
     if not _ok_q:
         return JSONResponse(status_code=401, content={"detail": "Missing or invalid query ticket"})
     if REQUEST_COUNTER is not None:
@@ -1583,8 +1585,13 @@ async def query(request: Request, background_tasks: BackgroundTasks, q: str = ""
 
 
 @app.post("/v1/query/ticket")
-def query_ticket(request: Request, user: str | None = None):
-    """签发一个短时、单次消费的 SSE 查询票据（带滑动窗口限流；绑定鉴权后 user）。"""
+def query_ticket(request: Request, user: str | None = None, scope: str | None = None):
+    """签发一个短时、单次消费的 SSE 查询票据（带滑动窗口限流；绑定鉴权后 user）。
+
+    中文：G-08——scope 分域可选（query/metrics/stream；缺省 query）。query 分域票可用于
+    /v1/query 与 /v1/query/stream（同属查询面），不可用于 /metrics；metrics 面须显式
+    scope=metrics。非法 scope 值 400 fail-closed。
+    """
     if REQUEST_COUNTER is not None:
         try:
             REQUEST_COUNTER.labels(endpoint="/v1/query/ticket").inc()
@@ -1632,6 +1639,12 @@ def query_ticket(request: Request, user: str | None = None):
         except (ValueError, TypeError, AttributeError):
             _authed = False
     _claimed_user = _norm_uid_ticket(user)
+    # 中文：G-08——分域归一（缺省 query；非法值 400）。
+    from hero_quant.api.security import _normalize_scope as _norm_scope_ticket
+
+    _ticket_scope = _norm_scope_ticket(scope) if scope is not None else "query"
+    if _ticket_scope is None:
+        return JSONResponse(status_code=400, content={"detail": "Invalid ticket scope (query/metrics/stream)"})
     # D线/G-02：票据 user 必须服务端绑定，拒绝自声明冒充他人 WS 频道。
     # 匿名票据一律 user_id=""（?user= 直接丢弃 + warning + 计数）；已鉴权调用方见下。
     _bound_user = _claimed_user
@@ -1667,7 +1680,7 @@ def query_ticket(request: Request, user: str | None = None):
         # ticket-channel 一致校验，不一致 4001 关闭）。真 per-user 隔离需 per-user 密钥身份（后续专线）。
         pass
     return {
-        "ticket": issue_ticket(ttl=SSE_TICKET_TTL_SECONDS, user_id=_bound_user),
+        "ticket": issue_ticket(ttl=SSE_TICKET_TTL_SECONDS, user_id=_bound_user, scope=_ticket_scope),
         "expires_in": SSE_TICKET_TTL_SECONDS,
     }
 
@@ -1711,7 +1724,9 @@ async def query_stream(request: Request, background_tasks: BackgroundTasks, q: s
             logger.warning("query_stream.replay_path_invalid", error=str(_e))
             raise HTTPException(status_code=400, detail="invalid replay_path")
     # 中文：ticket 只走 X-Ticket header（不再从 ?ticket= 读，避免票据暴露在 URL/history/logs/referer）。
-    if not consume_ticket(x_ticket):
+    # 中文：G-08——stream 接受 scope=query/stream（签发端默认 query，两端同属查询面；
+    # legacy 无分域票迁移期放行；metrics 分域票拒绝）。
+    if not consume_ticket(x_ticket, require_scope=("query", "stream")):
         return JSONResponse(status_code=403, content={"detail": "Invalid or expired SSE ticket"})
     # D线降级预判（链A）：无 key 即 FakeLLM 合成路径；checkpoint 非 real 即 emulated。
     # 响应头预置 degraded 标记（body 内首事件同步标记），外层预检命中缓存不阻塞流启动。
