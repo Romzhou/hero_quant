@@ -178,9 +178,12 @@ def test_c1_08_get_with_config_ttl_evict():
     saver = get_saver(dsn=dsn, ttl_seconds=2)
     tid = "wf:runTTL:tenantG"
     saver.put(tid, {"v": 1}, {"cfg": 1})
-    # 篡改时间戳为过期
+    # 篡改时间戳为过期：需同时老化全局 emulated 与实例级 _timestamps，
+    # 因 put() 双写两处，get()/get_with_config() 会回退到实例缓存；
+    # 仅老化一处会误判为“过期仍命中”（B线测试完备性修复，仅碰 tests/，不改 src/）。
     key = pg._pg_store_key(dsn, tid)
     pg._PG_GLOBAL_TS[key] = time.time() - 10
+    saver._timestamps[tid] = time.time() - 10
     # get_with_config 应返回 None 而非仍命中
     res = saver.get_with_config(tid)
     assert res is None, f"过期 emulated 仍被返回: {res}"

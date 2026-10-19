@@ -110,6 +110,15 @@ def test_ruff_no_f841() -> None:
     """ruff 增量：不应有 F841 未使用变量（otel 未使用 e 已修复）。"""
     import subprocess
 
-    r = subprocess.run(["ruff", "check", "src"], capture_output=True, text=True)
+    # Windows 默认 gbk 解码含中文的 ruff 输出会 UnicodeDecodeError，导致 stdout 为空；
+    # 显式 utf-8 + errors=replace，保证跨平台可断言（B线可移植性修复，仅碰 tests/）。
+    r = subprocess.run(
+        ["ruff", "check", "src"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    out = r.stdout or ""
     # 允许其他告警，但 F841 必须为 0（本次收敛目标）
-    assert "F841" not in r.stdout, f"仍有 F841: {r.stdout[:500]}"
+    assert "F841" not in out, f"仍有 F841: {out[:500]}"

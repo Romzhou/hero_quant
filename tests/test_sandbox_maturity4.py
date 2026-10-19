@@ -72,6 +72,7 @@ def test_landlock_grant_args_generation():
     assert grant_args({}) == []
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Landlock/bwrap Linux-only; echo is cmd-builtin not exe on Windows")
 def test_sandbox_fail_closed_raises_when_landlock_unusable():
     """Fail-closed: workspace-write without enforcement must raise SandboxUnavailableError, not silently run."""
     from hero_quant.sandbox.policy import resolve_policy

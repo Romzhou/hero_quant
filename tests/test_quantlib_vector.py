@@ -1,6 +1,9 @@
 # tests/test_quantlib_vector.py — TDD Task 6 vector parity
 import pandas as pd
 import math
+import pytest
+
+polars = pytest.importorskip("polars", reason="vector extras not installed locally; CI installs hero-quant[vector]")
 
 def test_sma_vector_equal_pandas():
     s = pd.Series([1, 2, 3, 4, 5])

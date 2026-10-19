@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import pathlib
+import sys
 
 import pytest
 
@@ -149,6 +150,7 @@ def test_landlock_sandbox_execute_python_wiring():
         sb.execute_python("def oops(:\n pass")
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Landlock/bwrap Linux-only; echo is cmd-builtin not exe on Windows")
 def test_non_python_payload_unaffected():
     """非 Python 载荷路径不受 AST 守卫影响."""
     from hero_quant.sandbox.policy import resolve_policy
