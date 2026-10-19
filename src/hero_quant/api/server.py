@@ -164,12 +164,28 @@ def _is_emulated_saver(saver: object) -> tuple[bool, str]:
         return True, _EMULATED_CHECKPOINT_REASON
 
 
+def _degraded_reason_header_value(reasons: list[str]) -> str:
+    """响应头 reason 脱敏：HTTP 头仅 latin-1，非 ASCII（中文）转义为 ?，完整 UTF-8 reason 只放 body。"""
+    try:
+        joined = "; ".join(r for r in reasons if r)[:512]
+    except (ValueError, TypeError, AttributeError):
+        return "degraded"
+    try:
+        joined.encode("latin-1")
+        return joined
+    except (ValueError, TypeError, UnicodeError):
+        try:
+            return joined.encode("ascii", errors="replace").decode("ascii")
+        except (ValueError, TypeError, UnicodeError):
+            return "degraded"
+
+
 def _with_degraded_headers(resp: JSONResponse, reasons: list[str]) -> JSONResponse:
     """给降级响应附加响应头 X-Degraded/X-Degrade-Reason（body 侧由调用方置 degraded:true + reason）。"""
     try:
         resp.headers[_DEGRADED_HEADER] = "true"
         if reasons:
-            resp.headers[_DEGRADED_REASON_HEADER] = "; ".join(r for r in reasons if r)[:512]
+            resp.headers[_DEGRADED_REASON_HEADER] = _degraded_reason_header_value(reasons)
     except (ValueError, TypeError, AttributeError):
         pass
     return resp
@@ -382,7 +398,12 @@ def _get_checkpoint_saver():
 
             saver = _get_saver(dsn)
             _checkpoint_saver_cache[dsn] = saver
-            logger.info("checkpoint.wired", dsn=dsn, mode="pg" if "postgres" in dsn else "memory")
+            logger.info(
+                "checkpoint.wired",
+                dsn=_redact_dsn_api(dsn),
+                dsn_host=_dsn_host(dsn),
+                mode="pg" if "postgres" in dsn else "memory",
+            )
             return saver
         except Exception as _e:
             logger.warning("checkpoint.wire_failed", error=str(_e), exc_info=_e)  # intentional: fallback to memory/noop
@@ -1328,6 +1349,7 @@ async def query(request: Request, background_tasks: BackgroundTasks, q: str = ""
         key = (s.api_key or s.openai_api_key or "")
         key = key.strip() if isinstance(key, str) else ""
         llm = None
+        _llm_degraded = False
         model_name = s.llm_model
         if key:
             try:
@@ -1382,6 +1404,7 @@ async def query(request: Request, background_tasks: BackgroundTasks, q: str = ""
                     return self.stream_chat(goal)
 
             llm = _FakeLLM()
+            _llm_degraded = True
         trace = None
         trace_dir_path = None
         _tmp_dir_obj = None
@@ -1440,11 +1463,14 @@ async def query(request: Request, background_tasks: BackgroundTasks, q: str = ""
         from hero_quant.agent.loop import AgentLoop
         # --- checkpoint wiring (best-effort, logged; offloaded — sync TCP/PG setup must not stall event loop) ---
         _saver = None
+        _ckpt_degraded, _ckpt_reason = True, _EMULATED_CHECKPOINT_REASON
         try:
             _saver = await asyncio.to_thread(_get_checkpoint_saver)
+            _ckpt_degraded, _ckpt_reason = _is_emulated_saver(_saver)
         except Exception as _e:
             logger.warning("checkpoint.get_failed", error=str(_e), exc_info=_e)
             _saver = None
+            _ckpt_degraded, _ckpt_reason = True, "checkpoint saver unavailable, memory fallback"
         loop_kwargs = dict(
             llm=llm,
             max_iterations=5,
@@ -1494,6 +1520,24 @@ async def query(request: Request, background_tasks: BackgroundTasks, q: str = ""
         # interaction: if loop reason indicates approval needed, surface it
         if isinstance(res.reason, str) and "approval" in res.reason.lower() or res.reason == "need_approval":
             out["need_approval"] = True
+        # D线降级标记（链A）：_FakeLLM 与 emulated checkpoint 必须在 body 置 degraded:true + reason，响应头同步标记。
+        _degrade_reasons: list[str] = []
+        if _llm_degraded:
+            _degrade_reasons.append(_FAKE_LLM_REASON)
+            out["llm_mode"] = "synthetic"
+        if _ckpt_degraded:
+            _degrade_reasons.append(_ckpt_reason or _EMULATED_CHECKPOINT_REASON)
+            out["checkpoint_mode"] = "emulated"
+        if _degrade_reasons:
+            out["degraded"] = True
+            out["degraded_reason"] = "; ".join(_degrade_reasons)
+            _inc_api_error("query", "degraded_response")
+            logger.warning(
+                "query.degraded",
+                error_code="degraded_response",
+                chain="A",
+                degraded_reason=out["degraded_reason"],
+            )
         # 显式关闭 TraceWriter（Windows 句柄释放，避免 cleanup 噪音）。
         # 注意：res.trace_path 落在 _tmp_dir_obj 内——此处不得同步 cleanup，
         # 由 BackgroundTasks 在响应发送后清理，否则返回悬空路径（use-after-delete）。
@@ -1502,6 +1546,8 @@ async def query(request: Request, background_tasks: BackgroundTasks, q: str = ""
                 trace.close()
         except Exception:
             pass
+        if _degrade_reasons:
+            return _with_degraded_headers(JSONResponse(status_code=200, content=out), _degrade_reasons)
         return out
     except HTTPException:
         raise
@@ -1613,6 +1659,28 @@ async def query_stream(request: Request, background_tasks: BackgroundTasks, q: s
     # 中文：ticket 只走 X-Ticket header（不再从 ?ticket= 读，避免票据暴露在 URL/history/logs/referer）。
     if not consume_ticket(x_ticket):
         return JSONResponse(status_code=403, content={"detail": "Invalid or expired SSE ticket"})
+    # D线降级预判（链A）：无 key 即 FakeLLM 合成路径；checkpoint 非 real 即 emulated。
+    # 响应头预置 degraded 标记（body 内首事件同步标记），外层预检命中缓存不阻塞流启动。
+    _stream_degrade_reasons: list[str] = []
+    try:
+        from hero_quant.config.settings import Settings as _StreamSettings
+
+        _sk = _StreamSettings()
+        _skey = (_sk.api_key or _sk.openai_api_key or "")
+        _skey = _skey.strip() if isinstance(_skey, str) else ""
+        if not _skey:
+            _stream_degrade_reasons.append(_FAKE_LLM_REASON)
+    except (ValueError, TypeError, AttributeError, OSError, RuntimeError) as _e:
+        logger.warning("stream.degraded_precheck_failed", error_code="degraded_precheck_failed", exc_info=_e)
+        _stream_degrade_reasons.append(_FAKE_LLM_REASON)
+    try:
+        _pre_saver = await asyncio.to_thread(_get_checkpoint_saver)
+        _pre_ckpt_bad, _pre_ckpt_reason = _is_emulated_saver(_pre_saver)
+        if _pre_ckpt_bad:
+            _stream_degrade_reasons.append(_pre_ckpt_reason or _EMULATED_CHECKPOINT_REASON)
+    except (ValueError, TypeError, AttributeError, OSError, RuntimeError) as _e:
+        logger.warning("stream.checkpoint_precheck_failed", error_code="checkpoint_precheck_failed", exc_info=_e)
+        _stream_degrade_reasons.append("checkpoint saver unavailable, memory fallback")
 
     async def event_generator():
         import json as _json
@@ -1620,6 +1688,7 @@ async def query_stream(request: Request, background_tasks: BackgroundTasks, q: s
         import pathlib as _pl
         trace = None
         _tmp_stream_dir = None
+        _gen_reasons: list[str] = list(_stream_degrade_reasons)
         try:
             from hero_quant.config.settings import Settings
             s = Settings()
@@ -1678,6 +1747,8 @@ async def query_stream(request: Request, background_tasks: BackgroundTasks, q: s
                         return self.stream_chat(goal)
 
                 llm = _FakeLLM()
+                if _FAKE_LLM_REASON not in _gen_reasons:
+                    _gen_reasons.append(_FAKE_LLM_REASON)
             # trace/_tmp_stream_dir 已在 event_generator 顶部预初始化（防 finally UnboundLocalError）
             trace_dir_path = None
             try:
@@ -1734,8 +1805,13 @@ async def query_stream(request: Request, background_tasks: BackgroundTasks, q: s
             _saver2 = None
             try:
                 _saver2 = await asyncio.to_thread(_get_checkpoint_saver)
+                _s2_bad, _s2_reason = _is_emulated_saver(_saver2)
+                if _s2_bad and (_s2_reason or _EMULATED_CHECKPOINT_REASON) not in _gen_reasons:
+                    _gen_reasons.append(_s2_reason or _EMULATED_CHECKPOINT_REASON)
             except Exception as _e:
                 logger.warning("checkpoint.get_failed_stream", error=str(_e), exc_info=_e)
+                if "checkpoint saver unavailable, memory fallback" not in _gen_reasons:
+                    _gen_reasons.append("checkpoint saver unavailable, memory fallback")
             loop_kwargs2 = dict(
                 llm=llm,
                 max_iterations=5,
@@ -1791,6 +1867,16 @@ async def query_stream(request: Request, background_tasks: BackgroundTasks, q: s
             except Exception as _e:
                 logger.warning("trace.read_failed", error=str(_e))
             emitted = 0
+            if _gen_reasons:
+                # D线降级标记（链A）：流首事件置 degraded:true + reason，与响应头对应。
+                _inc_api_error("stream", "degraded_response")
+                logger.warning(
+                    "stream.degraded",
+                    error_code="degraded_response",
+                    chain="A",
+                    degraded_reason="; ".join(_gen_reasons),
+                )
+                yield f"data: {_json.dumps({'type': 'degraded', 'degraded': True, 'reason': '; '.join(_gen_reasons)}, ensure_ascii=False)}\n\n"
             for rec in tool_records:
                 try:
                     t = rec.get("type", "")
@@ -1890,7 +1976,12 @@ async def query_stream(request: Request, background_tasks: BackgroundTasks, q: s
             except Exception:
                 pass
 
-    return StreamingResponse(event_generator(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+    _stream_headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+    if _stream_degrade_reasons:
+        # D线降级响应头：degraded body 首事件与本头对应（reason 经 latin-1 脱敏，完整文本在 body）
+        _stream_headers[_DEGRADED_HEADER] = "true"
+        _stream_headers[_DEGRADED_REASON_HEADER] = _degraded_reason_header_value(_stream_degrade_reasons)
+    return StreamingResponse(event_generator(), media_type="text/event-stream", headers=_stream_headers)
 
 
 # 研究页回测产物：以 BacktestEngine 合成生成，保证 metrics/sharpe/date/tearsheet 齐全
