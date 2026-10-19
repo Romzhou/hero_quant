@@ -127,8 +127,23 @@ class AuditLogger:
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                 },
             )
-        except Exception:
-            pass
+        except Exception as _e:  # intentional: 审计永不抛（保住主请求）；emit 失败经独立 logger 兜底告警
+            try:
+                logging.getLogger(__name__).warning(
+                    "audit.emit_failed op=log_tool_call error=%s error_code=audit.emit_failed chain=A",
+                    str(_e),
+                    exc_info=_e,
+                )
+                try:
+                    import structlog as _structlog  # type: ignore
+
+                    _structlog.get_logger(__name__).warning(
+                        "audit.emit_failed", error_code="audit.emit_failed", chain="A", op="log_tool_call"
+                    )
+                except (ImportError, AttributeError, ValueError, TypeError, OSError, RuntimeError):
+                    pass
+            except Exception:
+                pass
 
     @staticmethod
     def log_tool_failure(user_id: int, tool_name: str, error: str, session_id: int | None = None):
@@ -147,8 +162,23 @@ class AuditLogger:
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                 },
             )
-        except Exception:
-            pass
+        except Exception as _e:  # intentional: 审计永不抛；emit 失败经独立 logger 兜底告警
+            try:
+                logging.getLogger(__name__).warning(
+                    "audit.emit_failed op=log_tool_failure error=%s error_code=audit.emit_failed chain=A",
+                    str(_e),
+                    exc_info=_e,
+                )
+                try:
+                    import structlog as _structlog  # type: ignore
+
+                    _structlog.get_logger(__name__).warning(
+                        "audit.emit_failed", error_code="audit.emit_failed", chain="A", op="log_tool_failure"
+                    )
+                except (ImportError, AttributeError, ValueError, TypeError, OSError, RuntimeError):
+                    pass
+            except Exception:
+                pass
 
     @staticmethod
     def log_rate_limit_hit(user_id: int, endpoint: str):
@@ -162,8 +192,23 @@ class AuditLogger:
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                 },
             )
-        except Exception:
-            pass
+        except Exception as _e:  # intentional: 审计永不抛；emit 失败经独立 logger 兜底告警
+            try:
+                logging.getLogger(__name__).warning(
+                    "audit.emit_failed op=log_rate_limit_hit error=%s error_code=audit.emit_failed chain=A",
+                    str(_e),
+                    exc_info=_e,
+                )
+                try:
+                    import structlog as _structlog  # type: ignore
+
+                    _structlog.get_logger(__name__).warning(
+                        "audit.emit_failed", error_code="audit.emit_failed", chain="A", op="log_rate_limit_hit"
+                    )
+                except (ImportError, AttributeError, ValueError, TypeError, OSError, RuntimeError):
+                    pass
+            except Exception:
+                pass
 
 
 __all__ = ["AuditLogger", "audit_logger"]

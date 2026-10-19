@@ -12,6 +12,32 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+try:
+    import structlog as _structlog  # type: ignore
+
+    _slog = _structlog.get_logger(__name__)
+except Exception:  # pragma: no cover — 最小环境无 structlog
+    _slog = None  # type: ignore
+
+_CHAIN = "A"  # F线分级：本文件位于问答链（会话读写，会话丢失即上下文丢失）
+
+
+def _warn(op: str, msg: str, *args: Any, **fields: Any) -> None:
+    """F线分级告警（D线 risk/_log_silent_handled 同款 schema）：stdlib warning 为主
+    （caplog/现网采集兼容），structlog 结构化为辅（error_code + chain；trace_id 由
+    server.py contextvars 自动透传）。PII 约束：fields 只传非敏感字段，禁 session 原值。"""
+    _exc_info = fields.pop("exc_info", None)
+    try:
+        logger.warning(msg, *args, exc_info=_exc_info)
+    except Exception:
+        pass
+    if _slog is None:
+        return
+    try:
+        _slog.warning(op, error_code=op, chain=fields.pop("chain", _CHAIN), exc_info=_exc_info, **fields)
+    except Exception:
+        pass
+
 SESSION_PREFIX = "hero:session:"
 SESSION_TTL = 7 * 24 * 3600
 # session_id 上限：防超大键 DoS；归一化后仍超长直接拒绝
@@ -42,11 +68,11 @@ async def set_session(session_id: str, data: dict[str, Any]) -> bool:
 
     norm = _norm_id(session_id)
     if norm is None:
-        logger.debug("session.invalid_id op=set")
+        _warn("session.invalid_id", "session.invalid_id op=set error_code=session.invalid_id")
         return False
     if not isinstance(data, dict):
         # get 只返回 dict，非 dict 写入永远不可读，直接拒绝避免误导性成功
-        logger.debug("session.encode_failed error=non-dict data type=%s", type(data).__name__)
+        _warn("session.encode_failed", "session.encode_failed error=non-dict data type=%s error_code=session.encode_failed", type(data).__name__)
         return False
     client = await get_redis()
     if client is None:
@@ -55,13 +81,13 @@ async def set_session(session_id: str, data: dict[str, Any]) -> bool:
         # 不用 default=str：不可序列化值必须 loudly 失败，而非静默转字符串
         payload = json.dumps(data, ensure_ascii=False)
     except (TypeError, ValueError) as e:
-        logger.debug("session.encode_failed error=%s", str(e))
+        _warn("session.encode_failed", "session.encode_failed error=%s error_code=session.encode_failed", str(e))
         return False
     try:
         await client.set(_key(norm), payload, ex=SESSION_TTL)
         return True
     except Exception as e:
-        logger.debug("session.set_failed error=%s", str(e))
+        _warn("session.set_failed", "session.set_failed error=%s error_code=session.set_failed", str(e))
         return False
 
 
@@ -71,7 +97,7 @@ async def get_session(session_id: str) -> dict[str, Any] | None:
 
     norm = _norm_id(session_id)
     if norm is None:
-        logger.debug("session.invalid_id op=get")
+        _warn("session.invalid_id", "session.invalid_id op=get error_code=session.invalid_id")
         return None
     client = await get_redis()
     if client is None:
@@ -79,7 +105,7 @@ async def get_session(session_id: str) -> dict[str, Any] | None:
     try:
         raw = await client.get(_key(norm))
     except Exception as e:
-        logger.debug("session.get_failed error=%s", str(e))
+        _warn("session.get_failed", "session.get_failed error=%s error_code=session.get_failed", str(e))
         return None
     if not raw:
         return None
@@ -89,7 +115,7 @@ async def get_session(session_id: str) -> dict[str, Any] | None:
             raw = bytes(raw).decode("utf-8")
         obj = json.loads(raw)
     except (UnicodeDecodeError, ValueError, TypeError) as e:
-        logger.debug("session.decode_failed error=%s", str(e))
+        _warn("session.decode_failed", "session.decode_failed error=%s error_code=session.decode_failed", str(e))
         return None
     return obj if isinstance(obj, dict) else None
 

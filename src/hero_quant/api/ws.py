@@ -29,6 +29,33 @@ from hero_quant.infra.redis import RedisStream, get_redis
 
 logger = logging.getLogger(__name__)
 
+try:
+    import structlog as _structlog  # type: ignore
+
+    _slog = _structlog.get_logger(__name__)
+except Exception:  # pragma: no cover — 最小环境无 structlog
+    _slog = None  # type: ignore
+
+_CHAIN = "A"  # F线分级：本文件位于问答链（WS 实时推送 query/stream 轨迹事件）
+
+
+def _warn(op: str, msg: str, *args: Any, **fields: Any) -> None:
+    """F线分级告警（D线 risk/_log_silent_handled 同款 schema）：stdlib warning 为主
+    （caplog/现网采集兼容），structlog 结构化为辅（error_code + chain + trace 语义字段；
+    trace_id 由 server.py contextvars 自动透传）。PII 约束：fields 只传 error_code /
+    chain / channel 等非敏感字段，禁 ticket/user/key 原值。"""
+    _exc_info = fields.pop("exc_info", None)
+    try:
+        logger.warning(msg, *args, exc_info=_exc_info)
+    except Exception:
+        pass
+    if _slog is None:
+        return
+    try:
+        _slog.warning(op, error_code=op, chain=fields.pop("chain", _CHAIN), exc_info=_exc_info, **fields)
+    except Exception:
+        pass
+
 
 def _consume_ticket_identity(ticket: str | None) -> tuple[bool, str | None]:
     """消费票据并返回 (ok, user_id)：优先带绑定的原子消费，兼容仅桩 consume_ticket 的旧测试替身。
@@ -47,7 +74,7 @@ def _consume_ticket_identity(ticket: str | None) -> tuple[bool, str | None]:
         if consume_ticket(ticket):
             return True, ""
     except (ValueError, TypeError, AttributeError, RuntimeError, OSError):
-        pass
+        pass  # intentional: 旧测试替身兼容探针；失败即匿名不通过（fail-closed），见函数 docstring
     return False, None
 
 
@@ -116,7 +143,7 @@ def resolve_user_channel(user: str | None, ws: Any | None = None, kind: str = "t
 try:
     _HOST = socket.gethostname()
 except Exception:
-    _HOST = "unknown"
+    _HOST = "unknown"  # intentional: 主机名仅用于实例标识，失败回退 unknown（offline-safe）
 INSTANCE_ID = f"{_HOST}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
 
 # ── Online presence (Redis heartbeat, best-effort) ──
@@ -136,7 +163,13 @@ async def mark_online(channel: str) -> None:
             return
         await client.set(f"{ONLINE_PREFIX}{channel}", INSTANCE_ID, ex=ONLINE_TTL)
     except Exception as e:
-        logger.debug("ws.mark_online_failed error=%s", str(e))
+        _warn(
+            "ws.mark_online_failed",
+            "ws.mark_online_failed channel=%s error=%s error_code=ws.mark_online_failed",
+            channel,
+            str(e),
+            channel=channel,
+        )
 
 
 async def refresh_presence(channel: str) -> None:
@@ -173,17 +206,37 @@ async def mark_offline(channel: str) -> None:
             # eval 不可用（如部分 fakeredis）才退化为读后删；删错风险由 TTL 90s 兜底
             try:
                 current = await client.get(key)
-            except Exception:
+            except Exception as _e:
+                # presence 读失败视为不持有（TTL 90s 自愈）；告警便于发现 Redis 持续不可用
+                _warn(
+                    "ws.mark_offline_read_failed",
+                    "ws.mark_offline_read_failed channel=%s error=%s error_code=ws.mark_offline_read_failed",
+                    channel,
+                    str(_e),
+                    channel=channel,
+                )
                 current = None
             if current == INSTANCE_ID:
                 try:
                     await client.delete(key)
                 except Exception as e:
-                    logger.debug("ws.mark_offline_delete_failed error=%s", str(e))
+                    _warn(
+                        "ws.mark_offline_delete_failed",
+                        "ws.mark_offline_delete_failed channel=%s error=%s error_code=ws.mark_offline_delete_failed",
+                        channel,
+                        str(e),
+                        channel=channel,
+                    )
         finally:
             _presence_touched.pop(channel, None)
     except Exception as e:
-        logger.debug("ws.mark_offline_failed error=%s", str(e))
+        _warn(
+            "ws.mark_offline_failed",
+            "ws.mark_offline_failed channel=%s error=%s error_code=ws.mark_offline_failed",
+            channel,
+            str(e),
+            channel=channel,
+        )
 
 
 # ── Manager (多端登录) ──
@@ -211,7 +264,7 @@ class WSManager:
         try:
             await ws.close()
         except Exception:
-            pass
+            pass  # intentional: 连接已先摘除；close 失败不影响清理结果（best-effort 收尾）
 
     async def send_to(self, channel: str, data: dict[str, Any]) -> bool:
         conns = list(self._connections.get(channel, ()))
@@ -225,7 +278,13 @@ class WSManager:
                 await ws.send_json(data)
                 return True
             except (RuntimeError, ValueError, TypeError, OSError) as e:
-                logger.debug("ws.send_failed channel=%s error=%s", channel, str(e))
+                _warn(
+                    "ws.send_failed",
+                    "ws.send_failed channel=%s error=%s error_code=ws.send_failed",
+                    channel,
+                    str(e),
+                    channel=channel,
+                )
                 await self.disconnect(channel, ws)
                 return False
 
@@ -316,7 +375,7 @@ class HeartbeatMonitor:
                     try:
                         await ws.close(code=4002, reason="heartbeat timeout")
                     except Exception:
-                        pass
+                        pass  # intentional: 超时摘除已生效；close 失败不影响驱逐结果（best-effort 收尾）
                 # Do NOT delete a fresh record() from a reconnect that happened
                 # during the awaited close() above — otherwise the new
                 # connection is left unmonitored (never times out).
@@ -385,10 +444,16 @@ async def ws_trace(
                 await websocket.send_json({"type": "pong"})
             # Broadcast any tool/delta events from other sources? Client sends ignored
     except WebSocketDisconnect:
-        pass
+        pass  # intentional: 客户端正常断开，非错误（finally 照常清理连接与 presence）
     except (RuntimeError, ValueError, KeyError) as e:
         # 窄化：仅收 receive_json/连接层的协议与解析异常，其余程序错误继续上抛
-        logger.debug("ws.trace_error error=%s", str(e))
+        _warn(
+            "ws.trace_error",
+            "ws.trace_error channel=%s error=%s error_code=ws.trace_error",
+            channel,
+            str(e),
+            channel=channel,
+        )
     finally:
         await manager.disconnect(channel, websocket)
         if not manager.is_online(channel):
@@ -445,9 +510,15 @@ async def ws_query(
                 await websocket.send_json({"delta": f"query received: {q[:80]}"})
                 await websocket.send_json({"type": "done"})
     except WebSocketDisconnect:
-        pass
+        pass  # intentional: 客户端正常断开，非错误（finally 照常清理连接与 presence）
     except (RuntimeError, ValueError, KeyError) as e:
-        logger.debug("ws.query_error error=%s", str(e))
+        _warn(
+            "ws.query_error",
+            "ws.query_error channel=%s error=%s error_code=ws.query_error",
+            channel,
+            str(e),
+            channel=channel,
+        )
     finally:
         await manager.disconnect(channel, websocket)
         # 共享 channel（如 ws:channel:{user} 多端登录）：仅最后一条连接离开才清状态
@@ -486,7 +557,13 @@ async def broadcast_trace_event(event: dict[str, Any], user: str | None = None) 
             },
         )
     except Exception as e:
-        logger.debug("ws.stream_publish_failed error=%s", str(e))
+        _warn(
+            "ws.stream_publish_failed",
+            "ws.stream_publish_failed channel=%s error=%s error_code=ws.stream_publish_failed",
+            channel,
+            str(e),
+            channel=channel,
+        )
         # Fall back to local delivery only when publish failed / no Redis.
     try:
         if channel == TRACE_CHANNEL:
@@ -494,7 +571,13 @@ async def broadcast_trace_event(event: dict[str, Any], user: str | None = None) 
         else:
             await manager.send_to(channel, event)
     except Exception as e2:
-        logger.debug("ws.broadcast_failed error=%s", str(e2))
+        _warn(
+            "ws.broadcast_failed",
+            "ws.broadcast_failed channel=%s error=%s error_code=ws.broadcast_failed",
+            channel,
+            str(e2),
+            channel=channel,
+        )
 
 
 def _stream_entry_is_stale(msg_id: str, started_ms: int) -> bool:
@@ -529,7 +612,8 @@ async def run_trace_consumer(stop_event: asyncio.Event | None = None) -> None:
                 TRACE_STREAM, group, consumer, count=20, block=1000
             )
         except Exception as e:
-            logger.debug("ws.consumer_read_failed error=%s", str(e))
+            # intentional: 轮询循环 1s 重试，warning 会刷屏；Redis 持续不可用由 publish 侧 warning 暴露
+            logger.debug("ws.consumer_read_failed error=%s error_code=ws.consumer_read_failed", str(e))
             await asyncio.sleep(1.0)
             continue
         if not entries:
@@ -544,7 +628,7 @@ async def run_trace_consumer(stop_event: asyncio.Event | None = None) -> None:
                     try:
                         await stream.ack(TRACE_STREAM, group, msg_id)
                     except Exception:
-                        pass
+                        pass  # intentional: ack 失败由 stream pending 重投递自愈；抛错会中断消费循环
                     continue
                 if str(fields.get("origin") or "") == INSTANCE_ID:
                     # Own publish was already delivered locally by
@@ -552,7 +636,7 @@ async def run_trace_consumer(stop_event: asyncio.Event | None = None) -> None:
                     try:
                         await stream.ack(TRACE_STREAM, group, msg_id)
                     except Exception:
-                        pass
+                        pass  # intentional: 同上（ack 自愈，不中断消费循环）
                     continue
                 chan = str(fields.get("channel", TRACE_CHANNEL) or TRACE_CHANNEL)
                 raw = fields.get("data", "{}")
@@ -565,12 +649,13 @@ async def run_trace_consumer(stop_event: asyncio.Event | None = None) -> None:
             except Exception as e:
                 # Forward/parse failure: do NOT ack — the entry stays pending
                 # for redelivery instead of being silently dropped.
-                logger.debug("ws.consumer_forward_failed error=%s", str(e))
+                # intentional: 不 ack 即重投递自愈；warning 会按坏消息刷屏，pending 积压由运维侧观察
+                logger.debug("ws.consumer_forward_failed error=%s error_code=ws.consumer_forward_failed", str(e))
                 continue
             try:
                 await stream.ack(TRACE_STREAM, group, msg_id)
             except Exception:
-                pass
+                pass  # intentional: ack 失败由 stream pending 重投递自愈；抛错会中断消费循环
 
 
 def broadcast_trace_event_sync(event: dict[str, Any], user: str | None = None) -> None:
@@ -584,7 +669,11 @@ def broadcast_trace_event_sync(event: dict[str, Any], user: str | None = None) -
             loop = asyncio.get_running_loop()
         except RuntimeError:
             # 无运行中 loop 时不再静默吞事件：打日志便于排查调用方上下文问题
-            logger.debug("ws.broadcast_sync_no_loop dropping event type=%s", type(event).__name__)
+            _warn(
+                "ws.broadcast_sync_no_loop",
+                "ws.broadcast_sync_no_loop dropping event type=%s error_code=ws.broadcast_sync_no_loop",
+                type(event).__name__,
+            )
             return
         # Keep the single-arg call shape when no routing is needed (call-site
         # monkeypatch compat); pass user through only when set.
@@ -593,7 +682,11 @@ def broadcast_trace_event_sync(event: dict[str, Any], user: str | None = None) -
         else:
             task = loop.create_task(broadcast_trace_event(event, user=user))
     except Exception as e:
-        logger.debug("ws.broadcast_sync_schedule_failed error=%s", str(e))
+        _warn(
+            "ws.broadcast_sync_schedule_failed",
+            "ws.broadcast_sync_schedule_failed error=%s error_code=ws.broadcast_sync_schedule_failed",
+            str(e),
+        )
         return
 
     def _log_task_error(t: asyncio.Task) -> None:
@@ -603,12 +696,24 @@ def broadcast_trace_event_sync(event: dict[str, Any], user: str | None = None) -
                 return
             err = t.exception()
         except Exception as e:
-            logger.debug("ws.broadcast_sync_failed error=%s", str(e))
+            _warn(
+                "ws.broadcast_sync_failed",
+                "ws.broadcast_sync_failed error=%s error_code=ws.broadcast_sync_failed",
+                str(e),
+            )
             return
         if err is not None:
-            logger.debug("ws.broadcast_sync_failed error=%s", str(err))
+            _warn(
+                "ws.broadcast_sync_failed",
+                "ws.broadcast_sync_failed error=%s error_code=ws.broadcast_sync_failed",
+                str(err),
+            )
 
     try:
         task.add_done_callback(_log_task_error)
     except Exception as e:
-        logger.debug("ws.broadcast_sync_callback_failed error=%s", str(e))
+        _warn(
+            "ws.broadcast_sync_callback_failed",
+            "ws.broadcast_sync_callback_failed error=%s error_code=ws.broadcast_sync_callback_failed",
+            str(e),
+        )
