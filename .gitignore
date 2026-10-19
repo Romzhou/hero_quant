@@ -77,3 +77,9 @@ interview-*.md
 eval_*.json
 all_issues.txt
 ocr_*.log
+# sweep 2026-10-19: local run artifacts, never commit
+debug.log
+traces/
+acl-reports/
+# lock convention: requirements-lock.txt is canonical (see AGENTS.md sec 4); uv.lock is local-only
+uv.lock
