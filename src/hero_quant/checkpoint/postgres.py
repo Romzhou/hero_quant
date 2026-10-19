@@ -19,6 +19,40 @@ import time
 from typing import Any, Dict, Optional
 logger = logging.getLogger("hero_quant.checkpoint.postgres")
 
+try:
+    import structlog as _structlog
+
+    _slog = _structlog.get_logger("checkpoint.postgres")
+except Exception:
+    _slog = None
+
+
+def _redacted_host(dsn: str | None) -> str:
+    """D线脱敏 dsn_host：只保留 host[:port]，user/password/query 一律丢弃，PII/API key 永不进日志。"""
+    try:
+        s = str(dsn or "")
+        if "://" in s:
+            s = s.split("://", 1)[1]
+        if "@" in s:
+            s = s.split("@", 1)[1]
+        host = s.split("/", 1)[0].split("?", 1)[0].strip()
+        return host or "***"
+    except (ValueError, TypeError, AttributeError):
+        return "***"
+
+
+def _log_silent_handled(
+    op: str, error_code: str, exc: BaseException | None = None, dsn: str | None = None, level: str = "debug"
+) -> None:
+    """D线 silent-handled 统一 schema：exc_info + error.code + dsn_host(脱敏)。默认 debug 防刷屏，缺配类用 warning。"""
+    try:
+        if _slog is None:
+            return
+        fn = getattr(_slog, level, None) or _slog.debug
+        fn(op, error_code=error_code, dsn_host=_redacted_host(dsn), exc_info=exc)
+    except (ValueError, TypeError, AttributeError):
+        pass
+
 # 默认 TTL 7 天 — 控制可恢复窗口，超时自动清理避免无限堆积
 DEFAULT_TTL_SECONDS = 7 * 24 * 3600
 
@@ -111,8 +145,8 @@ def _evict_seq_if_needed() -> None:
             oldest_rev = list(_PG_RUN_BY_SEQ.keys())[: len(_PG_RUN_BY_SEQ) - _PG_SEQ_MAXSIZE]
             for k in oldest_rev:
                 _PG_RUN_BY_SEQ.pop(k, None)
-    except Exception:
-        pass
+    except Exception as _e:
+        _log_silent_handled("checkpoint.seq_evict_failed", "seq_evict_failed", _e)
 
 
 def _get_async_lock() -> asyncio.Lock | None:
@@ -128,15 +162,16 @@ def _get_async_lock() -> asyncio.Lock | None:
         if _PG_ASYNC_LOCK is None:
             try:
                 _PG_ASYNC_LOCK = asyncio.Lock()
-            except Exception:
+            except Exception as _e:
+                _log_silent_handled("checkpoint.async_lock_create_failed", "async_lock_create_failed", _e)
                 return None
         # 中文：跨 loop 复用会绑死旧 loop；若绑定 loop 已关闭则重建
         try:
             _loop = getattr(_PG_ASYNC_LOCK, "_loop", None)  # type: ignore[attr-defined]
             if _loop is not None and _loop.is_closed():
                 _PG_ASYNC_LOCK = asyncio.Lock()
-        except Exception:
-            pass
+        except Exception as _e:
+            _log_silent_handled("checkpoint.async_lock_loop_check_failed", "async_lock_loop_check_failed", _e)
         return _PG_ASYNC_LOCK
 
 
@@ -169,8 +204,8 @@ def _evict_if_needed() -> None:
             _PG_GLOBAL_META.pop(k, None)
             _PG_GLOBAL_TS.pop(k, None)
             _PG_GLOBAL_VER.pop(k, None)
-    except Exception:
-        pass
+    except Exception as _e:
+        _log_silent_handled("checkpoint.store_evict_failed", "store_evict_failed", _e)
 
 
 def _ckpt_version(checkpoint: Dict[str, Any]) -> int:
@@ -243,6 +278,9 @@ def _default_pg_dsn() -> str:
             return eff.strip()
     except (ImportError, AttributeError, ValueError) as _exc:
         logger.warning("checkpoint 默认 DSN 解析失败，fail-closed: %s", _exc)
+        # D线 schema：缺配走 warning + error.code + 脱敏 dsn_host + exc_info，透到 /ready reasons。
+        _log_silent_handled("checkpoint.default_dsn_failed", "checkpoint_default_dsn_failed", _exc, level="warning")
+    _log_silent_handled("checkpoint.pg_dsn_missing", "checkpoint_pg_dsn_missing", level="warning")
     raise RuntimeError(
         "checkpoint PG DSN 缺配：请设置 HERO_CHECKPOINT_DSN（fail-closed，无硬编码口令默认）"
     )
@@ -252,16 +290,16 @@ def _resolve_ttl(ttl_seconds: int | None) -> int:
     if ttl_seconds is not None:
         try:
             return int(ttl_seconds)
-        except Exception:
-            pass
+        except Exception as _e:
+            _log_silent_handled("checkpoint.ttl_parse_failed", "ttl_parse_failed", _e)
     # try Settings gate
     try:
         from hero_quant.config.settings import Settings
         s = Settings()
         if hasattr(s, "checkpoint_ttl_seconds"):
             return int(s.checkpoint_ttl_seconds)
-    except Exception:
-        pass
+    except Exception as _e:
+        _log_silent_handled("checkpoint.ttl_settings_failed", "ttl_settings_failed", _e)
     return DEFAULT_TTL_SECONDS
 
 
@@ -290,7 +328,8 @@ def _thread_to_keys(thread_id: str, dsn: str | None = None) -> tuple[str, str, i
     if dsn:
         try:
             _dsn_prefix = hashlib.sha256(dsn.encode()).hexdigest()[:12] + "::"
-        except Exception:
+        except Exception as _e:
+            _log_silent_handled("checkpoint.dsn_prefix_failed", "dsn_prefix_failed", _e, dsn=dsn)
             _dsn_prefix = ""
     try:
         base_seq = int(run)
@@ -339,8 +378,8 @@ def get_run_text(tenant: str, thread: str, seq: int, dsn: str | None = None) -> 
                     val = _PG_RUN_BY_SEQ.get(f"{_pfx}{tenant}::{thread}::{int(seq)}")
                     if val is not None:
                         return val
-                except Exception:
-                    pass
+                except Exception as _e:
+                    _log_silent_handled("checkpoint.run_prefix_lookup_failed", "run_prefix_lookup_failed", _e, dsn=dsn)
             _suffix = f"{tenant}::{thread}::{int(seq)}"
             val = _PG_RUN_BY_SEQ.get(_suffix)
             if val is not None:
@@ -350,7 +389,8 @@ def get_run_text(tenant: str, thread: str, seq: int, dsn: str | None = None) -> 
                 if _k.endswith(_suffix):
                     return _v
             return None
-    except Exception:
+    except Exception as _e:
+        _log_silent_handled("checkpoint.run_lookup_failed", "run_lookup_failed", _e, dsn=dsn)
         return None
 
 
