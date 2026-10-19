@@ -22,6 +22,32 @@ from hero_quant.backtest.engine import BacktestEngine
 
 logger = logging.getLogger(__name__)
 
+try:
+    import structlog as _structlog  # type: ignore
+
+    _slog = _structlog.get_logger(__name__)
+except Exception:  # pragma: no cover — 最小环境无 structlog
+    _slog = None  # type: ignore
+
+_CHAIN = "B"  # F线分级：本文件位于回测链（批量基准/落盘，配置回落即口径降级）
+
+
+def _warn(op, msg, *args, **fields):
+    """F线分级告警（D线 risk 同款 schema）：stdlib warning 为主，structlog 结构化为辅
+    （error_code + chain；trace_id 由 server.py contextvars 自动透传）。PII 约束：只传
+    非敏感字段，禁路径/标的外原文。"""
+    _exc_info = fields.pop("exc_info", None)
+    try:
+        logger.warning(msg, *args, exc_info=_exc_info)
+    except Exception:
+        pass
+    if _slog is None:
+        return
+    try:
+        _slog.warning(op, error_code=op, chain=fields.pop("chain", _CHAIN), exc_info=_exc_info, **fields)
+    except Exception:
+        pass
+
 
 def _build_tearsheet_html(results: dict[str, dict], disclosure_text: str) -> str:
     """Build minimal tearsheet html containing non-PIT disclosure and per-ticker rows."""
@@ -158,7 +184,7 @@ def _effective_benchmark_map(benchmark_map: dict[str, str] | None) -> dict[str, 
         if getattr(s, "benchmark_map", None):
             return dict(s.benchmark_map)
     except (ImportError, AttributeError) as e:
-        logger.debug("_effective_benchmark_map Settings unavailable: %s", e)
+        _warn("benchmark_map_settings_unavailable", "_effective_benchmark_map Settings unavailable error_code=benchmark_map_settings_unavailable: %s", e)
     except Exception as e:
         logger.warning("_effective_benchmark_map Settings failed: %s", e, exc_info=True)
         raise
@@ -178,7 +204,7 @@ def _effective_benchmark_ticker(benchmark_ticker: str | None) -> str | None:
         if bt:
             return str(bt)
     except (ImportError, AttributeError) as e:
-        logger.debug("_effective_benchmark_ticker Settings unavailable: %s", e)
+        _warn("benchmark_ticker_settings_unavailable", "_effective_benchmark_ticker Settings unavailable error_code=benchmark_ticker_settings_unavailable: %s", e)
     except Exception as e:
         logger.warning("_effective_benchmark_ticker Settings failed: %s", e, exc_info=True)
         raise
@@ -489,7 +515,7 @@ def run_batch(
             except ValueError:
                 raise
             except (OSError, RuntimeError):
-                pass
+                pass  # intentional: 路径遍历探测中断（symlink 检查遇 OS 错误即停）；终态仍经下文 _is_within 裁决
             if not (_is_within(_target, _base) or _is_within(_target, _tmpdir)):
                 raise ValueError(f"output_dir traversal detected: {output_dir!r} escapes {_base}")
             # 中文：safe_join 的 ValueError 是拒绝信号，必须传播；仅 import/类型问题可跳过
@@ -503,7 +529,7 @@ def run_batch(
                 except ValueError:
                     raise
                 except (TypeError, AttributeError, OSError) as e:
-                    logger.debug("output_dir safe_join check skipped: %s", e)
+                    _warn("output_dir_safe_join_check_skipped", "output_dir safe_join check skipped error_code=output_dir_safe_join_check_skipped: %s", e)
         # 中文：写经校验的解析目标 _target，不用未解析的 out（防 symlink TOCTOU）
         out = _target
         # 若给出的是 .json 文件路径则直接写入其本身，不强行旁写 tearsheet

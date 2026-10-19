@@ -98,7 +98,7 @@ def annual_return(equity: pd.Series, periods: int = 252) -> float:
                 _i1 = len(_valid_mask) - 1 - _valid_mask.tolist()[::-1].index(True)
                 n = max(_i1 - _i0, 1)
             except (ValueError, TypeError, AttributeError):
-                pass
+                pass  # intentional: 有效区间探测（无 True 即沿用全长 n）；属数值探针，非失败
     except (ValueError, TypeError, AttributeError):
         n = len(s) - 1
     if n <= 0:

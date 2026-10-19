@@ -15,6 +15,32 @@ from hero_quant.tools.registry import TOOL_REGISTRY, tool
 
 _logger = logging.getLogger(__name__)
 
+try:
+    import structlog as _structlog  # type: ignore
+
+    _slog = _structlog.get_logger(__name__)
+except Exception:  # pragma: no cover — 最小环境无 structlog
+    _slog = None  # type: ignore
+
+_CHAIN = "B"  # F线分级：本文件位于回测/行情链（数据源注册与并发安全回落即口径降级）
+
+
+def _warn(op: str, msg: str, *args: Any, **fields: Any) -> None:
+    """F线分级告警（D线 risk 同款 schema）：stdlib warning 为主，structlog 结构化为辅
+    （error_code + chain；trace_id 由 server.py contextvars 自动透传）。PII 约束：只传
+    非敏感字段，禁标的原文外价格序列。"""
+    _exc_info = fields.pop("exc_info", None)
+    try:
+        _logger.warning(msg, *args, exc_info=_exc_info)
+    except Exception:
+        pass
+    if _slog is None:
+        return
+    try:
+        _slog.warning(op, error_code=op, chain=fields.pop("chain", _CHAIN), exc_info=_exc_info, **fields)
+    except Exception:
+        pass
+
 _shared_registry = None
 _shared_lock = threading.RLock()  # 中文：保护 _shared_registry 的 check-then-act，避免并发重复初始化
 
@@ -56,7 +82,8 @@ def _synthetic_fallback(symbol: str, start: str, end: str):
 
         return generate_synthetic_bars(symbol, start, end)
     except (ImportError, AttributeError, OSError, RuntimeError) as e:  # 中文：窄化捕获
-        _logger.debug("public synthetic helper not available: %s", e, exc_info=True)
+        # intentional: 过渡态（随即走本地最小合成）；终态合成标记 ok:False 由下文保证
+        _logger.debug("public synthetic helper not available: %s error_code=synthetic_helper_not_available", e, exc_info=True)
     # 本地最小合成前先校验日期 — validation errors must fail closed, never
     # propagate invalid dates as if they were data
     try:
@@ -155,7 +182,7 @@ def get_market_data(
         try:
             is_safe = bool(spec.is_concurrency_safe({"symbol": symbol, "interval": interval}))
         except (AttributeError, TypeError, ValueError, RuntimeError) as e:  # 中文：窄化捕获
-            _logger.debug("is_concurrency_safe check failed: %s", e, exc_info=True)
+            _warn("concurrency_safe_check_failed", "is_concurrency_safe check failed error_code=concurrency_safe_check_failed: %s", e, exc_info=True)
             is_safe = False
     # 复用共享 registry，避免每调用重建
     try:

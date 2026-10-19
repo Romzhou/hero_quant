@@ -18,6 +18,32 @@ from hero_quant.tools.registry import tool
 
 logger = logging.getLogger(__name__)
 
+try:
+    import structlog as _structlog  # type: ignore
+
+    _slog = _structlog.get_logger(__name__)
+except Exception:  # pragma: no cover — 最小环境无 structlog
+    _slog = None  # type: ignore
+
+_CHAIN = "B"  # F线分级：本文件位于回测链（指标工具数据源/计算回落即结果口径降级）
+
+
+def _warn(op: str, msg: str, *args: Any, **fields: Any) -> None:
+    """F线分级告警（D线 risk 同款 schema）：stdlib warning 为主，structlog 结构化为辅
+    （error_code + chain；trace_id 由 server.py contextvars 自动透传）。PII 约束：只传
+    非敏感字段，禁标的原文外价格序列。"""
+    _exc_info = fields.pop("exc_info", None)
+    try:
+        logger.warning(msg, *args, exc_info=_exc_info)
+    except Exception:
+        pass
+    if _slog is None:
+        return
+    try:
+        _slog.warning(op, error_code=op, chain=fields.pop("chain", _CHAIN), exc_info=_exc_info, **fields)
+    except Exception:
+        pass
+
 SUPPORTED_INDICATORS = {"sma", "ma", "ema", "rsi", "bollinger", "bb", "boll", "macd", "max_drawdown", "mdd", "drawdown"}
 
 _shared_registry = None
@@ -41,7 +67,7 @@ def _get_shared_registry():
 
                 reg.register(YahooLoader())
             except (ImportError, ModuleNotFoundError) as e:
-                logger.debug("YahooLoader not available: %s", e)
+                _warn("yahoo_loader_not_available", "YahooLoader not available error_code=yahoo_loader_not_available: %s", e)
             except Exception as e:
                 logger.warning("YahooLoader register failed: %s", e, exc_info=True)
             _shared_registry = reg
@@ -159,7 +185,7 @@ def compute_indicator(
         try:
             from hero_quant.quantlib.indicators import sma, ema, rsi, bollinger, macd
         except (ImportError, ModuleNotFoundError) as e:
-            logger.debug("quantlib not available, fallback to pandas: %s", e)
+            _warn("quantlib_not_available", "quantlib not available, fallback to pandas error_code=quantlib_not_available: %s", e)
             sma = ema = rsi = bollinger = macd = None  # type: ignore
 
         if ind in ("sma", "ma"):
@@ -246,7 +272,7 @@ def compute_indicator(
             try:
                 from hero_quant.quantlib.indicators import max_drawdown as q_mdd
             except (ImportError, ModuleNotFoundError) as e:
-                logger.debug("max_drawdown quantlib not available: %s", e)
+                _warn("max_drawdown_quantlib_not_available", "max_drawdown quantlib not available error_code=max_drawdown_quantlib_not_available: %s", e)
                 q_mdd = None  # type: ignore
             if q_mdd is not None:
                 v = q_mdd(s)

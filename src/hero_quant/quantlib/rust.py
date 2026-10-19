@@ -7,8 +7,11 @@
 from __future__ import annotations
 
 import importlib.util
+import logging
 
 import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 # 运行时探测：是否可用 Rust 编译扩展
 IS_RUST = False
@@ -22,6 +25,7 @@ try:
         _RUST_MOD = _rust_ext
         IS_RUST = True
 except Exception:
+    # intentional: Rust 扩展可选（无工具链即纯 Python）；探测失败即关闭加速分支，无失败语义
     _RUST_MOD = None
     IS_RUST = False
 
@@ -143,8 +147,8 @@ def ema(series, span: int = 20, *args, **kwargs) -> pd.Series:
             else:
                 idx = None
             return pd.Series(raw, index=idx)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("quantlib rust ema failed, fallback to python error_code=quantlib_rust_fallback: %s", exc)
     return _py_ema(series, span, *args, **kwargs)
 
 
@@ -171,8 +175,8 @@ def rsi(series, period: int = 14, *args, **kwargs) -> pd.Series:
             else:
                 idx = None
             return pd.Series(raw, index=idx)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("quantlib rust rsi failed, fallback to python error_code=quantlib_rust_fallback: %s", exc)
     return _py_rsi(series, period, *args, **kwargs)
 
 
@@ -198,8 +202,8 @@ def bollinger(series, window: int = 20, num_std: float = 2.0, *args, **kwargs):
             else:
                 idx = None
             return pd.Series(vals_mid, index=idx), pd.Series(vals_up, index=idx), pd.Series(vals_low, index=idx)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("quantlib rust bollinger failed, fallback to python error_code=quantlib_rust_fallback: %s", exc)
     return _py_bollinger(series, window, num_std, *args, **kwargs)
 
 
@@ -222,8 +226,8 @@ def macd(series, fast: int = 12, slow: int = 26, signal: int = 9, *args, **kwarg
             else:
                 idx = None
             return pd.Series(a, index=idx), pd.Series(b, index=idx), pd.Series(c, index=idx)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("quantlib rust macd failed, fallback to python error_code=quantlib_rust_fallback: %s", exc)
     return _py_macd(series, fast, slow, signal, *args, **kwargs)
 
 
@@ -239,8 +243,8 @@ def max_drawdown(equity) -> float:
                 data = list(equity) if equity is not None else []
             clean = [float(x) for x in data if x is not None]
             return float(_RUST_MOD.max_drawdown(clean))
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("quantlib rust max_drawdown failed, fallback to python error_code=quantlib_rust_fallback: %s", exc)
     return _py_mdd(equity)
 
 

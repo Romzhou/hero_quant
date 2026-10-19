@@ -14,6 +14,32 @@ from hero_quant.tools.registry import tool
 
 logger = logging.getLogger(__name__)
 
+try:
+    import structlog as _structlog  # type: ignore
+
+    _slog = _structlog.get_logger(__name__)
+except Exception:  # pragma: no cover — 最小环境无 structlog
+    _slog = None  # type: ignore
+
+_CHAIN = "B"  # F线分级：本文件位于回测链（工具侧行情拉取/合成构造）
+
+
+def _warn(op: str, msg: str, *args: Any, **fields: Any) -> None:
+    """F线分级告警（D线 risk 同款 schema）：stdlib warning 为主，structlog 结构化为辅
+    （error_code + chain；trace_id 由 server.py contextvars 自动透传）。PII 约束：只传
+    非敏感字段，禁标的原文外价格序列。"""
+    _exc_info = fields.pop("exc_info", None)
+    try:
+        logger.warning(msg, *args, exc_info=_exc_info)
+    except Exception:
+        pass
+    if _slog is None:
+        return
+    try:
+        _slog.warning(op, error_code=op, chain=fields.pop("chain", _CHAIN), exc_info=_exc_info, **fields)
+    except Exception:
+        pass
+
 
 def _fetch_bars_for_backtest(symbol: str, start: str, end: str, interval: str = "1d"):
     """为回测拉取行情，返回 (bars, provenance_dict|None)。
@@ -33,7 +59,7 @@ def _fetch_bars_for_backtest(symbol: str, start: str, end: str, interval: str = 
 
             reg.register(YahooLoader())
         except (ImportError, ModuleNotFoundError, AttributeError, ValueError) as e:
-            logger.debug("YahooLoader register failed: %s", e, exc_info=True)
+            _warn("yahoo_loader_register_failed", "YahooLoader register failed error_code=yahoo_loader_register_failed: %s", e, exc_info=True)
         # Use keyword interval for clarity; positional shim is brittle
         bars, prov = reg.get_bars(symbol, start, end, interval=interval)
         prov_dict = None
@@ -83,7 +109,8 @@ def _synthetic_prices_for_backtest(index, ticker: str):
     try:
         df["open"] = df["close"].shift(1).fillna(df["close"].iloc[0])
     except (ValueError, TypeError, AttributeError, IndexError, KeyError) as e:
-        logger.debug("synthetic open fill failed: %s", e, exc_info=True)
+        # intentional: 合成帧构造探针（失败即 open=close）；确定性合成路径，属构造期 garnish
+        logger.debug("synthetic open fill failed: %s error_code=synthetic_open_fill_failed", e, exc_info=True)
         df["open"] = df["close"]
     return df
 

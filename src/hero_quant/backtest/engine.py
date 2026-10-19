@@ -21,6 +21,32 @@ from .validation import NON_PRICE_COLS, PIT_ACK, ValidationError, validate
 
 logger = logging.getLogger(__name__)
 
+try:
+    import structlog as _structlog  # type: ignore
+
+    _slog = _structlog.get_logger(__name__)
+except Exception:  # pragma: no cover — 最小环境无 structlog
+    _slog = None  # type: ignore
+
+_CHAIN = "B"  # F线分级：本文件位于回测链（引擎计算回落/计数失败即结果质量降级）
+
+
+def _warn(op, msg, *args, **fields):
+    """F线分级告警（D线 risk 同款 schema）：stdlib warning 为主，structlog 结构化为辅
+    （error_code + chain；trace_id 由 server.py contextvars 自动透传）。PII 约束：只传
+    非敏感字段，禁价格/持仓原文。"""
+    _exc_info = fields.pop("exc_info", None)
+    try:
+        logger.warning(msg, *args, exc_info=_exc_info)
+    except Exception:
+        pass
+    if _slog is None:
+        return
+    try:
+        _slog.warning(op, error_code=op, chain=fields.pop("chain", _CHAIN), exc_info=_exc_info, **fields)
+    except Exception:
+        pass
+
 # PIT 旁路二次确认契约字符串（全局冻结）：复用 validation.PIT_ACK 单一来源，
 # 本模块不再另行定义字面量；engine/bench/测试均以该常量为准。
 __all__ = ["BacktestEngine", "Signal", "generate_signal", "PITViolation", "DataFeedError", "PIT_ACK"]
@@ -97,7 +123,7 @@ class Signal:
                     s_val = float(pd.Series(sma_s).iloc[-1])
                     l_val = float(pd.Series(sma_l).iloc[-1])
                 except (ImportError, AttributeError, ValueError, TypeError) as e:
-                    logger.debug("quantlib sma unavailable, fallback to pandas: %s", e)
+                    _warn("quantlib_sma_unavailable", "quantlib sma unavailable, fallback to pandas error_code=quantlib_sma_unavailable: %s", e)
                     sma_s = close.rolling(self.window_short).mean().iloc[-1]
                     sma_l = close.rolling(self.window_long).mean().iloc[-1]
                     s_val = float(sma_s) if pd.notna(sma_s) else float("nan")
@@ -402,7 +428,7 @@ class BacktestEngine:
 
                 self._tick_factor = IncrementalFactor(window=20)
             except (ImportError, AttributeError, ValueError, TypeError) as e:
-                logger.debug("IncrementalFactor unavailable: %s", e)
+                _warn("incremental_factor_unavailable", "IncrementalFactor unavailable error_code=incremental_factor_unavailable: %s", e)
                 self._tick_factor = None
         val = 0.0
         try:
@@ -421,7 +447,7 @@ class BacktestEngine:
             try:
                 self._latency_breach_count = int(getattr(self, "_latency_breach_count", 0)) + 1
             except (ValueError, TypeError, AttributeError) as e:
-                logger.debug("latency breach count increment failed: %s", e)
+                _warn("latency_breach_count_failed", "latency breach count increment failed error_code=latency_breach_count_failed: %s", e)
                 self._latency_breach_count = 1
         return {"factor": val, "value": val, "latency_ms": latency_ms, "latency_breach": latency_breach, "latency_breach_count": int(getattr(self, "_latency_breach_count", 0) if latency_breach else getattr(self, "_latency_breach_count", 0)), "symbol": symbol, "price": price}
 
@@ -468,7 +494,7 @@ class BacktestEngine:
                 if col_vals.notna().any():
                     candidate_cols.append(c)
             except (ValueError, TypeError, AttributeError) as e:
-                logger.debug("price matrix candidate check failed for %s: %s", c, e)
+                _warn("price_matrix_candidate_check_failed", "price matrix candidate check failed for %s error_code=price_matrix_candidate_check_failed: %s", c, e)
                 continue
 
         if len(candidate_cols) == 0:
@@ -811,7 +837,7 @@ class BacktestEngine:
         except NameError:
             _turnover_rate = None
         except (AttributeError, TypeError) as e:
-            logger.debug("_turnover_rate lookup failed: %s", e)
+            _warn("turnover_rate_lookup_failed", "_turnover_rate lookup failed error_code=turnover_rate_lookup_failed: %s", e)
             _turnover_rate = None
         prev_aligned_price: pd.Series | None = None
         # 中文：_align(i) 已返回次日可执行价 P[i+1]，故 E[i]/E[i-1] 即本 Bar 可
@@ -897,7 +923,7 @@ class BacktestEngine:
                     if np.isfinite(_cost_drag):
                         ret_i = ret_gross - _cost_drag
                 except (ValueError, TypeError, KeyError, IndexError, AttributeError):
-                    pass
+                    pass  # intentional: 逐 Bar 成本探针（脏数据即按毛收益计）；warning 会按 Bar 刷屏
             if not np.isfinite(ret_i):
                 ret_i = 0.0
             # 更新 prev_aligned 供下次计算（首 Bar 初始化基准）— Series only
@@ -927,7 +953,7 @@ class BacktestEngine:
                     except (ValueError, TypeError, KeyError, IndexError, AttributeError):
                         prev_aligned_price = _aligned_price
             except (ValueError, TypeError):
-                pass
+                pass  # intentional: 逐 Bar 对齐回退探针（失败即沿用上次对齐价）；warning 会按 Bar 刷屏
             cum = cum * (1 + ret_i)
             eq = cum * self.initial_capital
             if not np.isfinite(eq):
