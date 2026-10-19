@@ -280,23 +280,6 @@ class BillingService:
         with _GLOBAL_LOCK:
             return copy.deepcopy(_GLOBAL_PURCHASES.get(_dsn_key(self.dsn), []))  # type: ignore
 
-    def _real_pg_publish_sync(self, factor: dict) -> bool:
-        """真 PG 同一事务内 SET LOCAL 后紧跟 INSERT INTO factors — 中文：事务级 RLS。
-
-        无真实池时返回 False（fail-closed，不伪成功）。commit 异常记 "billing commit failed" 并返 False。
-        """
-        # 中文：同一连接同一事务内完成 SET LOCAL + INSERT INTO factors，避免瞬时连接丢弃 SET LOCAL。
-        _set_local_tenant_sql = "SET LOCAL app.tenant = %s"
-        _set_local_current_sql = "SET LOCAL app.current_tenant = %s"
-        _insert_factors_sql = "INSERT INTO factors (factor_id, name, price, tenant, description) VALUES (%s, %s, %s, %s, %s) ON CONFLICT (factor_id) DO NOTHING"
-        _ = (_set_local_tenant_sql, _set_local_current_sql, _insert_factors_sql)
-        if not self._is_real_pg():
-            _log_warning("PG publish degraded (no real pool, emulated store authoritative) tenant=%s dsna=%s", str(factor.get("tenant", "default")), "__hashed__", exc_info=False)
-            return False
-        if getattr(self, "_pool", None) is None:
-            _log_warning("PG publish no pool tenant=%s", str(factor.get("tenant", "default")), exc_info=False)
-            return False
-
     def _pg_publish_noop(self, factor: dict) -> bool:
         """已废弃的 no-op 桩（兼容别名）：一律 fail-closed 返 False。中文：无真实持久化，勿作成功判据。"""
         _log_warning(
