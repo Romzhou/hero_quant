@@ -1579,6 +1579,9 @@ def query_ticket(request: Request, user: str | None = None):
         except Exception as _e:
             logger.debug("metrics.counter_failed", error=str(_e))
     # Rate limit: 10 tickets per minute per IP (zset sliding window via Redis/fakeredis)
+    # 中文：G-06——fail-closed：配额耗尽 429；限流器异常 503 不签发（旧 fail-open 已收口）。
+    # 键经 infra RateLimiter 自动加 hero:ratelimit: 前缀（与 infra/redis.py:53 同命名空间），
+    # 此处裸键 ticket:{ip} 落盘即 hero:ratelimit:ticket:{ip}，无分叉。
     try:
         from hero_quant.infra.redis import RateLimiter
 
@@ -1586,12 +1589,20 @@ def query_ticket(request: Request, user: str | None = None):
         # Use client host as key; fallback to "unknown" if unavailable
         try:
             client_ip = getattr(getattr(request, "client", None), "host", None) or "unknown"
-        except Exception:
+        except (ValueError, TypeError, AttributeError):
             client_ip = "unknown"
         if not limiter.try_acquire_sync(f"ticket:{client_ip}", 10, 60):
             return JSONResponse(status_code=429, content={"detail": "Too many ticket requests"})
-    except Exception as _e:
-        logger.debug("ticket.ratelimit_failed error=%s", str(_e))
+    except (ImportError, AttributeError, TypeError, ValueError, ConnectionError, TimeoutError, OSError, RuntimeError) as _e:
+        _inc_api_error("ticket", "ratelimit_unavailable")
+        logger.warning(
+            "ticket.ratelimit_failed_503",
+            error=str(_e),
+            error_code="ratelimit_unavailable",
+            endpoint="ticket",
+            exc_info=_e,
+        )
+        return JSONResponse(status_code=503, content={"detail": "Rate limiter unavailable"})
     # 中文：T1-3 身份闭环：签发前鉴权（X-API-Key/HMAC 任一通过）并绑定 user；匿名仅允许未配 key 的
     # 本地开发/测试回退（仍签匿名票 user_id=""，兼容旧单票调用），生产无鉴权时 401。
     from hero_quant.api.security import _normalize_user_id as _norm_uid_ticket
