@@ -1609,6 +1609,9 @@ def query_ticket(request: Request, user: str | None = None):
         except (ValueError, TypeError, AttributeError):
             _authed = False
     _claimed_user = _norm_uid_ticket(user)
+    # D线/G-02：票据 user 必须服务端绑定，拒绝自声明冒充他人 WS 频道。
+    # 匿名票据一律 user_id=""（?user= 直接丢弃 + warning + 计数）；已鉴权调用方见下。
+    _bound_user = _claimed_user
     if not _authed:
         # 中文：未配置 HERO_API_KEY/HERO_HMAC_SECRET 的本地开发/测试允许匿名票（告警可观测）；
         # 已配置凭据时无鉴权一律 401（fail-closed，防未鉴权签 A 票）。pytest 进程内
@@ -1624,9 +1627,24 @@ def query_ticket(request: Request, user: str | None = None):
             _key_cfg, _hmac_cfg, _hero_env, _in_pytest = "", "", "", False
         if (_key_cfg or _hmac_cfg) and not _in_pytest and _hero_env != "development":
             return JSONResponse(status_code=401, content={"detail": "Unauthorized ticket request"})
+        if _claimed_user:
+            # G-02 修发侧：匿名票据不得携带自声明身份，否则可直达他人 ws:channel:{user}。
+            _inc_api_error("ticket", "ticket_user_dropped_anonymous")
+            logger.warning(
+                "security.ticket_user_dropped_anonymous",
+                error_code="ticket_user_dropped_anonymous",
+                chain="A",
+                claimed_nonempty=True,
+            )
+            _bound_user = ""
         logger.warning("security.ticket_anonymous_issued_no_auth_configured")
+    else:
+        # G-02 说明：API-Key/HMAC 现为单共享密钥，仅返回是否通过，无服务端 per-user 身份可绑定，
+        # 故已鉴权签发的 ?user= 仍为同密钥持有者互信声明（WS 侧 _resolve_identity_channel 已做
+        # ticket-channel 一致校验，不一致 4001 关闭）。真 per-user 隔离需 per-user 密钥身份（后续专线）。
+        pass
     return {
-        "ticket": issue_ticket(ttl=SSE_TICKET_TTL_SECONDS, user_id=_claimed_user),
+        "ticket": issue_ticket(ttl=SSE_TICKET_TTL_SECONDS, user_id=_bound_user),
         "expires_in": SSE_TICKET_TTL_SECONDS,
     }
 
