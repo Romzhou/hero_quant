@@ -24,6 +24,32 @@ try:
 except Exception:  # pragma: no cover
     _RetryPolicy = None  # type: ignore
 
+try:
+    import structlog as _structlog  # type: ignore
+
+    _slog = _structlog.get_logger(__name__)
+except Exception:  # pragma: no cover — 最小环境无 structlog
+    _slog = None  # type: ignore
+
+_CHAIN = "A"  # F线分级：本文件为问答链核心循环（AgentLoop.run）
+
+
+def _warn(op, msg, *args, **fields):
+    """F线分级告警（D线 risk 同款 schema）：stdlib warning 为主（caplog 兼容），structlog
+    结构化为辅（error_code + chain；trace_id 由 server.py contextvars 自动透传）。PII 约束：
+    只传非敏感字段，禁 goal/prompt/记忆原文。"""
+    _exc_info = fields.pop("exc_info", None)
+    try:
+        logging.getLogger(__name__).warning(msg, *args, exc_info=_exc_info)
+    except Exception:
+        pass
+    if _slog is None:
+        return
+    try:
+        _slog.warning(op, error_code=op, chain=fields.pop("chain", _CHAIN), exc_info=_exc_info, **fields)
+    except Exception:
+        pass
+
 
 def estimate_tokens(text: Any) -> int:
     """估算文本 token 数，约 4 字符/token（JSON 序列化长度 //4 粗估）。
@@ -242,7 +268,7 @@ class AgentLoop:
                         try:
                             cand.relative_to(proj)
                             return cand
-                        except Exception:
+                        except (ValueError, TypeError):
                             pass
                         # 允许系统临时目录（回放件场景）与 replays 同名目录
                         try:
@@ -251,10 +277,10 @@ class AgentLoop:
                             try:
                                 cand.relative_to(tmp)
                                 return cand
-                            except Exception:
+                            except (ValueError, TypeError):
                                 pass
                         except Exception:
-                            pass
+                            pass  # intentional: 临时目录探测 best-effort（导入/解析失败即不认 tmp）
                         if cand.name == "replays":
                             return cand
                         logging.getLogger(__name__).warning(
@@ -278,7 +304,7 @@ class AgentLoop:
                 try:
                     p.relative_to(allow)
                     is_inside = True
-                except Exception:
+                except (ValueError, TypeError):
                     is_inside = False
             if not is_inside and _allow_root is None:
                 # 仅当 HERO_ALLOW_TMP_REPLAY=1 时才允许 tmp 回退，避免默认过宽的 /tmp 任意文件读取
@@ -295,10 +321,10 @@ class AgentLoop:
                             try:
                                 p.relative_to(tmp)
                                 is_inside = True
-                            except Exception:
+                            except (ValueError, TypeError):
                                 is_inside = False
                     except Exception:
-                        pass
+                        pass  # intentional: tmp 回退探测 best-effort；失败即保持外部判定（fail-closed）
             if not is_inside:
                 raise ValueError(f"replay_path outside allowed directory: {p} not in {allow}")
             self._replay_path = p
@@ -433,8 +459,10 @@ class AgentLoop:
                             try:
                                 if hasattr(self.context_manager, "add"):
                                     self.context_manager.add("system", f"[skills_digest] {sd_str[:2000]}")
-                            except Exception:
-                                pass
+                            except Exception as exc:
+                                logging.getLogger(__name__).debug(
+                                    "skills_digest inject failed error_code=skills_digest_inject_failed: %s", exc
+                                )
                             # 尽力确保 build_system_prompt 透传
                             try:
                                 if hasattr(self.context_manager, "build_system_prompt"):
@@ -450,19 +478,30 @@ class AgentLoop:
                                             _prompt2 = self.context_manager.build_system_prompt()
                                             if sd_str not in str(_prompt2) and hasattr(self.context_manager, "add"):
                                                 self.context_manager.add("system", f"[skills_digest] {sd_str[:500]}")
-                                        except Exception:
-                                            pass
-                            except Exception:
-                                pass
+                                        except Exception as exc:
+                                            logging.getLogger(__name__).debug(
+                                                "skills_digest compensate failed error_code=skills_digest_compensate_failed: %s",
+                                                exc,
+                                            )
+                            except Exception as exc:
+                                logging.getLogger(__name__).debug(
+                                    "skills_digest prompt build failed error_code=skills_digest_prompt_build_failed: %s",
+                                    exc,
+                                )
                             # trace for audit
                             tw2 = self._ensure_trace_writer()
                             if tw2 is not None:
                                 try:
                                     tw2.append({"type": "skills_digest", "digest": sd_str[:500]})
-                                except Exception:
-                                    pass
-                except Exception:
-                    pass
+                                except Exception as exc:
+                                    logging.getLogger(__name__).debug(
+                                        "skills_digest trace append failed error_code=skills_digest_trace_append_failed: %s",
+                                        exc,
+                                    )
+                except Exception as exc:
+                    logging.getLogger(__name__).debug(
+                        "skills_digest block failed error_code=skills_digest_block_failed: %s", exc
+                    )
             # 注入到 context_manager
             if isinstance(hits, list) and hits and self.context_manager is not None:
                 try:
@@ -474,17 +513,30 @@ class AgentLoop:
                             content = str(h)
                         if content and hasattr(self.context_manager, "add"):
                             self.context_manager.add("system", f"[memory recall] {content[:500]}")
-                except Exception:
-                    pass
+                except Exception as exc:
+                    _warn(
+                        "memory_recall_context_inject_failed",
+                        "memory recall context inject failed error_code=memory_recall_context_inject_failed: %s",
+                        exc,
+                    )
             # trace
             tw = self._ensure_trace_writer()
             if tw is not None:
                 try:
                     tw.append({"type": "memory_recall", "query": query[:200] if isinstance(query, str) else str(query)[:200], "hits": len(hits) if isinstance(hits, list) else 0})
-                except Exception:
-                    pass
+                except Exception as exc:
+                    _warn(
+                        "memory_recall_trace_append_failed",
+                        "memory recall trace append failed error_code=memory_recall_trace_append_failed: %s",
+                        exc,
+                    )
             return hits
-        except Exception:
+        except Exception as exc:
+            _warn(
+                "memory_recall_failed",
+                "memory recall failed, returning empty hits error_code=memory_recall_failed: %s",
+                exc,
+            )
             return []
 
     def _writeback(self, text: str):

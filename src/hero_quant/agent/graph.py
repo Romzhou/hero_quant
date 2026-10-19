@@ -318,7 +318,7 @@ def execute_node(state: State) -> Dict[str, Any]:
                     msgs.append({"role": "assistant", "content": f"{name}: error {e} -> compensate"})
                     continue
                 except Exception:
-                    pass
+                    pass  # intentional: 补偿回调不得抛错（否则掩盖原子错误）；失败即走下文默认 error 结果
             res = {"messages": [{"role": "assistant", "content": f"{name}: error"}], "subagent_outputs": []}
         outputs.extend(res.get("subagent_outputs", []))
         msgs.extend(res.get("messages", []))

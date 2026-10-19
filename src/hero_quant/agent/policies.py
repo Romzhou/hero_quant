@@ -101,13 +101,15 @@ def _get_lg_command():
 
         return _LG
     except Exception as exc:
-        logger.debug("langgraph.types.Command import failed: %s", exc)
+        # intentional: 可选 langgraph 分支探测；缺失即回退内置 LGCommand（offline-safe）
+        logger.debug("langgraph.types.Command import failed: %s error_code=langgraph_command_import_failed", exc)
         try:
             from langgraph.graph import Command as _LG2  # type: ignore
 
             return _LG2
         except Exception as exc2:
-            logger.debug("langgraph.graph.Command import failed: %s", exc2)
+            # intentional: 同上（第二候选路径探测）
+            logger.debug("langgraph.graph.Command import failed: %s error_code=langgraph_command_import_failed", exc2)
             return LGCommand
 
 

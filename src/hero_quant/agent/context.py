@@ -15,6 +15,32 @@ from typing import TYPE_CHECKING
 
 logger = logging.getLogger(__name__)
 
+try:
+    import structlog as _structlog  # type: ignore
+
+    _slog = _structlog.get_logger(__name__)
+except Exception:  # pragma: no cover — 最小环境无 structlog
+    _slog = None  # type: ignore
+
+_CHAIN = "A"  # F线分级：本文件位于问答链（上下文组装，digest 缺失即工具可见性降级）
+
+
+def _warn(op, msg, *args, **fields):
+    """F线分级告警（D线 risk 同款 schema）：stdlib warning 为主，structlog 结构化为辅
+    （error_code + chain；trace_id 由 server.py contextvars 自动透传）。PII 约束：只传
+    非敏感字段，禁 prompt/记忆原文。"""
+    _exc_info = fields.pop("exc_info", None)
+    try:
+        logger.warning(msg, *args, exc_info=_exc_info)
+    except Exception:
+        pass
+    if _slog is None:
+        return
+    try:
+        _slog.warning(op, error_code=op, chain=fields.pop("chain", _CHAIN), exc_info=_exc_info, **fields)
+    except Exception:
+        pass
+
 if TYPE_CHECKING:
     from hero_quant.skills.loader import SkillsLoader
 
@@ -32,7 +58,8 @@ def _cached_auto_digest() -> str:
                 if cand.exists():
                     _roots.append(str(cand))
             except Exception as exc:
-                logger.debug("digest root check failed for %s: %s", cand, exc)
+                # intentional: 逐候选目录探测循环，warning 会按目录刷屏；整体失败由下文明示
+                logger.debug("digest root check failed for %s: %s error_code=digest_root_check_failed", cand, exc)
                 continue
         if _roots:
             try:
@@ -45,7 +72,11 @@ def _cached_auto_digest() -> str:
             _auto_loader = SkillsLoader(roots=["skills"])
             return _auto_loader.get_descriptions() or ""
         except Exception as exc:
-            logger.debug("auto digest fallback failed: %s", exc)
+            _warn(
+                "auto_digest_fallback_failed",
+                "auto digest fallback failed: %s error_code=auto_digest_fallback_failed",
+                exc,
+            )
             return ""
     except Exception as exc:
         logger.warning("cached auto digest unexpected failure: %s", exc, exc_info=True)
@@ -343,7 +374,11 @@ def skills_observed_invalidate(loader: "SkillsLoader", path: str) -> None:
     try:
         _cached_auto_digest.cache_clear()
     except Exception as exc:
-        logger.debug("cached auto digest clear failed: %s", exc)
+        _warn(
+            "cached_auto_digest_clear_failed",
+            "cached auto digest clear failed: %s error_code=cached_auto_digest_clear_failed",
+            exc,
+        )
 
 
 def build_system_prompt(

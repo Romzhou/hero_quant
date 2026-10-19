@@ -70,7 +70,7 @@ def default_trace_dir() -> Path:
         try:
             fallback.mkdir(parents=True, exist_ok=True)
         except Exception:
-            pass
+            pass  # intentional: 三级回退均不可写时返回路径占位，后续写入失败会明示告警
         return fallback
 
 
@@ -393,7 +393,7 @@ class TraceWriter:
         """关闭文件句柄，线程安全，幂等，关前 fsync."""
         with self._lock:
             if getattr(self, "_closed", False):
-                logger.debug("TraceWriter.close called on already closed writer %s", self.path)
+                logger.debug("TraceWriter.close called on already closed writer %s error_code=trace_close_idempotent", self.path)  # intentional: 幂等 close 通知，非错误
                 return
             try:
                 try:
@@ -419,7 +419,7 @@ class TraceWriter:
                 logger.warning("TraceWriter leaked without close() for %s, auto-closing", getattr(self, "path", "unknown"))
                 self.close()
         except Exception:
-            pass
+            pass  # intentional: 析构期兜底（泄漏已在上文明示 warning）；析构抛错会掩盖真实异常
 
     def read(self, resolve_offloads: bool = False) -> List[Dict[str, Any]]:
         """读取 trace.jsonl，resolve_offloads 为 True 时回灌侧车内容并校验路径."""
@@ -454,10 +454,11 @@ class TraceWriter:
                                         rec = original
                                     else:
                                         rec["sidecar_content"] = raw
-                                except Exception:
+                                except (ValueError, TypeError, AttributeError):
                                     rec["sidecar_content"] = raw
-                            except Exception:
-                                pass
+                            except Exception as exc:
+                                # intentional: 逐记录回灌探针；侧车缺失即跳过该条，回灌失败不丢记录主体
+                                logger.debug("trace sidecar read skipped: %s error_code=trace_sidecar_read_skipped", exc)
                     elif "result_path" in rec:
                         sp = self._safe_sidecar_path(self.dir_path, rec["result_path"])
                         if sp is not None and sp.exists():
@@ -466,8 +467,9 @@ class TraceWriter:
                                 # 仅当 rec 未含 content 时回灌，避免覆盖已有的 preview 逻辑
                                 if "content" not in rec:
                                     rec["content"] = content
-                            except Exception:
-                                pass
+                            except Exception as exc:
+                                # intentional: 同上（逐记录回灌探针，失败不丢记录主体）
+                                logger.debug("trace result_path read skipped: %s error_code=trace_result_path_read_skipped", exc)
                 records.append(rec)
         return records
 
@@ -494,11 +496,11 @@ class TraceWriter:
                 try:
                     os.close(fd)
                 except Exception:
-                    pass
+                    pass  # intentional: 异常路径 fd 回收，抛错会掩盖原始写入错误（下文 raise 优先）
                 try:
                     os.unlink(tmp)
                 except OSError:
-                    pass
+                    pass  # intentional: 同上（tmp 清理 best-effort，原始错误向上传播）
                 raise
             else:
                 os.close(fd)
@@ -510,7 +512,7 @@ class TraceWriter:
                 try:
                     os.unlink(tmp)
                 except OSError:
-                    pass
+                    pass  # intentional: 幂等已达成（目标已存在）；tmp 清理 best-effort
                 return
             except OSError as exc:
                 # 跨设备/Windows 无法 hardlink 时回退；已存在则不覆盖以保幂等
@@ -518,7 +520,7 @@ class TraceWriter:
                     try:
                         os.unlink(tmp)
                     except OSError:
-                        pass
+                        pass  # intentional: 同上（幂等已达成，tmp 清理 best-effort）
                     return
                 try:
                     os.replace(tmp, path)
@@ -527,14 +529,14 @@ class TraceWriter:
                     try:
                         os.unlink(tmp)
                     except OSError:
-                        pass
+                        pass  # intentional: 回退亦失败时 tmp 清理 best-effort；主错下文明示
                     self._warn_fsync_failure(exc, path)
                     return
             if linked:
                 try:
                     os.unlink(tmp)
                 except OSError:
-                    pass
+                    pass  # intentional: 发布成功后 tmp 清理 best-effort（残留 tmp 不影响读取）
                 self._fsync_dir(path.parent)
 
     def _fsync_dir(self, directory: Path) -> None:
@@ -545,7 +547,7 @@ class TraceWriter:
                 flags |= os.O_DIRECTORY
             dir_fd = os.open(directory, flags)
         except OSError:
-            return
+            return  # intentional: 目录 fd 打不开则跳过目录 fsync（文件 fsync 已做；属 best-effort 耐久）
         try:
             os.fsync(dir_fd)
         except OSError as exc:
@@ -558,7 +560,7 @@ class TraceWriter:
         last = getattr(self, "_last_fsync_warning", 0)
         # 限流但不永久静默：5秒内重复仅 debug，超时后再次 warning
         if self._fsync_warned and (now - last) < 5:
-            logger.debug("trace fsync throttled on %s: %s", target, exc)
+            logger.debug("trace fsync throttled on %s: %s error_code=trace_fsync_throttled", target, exc)
             return
         logger.warning(
             "trace fsync failed on %s (%s); trace durability degraded to flush-only",

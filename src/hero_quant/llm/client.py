@@ -3,10 +3,40 @@
 from __future__ import annotations
 
 import inspect as _inspect
+import logging
 import os
 import random
 import time
 from typing import Any
+
+logger = logging.getLogger(__name__)
+
+try:
+    import structlog as _structlog  # type: ignore
+
+    _slog = _structlog.get_logger(__name__)
+except Exception:  # pragma: no cover — 最小环境无 structlog
+    _slog = None  # type: ignore
+
+_CHAIN = "A"  # F线分级：本文件位于问答链核心（LLM 调用/重试/用量计量）
+
+
+def _warn(op, msg, *args, **fields):
+    """F线分级告警（D线 risk 同款 schema）：stdlib warning 为主，structlog 结构化为辅
+    （error_code + chain；trace_id 由 server.py contextvars 自动透传）。PII 约束：只传
+    非敏感字段，禁 prompt/用量原文。"""
+    _exc_info = fields.pop("exc_info", None)
+    try:
+        logger.warning(msg, *args, exc_info=_exc_info)
+    except Exception:
+        pass
+    if _slog is None:
+        return
+    try:
+        _slog.warning(op, error_code=op, chain=fields.pop("chain", _CHAIN), exc_info=_exc_info, **fields)
+    except Exception:
+        pass
+
 
 def _inc_llm_retry(reason: str = "error") -> None:
     try:
@@ -16,7 +46,7 @@ def _inc_llm_retry(reason: str = "error") -> None:
         prov = os.environ.get("HERO_LLM_PROVIDER", "unknown")
         inc_llm_retry(provider=prov, reason=reason)
     except Exception:
-        pass
+        pass  # intentional: 指标 best-effort（observability must not break business）；指标模块内部已 debug
 
 
 def _inc_llm_timeout() -> None:
@@ -26,7 +56,7 @@ def _inc_llm_timeout() -> None:
         prov = os.environ.get("HERO_LLM_PROVIDER", "unknown")
         inc_llm_timeout(provider=prov)
     except Exception:
-        pass
+        pass  # intentional: 同上（超时计数 best-effort）
 
 
 def _retry_delay(attempt: int) -> float:
@@ -148,7 +178,7 @@ class LLMClient:
                             if callable(close_fn):
                                 close_fn()
                         except Exception:
-                            pass
+                            pass  # intentional: 生成器收尾 best-effort；close 失败不影响已产出内容
                         try:
                             aclose_fn = getattr(gen, "aclose", None)
                             if callable(aclose_fn):
@@ -158,9 +188,9 @@ class LLMClient:
                                     try:
                                         res.close()
                                     except Exception:
-                                        pass
+                                        pass  # intentional: 同上（协程收尾 best-effort）
                         except Exception:
-                            pass
+                            pass  # intentional: 同上（aclose 探测 best-effort）
                 # usage capture after successful iteration (reset at call start; set only on success)
                 self._capture_usage()
                 return
@@ -173,7 +203,7 @@ class LLMClient:
                     if isinstance(e, TimeoutError):
                         _inc_llm_timeout()
                 except Exception:
-                    pass
+                    pass  # intentional: 重试计数 best-effort；主重试流程不受影响
                 if attempt == self.max_retries:
                     raise
                 time.sleep(_retry_delay(attempt))
@@ -190,8 +220,12 @@ class LLMClient:
                 if lu is not None:
                     self.usage = lu
                     self.last_usage = lu
-        except Exception:
-            pass
+        except Exception as exc:
+            _warn(
+                "llm_usage_capture_failed",
+                "llm usage capture failed error_code=llm_usage_capture_failed",
+                exc_info=exc,
+            )
 
     def _invoke_once(self, func, prompt: str):
         """Single non-idempotent RPC attempt with timeout probe (no blind re-execution).
@@ -217,7 +251,7 @@ class LLMClient:
                     if isinstance(e, TimeoutError):
                         _inc_llm_timeout()
                 except Exception:
-                    pass
+                    pass  # intentional: 重试计数 best-effort；主重试流程不受影响
                 if attempt == self.max_retries:
                     raise
                 time.sleep(_retry_delay(attempt))

@@ -36,14 +36,16 @@ def get_vector_dim(default: int | None = None) -> int:
         if 8 <= v <= 2048:
             return v
     except (ImportError, ValueError, TypeError, AttributeError, OSError) as e:
-        logger.debug("get_vector_dim settings failed: %s", e)
+        # intentional: 配置缺失回落默认维度（offline-safe 默认）；逐调用触发，warning 会刷屏
+        logger.debug("get_vector_dim settings failed: %s error_code=get_vector_dim_settings_failed", e)
     if default is not None:
         try:
             iv = int(default)
             if 8 <= iv <= 2048:
                 return iv
         except (ValueError, TypeError) as e:
-            logger.debug("get_vector_dim default parse failed: %s", e)
+            # intentional: 同上（调用方显式 default 解析失败，回落默认维度）
+            logger.debug("get_vector_dim default parse failed: %s error_code=get_vector_dim_default_parse_failed", e)
     return _DEFAULT_DIM
 
 
@@ -343,7 +345,7 @@ def embed(text: str, dim: int | None = None) -> List[float]:
         # provider-aware key，历史 _last_provider 清理保留兼容但不再依赖
         try:
             _prov = _active_provider_name()
-        except Exception:
+        except (ValueError, TypeError, AttributeError, RuntimeError, OSError):
             _prov = "offline"
         vec = _embed_cached(str(text), int(eff_dim), _prov)
     except Exception as exc:
