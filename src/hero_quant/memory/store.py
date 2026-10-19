@@ -22,6 +22,32 @@ from .lifecycle import compute_importance
 
 logger = logging.getLogger("hero_quant.memory.store")
 
+try:
+    import structlog as _structlog  # type: ignore
+
+    _slog = _structlog.get_logger(__name__)
+except Exception:  # pragma: no cover — 最小环境无 structlog
+    _slog = None  # type: ignore
+
+_CHAIN = "A"  # F线分级：本文件位于问答链（记忆检索/落盘；关闭失败即 durability 降级）
+
+
+def _warn(op, msg, *args, **fields):
+    """F线分级告警（D线 risk 同款 schema）：stdlib warning 为主，structlog 结构化为辅
+    （error_code + chain；trace_id 由 server.py contextvars 自动透传）。PII 约束：只传
+    非敏感字段，禁记忆原文。"""
+    _exc_info = fields.pop("exc_info", None)
+    try:
+        logger.warning(msg, *args, exc_info=_exc_info)
+    except Exception:
+        pass
+    if _slog is None:
+        return
+    try:
+        _slog.warning(op, error_code=op, chain=fields.pop("chain", _CHAIN), exc_info=_exc_info, **fields)
+    except Exception:
+        pass
+
 
 class _SQLiteConnWrapper:
     """Wrapper around sqlite3.Connection to allow commit patching in tests (Python 3.13 commit is read-only)."""
@@ -111,8 +137,8 @@ def _vector_to_literal(vec) -> str:
         from hero_quant.agent.embed import to_pgvector_literal  # type: ignore
 
         return to_pgvector_literal(vec)  # type: ignore
-    except Exception:
-        pass
+    except (ImportError, ValueError, TypeError, AttributeError):
+        pass  # intentional: 序列化回退（仍走下文手动格式化；非有限值已在上文明示抛错）
     vals: list[str] = []
     for x in vec:
         vals.append(f"{float(x):.6f}")
@@ -605,7 +631,7 @@ class MemoryStore:
                     self._retrieval_cache.clear()
                     self._vector_cache.clear()
                 except Exception:
-                    pass
+                    pass  # intentional: 关闭期缓存清理 best-effort；主关闭流程继续
                 # close sqlite connection if open
                 conn = getattr(self, "_conn", None)
                 if conn is not None:
@@ -614,19 +640,19 @@ class MemoryStore:
                         try:
                             real.commit()
                         except Exception:
-                            pass
+                            pass  # intentional: 关闭期提交 best-effort；失败即丢弃未落盘写（下文明示）
                         try:
                             real.execute("PRAGMA wal_checkpoint(TRUNCATE)")
                         except Exception:
-                            pass
+                            pass  # intentional: 同上（WAL 检查点 best-effort）
                         real.close()
                     except Exception as e:
-                        logger.debug("MemoryStore close failed: %s", e)
+                        _warn("memory_store_close_failed", "MemoryStore close failed error_code=memory_store_close_failed: %s", e)
                     finally:
                         # mark as closed to make idempotent
                         self._conn = None  # type: ignore
         except Exception as e:
-            logger.debug("MemoryStore close outer failed: %s", e)
+            _warn("memory_store_close_outer_failed", "MemoryStore close outer failed error_code=memory_store_close_outer_failed: %s", e)
 
     def __enter__(self):
         return self
@@ -635,7 +661,7 @@ class MemoryStore:
         try:
             self.close()
         except Exception:
-            pass
+            pass  # intentional: close 失败已在 close 内明示；此处抛错会掩盖 with 体原始异常
         return False
 
     @property
@@ -812,7 +838,7 @@ class MemoryStore:
         try:
             self._reconcile_orphan_files()
         except Exception as _exc:
-            logger.debug("startup reconcile failed: %s", _exc)
+            _warn("memory_startup_reconcile_failed", "startup reconcile failed error_code=memory_startup_reconcile_failed: %s", _exc)
 
     def _reconcile_orphan_files(self) -> int:
         """Scan base/**/*.md vs notes keys, re-index missing files. Returns count.
@@ -1115,7 +1141,7 @@ class MemoryStore:
                 sorted_items = sorted(self._recent_hashes.items(), key=lambda kv: kv[1])
                 # keep newest 2048
                 self._recent_hashes = dict(sorted_items[-2048:])
-                logger.debug("recent_hashes capped to 2048, evicted %d", len(sorted_items) - 2048)
+                logger.debug("recent_hashes capped to 2048, evicted %d error_code=memory_recent_hashes_capped", len(sorted_items) - 2048)  # intentional: 常规容量治理通知，非错误
             if full_hash in self._recent_hashes:
                 # same (ns_key, content) re-write within window: suppress duplicate
                 logger.info("dedup hit ns_key=%s content_hash=%s", ns_key, content_hash)
@@ -1360,12 +1386,12 @@ class MemoryStore:
                 keep = dict(sorted_meta[-4096:])
                 self._meta.clear()
                 self._meta.update(keep)
-                logger.debug("meta capped to 4096, evicted %d", len(sorted_meta) - 4096)
+                logger.debug("meta capped to 4096, evicted %d error_code=memory_meta_capped", len(sorted_meta) - 4096)  # intentional: 常规容量治理通知，非错误
         # 写入后失效检索缓存，保证新笔记立即可召回
         try:
             self._invalidate_search_caches()
         except Exception:
-            pass
+            pass  # intentional: 检索缓存失效 hygiene；下次读取重建，不影响正确性
 
     def index_external(self, key: str, content: str) -> None:
         """索引已由外部文件持久化的内容，不重复写入记忆文件。"""
@@ -1431,11 +1457,12 @@ class MemoryStore:
                         logger.debug("silent handled: offline-safe: memory sidecar/pgvector optional, fallback to local", exc_info=_exc)  # intentional: offline-safe: memory sidecar/pgvector optional, fallback to local
                         pass  # intentional offline-safe: memory sidecar/pgvector optional, fallback to local
                 self._conn.commit()
-        except Exception:
+        except Exception as _exc:
+            _warn("memory_store_write_failed", "memory store write failed, rolled back error_code=memory_store_write_failed: %s", _exc)
             try:
                 self._conn.rollback()
-            except Exception as _exc:
-                logger.debug("silent handled: offline-safe: memory sidecar/pgvector optional, fallback to local", exc_info=_exc)  # intentional: offline-safe: memory sidecar/pgvector optional, fallback to local
+            except Exception as _exc2:
+                logger.debug("silent handled: offline-safe: memory sidecar/pgvector optional, fallback to local", exc_info=_exc2)  # intentional: offline-safe: memory sidecar/pgvector optional, fallback to local
                 pass  # intentional offline-safe: memory sidecar/pgvector optional, fallback to local
             return
 
@@ -1446,7 +1473,7 @@ class MemoryStore:
         try:
             self._invalidate_search_caches()
         except Exception:
-            pass
+            pass  # intentional: 检索缓存失效 hygiene；下次读取重建，不影响正确性
 
     def _importance_for(self, item: dict, now: float) -> float:
         """按 Ebbinghaus 14 天衰减计算单条记忆的重要性。"""
@@ -1472,7 +1499,7 @@ class MemoryStore:
         try:
             return compute_importance(qs, ac, days)
         except Exception:
-            return qs
+            return qs  # intentional: 重要性计算探针；失败即用质量分原值排序
 
     def _rank_with_decay(self, items: list[dict]) -> list[dict]:
         """按衰减后的重要性对候选集重排。"""
@@ -1957,7 +1984,7 @@ class MemoryStore:
                             out2.append(it)
                     result = out2
             except Exception as _exc:
-                logger.debug("silent handled: rerank fallback", exc_info=_exc)  # intentional fallback
+                logger.debug("silent handled: rerank fallback error_code=memory_rerank_fallback", exc_info=_exc)  # intentional fallback
                 pass
 
         # 已做命名空间隔离，最后按内容去重

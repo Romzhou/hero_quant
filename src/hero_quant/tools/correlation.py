@@ -88,7 +88,7 @@ def _fetch_closes(symbol: str, start: str, end: str):
                         "synthetic fallback enabled", symbol=symbol, error=str(e), exc_info=True
                     )
                 except (ImportError, AttributeError, ValueError, TypeError, OSError, RuntimeError):
-                    pass
+                    pass  # intentional: structlog 次级通道失败即丢弃（主通道 stdlib 已 warning）
                 # 中文：合成数据必须标记不可用，调用方将转为 ok:False + provenance synthetic
                 raise SyntheticDataUnavailable(f"synthetic closes for {symbol} {start}->{end} (synthetic provenance, not live)") from e
         except SyntheticDataUnavailable:
@@ -107,7 +107,7 @@ def _fetch_closes(symbol: str, start: str, end: str):
                 "fetch closes failed", symbol=symbol, error=str(e), exc_info=True
             )
         except (ImportError, AttributeError, ValueError, TypeError, OSError, RuntimeError):
-            pass
+            pass  # intentional: structlog 次级通道失败即丢弃（主通道 stdlib 已 warning）
         raise
 
 
@@ -158,14 +158,22 @@ def compute_correlation(
             from hero_quant.data.loaders.tencent import TencentLoader as _TL
 
             _reg.register(_TL())
-        except Exception:
-            pass
+        except (ImportError, ModuleNotFoundError, AttributeError, ValueError) as e:
+            import logging as _logging
+
+            _logging.getLogger(__name__).warning(
+                "correlation TencentLoader register failed error_code=correlation_loader_register_failed: %s", e
+            )
         try:
             from hero_quant.data.loaders.yahoo import YahooLoader as _YL
 
             _reg.register(_YL())
-        except Exception:
-            pass
+        except (ImportError, ModuleNotFoundError, AttributeError, ValueError) as e:
+            import logging as _logging
+
+            _logging.getLogger(__name__).warning(
+                "correlation YahooLoader register failed error_code=correlation_loader_register_failed: %s", e
+            )
         _live_prov = None
         try:
             _bars_a, _prov_a = _reg.get_bars(symbol_a, start, end, interval="1d")
@@ -235,7 +243,7 @@ def compute_correlation(
                 }
                 _out["isMock"] = False
         except (AttributeError, TypeError):
-            pass
+            pass  # intentional: provenance 导出 garnish；失败即保留合成标记（不覆盖 ok/provenance 主结论）
         return _out
     except Exception as e:
         import logging as _logging
@@ -250,7 +258,7 @@ def compute_correlation(
                 "compute_correlation failed", symbol_a=symbol_a, symbol_b=symbol_b, error=str(e), exc_info=True
             )
         except (ImportError, AttributeError, ValueError, TypeError, OSError, RuntimeError):
-            pass
+            pass  # intentional: structlog 次级通道失败即丢弃（主通道 stdlib 已 warning）
         # 中文：合成回退走显式 SyntheticDataUnavailable 信号，不可用作 live
         if isinstance(e, SyntheticDataUnavailable):
             return {

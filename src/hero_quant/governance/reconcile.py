@@ -294,7 +294,7 @@ def aggregate_shadow(
                         try:
                             _rec_unlock(_h)
                         except Exception:
-                            pass
+                            pass  # intentional: finally 内解锁 best-effort；抛错会掩盖读路径原始错误
                 try:
                     text = _raw.decode("utf-8")
                 except UnicodeDecodeError as exc:

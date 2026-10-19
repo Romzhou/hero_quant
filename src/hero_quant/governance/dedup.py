@@ -21,8 +21,35 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+try:
+    import structlog as _structlog  # type: ignore
+
+    _slog = _structlog.get_logger(__name__)
+except Exception:  # pragma: no cover — 最小环境无 structlog
+    _slog = None  # type: ignore
+
+_CHAIN = "A"  # F线分级：本文件位于问答链（工具调用幂等门；去重视败即重复执行/状态错乱）
+
+
+def _warn(op: str, msg: str, *args: Any, **fields: Any) -> None:
+    """F线分级告警（D线 risk 同款 schema）：stdlib warning 为主，structlog 结构化为辅
+    （error_code + chain；trace_id 由 server.py contextvars 自动透传）。PII 约束：只传
+    非敏感字段，禁 key/result 原文。"""
+    _exc_info = fields.pop("exc_info", None)
+    try:
+        logger.warning(msg, *args, exc_info=_exc_info)
+    except Exception:
+        pass
+    if _slog is None:
+        return
+    try:
+        _slog.warning(op, error_code=op, chain=fields.pop("chain", _CHAIN), exc_info=_exc_info, **fields)
+    except Exception:
+        pass
+
 
 # 可观测性探针（离线安全，无硬依赖）：记录 dedup 操作耗时与计数，失败时静默降级
+# intentional: 指标 best-effort（observability must not break business）；下文 4 处 pass 均为指标发射 guard
 def _dedup_observe(op: str, start: float, status: str = "success") -> None:
     try:
         elapsed = time.monotonic() - start
@@ -33,16 +60,16 @@ def _dedup_observe(op: str, start: float, status: str = "success") -> None:
                 try:
                     DEDUP_OP_TOTAL.labels(op=op, status=status).inc()
                 except Exception:
-                    pass
+                    pass  # intentional: 指标计数 best-effort（见函数注记）
             if observe_wall_time is not None:
                 try:
                     observe_wall_time(f"dedup_{op}", elapsed, status=status)
                 except Exception:
-                    pass
+                    pass  # intentional: 同上（耗时观测 best-effort）
         except Exception:
-            pass
+            pass  # intentional: 同上（指标导入/调用 best-effort）
     except Exception:
-        pass
+        pass  # intentional: 同上（探针自身永不抛错）
 
 DEFAULT_TTL_SECONDS = 7 * 24 * 3600
 
@@ -117,7 +144,7 @@ def _pg_set_dual_tenant_sync(conn: Any, tenant: str) -> None:
                 with conn.cursor() as _c:  # type: ignore[attr-defined]
                     _c.execute(_sql, (val,))
         except Exception as _e:
-            logger.debug("dedup SET LOCAL %s failed: %s", _key, _e)
+            _warn("dedup_set_local_failed", "dedup SET LOCAL %s failed error_code=dedup_set_local_failed: %s", _key, _e)
 
 
 def _pg_tenant_from_key(key: str) -> str:
@@ -156,8 +183,8 @@ def _is_memory_allowed(allow_memory: bool = False) -> bool:
     try:
         if bool(allow_memory):
             return True
-    except Exception:
-        pass
+    except (ValueError, TypeError, AttributeError):
+        pass  # intentional: 标志位布尔探针；不可判定即按默认关闭处理（fail-closed）
     try:
         return "PYTEST_CURRENT_TEST" in os.environ
     except Exception:
@@ -312,7 +339,7 @@ class DedupStore:
         if not self._is_pg or self.pool is None:
             return
         # 与同步路径一致 fail-closed：RLS/DDL 是租户隔离根基，失败必须 loud 上浮，
-        # 不可 except: pass 静默放行（否则异步 PG 形同无隔离而同步路径已拒绝）。
+        # 不可裸捕获后静默放行（否则异步 PG 形同无隔离而同步路径已拒绝）。
         if hasattr(self.pool, "open"):
             try:
                 await self.pool.open()  # type: ignore
@@ -400,9 +427,9 @@ class DedupStore:
                 for k, _ in sorted_keys[:to_evict]:
                     self._mem.pop(k, None)
                     self._mem_ts.pop(k, None)
-                logger.debug("dedup _mem capped, evicted %d", to_evict)
+                logger.debug("dedup _mem capped, evicted %d error_code=dedup_mem_capped", to_evict)  # intentional: 常规容量治理通知，非错误
         except Exception as e:
-            logger.debug("dedup eviction failed: %s", e)
+            _warn("dedup_eviction_failed", "dedup eviction failed error_code=dedup_eviction_failed: %s", e)
 
     # PG 辅助（同步）：插入占位或查询/更新，None 表示回退到 SQLite/内存
     def _pg_insert_pending_sync(self, key: str, tool: str) -> bool | None:

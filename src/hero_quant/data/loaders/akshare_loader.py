@@ -96,7 +96,7 @@ class AKShareLoader:
                 df["date"] = pd.to_datetime(df["date"], errors="raise")
                 df = df.set_index("date")
             except (ValueError, TypeError, pd.errors.OutOfBoundsDatetime) as e:
-                # 窄化捕获，禁止裸 except pass 静默错位
+                # 窄化捕获，禁止裸捕获后静默错位（解析失败必须明示并上浮）
                 logger.warning("akshare date parse failed: %s", e, exc_info=True)
                 raise DataValidationError(f"akshare invalid date index: {e}") from e
         # 成交量口径（fail-closed，不静默换算）：本 loader 声明 unit="board_lots"（A股手）。

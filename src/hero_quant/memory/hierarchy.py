@@ -143,7 +143,8 @@ class MemoryHierarchy:
                     item.rename(target)
                     recovered.append(target)
                 except FileExistsError:
-                    logger.debug("race: target appeared %s", target)
+                    # intentional: 恢复期并发竞态（目标已被他者恢复）；跳过即幂等
+                    logger.debug("race: target appeared %s error_code=hierarchy_recover_race", target)
                     continue
                 except OSError as e:
                     logger.warning("rename %s -> %s failed: %s", item, target, e)
@@ -246,7 +247,7 @@ class MemoryHierarchy:
                     if tmp_path.exists():
                         tmp_path.unlink()
                 except OSError:
-                    pass
+                    pass  # intentional: 索引失败路径 tmp 清理 best-effort；主错已明示并上浮
                 raise
             try:
                 with open(tmp_path, "rb") as _f:
@@ -259,7 +260,7 @@ class MemoryHierarchy:
                 if tmp_path.exists():
                     tmp_path.unlink()
             except OSError:
-                pass
+                pass  # intentional: 发布后 tmp 清理 best-effort（残留 tmp 不影响读取）
         # fsync directory to durably persist rename
         try:
             flags = os.O_RDONLY
@@ -421,13 +422,14 @@ class MemoryHierarchy:
             logger.warning("migrate dest resolve failed: %s", e)
             return None
         if dest_path.exists():
-            logger.debug("migrate skipped, dest exists: %s", dest_path)
+            logger.debug("migrate skipped, dest exists: %s error_code=hierarchy_migrate_skipped", dest_path)  # intentional: 目标已存在即幂等跳过
             return None
         try:
             file_path.rename(dest_path)
             return dest_path
         except FileExistsError:
-            logger.debug("migrate race, dest already exists: %s", dest_path)
+            # intentional: 迁移期并发竞态；返回 None 即调用方按未迁移处理（幂等）
+            logger.debug("migrate race, dest already exists: %s error_code=hierarchy_migrate_race", dest_path)
             return None
         except OSError as e:
             logger.warning("migrate %s -> %s failed: %s", file_path, dest_path, e)

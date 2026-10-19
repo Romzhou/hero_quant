@@ -29,6 +29,32 @@ except ImportError:  # pragma: no cover - POSIX
 
 logger = logging.getLogger(__name__)
 
+try:
+    import structlog as _structlog  # type: ignore
+
+    _slog = _structlog.get_logger(__name__)
+except Exception:  # pragma: no cover — 最小环境无 structlog
+    _slog = None  # type: ignore
+
+_CHAIN = "A+B"  # F线分级：证据账本（链A 审计轨迹 + 链B 回测证据；rotate 失败即无界增长）
+
+
+def _warn(op: str, msg: str, *args: Any, **fields: Any) -> None:
+    """F线分级告警（D线 risk 同款 schema）：stdlib warning 为主，structlog 结构化为辅
+    （error_code + chain；trace_id 由 server.py contextvars 自动透传）。PII 约束：只传
+    非敏感字段，禁记录原文。"""
+    _exc_info = fields.pop("exc_info", None)
+    try:
+        logger.warning(msg, *args, exc_info=_exc_info)
+    except Exception:
+        pass
+    if _slog is None:
+        return
+    try:
+        _slog.warning(op, error_code=op, chain=fields.pop("chain", _CHAIN), exc_info=_exc_info, **fields)
+    except Exception:
+        pass
+
 # T2-2: legacy豁免告警计数（进程内单调，用于可观测；verify命中旧式hash时+1并warning）
 LEGACY_HASH_WARNING = "legacy hash accepted via explicit exemption"
 
@@ -1281,9 +1307,9 @@ class Ledger:
                 except LedgerCorruptionError:
                     logger.warning("ledger auto-rotate refused due to corruption")
                 except Exception as e:
-                    logger.debug("ledger auto-rotate failed: %s", e)
+                    _warn("ledger_auto_rotate_failed", "ledger auto-rotate failed error_code=ledger_auto_rotate_failed: %s", e)
         except Exception as e:
-            logger.debug("ledger auto-rotate check failed: %s", e)
+            _warn("ledger_auto_rotate_check_failed", "ledger auto-rotate check failed error_code=ledger_auto_rotate_check_failed: %s", e)
         # P2: shallow copy leak - return deep copy
         import copy
         return copy.deepcopy(obj)

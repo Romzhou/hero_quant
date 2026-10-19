@@ -560,7 +560,7 @@ class BillingService:
                     try:
                         pool.putconn(_conn2)  # type: ignore
                     except Exception:
-                        pass
+                        pass  # intentional: 连接回收期清理，抛错会掩盖业务原始错误（主错已明示）
         except Exception as _e:
             _log_warning("billing _pg_publish_sync failed: %s", _e, exc_info=True)
             return False
@@ -622,7 +622,7 @@ class BillingService:
                     try:
                         pool.putconn(_conn2)  # type: ignore
                     except Exception:
-                        pass
+                        pass  # intentional: 连接回收期清理，抛错会掩盖业务原始错误（主错已明示）
         except Exception as _e:
             _log_warning("billing _pg_delete_factor_sync failed: %s", _e, exc_info=True)
             return False
@@ -657,7 +657,7 @@ class BillingService:
                 try:
                     _PENDING_LEDGER.remove(item)
                 except ValueError:
-                    pass
+                    pass  # intentional: 重放队列竞态删除（已被消费即视为成功）；属幂等收尾
         return ok_count
 
     def list_factors(self, tenant: str | None = None) -> List[dict]:
@@ -1037,7 +1037,7 @@ class BillingService:
                 try:
                     pool.putconn(_conn2)  # type: ignore
                 except Exception:
-                    pass
+                    pass  # intentional: 连接回收期清理，抛错会掩盖业务原始错误（主错已明示）
         return True
 
     def _pg_purchase_sync(self, receipt: dict) -> bool:
@@ -1084,7 +1084,7 @@ class BillingService:
                     try:
                         pool.putconn(_conn2)  # type: ignore
                     except Exception:
-                        pass
+                        pass  # intentional: 连接回收期清理，抛错会掩盖业务原始错误（主错已明示）
         except Exception as _e:
             _log_warning("billing _pg_delete_purchase_sync failed: %s", _e, exc_info=True)
             return False

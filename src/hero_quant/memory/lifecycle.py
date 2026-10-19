@@ -15,6 +15,32 @@ from types import MappingProxyType
 
 logger = logging.getLogger(__name__)
 
+try:
+    import structlog as _structlog  # type: ignore
+
+    _slog = _structlog.get_logger(__name__)
+except Exception:  # pragma: no cover — 最小环境无 structlog
+    _slog = None  # type: ignore
+
+_CHAIN = "A"  # F线分级：本文件位于问答链（记忆 GC/排序；回写失败即检索排序信号丢失）
+
+
+def _warn(op, msg, *args, **fields):
+    """F线分级告警（D线 risk 同款 schema）：stdlib warning 为主，structlog 结构化为辅
+    （error_code + chain；trace_id 由 server.py contextvars 自动透传）。PII 约束：只传
+    非敏感字段，禁记忆原文。"""
+    _exc_info = fields.pop("exc_info", None)
+    try:
+        logger.warning(msg, *args, exc_info=_exc_info)
+    except Exception:
+        pass
+    if _slog is None:
+        return
+    try:
+        _slog.warning(op, error_code=op, chain=fields.pop("chain", _CHAIN), exc_info=_exc_info, **fields)
+    except Exception:
+        pass
+
 HALF_LIFE_DAYS = 14.0
 _DECAY_LAMBDA = math.log(2) / HALF_LIFE_DAYS  # 衰减系数 λ，决定半衰期
 _ACCESS_BOOST = 0.1  # 每次访问的增益，封顶 0.3
@@ -122,15 +148,15 @@ class MemoryLifecycle:
             try:
                 qs = float(value.get("quality_score", qs))
             except (TypeError, ValueError):
-                pass
+                pass  # intentional: meta 数值探针（脏值即沿用默认；属逐条目回退）
             try:
                 ac = int(value.get("access_count", ac))
             except (TypeError, ValueError):
-                pass
+                pass  # intentional: 同上（access_count 探针）
             try:
                 last = float(value.get("last_accessed", last))
             except (TypeError, ValueError):
-                pass
+                pass  # intentional: 同上（last_accessed 探针）
 
         # P2: 若上层已预计算 safe_filename -> meta 映射则直接 O(1) 命中，避免每文件 O(N) 遍历
         if _meta_lookup is not None:
@@ -153,7 +179,7 @@ class MemoryLifecycle:
                     try:
                         safe = self._memory._safe_filename(k)  # type: ignore
                     except Exception:
-                        safe = f"{k}.md"
+                        safe = f"{k}.md"  # intentional: 文件名安全探针；失败即用原文 key（meta 侧容错）
                     lookup[safe] = v
                     stem_lookup[k] = v
                 fname = file_path.name
@@ -180,12 +206,12 @@ class MemoryLifecycle:
                         try:
                             qs = float(stripped.split(":", 1)[1].strip())
                         except (TypeError, ValueError):
-                            pass
+                            pass  # intentional: frontmatter 单字段探针（坏值跳过，不阻断其余字段）
                     elif stripped.startswith("access_count:"):
                         try:
                             ac = int(stripped.split(":", 1)[1].strip())
                         except (TypeError, ValueError):
-                            pass
+                            pass  # intentional: 同上（access_count 字段探针）
                     elif stripped.startswith("last_accessed:"):
                         # 兼容 ISO 与时间戳两种写法，支持缩进
                         val = stripped.split(":", 1)[1].strip()
@@ -200,8 +226,8 @@ class MemoryLifecycle:
                                 if dt.tzinfo is None:
                                     dt = dt.replace(tzinfo=timezone.utc)
                                 last = dt.timestamp()
-                            except Exception:
-                                pass
+                            except (ValueError, TypeError, AttributeError, OverflowError, OSError):
+                                pass  # intentional: 同上（ISO 时间解析探针；失败即沿用默认值）
         except Exception as _exc:
             logger.debug("silent handled: offline-safe: lifecycle optional", exc_info=_exc)  # intentional: offline-safe: lifecycle optional
             pass  # intentional offline-safe: lifecycle optional
@@ -232,7 +258,7 @@ class MemoryLifecycle:
                     _merged.setdefault(_kk, _vv)
                 _meta_lookup = _merged
         except Exception as exc:  # 中文注释：meta-map 构建失败应可观测
-            logger.debug("GC meta-map build failed, falling back to frontmatter: %s", exc)
+            logger.debug("GC meta-map build failed, falling back to frontmatter: %s error_code=gc_metamap_build_failed", exc)
             _meta_lookup = None
         actions: list[dict] = []
         # capacity enforcement: entries beyond MAX_MEMORY_COUNT are archived
@@ -520,7 +546,7 @@ class MemoryLifecycle:
                             if tmp.exists():
                                 tmp.unlink()
                         except OSError:
-                            pass
+                            pass  # intentional: 压缩失败路径 tmp 清理 best-effort；主错已明示
                         continue
             except OSError as exc:
                 logger.warning("Compression write failed for %s: %s", target, exc)
@@ -549,7 +575,7 @@ class MemoryLifecycle:
                     try:
                         safe = self._memory._safe_filename(name)  # type: ignore
                     except Exception:
-                        safe = f"{name}.md"
+                        safe = f"{name}.md"  # intentional: 文件名安全探针；失败即用原文 key（meta 侧容错）
                     entry = meta_dict.get(safe)
                 if isinstance(entry, dict):
                     try:
@@ -563,7 +589,7 @@ class MemoryLifecycle:
                     except (TypeError, ValueError):
                         entry["access_count"] = 1
         except Exception as exc:
-            logger.debug("reinforce meta writeback failed for %s: %s", name, exc)
+            _warn("reinforce_meta_writeback_failed", "reinforce meta writeback failed for %s error_code=reinforce_meta_writeback_failed: %s", name, exc)
         return True
 
     def track_access(self, entry) -> None:

@@ -72,9 +72,9 @@ def get_fallback_count() -> int:
                         total = total.get()
                 return int(total)
             except Exception:
-                pass
+                pass  # intentional: 指标内省 best-effort；失败即走下文进程内计数
     except Exception:
-        pass
+        pass  # intentional: 同上（指标读取永不阻断回退计数）
     with _fallback_lock:
         return int(_fallback_count)
 
@@ -86,7 +86,7 @@ def _inc_fallback() -> None:
     try:
         rerank_fallback_total.inc()  # type: ignore
     except Exception:
-        pass
+        pass  # intentional: 指标 best-effort（observability must not break business）
 
 
 class CohereReranker:
@@ -101,7 +101,7 @@ class CohereReranker:
 
                 self.api_key = (_Settings().cohere_api_key or "").strip()
             except Exception:
-                self.api_key = ""
+                self.api_key = ""  # intentional: 配置缺失即无 key（离线回退排序）；key 永不进日志
         # timeout 校验(0/负/非数→ValueError)
         try:
             t = int(timeout)  # type: ignore[arg-type]

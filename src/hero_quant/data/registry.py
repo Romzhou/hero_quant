@@ -147,7 +147,7 @@ class MarketDataRegistry:
             from hero_quant.data.trait import validate_loader as _validate_loader
             _validate_loader(loader)
         except ImportError:
-            pass
+            pass  # intentional: 可选 trait 校验缺失即跳过（注册后仍有显式 unit fail-closed 校验）
         except (ValueError, TypeError, AttributeError) as e:  # 中文：窄化契约异常，exc_info 链
             # validate_loader raises ValueError/TypeError on contract violation
             raise ValueError(f"loader trait validation failed: {e}") from e
@@ -237,7 +237,7 @@ class MarketDataRegistry:
                     if pd.isna(val):
                         return None
                 except (ValueError, TypeError, AttributeError):
-                    pass
+                    pass  # intentional: 值探针（pd.isna 不可用即按原值继续；外层转换失败已明示 warning）
                 if val is None:
                     return None
                 try:
@@ -275,7 +275,7 @@ class MarketDataRegistry:
                     if pd.isna(v):
                         return None
                 except (ValueError, TypeError, AttributeError):
-                    pass
+                    pass  # intentional: 值探针（pd.isna 不可用即按原值继续；外层转换失败已明示 warning）
                 try:
                     f = float(v)
                 except (ValueError, TypeError) as e:
@@ -300,7 +300,7 @@ class MarketDataRegistry:
             if isinstance(attrs, dict) and attrs.get("unit") in ("board_lots", "shares"):
                 return attrs["unit"]
         except (TypeError, ValueError, AttributeError):
-            pass
+            pass  # intentional: 值探针（attrs/迭代不可用即返回 None；调用方 fail-closed 处理）
         try:
             first = None
             for b in (bars[:1] if hasattr(bars, "__getitem__") else []):  # type: ignore[index]
@@ -309,7 +309,7 @@ class MarketDataRegistry:
             if isinstance(first, dict) and first.get("unit") in ("board_lots", "shares"):
                 return first["unit"]
         except (TypeError, ValueError, AttributeError):
-            pass
+            pass  # intentional: 值探针（attrs/迭代不可用即返回 None；调用方 fail-closed 处理）
         return None
 
     @staticmethod
@@ -356,7 +356,7 @@ class MarketDataRegistry:
                     if pd.isna(val):
                         return None
                 except (ValueError, TypeError, AttributeError):
-                    pass
+                    pass  # intentional: 值探针（pd.isna 不可用即按原值继续；外层转换失败已明示 warning）
                 if val is None:
                     return None
                 try:
@@ -396,7 +396,7 @@ class MarketDataRegistry:
                     if pd.isna(v):
                         return None
                 except (ValueError, TypeError, AttributeError):
-                    pass
+                    pass  # intentional: 值探针（pd.isna 不可用即按原值继续；外层转换失败已明示 warning）
                 try:
                     f = float(v)
                 except (ValueError, TypeError) as e:
