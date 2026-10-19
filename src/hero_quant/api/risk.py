@@ -38,17 +38,14 @@ _CROSS_CALL_ERRORS = tuple(
 _RISK_ERROR_TOTAL = None
 try:
     from prometheus_client import Counter as _RiskCounter
-    from prometheus_client import REGISTRY as _RiskRegistry
 
     try:
         _RISK_ERROR_TOTAL = _RiskCounter(
             "hero_quant_risk_errors_total", "Total risk probe handled errors", ["op", "error_code"]
         )
     except Exception:
-        try:
-            _RISK_ERROR_TOTAL = getattr(_RiskRegistry, "_names_to_collectors", {}).get("hero_quant_risk_errors_total")
-        except Exception:
-            _RISK_ERROR_TOTAL = None
+        # 与 server.py 同理：彻底去私有名，重复注册时降级为 None（best-effort 计数）。
+        _RISK_ERROR_TOTAL = None
 except Exception:
     _RISK_ERROR_TOTAL = None
 

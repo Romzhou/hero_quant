@@ -83,17 +83,16 @@ _DEGRADED_REASON_HEADER = "X-Degrade-Reason"
 API_ERROR_TOTAL = None
 try:
     from prometheus_client import Counter as _DLineCounter
-    from prometheus_client import REGISTRY as _DLineRegistry
 
     try:
         API_ERROR_TOTAL = _DLineCounter(
             "hero_quant_api_errors_total", "Total API handled errors", ["endpoint", "error_code"]
         )
     except Exception:
-        try:
-            API_ERROR_TOTAL = getattr(_DLineRegistry, "_names_to_collectors", {}).get("hero_quant_api_errors_total")
-        except Exception:
-            API_ERROR_TOTAL = None
+        # 重复注册（模块重载/测试并行）时放弃复用：公共 API 无按名取回收集器的能力，
+        # 为彻底去私有名（test_c4_server_no_private_registry），降级为 None；
+        # _inc_api_error 本就 best-effort，计数缺失不影响主流程。
+        API_ERROR_TOTAL = None
 except Exception:
     API_ERROR_TOTAL = None
 
