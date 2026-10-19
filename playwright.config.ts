@@ -21,5 +21,9 @@ export default defineConfig({
       name: 'spa-routes',
       testMatch: /spa\.spec\.ts/,
     },
+    {
+      name: 'reconciliation',
+      testMatch: /reconciliation\.spec\.ts/,
+    },
   ],
 });
