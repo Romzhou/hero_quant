@@ -2073,14 +2073,26 @@ _BACKTEST_BUNDLE_CACHE_PREFIX = "hero:cache:backtest:bundle:"
 _BACKTEST_BUNDLE_LOCK_KEY = "hero:lock:backtest:bundle"
 
 
-def _backtest_bundle_cache_key() -> str:
-    """bundle 参数哈希 key（当前参数固定，保留 hash(params) 形态便于扩展）。"""
-    raw = json.dumps({"v": 1, "capital": 1.0, "weights": [0.5, 0.5]}, sort_keys=True)
+def _backtest_bundle_cache_key(tenant: str | None = None) -> str:
+    """bundle 参数哈希 key（当前参数固定，保留 hash(params) 形态便于扩展）。
+
+    中文：G-12——tenant 可选混入 hash：当前 bundle 为全局合成 demo 数据（无租户私密成分），
+    缺省 tenant=None 时键与旧全局键完全一致（兼容）；未来参数/数据按租户分化时，调用方
+    传入 tenant 即可隔离（非空租户归一后参与 hash，避免跨租户串扰）。
+    """
+    try:
+        _t = tenant.strip() if isinstance(tenant, str) else ""
+    except (ValueError, TypeError, AttributeError):
+        _t = ""
+    if _t:
+        raw = json.dumps({"v": 1, "capital": 1.0, "weights": [0.5, 0.5], "tenant": _t}, sort_keys=True)
+    else:
+        raw = json.dumps({"v": 1, "capital": 1.0, "weights": [0.5, 0.5]}, sort_keys=True)
     digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
     return f"{_BACKTEST_BUNDLE_CACHE_PREFIX}{digest}"
 
 
-def _read_backtest_bundle_cache() -> dict | None:
+def _read_backtest_bundle_cache(tenant: str | None = None) -> dict | None:
     """优先读 Redis L2（JSON 反序列化；positions 存 CSV 文本，还原为 None 由调用方按 csv 用）。"""
     try:
         from hero_quant.infra.redis import get_redis_sync
@@ -2088,7 +2100,7 @@ def _read_backtest_bundle_cache() -> dict | None:
         client = get_redis_sync()
         if client is None:
             return None
-        raw = client.get(_backtest_bundle_cache_key())
+        raw = client.get(_backtest_bundle_cache_key(tenant))
         if not raw:
             return None
         data = json.loads(raw)
@@ -2100,7 +2112,7 @@ def _read_backtest_bundle_cache() -> dict | None:
         return None
 
 
-def _write_backtest_bundle_cache(bundle: dict) -> None:
+def _write_backtest_bundle_cache(bundle: dict, tenant: str | None = None) -> None:
     """计算后写 L2（JSON ex=600；positions 为 DataFrame 时只存 csv/tearsheet/metrics）。"""
     try:
         from hero_quant.infra.redis import get_redis_sync
@@ -2113,7 +2125,7 @@ def _write_backtest_bundle_cache(bundle: dict) -> None:
             "csv": bundle.get("csv", ""),
             "tearsheet": bundle.get("tearsheet", ""),
         }
-        client.set(_backtest_bundle_cache_key(), json.dumps(payload, ensure_ascii=False, default=str), ex=600)
+        client.set(_backtest_bundle_cache_key(tenant), json.dumps(payload, ensure_ascii=False, default=str), ex=600)
     except Exception as _e:
         logger.debug(f"backtest.bundle_cache_write_failed error={_e}")
 
