@@ -170,7 +170,9 @@ def issue_ticket(ttl: float = SSE_TICKET_TTL_SECONDS, user: Any | None = None, u
         bound_user = ""
     payload = _ticket_payload(bound_user)
     # 中文：ttl<=0 语义为立即过期（签发即不可消费；兼容旧契约，不落 Redis 避免 EX 非法）。
+    # M-round2：此分支返回永不可消费的票据，必须 warning 可观测，防调用方把 200 签发误当有效票。
     if ttl_int <= 0:
+        logger.warning("security.ticket_issued_immediately_expired ttl=%r", ttl)
         ticket = secrets.token_urlsafe(32)
         return ticket
     ticket = secrets.token_urlsafe(32)
