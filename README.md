@@ -60,11 +60,10 @@ export HERO_DATA_MODE=live   # synthetic | live  (live 才调 qt.gtimg.cn/yahoo)
 export HERO_LLM_MODEL=gpt-4o-mini
 
 # 3. 跑测试
-pytest -q  # 277 passed
+pytest -q
 
-# 4. 启动
-uvicorn hero_quant.api.server:app --host 0.0.0.0 --port 8899 --reload
-# 或 python -m hero_quant.api.server
+# 4. 启动（唯一入口，旧式模块写法已废弃，见 Dockerfile CMD）
+uvicorn hero_quant.api.server:app --host 0.0.0.0 --port 8899
 open http://127.0.0.1:8899          # 前端（若 frontend/dist 已 build）
 open http://127.0.0.1:8899/docs     # Swagger
 curl http://127.0.0.1:8899/live    # liveness
@@ -102,6 +101,8 @@ docker run -p 127.0.0.1:8899:8899 --env-file .env hero-quant:0.2.0
 | `HERO_API_KEY` | — | LLM 密钥 |
 | `HERO_DATA_MODE` | `live` | `synthetic` 本地合成（测试/离线）/`live` 调真实行情（默认 `live`） |
 | `HERO_DATA_MARKET` | `CN` | 默认市场 |
+| `HERO_PG_HOST` | `localhost` | PG 主机切换：本地 `localhost` / compose 内 `postgres`（显式 `HERO_*_DSN` 优先） |
+| `HERO_CHECKPOINT_DSN` | `postgresql://localhost:5432/hero_quant` | 显式 PG DSN 优先；compose 内为 `postgresql://heroquant:heroquant@postgres:5432/heroquant` |
 | `HERO_OTEL_MODE` | `disabled` | `disabled`/`shared`/`private` |
 | `HERO_TRACE_*` | `50000/500` | `TOOL_RESULT_OFFLOAD/TEXT_OFFLOAD/PREVIEW` |
 | `FRONTEND_DIST` | 自动探测 | 前端 dist 覆盖路径 |
@@ -127,7 +128,7 @@ curl -N "http://127.0.0.1:8899/v1/query/stream?q=对比 茅台 vs 五粮液 近3
 ```bash
 ruff check src
 black src
-pytest -q --cov=src/hero_quant --cov-fail-under=30  # core 30 起步
+pytest -q --cov=src/hero_quant --cov-fail-under=50  # 以 pyproject fail_under=50 为准
 npm --prefix frontend run test:run
 ```
 
@@ -139,7 +140,7 @@ npm --prefix frontend run test:run
 - [x] 回测 PIT/多标/tearsheet
 - [x] AgentLoop 10 控制点 + LangGraph 双路由
 - [ ] Memory 多租户 namespace + Governance 跨段校验
-- [ ] Checkpoint 真 PG 落盘（已默认 PG `postgresql://postgres:postgres@localhost:5432/hero_quant`，PG 不可达时回退 `memory://`）
+- [ ] Checkpoint 真 PG 落盘（settings 默认无口令 PG `postgresql://localhost:5432/hero_quant`，本地/示例口令与 compose 对齐 `postgresql://heroquant:heroquant@localhost:5432/heroquant`，compose 内主机名为 `postgres`，PG 不可达时回退 `memory://`）
 - [x] `requirements-lock.txt` 真 hash 全量（已 `uv pip compile --generate-hashes` 非占位）
 
 ## 合规与免责
