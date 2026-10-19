@@ -2,12 +2,17 @@
 
 职责：多实例共享的用户会话读写；序列化失败/Redis 缺失时 fail-closed（set False/get None）。
 架构位置：infra 层，基于 infra.redis.get_redis 接入。
+
+中文：G-13——fixation 前置：session_id 必须由服务端 generate_session_id() 生成（密码学随机，
+不可接受客户端供给的 id 直接建会话）；启用身份绑定时用 bind_session_owner() 显式绑定，
+消费端用 check_session_owner() 校验归属。既有 set/get 保持原语义（归一化 + 空 id 拒绝）。
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import secrets
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -42,6 +47,56 @@ SESSION_PREFIX = "hero:session:"
 SESSION_TTL = 7 * 24 * 3600
 # session_id 上限：防超大键 DoS；归一化后仍超长直接拒绝
 MAX_SESSION_ID_LEN = 128
+# 服务端生成 id 熵：32 字节 urlsafe（~43 字符，不可预测，防 fixation/枚举）
+SERVER_SESSION_ID_BYTES = 32
+
+
+def generate_session_id() -> str:
+    """服务端生成 session_id（G-13 fixation 前置：调用方不得用客户端供给 id 建会话）。
+
+    中文：密码学随机 token_urlsafe，归一化必过（非空、远小于 128 上限）；失败永不回退
+    可预测值（secrets 抛错即向上传播，由调用方 fail-closed，禁止收敛共享键）。
+    """
+    return secrets.token_urlsafe(SERVER_SESSION_ID_BYTES)
+
+
+async def create_session(data: dict[str, Any], owner: str | None = None) -> str | None:
+    """服务端建会话：生成随机 id 并写入，返回 id；失败返回 None（fail-closed）。
+
+    中文：G-13——新建会话唯一入口（防 fixation）；owner 非空时一并写入归属绑定
+    （_owner 保留键），消费端用 check_session_owner() 校验。data 非 dict 直接拒绝。
+    """
+    sid = generate_session_id()
+    payload = dict(data) if isinstance(data, dict) else None
+    if payload is None:
+        _warn("session.encode_failed", "session.encode_failed error=non-dict data type=%s error_code=session.encode_failed", type(data).__name__)
+        return None
+    if isinstance(owner, str) and owner.strip():
+        payload = dict(payload)
+        payload["_owner"] = owner.strip()
+    ok = await set_session(sid, payload)
+    return sid if ok else None
+
+
+async def check_session_owner(session_id: str, owner: str) -> bool:
+    """校验会话归属：存储的 _owner 与给定 owner 一致才 True；缺失/损坏/不一致一律 False。"""
+    if not isinstance(owner, str) or not owner.strip():
+        return False
+    doc = await get_session(session_id)
+    if not isinstance(doc, dict):
+        return False
+    try:
+        bound = doc.get("_owner")
+    except (AttributeError, TypeError, ValueError):
+        return False
+    if not isinstance(bound, str) or not bound:
+        return False
+    try:
+        import hmac as _hmac
+
+        return _hmac.compare_digest(bound.strip(), owner.strip())
+    except (TypeError, ValueError, AttributeError):
+        return False
 
 
 def _norm_id(session_id: str) -> str | None:
@@ -120,4 +175,12 @@ async def get_session(session_id: str) -> dict[str, Any] | None:
     return obj if isinstance(obj, dict) else None
 
 
-__all__ = ["SESSION_PREFIX", "SESSION_TTL", "get_session", "set_session"]
+__all__ = [
+    "SESSION_PREFIX",
+    "SESSION_TTL",
+    "check_session_owner",
+    "create_session",
+    "generate_session_id",
+    "get_session",
+    "set_session",
+]
