@@ -889,11 +889,16 @@ def _is_pg_dsn_ready(dsn: str | None) -> bool:
 
 
 def _redact_dsn_api(dsn: str) -> str:
-    """脱敏 DSN，日志不泄露密码。"""
+    """脱敏 DSN，日志不泄露密码。
+
+    中文：G-09——与 settings._redact_dsn 共用同一实现（消灭分叉；同时覆盖 user:pass@
+    与 :pass@ 空用户名两种带口令形态）。settings 侧为正典，本函数仅做薄委托。
+    """
     try:
-        import re as _re
-        return _re.sub(r"://([^:]+):[^@]*@", r"://\1:***@", dsn)
-    except Exception:
+        from hero_quant.config.settings import _redact_dsn as _canonical_redact
+
+        return _canonical_redact(dsn)
+    except (ImportError, ValueError, TypeError, AttributeError):
         return "***"
 
 
