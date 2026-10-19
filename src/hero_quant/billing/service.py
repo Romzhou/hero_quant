@@ -213,11 +213,29 @@ def _log_pg_warning_once():
 
 
 def _billing_dsn_from_env(explicit: str | None = None) -> str | None:
+    """Billing DSN 解析：显式参数/HERO_BILLING_DSN 直认；共享库回退须 opt-in。
+
+    中文：G-05——与 settings._billing_dsn_from_env 同门禁：回退 HERO_PG_DSN/
+    HERO_CHECKPOINT_DSN 必须 HERO_BILLING_ALLOW_SHARED_DB=1/true/yes/on 显式 opt-in，
+    否则 fail-closed 返回 None（财务与 checkpoint 混库有表冲突/资金完整性风险）。
+    未 opt-in 时的回退尝试记 warning（fail-visible），不静默混库。
+    """
     if explicit and explicit.strip().startswith(_PG_PREFIXES):
         return explicit.strip()
-    for k in ("HERO_BILLING_DSN", "HERO_PG_DSN", "HERO_CHECKPOINT_DSN"):
+    raw_billing = os.environ.get("HERO_BILLING_DSN", "") or ""
+    if isinstance(raw_billing, str) and raw_billing.strip().startswith(_PG_PREFIXES):
+        return raw_billing.strip()
+    _opt_in = (os.environ.get("HERO_BILLING_ALLOW_SHARED_DB", "") or "").strip().lower() in ("1", "true", "yes", "on")
+    if not _opt_in:
+        return None
+    for k in ("HERO_PG_DSN", "HERO_CHECKPOINT_DSN"):
         raw = os.environ.get(k, "") or ""
         if isinstance(raw, str) and raw.strip().startswith(_PG_PREFIXES):
+            _log_warning(
+                "HERO_BILLING_DSN not set, falling back to %s with shared-DB opt-in (billing/checkpoint share DB)",
+                k,
+                exc_info=False,
+            )
             return raw.strip()
     return None
 
