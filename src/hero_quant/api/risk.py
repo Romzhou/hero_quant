@@ -11,6 +11,61 @@ import math
 
 from fastapi import APIRouter
 
+try:
+    import structlog as _structlog
+
+    _slog = _structlog.get_logger("risk")
+except Exception:
+    _slog = None
+
+# D线收窄支撑：ValidationError 直承 Exception，预取类对象以便显式捕获而非裸 except Exception。
+try:
+    from hero_quant.backtest.validation import ValidationError as _PitValidationError
+except Exception:
+    _PitValidationError = None
+try:
+    from hero_quant.data.registry import CrossSourceError as _CrossSourceError
+except Exception:
+    _CrossSourceError = None
+
+_PIT_CALL_ERRORS = tuple(
+    t for t in (_PitValidationError, RuntimeError, ValueError, OSError, ImportError, AttributeError) if isinstance(t, type)
+)
+_CROSS_CALL_ERRORS = tuple(
+    t for t in (_CrossSourceError, RuntimeError, ValueError, OSError, ImportError, AttributeError) if isinstance(t, type)
+)
+
+_RISK_ERROR_TOTAL = None
+try:
+    from prometheus_client import Counter as _RiskCounter
+    from prometheus_client import REGISTRY as _RiskRegistry
+
+    try:
+        _RISK_ERROR_TOTAL = _RiskCounter(
+            "hero_quant_risk_errors_total", "Total risk probe handled errors", ["op", "error_code"]
+        )
+    except Exception:
+        try:
+            _RISK_ERROR_TOTAL = getattr(_RiskRegistry, "_names_to_collectors", {}).get("hero_quant_risk_errors_total")
+        except Exception:
+            _RISK_ERROR_TOTAL = None
+except Exception:
+    _RISK_ERROR_TOTAL = None
+
+
+def _risk_observe(op: str, error_code: str) -> None:
+    """D线结构化记录 + 指标计数（best-effort，PII/key 永不进日志；链B统一 warning 级）。"""
+    try:
+        if _RISK_ERROR_TOTAL is not None:
+            _RISK_ERROR_TOTAL.labels(op=op, error_code=error_code).inc()
+    except (ValueError, TypeError, AttributeError):
+        pass
+    try:
+        if _slog is not None:
+            _slog.warning("risk." + op, error_code=error_code, chain="B")
+    except (ValueError, TypeError, AttributeError):
+        pass
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
@@ -161,8 +216,9 @@ def _get_pit_status() -> str:
         except (ValueError, OSError) as e:
             logger.warning("pit validation call failed %s", e)
             return "failed"
-        except Exception as e:  # ValidationError is subclass of Exception
-            # narrow but need to catch ValidationError explicitly
+        except _PIT_CALL_ERRORS as e:
+            # D线收窄：仅捕获校验/IO/导入类异常（含直承 Exception 的 ValidationError）；链B warning + 计数。
+            _risk_observe("pit_call_failed", "pit_call_failed")
             try:
                 from hero_quant.backtest.validation import ValidationError as _VE
 
@@ -233,7 +289,9 @@ def _get_cross_source() -> str:
             # CrossSourceError is ValueError subclass
             logger.warning("cross_source check failed %s", e)
             return "fail"
-        except Exception as e:
+        except _CROSS_CALL_ERRORS as e:
+            # D线收窄：仅捕获跨源校验/IO/导入类异常（含 ValueError 子类 CrossSourceError）；链B warning + 计数。
+            _risk_observe("cross_source_call_failed", "cross_source_call_failed")
             try:
                 from hero_quant.data.registry import CrossSourceError as _CE
 

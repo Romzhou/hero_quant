@@ -20,6 +20,7 @@ import os
 import pathlib
 import json
 import asyncio
+import concurrent.futures as _cf_ready
 import threading
 import tempfile
 import itertools
@@ -274,7 +275,9 @@ def _final_answer(llm, q: str, narrative: str, tool_records: list) -> str:
                 _tname = _tt.get("tool") or _tt.get("name") or "unknown"
                 _content = str(_tt.get("content", ""))[:1200]
                 _brief.append(f"[{_tname}] {_content}")
-            except Exception:
+            except (ValueError, TypeError, AttributeError, KeyError) as _e:
+                # D线收窄：链A摘要组装单条失败跳过，debug + error.code（整体回退 narrative，不阻断）。
+                logger.debug("final_summary.brief_skip", error=str(_e), error_code="final_summary_brief_skip")
                 continue
         if not _brief:
             return narrative
@@ -290,7 +293,9 @@ def _final_answer(llm, q: str, narrative: str, tool_records: list) -> str:
         if _chat is not None and hasattr(_chat, "bound"):
             try:
                 _chat = _chat.bound  # RunnableBinding.bound -> 未绑定的原始 ChatOpenAI
-            except Exception:
+            except (ValueError, TypeError, AttributeError, RuntimeError) as _e:
+                # D线收窄：链A clean-chat 回退，debug + error.code。
+                logger.debug("final_summary.bound_fallback", error=str(_e), error_code="final_summary_bound_fallback")
                 pass
         if _chat is None or not callable(getattr(_chat, "invoke", None)):
             # 兜底：重建一个未绑定工具的 LLMClient
@@ -554,8 +559,10 @@ def _warm_imports() -> None:
 
 try:
     threading.Thread(target=_warm_imports, daemon=True).start()
-except Exception:
-    pass
+except (ValueError, TypeError, AttributeError, OSError, RuntimeError) as _e:
+    # D线收窄：后台预热线程起不来仅 warning + 计数，不阻断启动。
+    _inc_api_error("warmup", "thread_start_failed")
+    logger.warning("warmup.thread_start_failed", error=str(_e), error_code="thread_start_failed", exc_info=_e)
 
 # Wave4: risk summary router
 try:
@@ -880,8 +887,6 @@ def _redact_dsn_api(dsn: str) -> str:
 
 
 # ---- D线 /ready 探针基础设施：全局复用池 + TTL 缓存（禁止每次新建 ThreadPoolExecutor） ----
-import concurrent.futures as _cf_ready
-
 _READY_POOL = _cf_ready.ThreadPoolExecutor(max_workers=4, thread_name_prefix="ready-probe")
 _READY_CACHE: dict[str, tuple[float, tuple[bool, str]]] = {}
 _READY_CACHE_LOCK = threading.Lock()
@@ -1360,7 +1365,9 @@ async def query(request: Request, background_tasks: BackgroundTasks, q: str = ""
                 try:
                     model_info = factory.model_for_stage("plan")
                     model_name = model_info.name
-                except Exception:
+                except (ValueError, TypeError, AttributeError, RuntimeError) as _e:
+                    # D线收窄：链A模型选择回退默认，debug + error.code。
+                    logger.debug("llm.model_for_stage_fallback", error=str(_e), error_code="model_for_stage_fallback")
                     model_name = s.llm_model
                 llm = factory.create(model=model_name, api_key=key, streaming=True, temperature=0.2)
                 # ensure LLMClient wrapper
@@ -1375,12 +1382,15 @@ async def query(request: Request, background_tasks: BackgroundTasks, q: str = ""
                         if hasattr(llm, "_chat") and hasattr(llm._chat, "bind_tools"):
                             try:
                                 llm._chat = llm._chat.bind_tools(defs)  # type: ignore
-                            except Exception:
+                            except (ValueError, TypeError, AttributeError, RuntimeError) as _e:
+                                # D线收窄：链A工具绑定失败回退无工具，debug + error.code（外层 tools.bind_failed 已 warning）。
+                                logger.debug("tools.bind_chat_failed", error=str(_e), error_code="tools_bind_failed")
                                 pass
                         elif hasattr(llm, "bind_tools"):
                             try:
                                 llm = llm.bind_tools(defs)  # type: ignore
-                            except Exception:
+                            except (ValueError, TypeError, AttributeError, RuntimeError) as _e:
+                                logger.debug("tools.bind_llm_failed", error=str(_e), error_code="tools_bind_failed")
                                 pass
                 except Exception as _e:
                     logger.warning("tools.bind_failed", error=str(_e))  # intentional: fallback to no tools
@@ -1418,7 +1428,9 @@ async def query(request: Request, background_tasks: BackgroundTasks, q: str = ""
                 trace_dir_path = pathlib.Path(_tmp_dir_obj.name)
                 try:
                     background_tasks.add_task(_tmp_dir_obj.cleanup)
-                except Exception:
+                except (ValueError, TypeError, AttributeError, RuntimeError) as _e:
+                    # D线收窄：链A trace 清理入队失败仅 debug + error.code。
+                    logger.debug("trace.cleanup_enqueue_failed", error=str(_e), error_code="trace_cleanup_enqueue_failed")
                     pass  # BackgroundTask 清理失败忽略
             trace = TraceWriter(trace_dir_path / "trace.jsonl")
         except Exception as _e:
@@ -1544,7 +1556,9 @@ async def query(request: Request, background_tasks: BackgroundTasks, q: str = ""
         try:
             if trace is not None and hasattr(trace, "close"):
                 trace.close()
-        except Exception:
+        except (ValueError, TypeError, AttributeError, OSError, RuntimeError) as _e:
+            # D线收窄：链A TraceWriter 关闭失败 debug + error.code。
+            logger.debug("trace.close_failed", error=str(_e), error_code="trace_close_failed")
             pass
         if _degrade_reasons:
             return _with_degraded_headers(JSONResponse(status_code=200, content=out), _degrade_reasons)
@@ -1705,7 +1719,9 @@ async def query_stream(request: Request, background_tasks: BackgroundTasks, q: s
                     try:
                         model_info = factory.model_for_stage("plan")
                         model_name = model_info.name
-                    except Exception:
+                    except (ValueError, TypeError, AttributeError, RuntimeError) as _e:
+                        # D线收窄：链A模型选择回退默认，debug + error.code。
+                        logger.debug("llm.model_for_stage_fallback", error=str(_e), error_code="model_for_stage_fallback")
                         model_name = s.llm_model
                     llm = factory.create(model=model_name, api_key=key, streaming=True, temperature=0.2)
                     if not isinstance(llm, LLMClient):
@@ -1718,12 +1734,15 @@ async def query_stream(request: Request, background_tasks: BackgroundTasks, q: s
                             if hasattr(llm, "_chat") and hasattr(llm._chat, "bind_tools"):
                                 try:
                                     llm._chat = llm._chat.bind_tools(defs)  # type: ignore
-                                except Exception:
+                                except (ValueError, TypeError, AttributeError, RuntimeError) as _e:
+                                    # D线收窄：链A工具绑定失败回退无工具，debug + error.code。
+                                    logger.debug("tools.bind_chat_failed", error=str(_e), error_code="tools_bind_failed")
                                     pass
                             elif hasattr(llm, "bind_tools"):
                                 try:
                                     llm = llm.bind_tools(defs)  # type: ignore
-                                except Exception:
+                                except (ValueError, TypeError, AttributeError, RuntimeError) as _e:
+                                    logger.debug("tools.bind_llm_failed", error=str(_e), error_code="tools_bind_failed")
                                     pass
                     except Exception as _e:
                         logger.debug("best_effort.failed", error=str(_e))  # intentional offline-safe
@@ -1761,7 +1780,9 @@ async def query_stream(request: Request, background_tasks: BackgroundTasks, q: s
                     trace_dir_path = _pl.Path(_tmp_stream_dir.name)
                     try:
                         background_tasks.add_task(_tmp_stream_dir.cleanup)
-                    except Exception:
+                    except (ValueError, TypeError, AttributeError, RuntimeError) as _e:
+                        # D线收窄：链A trace 清理入队失败仅 debug + error.code。
+                        logger.debug("trace.cleanup_enqueue_failed", error=str(_e), error_code="trace_cleanup_enqueue_failed")
                         pass
                 trace = TraceWriter(trace_dir_path / "trace.jsonl")
             except Exception as _e:
