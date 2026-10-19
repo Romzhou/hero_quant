@@ -8,8 +8,8 @@
 
 ## 结论速览
 
-- 高危：3（已修 0 / 记账 3）；中危：5（记账 5）；低危：7（记账 3 / 无需修 4）
-- 本报告独占文件 `docs/security-audit.md`（I 线不碰）；src 零改动，无 `G: ...` 修复 commit
+- 高危：3（已修 0 / 记账 3，其中 G-03 待 billing 架构专线不动）；中危：5（已修 5）；低危：7（已修 7，其中 G-11~G-15 为加固/回归锁）
+- 本报告独占文件 `docs/security-audit.md`（I 线不碰）；K 线 12 条修复 commit（`K: ...` 前缀，见各条状态行），G-03 不动
 
 ---
 
@@ -55,14 +55,14 @@
   `service.py:1053-1091`（`_pg_delete_purchase_sync` 全程无 SET LOCAL）；
   对照 `migrations/002_billing_rls.sql:37-40`（FORCE RLS）与 `current_tenant()`（`002:3-8`，未设置返回 NULL → `tenant = NULL` 永假）
 - 定级：中（仅真 PG + ledger 失败复合条件下触发；触发后计费行已提交、ledger 无记录，恰是补偿机制声称要消灭的半提交）
-- 状态：记账 → 转 billing 专线（修复方向：补偿删除建连接后先执行双键 SET LOCAL，与 `_pg_insert_purchase_sync:995-1009` 对齐）
+- 状态：已修（`e2708a2`）→ K 线：`_pg_delete_factor_sync` 新增可选 tenant 参（调用方传入归属租户）+ `_set_local_dual_tenant` 双写 `app.tenant`/`app.current_tenant`，`_pg_delete_purchase_sync` 以 buyer 双写后删；与 `_pg_insert_purchase_sync` 对齐，FORCE RLS 下不再静默 no-op
 
 ### G-05 service 层 DSN 回退绕过 settings 共享库 opt-in 门
 - 文件+行号：`src/hero_quant/billing/service.py:215-222`（`_billing_dsn_from_env` 无声回退 `HERO_PG_DSN`/`HERO_CHECKPOINT_DSN`）
   vs `src/hero_quant/config/settings.py:203-230`（必须 `HERO_BILLING_ALLOW_SHARED_DB=1` 显式 opt-in，否则 fail-closed 返回 None，
   注释明示"财务数据与 checkpoint 混库有表冲突/资金完整性风险"）
 - 定级：中（走 service 直连的调用方在未 opt-in 时仍混库；settings 门禁被旁路）
-- 状态：记账 → 转 billing 专线（修复方向：service 回退同样要求 opt-in 环境位，或删除回退只认 `HERO_BILLING_DSN`）
+- 状态：已修（`953fb5c`）→ K 线：service `_billing_dsn_from_env` 回退 `HERO_PG_DSN`/`HERO_CHECKPOINT_DSN` 同 settings 门禁，须 `HERO_BILLING_ALLOW_SHARED_DB=1/true/yes/on` 显式 opt-in，否则 fail-closed 返回 None（未 opt-in 回退记 warning，不静默混库）；`HERO_BILLING_DSN`/显式参数直认不变
 
 ### G-06 票据签发限流 fail-open（异常即放行签发）
 - 文件+行号：`src/hero_quant/api/server.py:1582-1594`
@@ -70,20 +70,20 @@
   对照同文件 `_check_rate_limit:503-538` 的 fail-closed 503 语义 decoration 不一致；
   另限流键 `server.py:1591` `f"ticket:{client_ip}"` 缺 `hero:` 前缀，与 `infra/redis.py:26` 命名空间惯例分叉）
 - 定级：中（Redis 故障/异常时票据无限签发，放大 G-02 冒充面；debug 级日志难被发现）
-- 状态：记账 → 转 D 线（修复方向：异常分支 503 fail-closed + 日志提 warning + 键加 `hero:ratelimit:` 前缀）
+- 状态：已修（`67d27d5`）→ K 线：票据签发限流异常分支 503 fail-closed（`_inc_api_error(ticket, ratelimit_unavailable)` + warning + `ticket.ratelimit_failed_503`，异常类收窄与 `_check_rate_limit` 同口径）；键 `ticket:{ip}` 经 infra RateLimiter 自动落 `hero:ratelimit:` 前缀（`infra/redis.py:53`），与命名空间惯例一致，无分叉
 
 ### G-07 限流键无租户维度（跨租户公平性缺口）
 - 文件+行号：`src/hero_quant/api/server.py:503-538`（key=`{endpoint}:{ip}`）、
   `src/hero_quant/api/rate_limiter.py:34-50`（key=`user:{id}`/`ip:{ip}`，无 tenant 参与）
 - 定级：中（同一出口 IP/NAT 后多租户共享桶；`ip:unknown` 已收敛小桶 `rate_limiter.py:23` + `server.py:509-521` 缓解误伤，
   但反向"单租户打满拖累同 IP 他人"仍存在）
-- 状态：记账 → 转 D 线（修复方向：key 混入 tenant（有身份时），或按 tenant 维度配额；属配额模型变更，需 D 线评估）
+- 状态：已修（`b7c697a`）→ K 线：`rate_limiter.limit_key` 新增 `_extract_tenant`（`request.state.current_tenant/tenant` 或 `user.tenant`），有身份时键为 `user:{id}:tenant:{t}`/`ip:{ip}:tenant:{t}`；`server._check_rate_limit` 同理混入 tenant 后缀；无身份回退 legacy 键（`test_0904_c4` 绿，配额模型向后兼容）
 
 ### G-08 票据无 audience/scope 绑定，query 票可用于 /metrics
 - 文件+行号：`src/hero_quant/api/server.py:1279-1299`（`/metrics` 接受任意有效 `consume_ticket_with_user` 票据，
   注释称"复用 query 的 X-Ticket 票据逻辑"）；签发端 `src/hero_quant/api/security.py:153-195` 无 scope/audience 字段
 - 定级：中（单次消费限制了重放，但端点间权限未隔离；/metrics 鉴权强度被拉低到"任一 query 票"）
-- 状态：记账 → 转 D 线（修复方向：ticket payload 加 `scope`（query/metrics/stream），消费端校验；属契约变更需同步单测）
+- 状态：已修（`f68052f`）→ K 线：ticket payload 加 `scope`（query/metrics/stream，`security._TICKET_SCOPES` 白名单；`issue_ticket(..., scope)`，None=legacy 无分域）；`consume_ticket[_with_user]` 新增 `require_scope`（legacy 迁移期放行，不匹配 fail-closed 销毀 + warning）；`/metrics` 要求 metrics、`/v1/query` 要求 query、stream 接受 query/stream、签发端缺省 query（`test_api/test_sse_ticket` 绿）
 
 ---
 
@@ -93,40 +93,41 @@
 - 文件+行号：`src/hero_quant/api/server.py:879-883`（正则 `://([^:]+):[^@]*@` 要求用户名非空）
   vs `src/hero_quant/config/settings.py:37-45`（已覆盖两种形态）
 - 定级：低（触发需空用户名 DSN + 走 server 脱敏路径打日志；settings 主路径已安全）
-- 状态：记账 → 转 D 线（修复方向：与 settings 共用同一 `_redact_dsn` 实现，消灭分叉）
+- 状态：已修（`cbe699c`）→ K 线：`server._redact_dsn_api` 改为薄委托 `settings._redact_dsn`（正典），分叉消除，`:pass@` 空用户名形态同步覆盖
 
 ### G-10 `_real_pg_publish_sync` 重复定义，首个为死代码
 - 文件+行号：`src/hero_quant/billing/service.py:283-298`（死桩：仅 `__hashed__` 告警返 False 即被覆盖）
   vs `service.py:496-567`（真正实现，SET LOCAL 双写 + commit）
 - 定级：低（当前行为以后定义为准，无功能影响；但"publish 降级语义" зависимости看第 283 行会误判）
-- 状态：记账 → 转 billing 专线（删死定义，保留 `_pg_publish_sync:569` 统一入口注释）
+- 状态：已修（`d7f8c1b`）→ K 线：删首个死定义（`service.py:283-298` 旧桩），保留真实现 + `_pg_publish_sync` 统一入口注释；行为以后定义为准，零行为变化
 
 ### G-11 `HERO_ALLOW_INSECURE` 历史兼容开关
 - 文件+行号：`src/hero_quant/api/security.py:469-490`（`HERO_ALLOW_INSECURE=1` + 非 development/非 pytest 即阻断并告警；
   `HERO_ALLOW_INSECURE_DEV` 另要求 `HERO_ENV=development` + 回环 IP）
 - 定级：低（生产默认 fail-closed：`security.py:491-503` 无 key 即拒绝；开关需多条件同时满足才放行）
-- 状态：无需修（记录在案；建议后续版本删除该兼容分支，届时由 D 线评估单测影响）
+- 状态：已修（加固，`abd51df`）→ K 线：`HERO_ALLOW_INSECURE=1` 命中即 `DeprecationWarning` + warning 可观测（`security.api_key_allow_insecure_legacy_deprecated`），fail-closed 语义不变（非 development 且非 pytest 仍阻断；`test_api_security_real` 绿）；删除该分支待后续版本由 D 线评估单测影响
 
 ### G-12 回测 bundle 缓存键无租户/用户维度
 - 文件+行号：`src/hero_quant/api/server.py:2015-2019`
  （`_backtest_bundle_cache_key()` 参数固定 `{"v":1,...}`，键 `hero:cache:backtest:bundle:{hash}` 全局共享）
 - 定级：低（当前 bundle 为全局合成 demo 数据，无租户私密成分；见 `server.py:2007` 注释）
-- 状态：无需修（前置条件：未来参数/数据按租户分化时，必须把 tenant 混入 hash，否则跨租户串扰；届时由 D 线修）
+- 状态：已修（加固，`c8c6487`）→ K 线：`_backtest_bundle_cache_key(tenant=None)` 可选混入 tenant（非空归一后参与 hash）；`_read/_write_backtest_bundle_cache` 透传；缺省 None 时键与旧全局键完全一致（当前 bundle 仍全局合成 demo 数据，无串扰）
 
 ### G-13 session 模块暂无生产调用点， fixation 面休眠
 - 文件+行号：`src/hero_quant/infra/session.py:31-36`（空 id 抛错禁收敛共享键，好）、
   `session.py:39-94`（set/get 实现）；全仓 grep `set_session(`/`get_session(` 在 `src/` 内无调用方
 - 定级：低（键隔离 `hero:session:` + 归一化 + 128 上限均到位；风险仅在启用时：若 session_id 由客户端供给即 fixation）
-- 状态：无需修（启用前置条件：服务端生成随机 id + 绑定身份，届时由接入线修）
+- 状态：已修（加固，`85bf635`）→ K 线：新增 `generate_session_id()`（`secrets.token_urlsafe(32)`，失败不回退可预测值）+ `create_session(data, owner)`（建会话唯一入口，owner 写入 `_owner` 保留键）+ `check_session_owner()`（常量时间比较）；既有 `set/get` 语义不变（`test_0904_a4` 绿）；调用方须用服务端 id，禁客户端供给 id 建会话
 
 ### G-14 git 历史无密钥入库证据；`.env` 从未被追踪
 - 文件+行号：`.gitignore:6`（`.env` 忽略）；`git ls-files` 无 `.env` 命中；
   `git log -S HERO_LLM_API_KEY` 仅命中 2 个文档类 commit（未展开 patch，未贴值）；
   `git log --all -- .env` 零命中；`git log -S "sk-"` 命中为脱敏/红线修复类 commit（同上未展内容）
 - 定级：低（历史面干净；残余风险仅工作区本地 `.env`，已由 G-01 覆盖）
-- 状态：无需修
+- 状态：已修（回归锁，`293c511`）→ K 线：新增 `tests/test_k_g14_env_guard.py`（`.gitignore` 覆盖 `.env`、正典脱敏覆盖两种 userinfo 形态、server 与正典一致；全程不读 `.env` 真值）；git 历史面结论不变（`.env` 从未追踪，见原备注）
 
-### G-15 已到位的纵深（肯定项，无需修）
+### G-15 已到位的纵深（肯定项，回归锁 `4dbb35b`）
+- 状态：已修（回归锁，`4dbb35b`）→ K 线：新增 `tests/test_k_g15_defense_lock.py` 锁定 6 项（票据原子单次 + scope 隔离运行时、Host fail-closed、compare_digest 存在性、billing RLS DDL 与 migration 只读一致、DSN 键哈希化、未知 sink 回退最严）；src 零改动
 - 票据原子消费：`src/hero_quant/api/security.py:210-234`、`237-271`（GETDEL 优先 → Lua 兜底，无 GET-then-DEL 裸回退；TTL 有界 `153-175`）
 - Host 白名单 fail-closed：`security.py:311-326`（空表拒绝；IPv6/端口规范化 `284-308`）；仅认 `headers.host`（`446-460`）
 - HMAC/API-Key 常量时间比较：`security.py:415`、`435`、`515`；缺 key 缺 secret 一律 False（`355-361`、`491-503`）
@@ -137,19 +138,26 @@
 
 ---
 
-## 未修原因总述
+## 未修原因总述（K 线清账后）
 
-- G 线可写范围仅 `src/hero_quant/api/security/` 目录——该目录在当前树中不存在（鉴权实现实为单文件
-  `src/hero_quant/api/security.py` + `src/hero_quant/security/` 包 + `server.py`/`ws.py` 内联逻辑）。
-- 按任务指令"高危在别处→记账转对应线，不碰；中危一律记账不修"，本轮 src 零改动，无 `G: ...` 修复 commit。
-- 唯一写操作为本报告 `docs/security-audit.md`（G 线独占，I 线不碰）。
+- K 线授权覆盖 `billing/`、`rate_limiter`、`ticket/scope`、`redis` 键、`session`、脱敏、`publish` 去重、
+  `INSECURE` 开关、`backtest` 缓存键 + 独占报告文件；改前均 `git log --oneline -5` 核对，
+  并行 M/L 线提交（checkpoint 脱敏、issue_ticket warning、e2e）经读 diff 确认兼容后下手，无硬上。
+- G-03（billing tenant 归属）按红线不动，待 billing 架构专线；G-01（工作区 `.env` 真值）转 A 线轮换；
+  G-02（票据 user 绑定）已由 D/F 收敛发侧+订阅侧，K 线 G-08 在其上叠加 scope 分域，未改其语义。
+- `migrations/` 全程只读（G-15 锁中仅读 `002` 核对一行，未改）；`.env` 真值禁读（全程未打开）；
+  billing 改动 fail-closed 语义未弱化（无 pool 返 False/None 路径原样保留）。
+- 自验：`ruff check` 所改 7 文件全过；`test_0904_c4` 必跑 + 票据/鉴权/计费/会话/回测子集共 250 项绿（见终态）。
 
-## 转线清单
+## 转线清单（K 线清账后）
 
-| 编号 | 转往 | 文件 |
+| 编号 | 去向 | 文件 |
 |---|---|---|
-| G-01 | A 线 | 工作区 `.env` 轮换 + 占位符化 |
-| G-02 / G-06 / G-07 / G-08 / G-09 | D 线 | `server.py`（D 线独占）+ `ws.py` 身份通道语义 |
-| G-03 / G-04 / G-05 / G-10 | billing 专线（F 线扫荡中，由其认领或单独立专线） | `billing/service.py` |
-| G-12（未来） | D 线 | `server.py:2015-2019` |
-| G-13（未来） | 接入线 | `infra/session.py` 启用时 |
+| G-01 | A 线（未动） | 工作区 `.env` 轮换 + 占位符化 |
+| G-02 | D/F 已收敛（K 未改其语义，G-08 叠加 scope） | `server.py` + `ws.py` 身份通道语义 |
+| G-03 | billing 架构专线（K 红线未动） | `billing/service.py:978,835` + `002:28,58` |
+| G-04 / G-05 / G-10 | K 已修（`e2708a2` / `953fb5c` / `d7f8c1b`） | `billing/service.py` |
+| G-06 / G-07 / G-08 / G-09 / G-12 | K 已修（`67d27d5` / `b7c697a` / `f68052f` / `cbe699c` / `c8c6487`） | `server.py` + `rate_limiter.py` + `security.py` |
+| G-11 | K 加固（`abd51df`，删除待后续版本） | `security.py:469-490` |
+| G-13 | K 加固（`85bf635`） | `infra/session.py` |
+| G-14 / G-15 | K 回归锁（`293c511` / `4dbb35b`） | `tests/test_k_g14|g15_*.py` |
