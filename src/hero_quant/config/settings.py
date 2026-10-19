@@ -143,8 +143,18 @@ def _vector_dsn_from_env() -> str | None:
     return None
 
 
+def _pg_host_from_env() -> str:
+    """PG 主机名唯一切换点（env gate）：本地默认 localhost，compose 内经 HERO_PG_HOST=postgres 切换。
+
+    调用方（server.py 等）不得另写 localhost 硬编码默认值；容器连通性由
+    docker-compose.yml 的 HERO_PG_HOST / HERO_CHECKPOINT_DSN 显式 env 保证。
+    """
+    raw = (os.getenv("HERO_PG_HOST", "") or "").strip()
+    return raw or "localhost"
+
+
 def _checkpoint_dsn_from_env() -> str:
-    """Checkpoint PG DSN：显式配置优先；未配置时回退无口令本地 PG 默认。
+    """Checkpoint PG DSN：显式配置优先；未配置时按 HERO_PG_HOST 回退无口令 PG 默认。
 
     说明：源码不再硬编码任何口令（曾用的 postgres:postgres 已移除）。
     Task7 PG-default 架构被既有单测锁定（test_checkpoint_pg /
@@ -167,9 +177,10 @@ def _checkpoint_dsn_from_env() -> str:
     elif alt and alt.strip():
         warnings.warn(f"HERO_PG_DSN does not look like PG DSN: {_redact_dsn(alt)!r}", UserWarning, stacklevel=2)
         logger.warning("HERO_PG_DSN invalid PG DSN: %r", _redact_dsn(alt))
-    # 未配置：回退无口令本地 PG 默认（Task7 pinning 单测锁定 PG 形态；运行时无池走 emulated/memory）。
-    # 注意：此默认不含任何口令；fail-closed None 需先更新 pinning 单测（open item）。
-    return "postgresql://localhost:5432/hero_quant"
+    # 未配置：按 HERO_PG_HOST 回退无口令 PG 默认（本地 localhost / compose 内 postgres；
+    # Task7 pinning 单测锁定 PG 形态且默认不得含 userinfo，见 test_retest271_lane_e2；
+    # 运行时无池走 emulated/memory）。注意：此默认不含任何口令；fail-closed None 需先更新 pinning 单测（open item）。
+    return f"postgresql://{_pg_host_from_env()}:5432/hero_quant"
 
 
 def _checkpoint_ttl_from_env() -> int:
