@@ -335,7 +335,26 @@ def risk_summary():
         "reject_rate": reject_rate,
     }
     if degraded:
+        # M-round2：AGENTS §6 要求 degraded:true 必须带 reason，不许无因降级。
+        reasons: list[str] = []
+        if turnover is None:
+            reasons.append("turnover_missing")
+        if exposure is None:
+            reasons.append("exposure_missing")
+        if single_limit is None:
+            reasons.append("single_limit_missing")
+        if circuit_threshold is None:
+            reasons.append("circuit_threshold_missing")
+        if reject_rate is None:
+            reasons.append("reject_rate_missing")
+        if circuit == "UNKNOWN":
+            reasons.append("circuit_unknown")
+        if pit == "unknown":
+            reasons.append("pit_unknown")
+        if cross_source == "unknown":
+            reasons.append("cross_source_unknown")
         resp["degraded"] = True
+        resp["reason"] = ";".join(reasons) if reasons else "risk_probe_degraded"
     return resp
 
 
