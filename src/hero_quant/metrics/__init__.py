@@ -12,7 +12,7 @@ import logging
 from typing import Any
 
 try:
-    from prometheus_client import Counter, Gauge, Histogram, REGISTRY  # type: ignore
+    from prometheus_client import Counter, Gauge, Histogram  # type: ignore
 except Exception:  # pragma: no cover - prometheus_client unavailable fallback to stub
     Counter = Histogram = Gauge = None  # type: ignore
     REGISTRY = None  # type: ignore
@@ -53,16 +53,8 @@ def _get_or_create_histogram(name: str, doc: str, labels: list[str], buckets=Non
         h = Histogram(name, doc, **kw)
         return h
     except Exception:
-        # 已注册（重载/测试场景）—— 从 REGISTRY 复用既有收集器（回退到私有 API，仅作兼容）
-        try:
-            if REGISTRY is not None:
-                collectors = getattr(REGISTRY, "_names_to_collectors", {})
-                for cand in (name, f"{name}_bucket", f"{name}_count"):
-                    if cand in collectors:
-                        return collectors[cand]  # type: ignore[attr-defined]
-                return collectors.get(name)  # type: ignore[attr-defined]
-        except Exception:
-            pass
+        # D线：彻底去私有名；重复注册（重载/测试场景）时降级为 None（best-effort 观测），
+        # 公共 API 无按名取回收集器的能力，不用 REGISTRY 私有 API 复用。
         return None
 
 
@@ -74,11 +66,7 @@ def _get_or_create_counter(name: str, doc: str, labels: list[str]):
         c = Counter(name, doc, labels)
         return c
     except Exception:
-        try:
-            if REGISTRY is not None and name in getattr(REGISTRY, "_names_to_collectors", {}):
-                return REGISTRY._names_to_collectors[name]  # type: ignore[attr-defined]
-        except Exception:
-            pass
+        # D线：彻底去私有名；重复注册时降级为 None（best-effort 计数）。
         return None
 
 
@@ -93,11 +81,7 @@ def _get_or_create_gauge(name: str, doc: str, labels: list[str] | None = None):
             g = Gauge(name, doc)
         return g
     except Exception:
-        try:
-            if REGISTRY is not None and name in getattr(REGISTRY, "_names_to_collectors", {}):
-                return REGISTRY._names_to_collectors[name]  # type: ignore[attr-defined]
-        except Exception:
-            pass
+        # D线：彻底去私有名；重复注册时降级为 None（best-effort 观测）。
         return None
 
 
