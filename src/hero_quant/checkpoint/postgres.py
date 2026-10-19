@@ -236,10 +236,14 @@ _READ_ORDER_SQL_LEGACY = "SELECT checkpoint, config FROM checkpoints_legacy WHER
 
 def _redact_dsn(dsn: str) -> str:
     """脱敏 DSN 密码，日志仅输出 ***，保持 exc_info=True。"""
+    # M-round2：与 settings._redact_dsn 对齐，同时覆盖 user:pass@ 与 :pass@（空用户名）
+    # 两种带口令形态（此前 [^:]+ 要求用户名非空，空用户名 DSN 的口令会明文进日志）。
+    if not isinstance(dsn, str) or "://" not in dsn:
+        return "***"
     try:
         import re as _re
-        return _re.sub(r"://([^:]+):[^@]*@", r"://\1:***@", dsn)
-    except Exception:
+        return _re.sub(r"://([^/@]*):[^@]*@", r"://\1:***@", dsn)
+    except (TypeError, ValueError, AttributeError):
         return "***"
 
 
