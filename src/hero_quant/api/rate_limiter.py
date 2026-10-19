@@ -31,13 +31,36 @@ except ImportError:
     SLOWAPI_AVAILABLE = False  # intentional: slowapi 可选依赖；缺失即走 infra RateLimiter 单实现
 
 
+def _extract_tenant(request: Request) -> str | None:
+    """提取租户维度（有身份时混入限流键）：request.state.current_tenant/tenant 或 user.tenant。
+
+    中文：G-07——同一出口 IP/NAT 后多租户共享桶时，单租户打满拖累同 IP 他人；
+    有租户身份时键混入 tenant 实现配额隔离；无身份时回退 legacy 键（兼容旧单测）。
+    """
+    try:
+        state = getattr(request, "state", None)
+        for _attr in ("current_tenant", "tenant"):
+            _t = getattr(state, _attr, None) if state is not None else None
+            if isinstance(_t, str) and _t.strip():
+                return _t.strip()
+        user = getattr(state, "current_user", None) if state is not None else None
+        _ut = getattr(user, "tenant", None) if user is not None else None
+        if isinstance(_ut, str) and _ut.strip():
+            return _ut.strip()
+    except (AttributeError, TypeError, ValueError):
+        return None
+    return None
+
+
 def limit_key(request: Request) -> str:
-    """限流 key：优先已认证 user_id，否则回退客户端 IP。"""
+    """限流 key：优先已认证 user_id，否则回退客户端 IP；有租户身份时混入 tenant 隔离。"""
     user = getattr(getattr(request, "state", None), "current_user", None)
     uid = getattr(user, "id", None) if user is not None else None
+    tenant = _extract_tenant(request)
+    _tenant_suffix = f":tenant:{tenant}" if tenant else ""
     # 显式 is not None 判定：0 为合法 id，不得当匿名
     if uid is not None and uid != "":
-        return f"user:{uid}"
+        return f"user:{uid}{_tenant_suffix}"
     try:
         ip = getattr(getattr(request, "client", None), "host", None) or "unknown"
     except Exception:
@@ -46,7 +69,7 @@ def limit_key(request: Request) -> str:
         # 可观测性：缺失 IP 的调用方全部折叠进同一 ip:unknown 桶（单 actor 可
         # 耗尽配额误伤他人；反向代理后未取真实 IP 时同理），打 warning 暴露配置问题。
         logger.warning("ratelimiter.unknown_ip endpoint_bucket_fallback")
-    return f"ip:{ip}"
+    return f"ip:{ip}{_tenant_suffix}"
 
 
 # slowapi 实例仅用于 app.state 接线（生产 gate）；配额判定走 infra RateLimiter 单实现。

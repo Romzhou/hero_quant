@@ -512,6 +512,18 @@ def _check_rate_limit(request: Request | None, endpoint: str, max_requests: int,
         _ip = _client_ip(request)
     except (ValueError, TypeError, AttributeError):
         _ip = "unknown"
+    # 中文：G-07——有租户身份时键混入 tenant（配额按租户隔离，防单租户打满拖累同 IP 他人）；
+    # 无身份时回退 legacy {endpoint}:{ip} 键（兼容旧行为）。
+    _tenant_suffix = ""
+    try:
+        _state = getattr(request, "state", None) if request is not None else None
+        for _tattr in ("current_tenant", "tenant"):
+            _tv = getattr(_state, _tattr, None) if _state is not None else None
+            if isinstance(_tv, str) and _tv.strip():
+                _tenant_suffix = f":tenant:{_tv.strip()}"
+                break
+    except (ValueError, TypeError, AttributeError):
+        _tenant_suffix = ""
     if _ip == "unknown":
         try:
             from hero_quant.api.rate_limiter import UNKNOWN_IP_SMALL_MAX as _UNKNOWN_SMALL
@@ -522,7 +534,7 @@ def _check_rate_limit(request: Request | None, endpoint: str, max_requests: int,
     try:
         from hero_quant.infra.redis import RateLimiter
 
-        if not RateLimiter().try_acquire_sync(f"{endpoint}:{_ip}", _quota, window_seconds):
+        if not RateLimiter().try_acquire_sync(f"{endpoint}:{_ip}{_tenant_suffix}", _quota, window_seconds):
             return JSONResponse(status_code=429, content={"detail": f"Too many {endpoint} requests"})
     except (ImportError, AttributeError, TypeError, ValueError, ConnectionError, TimeoutError, OSError, RuntimeError) as _e:
         # D线收窄：仅捕获限流器可预期的导入/参数/连接/超时/运行时异常；链A限流失败 warning + 指标计数，fail-closed 503。
