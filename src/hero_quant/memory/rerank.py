@@ -11,7 +11,7 @@ logger = logging.getLogger("hero_quant.memory.rerank")
 
 # prometheus counter or simple fallback
 try:
-    from prometheus_client import Counter, REGISTRY  # type: ignore
+    from prometheus_client import Counter  # type: ignore
 
     try:
         rerank_fallback_total = Counter(
@@ -19,24 +19,19 @@ try:
             "Total Cohere rerank fallback events",
         )
     except Exception:
-        # duplicate registration reuse
-        try:
-            rerank_fallback_total = REGISTRY._names_to_collectors.get("hero_quant_rerank_fallback_total")  # type: ignore
-            if rerank_fallback_total is None:
-                raise KeyError
-        except Exception:
-            # fallback simple counter
-            class _SimpleCounter:
-                def __init__(self):
-                    self._value = 0
+        # D线：彻底去私有名；重复注册时直接用本地 _SimpleCounter（best-effort 计数）。
+        # fallback simple counter
+        class _SimpleCounter:
+            def __init__(self):
+                self._value = 0
 
-                def inc(self, amount=1):
-                    self._value += amount
+            def inc(self, amount=1):
+                self._value += amount
 
-                def _get(self):
-                    return self._value
+            def _get(self):
+                return self._value
 
-            rerank_fallback_total = _SimpleCounter()  # type: ignore
+        rerank_fallback_total = _SimpleCounter()  # type: ignore
 except Exception:
     # prometheus not available
     class _SimpleCounter:
