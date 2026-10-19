@@ -69,6 +69,111 @@ structlog.configure(
 
 logger = structlog.get_logger("api")
 
+# ---- D线可观测 helpers（唯一维护者：D线；链路分级/脱敏/计数集中于此） ----
+# 链路分级：链A问答（query/stream/ticket/trace/loop/llm/grounding/final_summary/shadow）
+#   异常升级 warning/error；链B回测（backtest/billing/checkpoint/risk/ready）异常 warning；
+#   离线可选链路（otel/metrics/warmup）保持 debug + error.code，不阻断主流程。
+# 日志铁律：PII/API key 永不进日志；DSN 只记脱敏 host（_dsn_host），密码段一律 ***。
+_FAKE_LLM_REASON = "missing HERO_API_KEY, synthetic placeholder response"
+_EMULATED_CHECKPOINT_REASON = "checkpoint PG unreachable or unconfigured, emulated store in use"
+_DEGRADED_HEADER = "X-Degraded"
+_DEGRADED_REASON_HEADER = "X-Degrade-Reason"
+
+API_ERROR_TOTAL = None
+try:
+    from prometheus_client import Counter as _DLineCounter
+    from prometheus_client import REGISTRY as _DLineRegistry
+
+    try:
+        API_ERROR_TOTAL = _DLineCounter(
+            "hero_quant_api_errors_total", "Total API handled errors", ["endpoint", "error_code"]
+        )
+    except Exception:
+        try:
+            API_ERROR_TOTAL = getattr(_DLineRegistry, "_names_to_collectors", {}).get("hero_quant_api_errors_total")
+        except Exception:
+            API_ERROR_TOTAL = None
+except Exception:
+    API_ERROR_TOTAL = None
+
+
+def _inc_api_error(endpoint: str, error_code: str) -> None:
+    """D线错误计数（best-effort，永不抛）。"""
+    try:
+        if API_ERROR_TOTAL is not None:
+            API_ERROR_TOTAL.labels(endpoint=endpoint, error_code=error_code).inc()
+    except (ValueError, TypeError, AttributeError):
+        pass
+
+
+def _dsn_host(dsn: str | None) -> str:
+    """脱敏 dsn_host：只保留 host[:port]，user/password/query 一律丢弃，永不泄露凭据/PII。"""
+    try:
+        s = str(dsn or "")
+        if "://" in s:
+            s = s.split("://", 1)[1]
+        if "@" in s:
+            s = s.split("@", 1)[1]
+        host = s.split("/", 1)[0].split("?", 1)[0].strip()
+        return host or "***"
+    except (ValueError, TypeError, AttributeError):
+        return "***"
+
+
+def _is_emulated_saver(saver: object) -> tuple[bool, str]:
+    """判断 checkpoint saver 是否 emulated（非真实 PG）：pool 缺失或非 real 即 degraded。"""
+    try:
+        if saver is None:
+            return True, "checkpoint saver unavailable, memory fallback"
+        is_real = getattr(saver, "_is_real_pg_pool", None)
+        if callable(is_real):
+            try:
+                if bool(is_real()):
+                    return False, ""
+            except (ValueError, TypeError, AttributeError, OSError, RuntimeError) as _e:
+                _inc_api_error("checkpoint", "emulated_probe_failed")
+                logger.warning(
+                    "checkpoint.emulated_probe_failed",
+                    error_code="emulated_probe_failed",
+                    dsn_host="***",
+                    exc_info=_e,
+                )
+                return True, _EMULATED_CHECKPOINT_REASON
+            return True, _EMULATED_CHECKPOINT_REASON
+        if hasattr(saver, "_is_pg_mode"):
+            try:
+                if bool(saver._is_pg_mode()):
+                    if getattr(saver, "pool", None) is not None:
+                        return False, ""
+            except (ValueError, TypeError, AttributeError, OSError, RuntimeError) as _e:
+                _inc_api_error("checkpoint", "emulated_probe_failed")
+                logger.warning(
+                    "checkpoint.emulated_probe_failed",
+                    error_code="emulated_probe_failed",
+                    dsn_host="***",
+                    exc_info=_e,
+                )
+                return True, _EMULATED_CHECKPOINT_REASON
+            return True, _EMULATED_CHECKPOINT_REASON
+        if getattr(saver, "pool", None) is not None:
+            return False, ""
+        return True, _EMULATED_CHECKPOINT_REASON
+    except (ValueError, TypeError, AttributeError, OSError, RuntimeError) as _e:
+        _inc_api_error("checkpoint", "emulated_check_failed")
+        logger.warning("checkpoint.emulated_check_failed", error_code="emulated_check_failed", dsn_host="***", exc_info=_e)
+        return True, _EMULATED_CHECKPOINT_REASON
+
+
+def _with_degraded_headers(resp: JSONResponse, reasons: list[str]) -> JSONResponse:
+    """给降级响应附加响应头 X-Degraded/X-Degrade-Reason（body 侧由调用方置 degraded:true + reason）。"""
+    try:
+        resp.headers[_DEGRADED_HEADER] = "true"
+        if reasons:
+            resp.headers[_DEGRADED_REASON_HEADER] = "; ".join(r for r in reasons if r)[:512]
+    except (ValueError, TypeError, AttributeError):
+        pass
+    return resp
+
 # 预注册 metrics 加固指标（wall-time、ledger、去重等），失败不影响主流程
 try:
     import hero_quant.metrics  # noqa: F401  # registers WALL_TIME_SECONDS, etc.
@@ -231,7 +336,15 @@ def _get_checkpoint_saver():
                     saver = _Saver(dsn)  # pool will be None, but is_pg_mode=True so global emulated store is used
                     saver._setup_done = True  # skip setup DDL which would try to connect
                     _checkpoint_saver_cache[dsn] = saver
-                    logger.info("checkpoint.wired", dsn=dsn, mode="pg-emulated")
+                    logger.info(
+                        "checkpoint.wired",
+                        dsn=_redact_dsn_api(dsn),
+                        dsn_host=_dsn_host(dsn),
+                        mode="pg-emulated",
+                        degraded=True,
+                        reason=_EMULATED_CHECKPOINT_REASON,
+                        error_code="checkpoint_emulated",
+                    )
                     return saver
                 # When TRY_PG=1, do a quick 1s probe before full connect
                 _probe = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
@@ -250,7 +363,15 @@ def _get_checkpoint_saver():
                     saver = _Saver2(dsn)
                     saver._setup_done = True
                     _checkpoint_saver_cache[dsn] = saver
-                    logger.info("checkpoint.wired", dsn=dsn, mode="pg-emulated")
+                    logger.info(
+                        "checkpoint.wired",
+                        dsn=_redact_dsn_api(dsn),
+                        dsn_host=_dsn_host(dsn),
+                        mode="pg-emulated",
+                        degraded=True,
+                        reason=_EMULATED_CHECKPOINT_REASON,
+                        error_code="checkpoint_emulated",
+                    )
                     return saver
                 except Exception:
                     pass
@@ -378,8 +499,16 @@ def _check_rate_limit(request: Request | None, endpoint: str, max_requests: int,
 
         if not RateLimiter().try_acquire_sync(f"{endpoint}:{_ip}", _quota, window_seconds):
             return JSONResponse(status_code=429, content={"detail": f"Too many {endpoint} requests"})
-    except Exception as _e:
-        logger.warning(f"{endpoint}.ratelimit_failed_503 error={_e}")
+    except (ImportError, AttributeError, TypeError, ValueError, ConnectionError, TimeoutError, OSError, RuntimeError) as _e:
+        # D线收窄：仅捕获限流器可预期的导入/参数/连接/超时/运行时异常；链A限流失败 warning + 指标计数，fail-closed 503。
+        _inc_api_error(endpoint, "ratelimit_unavailable")
+        logger.warning(
+            f"{endpoint}.ratelimit_failed_503",
+            error=str(_e),
+            error_code="ratelimit_unavailable",
+            endpoint=endpoint,
+            exc_info=_e,
+        )
         return JSONResponse(status_code=503, content={"detail": "Rate limiter unavailable"})
     return None
 
@@ -604,8 +733,11 @@ async def add_request_id_and_otel(request: Request, call_next):
 
                 _t = asyncio.create_task(_otel_export_bg())
                 _t.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
-            except Exception as _e:
-                logger.debug("otel.export.failed", error=str(_e), exc_info=_e)  # intentional: offline-safe OTel best-effort
+            except (RuntimeError, ValueError, TypeError, AttributeError) as _e:
+                # D线收窄：create_task 仅抛 RuntimeError（无运行 loop/已关闭）与回调参数错误；
+                # 离线可选链路保持 debug + error.code + 计数，不阻断主流程。
+                _inc_api_error("otel", "export_enqueue_failed")
+                logger.debug("otel.export.failed", error=str(_e), error_code="export_enqueue_failed", exc_info=_e)  # intentional: offline-safe OTel best-effort
                 pass  # intentional offline-safe
     except Exception as _e:
         logger.debug("otel.middleware_failed", error=str(_e), exc_info=_e)  # intentional: offline-safe telemetry optional
@@ -726,6 +858,97 @@ def _redact_dsn_api(dsn: str) -> str:
         return "***"
 
 
+# ---- D线 /ready 探针基础设施：全局复用池 + TTL 缓存（禁止每次新建 ThreadPoolExecutor） ----
+import concurrent.futures as _cf_ready
+
+_READY_POOL = _cf_ready.ThreadPoolExecutor(max_workers=4, thread_name_prefix="ready-probe")
+_READY_CACHE: dict[str, tuple[float, tuple[bool, str]]] = {}
+_READY_CACHE_LOCK = threading.Lock()
+_READY_CACHE_TTL_SECONDS = 5.0
+
+
+def _ready_cached_probe(key: str, probe) -> tuple[tuple[bool, str], bool]:
+    """readiness 缓存：TTL 内复用探针结果，避免每次 /ready 都打 PG SELECT 1。返回 (result, cached)。"""
+    now = time.monotonic()
+    try:
+        with _READY_CACHE_LOCK:
+            hit = _READY_CACHE.get(key)
+            if hit is not None and (now - hit[0]) < _READY_CACHE_TTL_SECONDS:
+                return hit[1], True
+    except (ValueError, TypeError, AttributeError, OSError, RuntimeError) as _e:
+        logger.debug("ready.cache_read_failed", error=str(_e), error_code="ready_cache_read_failed", key=key)
+    result = probe()
+    try:
+        with _READY_CACHE_LOCK:
+            _READY_CACHE[key] = (now, result)
+    except (ValueError, TypeError, AttributeError, OSError, RuntimeError) as _e:
+        logger.debug("ready.cache_store_failed", error=str(_e), error_code="ready_cache_store_failed", key=key)
+    return result, False
+
+
+def _ready_run_with_timeout(fn, timeout: float = 2.0):
+    """经全局 _READY_POOL 执行探针 SELECT，超时 fail-closed（cancel 后抛 TimeoutError，由调用方降级）。"""
+    fut = _READY_POOL.submit(fn)
+    try:
+        return fut.result(timeout=timeout)
+    except _cf_ready.TimeoutError:
+        try:
+            fut.cancel()
+        except (ValueError, TypeError, AttributeError, RuntimeError):
+            pass
+        raise
+
+
+def _check_checkpoint_pg_full() -> tuple[tuple[bool, str, str], bool]:
+    """全量 checkpoint 探针：(ok, mode, reason) + 是否命中缓存。缺配/不可达一律 fail-closed 为 memory，reason 透出。"""
+    (ok, mode), cached = _ready_cached_probe("checkpoint", _check_checkpoint_pg)
+    reason = ""
+    if not ok:
+        try:
+            from hero_quant.config.settings import Settings
+
+            _s = Settings()
+            _dsn = getattr(_s, "checkpoint_dsn", None) or ""
+            if not _is_pg_dsn_ready(_dsn):
+                # checkpoint/postgres.py 缺配行为透到 /ready：无 PG DSN 即 fail-closed，不静默。
+                reason = "checkpoint PG DSN 缺配 fail-closed(memory)"
+                logger.warning(
+                    "ready.checkpoint_dsn_missing",
+                    error_code="checkpoint_dsn_missing",
+                    dsn_host="***",
+                )
+            else:
+                reason = "checkpoint PG unreachable or not real pool, fail-closed(memory)"
+        except (ValueError, TypeError, AttributeError, OSError, RuntimeError) as _e:
+            reason = "checkpoint probe failed fail-closed(memory)"
+            logger.warning("ready.checkpoint_reason_failed", error_code="checkpoint_reason_failed", exc_info=_e)
+    return (ok, mode, reason), cached
+
+
+def _check_billing_pg_full() -> tuple[tuple[bool, str, str], bool]:
+    """全量 billing 探针：(ok, mode, reason) + 是否命中缓存。HERO_BILLING_DSN 为空即 fail-closed，reason 透出。"""
+    (ok, mode), cached = _ready_cached_probe("billing", _check_billing_pg)
+    reason = ""
+    if not ok:
+        try:
+            from hero_quant.config.settings import Settings
+
+            _s = Settings()
+            _dsn = getattr(_s, "billing_dsn", None) or ""
+            if not _dsn:
+                # billing fail-closed：空 DSN 不得静默旁路，显式 reason 透到 /ready。
+                reason = "billing DSN 缺配 fail-closed(memory)"
+                logger.warning("ready.billing_dsn_missing", error_code="billing_dsn_missing", dsn_host="***")
+            elif not _is_pg_dsn_ready(_dsn):
+                reason = "billing DSN 非 PG fail-closed(memory)"
+            else:
+                reason = "billing PG unreachable or not real pool, fail-closed(memory)"
+        except (ValueError, TypeError, AttributeError, OSError, RuntimeError) as _e:
+            reason = "billing probe failed fail-closed(memory)"
+            logger.warning("ready.billing_reason_failed", error_code="billing_reason_failed", exc_info=_e)
+    return (ok, mode, reason), cached
+
+
 def _check_checkpoint_pg() -> tuple[bool, str]:
     """实探 checkpoint PG：仅当 _is_real_pg_pool 且 SELECT 1 成功才算 pg_ok，否则 fail-closed 为 memory。"""
     try:
@@ -788,14 +1011,22 @@ def _check_checkpoint_pg() -> tuple[bool, str]:
                             logger.warning("ready.checkpoint_putconn_failed", dsn=_redact_dsn_api(dsn), exc_info=_e)
                 else:
                     raise RuntimeError("pool has no connection/getconn")
-            # 中文：超时必传，避免无超时阻塞探测
-            with _cf.ThreadPoolExecutor(max_workers=1) as _ex:
-                fut = _ex.submit(_do_checkpoint_select)
+            # 中文：超时必传，避免无超时阻塞探测（D线：复用全局 _READY_POOL，禁止每次新建池）
+            fut = _READY_POOL.submit(_do_checkpoint_select)
+            try:
+                fut.result(timeout=2)
+            except _cf.TimeoutError:
                 try:
-                    fut.result(timeout=2)
-                except _cf.TimeoutError:
-                    logger.warning("ready.checkpoint_select_timeout", dsn=_redact_dsn_api(dsn))
-                    return False, "memory"
+                    fut.cancel()
+                except (ValueError, TypeError, AttributeError, RuntimeError):
+                    pass
+                logger.warning(
+                    "ready.checkpoint_select_timeout",
+                    dsn=_redact_dsn_api(dsn),
+                    dsn_host=_dsn_host(dsn),
+                    error_code="checkpoint_select_timeout",
+                )
+                return False, "memory"
         except Exception as _e:
             if "TimeoutError" in type(_e).__name__ or "timeout" in str(_e).lower():
                 logger.warning("ready.checkpoint_select_timeout", dsn=_redact_dsn_api(dsn), exc_info=_e)
@@ -871,14 +1102,22 @@ def _check_billing_pg() -> tuple[bool, str]:
                             logger.warning("ready.billing_putconn_failed", dsn=_redact_dsn_api(dsn or ""), exc_info=_e)
                 else:
                     raise RuntimeError("pool has no connection/getconn")
-            # 中文：超时必传，避免无超时阻塞探测
-            with _cf2.ThreadPoolExecutor(max_workers=1) as _ex2:
-                fut = _ex2.submit(_do_billing_select)
+            # 中文：超时必传，避免无超时阻塞探测（D线：复用全局 _READY_POOL，禁止每次新建池）
+            fut = _READY_POOL.submit(_do_billing_select)
+            try:
+                fut.result(timeout=2)
+            except _cf2.TimeoutError:
                 try:
-                    fut.result(timeout=2)
-                except _cf2.TimeoutError:
-                    logger.warning("ready.billing_select_timeout", dsn=_redact_dsn_api(dsn or ""))
-                    return False, "memory"
+                    fut.cancel()
+                except (ValueError, TypeError, AttributeError, RuntimeError):
+                    pass
+                logger.warning(
+                    "ready.billing_select_timeout",
+                    dsn=_redact_dsn_api(dsn or ""),
+                    dsn_host=_dsn_host(dsn),
+                    error_code="billing_select_timeout",
+                )
+                return False, "memory"
         except Exception as _e:
             if "TimeoutError" in type(_e).__name__ or "timeout" in str(_e).lower():
                 logger.warning("ready.billing_select_timeout", dsn=_redact_dsn_api(dsn or ""), exc_info=_e)
@@ -928,16 +1167,24 @@ def _check_cohere() -> bool:
 
 
 @app.get("/ready")
-def ready():
-    """就绪探针：聚合 degraded — probe PG (checkpoint), Cohere health, 返回 pg/checkpoint/billing."""
+def ready(mode: str = "ready"):
+    """就绪探针：聚合 degraded — probe PG (checkpoint), Cohere health, 返回 pg/checkpoint/billing。
+
+    liveness/readiness 分流：mode=live 仅返回进程存活（不打 PG/网络探针，恒 200，由 /live 承担纯存活语义，
+    /ready?mode=live 为其轻量别名）；默认 mode=ready 做全量就绪探针（5s 缓存 + 全局池超时 fail-closed）。
+    checkpoint 缺配与 billing fail-closed 以 reasons 透出；整体 degraded 时 503 + degraded:true + reason。
+    """
     if REQUEST_COUNTER is not None:
         try:
             REQUEST_COUNTER.labels(endpoint="/ready").inc()
         except Exception as _e:
             logger.debug("metrics.counter_failed", error=str(_e))
+    if str(mode or "").strip().lower() == "live":
+        # liveness：进程存活即 ok，不触发任何外部探针
+        return {"status": "ok", "mode": "live"}
     s = None  # 预定义避免 UnboundLocalError
-    pg_ok, checkpoint_mode = _check_checkpoint_pg()
-    billing_ok, billing_mode = _check_billing_pg()
+    (pg_ok, checkpoint_mode, checkpoint_reason), _ckpt_cached = _check_checkpoint_pg_full()
+    (billing_ok, billing_mode, billing_reason), _bill_cached = _check_billing_pg_full()
     cohere_ok = _check_cohere()
     # overall status: degraded if PG expected but unreachable or Cohere unhealthy
     # Determine if PG was expected
@@ -947,19 +1194,48 @@ def ready():
         s = Settings()
         exp_dsn = getattr(s, "checkpoint_dsn", "") or ""
         expect_pg = _is_pg_dsn_ready(exp_dsn)
-    except Exception:
+        billing_dsn = getattr(s, "billing_dsn", None) or ""
+        expect_billing_pg = _is_pg_dsn_ready(billing_dsn)
+    except (ValueError, TypeError, AttributeError, OSError, RuntimeError):
         expect_pg = False
+        expect_billing_pg = False
     # If PG expected and not ok => degraded, else check cohere
     if expect_pg and not pg_ok:
         status = "degraded"
     elif not cohere_ok:
         status = "degraded"
-    elif not billing_ok and _is_pg_dsn_ready(getattr(s, "billing_dsn", None) or ""):
+    elif expect_billing_pg and not billing_ok:
         # billing degraded only if billing PG was expected but not ok
         status = "degraded"
     else:
         status = "ok"
-    body = {"status": status, "pg": pg_ok, "checkpoint": checkpoint_mode, "billing": billing_mode}
+    reasons: dict[str, str] = {}
+    if checkpoint_reason:
+        reasons["checkpoint"] = checkpoint_reason
+    if billing_reason:
+        reasons["billing"] = billing_reason
+    if not cohere_ok:
+        reasons["cohere"] = "cohere unhealthy or key missing"
+    degraded = status != "ok"
+    if degraded:
+        _inc_api_error("ready", "degraded")
+        logger.warning(
+            "ready.degraded",
+            error_code="ready_degraded",
+            status=status,
+            checkpoint=checkpoint_mode,
+            billing=billing_mode,
+            reasons=reasons,
+        )
+    body = {
+        "status": status,
+        "degraded": degraded,
+        "pg": pg_ok,
+        "checkpoint": checkpoint_mode,
+        "billing": billing_mode,
+        "reasons": reasons,
+        "cached": {"checkpoint": bool(_ckpt_cached), "billing": bool(_bill_cached)},
+    }
     # return 503 when degraded to satisfy spec "503 or degraded json", but keep 200 for ok
     code = 200 if status == "ok" else 503
     # For backward compat with tests that expect 200 even degraded, we still return 200 if they check json degraded;
@@ -967,7 +1243,10 @@ def ready():
     # To keep existing frontend test (checks /ready 200) green when default is PG but emulated PG is ok, status will be ok -> 200.
     # Only mocked PG down will be degraded -> 503, which new test accepts as degraded.
     if status == "degraded":
-        return JSONResponse(status_code=code, content=body)
+        return _with_degraded_headers(
+            JSONResponse(status_code=code, content=body),
+            [reasons.get("checkpoint", ""), reasons.get("billing", ""), reasons.get("cohere", "")],
+        )
     return body
 
 
