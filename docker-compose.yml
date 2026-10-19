@@ -81,6 +81,7 @@ services:
     env_file:
       - .env
     environment:
+      HERO_PG_HOST: postgres
       HERO_CHECKPOINT_DSN: postgresql://heroquant:heroquant@postgres:5432/heroquant
       HERO_REDIS_DSN: redis://redis:6379/0
       HERO_OTEL_MODE: shared

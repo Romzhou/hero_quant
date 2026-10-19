@@ -101,4 +101,5 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8899/live')" || exit 1
 
 # Run API server (serves frontend/dist as static files)
-CMD ["python", "-m", "uvicorn", "hero_quant.api.server:app", "--host", "0.0.0.0", "--port", "8899"]
+# 标准启动：uvicorn hero_quant.api.server:app --port 8899（与 README 快速开始对齐）
+CMD ["uvicorn", "hero_quant.api.server:app", "--host", "0.0.0.0", "--port", "8899"]
