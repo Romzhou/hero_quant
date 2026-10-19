@@ -8,6 +8,8 @@
  */
 import { useEffect, useRef, useState } from "react"
 import { useChatStore } from "../store/chat"
+import DegradedBanner from "../components/DegradedBanner"
+import { detectDegradedFromText, extractDegradedReason, isDegradedPayload } from "../config/degraded"
 
 type ToolCall = { id: string; tool: string; status: "pending" | "success" | "error"; latencyMs?: number; preview?: string }
 
@@ -50,11 +52,15 @@ function isProtocolNoise(raw: string): boolean {
 }
 
 // 纯函数：统一解析 SSE payload，fetch 回退与 EventSource 共用
-export function parseSseData(raw: string): { kind: "delta" | "tool" | "error"; delta?: string; tool?: { tool: string; status: ToolCall["status"]; preview?: string; latencyMs?: number; rawId?: string }; error?: string } | null {
+// degraded 分支：D 线约定 `{ degraded: true, reason }`（待落地）；落地前文本兜底由 detectDegradedFromText 覆盖
+export function parseSseData(raw: string): { kind: "delta" | "tool" | "error" | "degraded"; delta?: string; degraded?: { reason: string | null }; tool?: { tool: string; status: ToolCall["status"]; preview?: string; latencyMs?: number; rawId?: string }; error?: string } | null {
   if (!raw || raw === SSE_DONE) return null
   try {
     const j = JSON.parse(raw) as Record<string, unknown>
-    if (j.type === "tool") {
+    // 降级优先判定：显式 degraded 载荷直接路由为横幅，不进入正文/轨迹
+    if (isDegradedPayload(j)) {
+      return { kind: "degraded", degraded: { reason: extractDegradedReason(j) } }
+    }    if (j.type === "tool") {
       const rawName = j.tool ?? j.name
       const tname = typeof rawName === "string" && rawName ? rawName : "unknown_tool"
       // 枚举白名单：未知 status 回退 success，避免 TOOL_STATUS_CLASS[t.status] 为 undefined 污染 className
@@ -86,6 +92,8 @@ export function parseSseData(raw: string): { kind: "delta" | "tool" | "error"; d
 export default function Chat() {
   const { messages, input, streaming, setInput, push, setStreaming } = useChatStore()
   const [error, setError] = useState<string | null>(null)
+  // 降级横幅：收到 degraded 载荷或命中合成演示文本标记时置位，send() 开新一轮时清零
+  const [degraded, setDegraded] = useState<string | null>(null)
   const [traceByMsgId, setTraceByMsgId] = useState<Record<string, ToolCall[]>>({})
   // 活跃消息 id 用 state 而非 ref：render 期读取 ref 不会触发重渲染，占位条会 stale
   const [activeAid, setActiveAid] = useState<string | null>(null)
@@ -194,6 +202,7 @@ export default function Chat() {
     setInput("")
     setStreaming(true)
     setError(null)
+    setDegraded(null)
 
     const aid = safeUUID()
     push({ id: aid, role: "assistant", content: "" })
@@ -264,6 +273,10 @@ export default function Chat() {
       if (!isAlive()) return
       hasDelta = true
       acc += delta
+      // 兼容兜底：D 线落地 `degraded:true` 前，_FakeLLM 仅在文本中写“演示模式”；
+      // 命中标记即点亮横幅（幂等：首个命中后不再覆盖后端显式 reason）
+      const fallback = detectDegradedFromText(delta)
+      if (fallback) setDegraded(prev => prev ?? fallback)
       // 直接写 Zustand，避免闭包 messages 过期；用单 rAF 聚合滚动避免每片 delta 强制布局抖动
       useChatStore.setState(s => ({
         messages: s.messages.map(m => m.id === aid ? { ...m, content: acc } : m),
@@ -276,6 +289,12 @@ export default function Chat() {
       if (!parsed) {
         if (raw === SSE_DONE) return
         // null means no-op (already handled) or empty
+        return
+      }
+      // 降级载荷：点亮横幅；若同时携带可读文本仍追加正文，保证信息不丢
+      if (parsed.kind === "degraded") {
+        if (!isAlive()) return
+        setDegraded(parsed.degraded?.reason ?? null)
         return
       }
       if (parsed.kind === "tool" && parsed.tool) {
@@ -395,6 +414,12 @@ export default function Chat() {
             }
             const parsed = parseSseData(data)
             if (!parsed) return
+            // 降级载荷（与 handlePayload 同语义，EventSource 主链路内联分支需同步处理）
+            if (parsed.kind === "degraded") {
+              if (!isAlive()) return
+              setDegraded(parsed.degraded?.reason ?? null)
+              return
+            }
             if (parsed.kind === "tool" && parsed.tool) {
               if (!isAlive()) return
               const { tool: tname, status, preview, latencyMs, rawId } = parsed.tool
@@ -506,6 +531,8 @@ export default function Chat() {
 
       <div ref={listRef} className="flex-1 overflow-auto px-4 py-6 md:px-6">
         <div className="mx-auto flex max-w-3xl flex-col gap-4">
+          {/* 降级横幅：degraded:true（D线）或合成演示文本兜底时展示 */}
+          {degraded ? <DegradedBanner reason={degraded} source="Chat SSE" /> : null}
           {messages.map(m => (
             <div key={m.id} className={m.role === "user" ? "flex justify-end" : "flex justify-start"}>
               <div
