@@ -81,10 +81,11 @@ def _consume_ticket_identity(ticket: str | None) -> tuple[bool, str | None]:
 def _resolve_identity_channel(
     ticket_user: str | None, claimed_user: str | None, ws: Any | None = None, kind: str = "trace"
 ) -> tuple[str | None, str]:
-    """由服务端身份派生 channel：绑定票优先 ticket_user；匿名票兼容 claimed_user。
+    """由服务端身份派生 channel：绑定票按 ticket_user；匿名票一律 per-connection。
 
     中文：ticket_user 非空时 claimed_user 为空则直接派生，声明不一致视为冒充返回 (None, reason)；
-    匿名票（""）时沿用旧语义由 claimed_user 决定频道（兼容 Monitor/旧单测），无声明则回退单机频道。
+    匿名票（""）忽略 ?user= 自声明，一律 per-connection 频道（G-02 订阅侧收紧：发侧已强制匿名
+    user_id=""，?user= 不可信，不得派生他人 ws:channel:{user}；ws=None 的直接调用回退共享 trace 频道）。
     返回 (channel, "") 成功；失败返回 (None, reason)。
     """
     try:
@@ -99,8 +100,10 @@ def _resolve_identity_channel(
         if claimed and claimed != t_user:
             return None, f"Ticket user mismatch (ticket={t_user!r} claimed={claimed!r})"
         return resolve_user_channel(t_user, ws, kind=kind), ""
-    # 匿名票：兼容旧 ?user= 频道语义（ticket 仍必填，仅防无票冒充）
-    return resolve_user_channel(claimed or None, ws, kind=kind), ""
+    # G-02 订阅侧收紧：匿名票禁止由 ?user= 派生他人用户频道，一律 per-connection 频道。
+    # 全量广播（user=None 事件走 manager.broadcast）仍触达匿名连接，Monitor 兼容不受影响；
+    # 匿名连接不再接收他人用户定向事件——此为 intended 隔离收紧，非回归（见 F2 端点注记）。
+    return resolve_user_channel(None, ws, kind=kind), ""
 
 router = APIRouter()
 
@@ -394,14 +397,16 @@ heartbeat = HeartbeatMonitor()
 async def ws_trace(
     websocket: WebSocket,
     ticket: str = Query(default="", description="SSE ticket from POST /v1/query/ticket"),
-    user: str = Query(default="", description="R3 可选 userId：非空则频道为 ws:channel:{user}"),
+    user: str = Query(default="", description="R3 可选 userId：仅绑定票生效（须与 ticket.user 一致，否则4001）；匿名票忽略"),
 ):
     """WebSocket 进度推送 — 订阅 trace 事件流。
 
     连接：ws://host/ws/trace?ticket=<ticket>&user=<userId，可选>
     票据单次有效，需先 POST /v1/query/ticket 获取。channel 由服务端票据身份派生：
     绑定票（user_id 非空）以 ticket.user 为准，?user= 声明不一致视为冒充关闭 4001；
-    匿名票（user_id=""）兼容旧语义由 ?user= 决定频道（仍要求有效票据）。
+    匿名票（user_id=""）忽略 ?user=，一律 per-connection 频道（G-02 订阅侧收紧）。
+    F2 兼容结论：全量广播（user=None 事件）仍触达所有连接（含匿名），旧 Monitor 语义保留；
+    匿名 ?user= 搭他人用户频道已关闭——intended 隔离收紧，语义不擅自扩大（真 per-user 身份待后续专线）。
     任何消息(ping/chat)均视为心跳，60s 无消息断开(4002)。
     """
     ok, ticket_user = _consume_ticket_identity(ticket)
@@ -465,9 +470,9 @@ async def ws_trace(
 async def ws_query(
     websocket: WebSocket,
     ticket: str = Query(default="", description="SSE ticket"),
-    user: str = Query(default="", description="R3 可选 userId：非空则频道为 ws:channel:{user}"),
+    user: str = Query(default="", description="R3 可选 userId：仅绑定票生效（须与 ticket.user 一致，否则4001）；匿名票忽略"),
 ):
-    """WebSocket for query stream — alternative to /v1/query/stream SSE（身份闭环同 ws_trace）。"""
+    """WebSocket for query stream — alternative to /v1/query/stream SSE（身份闭环同 ws_trace：绑定票 mismatch 4001 关闭；匿名票一律 per-connection，见 ws_trace F2 注记）。"""
     ok, ticket_user = _consume_ticket_identity(ticket)
     if not ticket or not ok:
         await websocket.accept()
