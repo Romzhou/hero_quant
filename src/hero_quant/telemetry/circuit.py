@@ -23,9 +23,8 @@ try:
             "Circuit breaker state (0=closed, 1=half_open, 2=open)",
         )
     except ValueError:
-        from prometheus_client import REGISTRY  # type: ignore
-
-        CIRCUIT_STATE_GAUGE = REGISTRY._names_to_collectors["circuit_state"]  # type: ignore[attr-defined]
+        # D线：彻底去私有名；重复注册时降级为 None（best-effort 观测），不用 REGISTRY 私有 API 复用。
+        CIRCUIT_STATE_GAUGE = None  # type: ignore
 except Exception:  # prometheus_client not available
     CIRCUIT_STATE_GAUGE = None  # type: ignore
 
@@ -40,11 +39,8 @@ try:
             ["source"],
         )
     except ValueError:
-        from prometheus_client import REGISTRY as _REG  # type: ignore
-
-        data_source_circuit_open_total = _REG._names_to_collectors[  # type: ignore[attr-defined]
-            "data_source_circuit_open_total"
-        ]
+        # D线：彻底去私有名；重复注册时降级为 None（best-effort 计数），不用 REGISTRY 私有 API 复用。
+        data_source_circuit_open_total = None  # type: ignore
 except Exception:  # prometheus_client not available
     data_source_circuit_open_total = None  # type: ignore
 
