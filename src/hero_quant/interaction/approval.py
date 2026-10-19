@@ -44,7 +44,7 @@ class ApprovalService(SecurityApprovalService):
             try:
                 _audit("decided", tool=tool, outcome=outcome, reason=reason, guard="disallowed", goto="decided")
             except Exception:
-                pass
+                pass  # intentional: 审批审计 best-effort（审计永不抛；决策 outcome 已返回调用方）
             cmd = Command(resume=outcome, goto="decided")
             return cmd
 
@@ -55,7 +55,7 @@ class ApprovalService(SecurityApprovalService):
             try:
                 _audit("decided", tool=tool, outcome=outcome, goto="decided", resume=outcome)
             except Exception:
-                pass
+                pass  # intentional: 同上（审计 best-effort；决策已确定）
             cmd = Command(resume=outcome, goto="decided")
             return cmd
 
@@ -71,7 +71,7 @@ class ApprovalService(SecurityApprovalService):
         try:
             _audit("decided", tool=tool, outcome=outcome, goto=cmd.goto, resume=cmd.resume)
         except Exception:
-            pass
+            pass  # intentional: 同上（审计 best-effort；Command 已构造返回）
         return cmd
 
 

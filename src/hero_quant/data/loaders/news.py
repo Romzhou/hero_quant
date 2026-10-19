@@ -63,7 +63,7 @@ def _parse_time(value) -> pd.Timestamp | None:
             return None
         return ts
     except (ValueError, TypeError, pd.errors.OutOfBoundsDatetime):
-        logger.debug("news _parse_time unparseable %r", value)
+        logger.debug("news _parse_time unparseable %r error_code=news_parse_time_unparseable", value)  # intentional: 逐条时间解析探针（坏值即跳过该条；warning 会按脏数据刷屏）
         return None
 
 
@@ -184,7 +184,7 @@ def _is_aware(ts: pd.Timestamp) -> bool:
         if tz is not None:
             return True
     except (AttributeError, TypeError, ValueError):
-        logger.debug("news _is_aware tz check failed for %r", ts, exc_info=True)
+        logger.debug("news _is_aware tz check failed for %r error_code=news_is_aware_check_failed", ts, exc_info=True)  # intentional: 同上（时区探测，失败即走 tzinfo 回退）
     return getattr(ts, "tzinfo", None) is not None
 
 

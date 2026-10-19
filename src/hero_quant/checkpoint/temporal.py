@@ -52,8 +52,8 @@ def clear_heartbeat_details() -> None:
             global _shared_details
             _shared_details = None
     except Exception as _exc:
-        logger.debug("silent handled: offline-safe: temporal sidecar optional", exc_info=_exc)
-        pass
+        logger.debug("silent handled: offline-safe: temporal sidecar optional", exc_info=_exc)  # intentional: offline-safe: temporal sidecar optional
+        pass  # intentional offline-safe: temporal sidecar optional
 
 
 def heartbeat(details: Dict[str, Any] | Any = None) -> None:
@@ -80,8 +80,8 @@ def heartbeat(details: Dict[str, Any] | Any = None) -> None:
             global _shared_details
             _shared_details = dict(payload)
     except Exception as _exc:
-        logger.debug("silent handled: offline-safe: temporal sidecar optional", exc_info=_exc)
-        pass
+        logger.debug("silent handled: offline-safe: temporal sidecar optional", exc_info=_exc)  # intentional: offline-safe: temporal sidecar optional
+        pass  # intentional offline-safe: temporal sidecar optional
 
     # 真实 Temporal 分支 — 若在 Activity 上下文中则透传，否则静默忽略
     try:
@@ -113,8 +113,8 @@ def get_heartbeat_details() -> Optional[Dict[str, Any]]:
             if _shared_details is not None:
                 return dict(_shared_details)
     except Exception as _exc:
-        logger.debug("silent handled: offline-safe: temporal sidecar optional", exc_info=_exc)
-        pass
+        logger.debug("silent handled: offline-safe: temporal sidecar optional", exc_info=_exc)  # intentional: offline-safe: temporal sidecar optional
+        pass  # intentional offline-safe: temporal sidecar optional
 
     # 回退：尝试 Temporal 原生 heartbeat_details
     try:
@@ -233,11 +233,11 @@ class HeartbeatHelper:
                         try:
                             task.cancel()
                         except RuntimeError as _exc:  # noqa: BLE001 窄化
-                            logger.debug("stop 取消任务已完成: %s", _exc)
+                            logger.debug("stop 取消任务已完成 error_code=temporal_stop_cancel_done: %s", _exc)
             except RuntimeError as _exc:  # noqa: BLE001 窄化
-                logger.debug("stop 取消任务已完成: %s", _exc)
+                logger.debug("stop 取消任务已完成 error_code=temporal_stop_cancel_done: %s", _exc)
             except Exception as _exc:  # noqa: BLE001 兜底
-                logger.debug("stop 取消异步任务失败: %s", _exc, exc_info=True)
+                logger.debug("stop 取消异步任务失败 error_code=temporal_stop_cancel_failed: %s", _exc, exc_info=True)
             # 已尝试取消，不再置 None 由 astop 或后续清理；此处保留句柄以便 astop await
             # 若任务已被 cancel 且不在 loop 中，置 None 亦可；保留句柄更安全
             if task.done() or task.cancelled():
@@ -263,9 +263,9 @@ class HeartbeatHelper:
             try:
                 await _old
             except asyncio.CancelledError:
-                pass
+                pass  # intentional: 取消旧任务的正常语义（非错误）
             except Exception as _exc:
-                logger.debug("astart 回收旧任务: %s", _exc, exc_info=True)
+                logger.debug("astart 回收旧任务 error_code=temporal_astart_reap_task: %s", _exc, exc_info=True)
         self._async_task = None
         if self._thread is not None:
             try:
@@ -274,7 +274,7 @@ class HeartbeatHelper:
                 self._stop.set()
                 await asyncio.to_thread(self._thread.join, 0.2)
             except Exception as _exc:
-                logger.debug("astart 回收旧线程: %s", _exc, exc_info=True)
+                logger.debug("astart 回收旧线程 error_code=temporal_astart_reap_thread: %s", _exc, exc_info=True)
             if not self._thread.is_alive():
                 self._thread = None
             self._stop.clear()
@@ -309,7 +309,7 @@ class HeartbeatHelper:
                 if _thread.is_alive():
                     logger.warning("temporal 心跳线程未在 1s 内退出")
             except Exception as _exc:
-                logger.debug("astop 回收线程: %s", _exc, exc_info=True)
+                logger.debug("astop 回收线程 error_code=temporal_astop_reap_thread: %s", _exc, exc_info=True)
             self._thread = None
         # 中文：取消经 loop 线程安全投递并 await 回收（本协程即跑在任务 loop 上）
         task = self._async_task
@@ -324,7 +324,7 @@ class HeartbeatHelper:
                     try:
                         await task
                     except asyncio.CancelledError:
-                        pass
+                        pass  # intentional: 取消任务的正常语义（非错误）
             except Exception as _exc:
                 logger.debug("silent handled: offline-safe: temporal sidecar optional", exc_info=_exc)  # intentional: offline-safe: temporal sidecar optional
                 pass  # intentional offline-safe: temporal sidecar optional

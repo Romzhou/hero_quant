@@ -159,7 +159,7 @@ def observe_wall_time(operation: str, duration: float, status: str = "success") 
         if WALL_TIME_SECONDS is not None:
             WALL_TIME_SECONDS.labels(operation=operation, status=status).observe(float(duration))
     except Exception as e:  # pragma: no cover - observability must not break business
-        _logger.debug("observe_wall_time failed: %s", e, exc_info=True)
+        _logger.debug("observe_wall_time failed error_code=metrics_emit_failed: %s", e, exc_info=True)  # intentional: 指标 best-effort（observability must not break business）
 
 
 def inc_wall_time_exceeded(operation: str = "generic") -> None:
@@ -168,7 +168,7 @@ def inc_wall_time_exceeded(operation: str = "generic") -> None:
         if WALL_TIME_BUDGET_EXCEEDED is not None:
             WALL_TIME_BUDGET_EXCEEDED.labels(operation=operation).inc()
     except Exception as e:  # pragma: no cover
-        _logger.debug("inc_wall_time_exceeded failed: %s", e, exc_info=True)
+        _logger.debug("inc_wall_time_exceeded failed error_code=metrics_emit_failed: %s", e, exc_info=True)  # intentional: 同上（指标 best-effort）
 
 
 def observe_ledger_append(tenant: str, duration: float, status: str = "success") -> None:
@@ -177,12 +177,12 @@ def observe_ledger_append(tenant: str, duration: float, status: str = "success")
         if LEDGER_APPEND_DURATION is not None:
             LEDGER_APPEND_DURATION.labels(tenant=tenant, status=status).observe(float(duration))
     except Exception as e:  # pragma: no cover
-        _logger.debug("observe_ledger_append duration failed: %s", e, exc_info=True)
+        _logger.debug("observe_ledger_append duration failed error_code=metrics_emit_failed: %s", e, exc_info=True)  # intentional: 同上（指标 best-effort）
     try:
         if LEDGER_APPEND_TOTAL is not None:
             LEDGER_APPEND_TOTAL.labels(tenant=tenant, status=status).inc()
     except Exception as e:  # pragma: no cover
-        _logger.debug("observe_ledger_append total failed: %s", e, exc_info=True)
+        _logger.debug("observe_ledger_append total failed error_code=metrics_emit_failed: %s", e, exc_info=True)  # intentional: 同上（指标 best-effort）
 
 
 def inc_ledger_append(tenant: str, status: str = "success") -> None:
@@ -191,7 +191,7 @@ def inc_ledger_append(tenant: str, status: str = "success") -> None:
         if LEDGER_APPEND_TOTAL is not None:
             LEDGER_APPEND_TOTAL.labels(tenant=tenant, status=status).inc()
     except Exception as e:  # pragma: no cover
-        _logger.debug("inc_ledger_append failed: %s", e, exc_info=True)
+        _logger.debug("inc_ledger_append failed error_code=metrics_emit_failed: %s", e, exc_info=True)  # intentional: 同上（指标 best-effort）
 
 
 def inc_llm_retry(provider: str = "unknown", reason: str = "error") -> None:
@@ -200,7 +200,7 @@ def inc_llm_retry(provider: str = "unknown", reason: str = "error") -> None:
         if LLM_RETRY_TOTAL is not None:
             LLM_RETRY_TOTAL.labels(provider=provider, reason=reason).inc()
     except Exception as e:  # pragma: no cover
-        _logger.debug("inc_llm_retry failed: %s", e, exc_info=True)
+        _logger.debug("inc_llm_retry failed error_code=metrics_emit_failed: %s", e, exc_info=True)  # intentional: 同上（指标 best-effort）
 
 
 def inc_llm_timeout(provider: str = "unknown") -> None:
@@ -209,7 +209,7 @@ def inc_llm_timeout(provider: str = "unknown") -> None:
         if LLM_TIMEOUT_TOTAL is not None:
             LLM_TIMEOUT_TOTAL.labels(provider=provider).inc()
     except Exception as e:  # pragma: no cover
-        _logger.debug("inc_llm_timeout failed: %s", e, exc_info=True)
+        _logger.debug("inc_llm_timeout failed error_code=metrics_emit_failed: %s", e, exc_info=True)  # intentional: 同上（指标 best-effort）
 
 
 def get_wall_time_metrics() -> dict[str, Any]:
@@ -220,5 +220,5 @@ def get_wall_time_metrics() -> dict[str, Any]:
         if WALL_TIME_BUDGET_EXCEEDED is not None:
             out["exceeded_metric_available"] = True
     except Exception:
-        pass
+        pass  # intentional: 可用性探针 best-effort；失败即报告不可用（缺省 False）
     return out

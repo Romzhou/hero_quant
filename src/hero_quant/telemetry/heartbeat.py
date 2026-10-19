@@ -60,7 +60,7 @@ def _temporal_emit(event: dict) -> None:
 
         _ckpt_hb(event)
     except (ImportError, ModuleNotFoundError):
-        logger.debug("checkpoint heartbeat not available (offline-safe)", exc_info=True)
+        logger.debug("checkpoint heartbeat not available (offline-safe) error_code=heartbeat_sidecar_unavailable", exc_info=True)
     except Exception:
         logger.warning("checkpoint heartbeat emit failed", exc_info=True)
     try:
@@ -68,7 +68,7 @@ def _temporal_emit(event: dict) -> None:
 
         _temporal_activity.heartbeat(event)  # type: ignore
     except (ImportError, ModuleNotFoundError):
-        logger.debug("temporalio not available (offline-safe)", exc_info=True)
+        logger.debug("temporalio not available (offline-safe) error_code=heartbeat_temporalio_unavailable", exc_info=True)
     except Exception:
         logger.warning("temporalio heartbeat failed", exc_info=True)
 
@@ -100,7 +100,7 @@ def get_temporal_heartbeat_details() -> dict | None:
         if res is not None:
             return res
     except (ImportError, ModuleNotFoundError):
-        logger.debug("get_heartbeat_details not available", exc_info=True)
+        logger.debug("get_heartbeat_details not available error_code=heartbeat_details_unavailable", exc_info=True)
     except Exception:
         logger.warning("get_heartbeat_details failed", exc_info=True)
     with _LAST_TEMPORAL_LOCK:
@@ -144,7 +144,7 @@ def _probe_downstream_status(timeout: float = 0.5) -> tuple[str, str]:
             if isinstance(ts, (int, float)) and (time.time() - float(ts)) <= PROBE_STALE_SECONDS:
                 return "healthy", "fresh_heartbeat"
         except Exception:
-            pass
+            pass  # intentional: 时间戳探针（坏值即按非新鲜处理；下文走 degraded 判定）
     try:
         import importlib.util as _ilu
 

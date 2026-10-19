@@ -425,7 +425,7 @@ def _try_acquire_singleflight(lock_key: str, px_ms: int = 60_000, retries: int =
             try:
                 _time.sleep(delay + _rand.uniform(0, delay))
             except Exception:
-                pass
+                pass  # intentional: 退避 sleep 中断（信号/关闭）即提前重试；属调度期探针
             delay = min(delay * 2, 0.5)
     return False, "local"
 
@@ -440,7 +440,7 @@ def _release_singleflight(lock_key: str, backend: str) -> None:
             try:
                 lk.release()  # type: ignore[union-attr]
             except Exception:
-                pass
+                pass  # intentional: 本地锁释放 best-effort（重复释放/未持有均无害）
     except Exception:
         logger.warning("scheduled singleflight release failed", exc_info=True)
 

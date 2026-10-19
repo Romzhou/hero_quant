@@ -69,7 +69,7 @@ def launcher_path(
         candidate = repo_root / "node_modules" / f"@deepseek-ai/node-addon-landlock-run-{sys.platform}-{os.uname().machine if hasattr(os, 'uname') else 'x64'}" / "bin" / LAUNCHER_BIN
         return str(candidate)
     except (IndexError, OSError):
-        pass
+        pass  # intentional: 二进制路径探测（越界/系统调用失败即回退 PATH 解析；探针无失败语义）
     # 最后回退为裸二进制名，依赖 PATH 解析；缺失时探针将返回 unusable
     return LAUNCHER_BIN
 
@@ -412,7 +412,7 @@ class LandlockSandbox(BaseSandbox):
                 try:
                     os.close(_ws_fd)
                 except OSError:
-                    pass
+                    pass  # intentional: finally 内 fd 回收 best-effort；抛错会掩盖授权构造原始错误
         # 注：fd 在授权构造前已关闭，残余 TOCTOU（授权→subprocess.run 间隔）仍存在；
         # 完全消除需 Landlock/bwrap 内核级挂载隔离，此处仅收敛校验窗口并文档化。
         if not Path(ws_canonical).is_dir():

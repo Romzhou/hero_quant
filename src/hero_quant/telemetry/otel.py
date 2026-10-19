@@ -3,6 +3,8 @@
 职责：基于环境变量提供 disabled/shared/private 三档遥测与导出能力。
 架构位置：`telemetry` 入口，被会话与全局遥测协调器引用。
 关键设计：`HERO_OTEL_MODE` 与 `OTEL_EXPORTER_OTLP_ENDPOINT` 环境门控；离线安全（无 SDK/无网络静默）；SDK 优先 `LoggerProvider+BatchLogRecordProcessor`，缺失时回退 urllib。
+F线分级：离线（不属链A/链B）——本文件所有 except 均为可选依赖/环境探针或发射期 guard，
+失败即降级/跳过（offline-safe），不升级 warning（防遥测刷屏反压业务）；遥测自身失败永不阻断业务。
 """
 
 from __future__ import annotations

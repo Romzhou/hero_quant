@@ -119,7 +119,7 @@ class UserQuestionService:
                             if hasattr(res, "close"):
                                 res.close()
                         except Exception:
-                            pass
+                            pass  # intentional: 避免协程泄漏的收尾 best-effort；主错下文已 error 明示
                         logger.error("ask_sync asyncio.run failed", exc_info=True)
                         raise
                 return res

@@ -151,7 +151,7 @@ def __getattr__(name: str) -> Any:
                         return val
                 except (ImportError, OSError, ValueError) as spec_err:
                     # find_spec 自身失败视为解析失败，fail-closed 上浮原异常
-                    logger.debug("runner spec check failed: %s", spec_err)
+                    logger.debug("runner spec check failed error_code=runner_spec_check_failed: %s", spec_err)
             raise
         except Exception:
             # 內部實現錯誤不應被包裝為存根，直接拋出以便 fail-closed

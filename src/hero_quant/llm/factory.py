@@ -200,7 +200,7 @@ class LLMFactory:
             if not hasattr(chat, "timeout"):
                 setattr(chat, "timeout", timeout)
         except Exception as e:
-            _logging.getLogger(__name__).debug("could not set timeout on chat object %r: %s", type(chat), e)
+            _logging.getLogger(__name__).debug("could not set timeout on chat object %r error_code=llm_chat_timeout_attr_failed: %s", type(chat), e)  # intentional: 内省属性 garnish；超时透传由 _invoke_once 签名探测保证
         return LLMClient(chat, timeout=timeout, max_retries=3)
 
 

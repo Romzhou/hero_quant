@@ -127,7 +127,7 @@ class RiskEngine:
                     "circuit breaker check failed, fail-closed", exc_info=True
                 )
             except Exception:
-                pass
+                pass  # intentional: structlog 次级通道失败即丢弃（主通道 stdlib 已 warning）
             return {"allowed": False, "reason": "circuit_open 熔断", "rule": "circuit"}
 
         for rule in self.rules:

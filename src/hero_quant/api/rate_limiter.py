@@ -28,7 +28,7 @@ try:
     SLOWAPI_AVAILABLE = True
 except ImportError:
     _SlowLimiter = None  # type: ignore
-    SLOWAPI_AVAILABLE = False
+    SLOWAPI_AVAILABLE = False  # intentional: slowapi 可选依赖；缺失即走 infra RateLimiter 单实现
 
 
 def limit_key(request: Request) -> str:
@@ -41,7 +41,7 @@ def limit_key(request: Request) -> str:
     try:
         ip = getattr(getattr(request, "client", None), "host", None) or "unknown"
     except Exception:
-        ip = "unknown"
+        ip = "unknown"  # intentional: key 探针；缺失 IP 下文已 warning 并收敛小桶（fail-visible）
     if ip == "unknown":
         # 可观测性：缺失 IP 的调用方全部折叠进同一 ip:unknown 桶（单 actor 可
         # 耗尽配额误伤他人；反向代理后未取真实 IP 时同理），打 warning 暴露配置问题。

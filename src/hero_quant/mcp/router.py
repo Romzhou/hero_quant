@@ -394,7 +394,7 @@ def _vector_score_for_tool(query_vec, tool_name: str, description: str) -> float
                         _DESC_VEC_CACHE.pop(k, None)
                 _DESC_VEC_CACHE[cache_key] = dvec
         except Exception:
-            pass
+            pass  # intentional: 描述向量缓存 hygiene；失败即本次不缓存（下次重算，不影响正确性）
         return _cosine(query_vec, dvec)
     except Exception as e:
         # 中文：窄化捕获改为宽捕获，保证向量失败回退 BM25
@@ -576,7 +576,7 @@ def route(query: str, k: int = 5) -> List[str]:
                         # reranker returns [(key, relevance)] sorted
                         scored = [(float(rel), key) for key, rel in reranked]
                 except Exception as _exc:
-                    logger.debug("silent handled: router rerank fallback", exc_info=_exc)
+                    logger.debug("silent handled: router rerank fallback error_code=router_rerank_fallback", exc_info=_exc)  # intentional: offline-safe: mcp router fallback（失败即用本地排序）
                     pass
         except Exception as e:
             logger.warning("router rank_fusion failed, falling back to BM25: %s", e)

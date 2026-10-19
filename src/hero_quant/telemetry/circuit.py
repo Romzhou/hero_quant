@@ -380,7 +380,7 @@ class TokenBucket:
             try:
                 logger.warning("token bucket reset without _privileged flag (compat path)", exc_info=False)
             except Exception:
-                pass
+                pass  # intentional: 日志自身失败即丢弃（reset 动作本身已执行，不可因此抛错）
         with self._lock:
             self.tokens = float(self.capacity)
             self._last = time.monotonic()
@@ -481,7 +481,7 @@ class DualBucketRateLimiter:
             try:
                 logger.warning("rate limiter reset without _privileged flag (compat path)", exc_info=False)
             except Exception:
-                pass
+                pass  # intentional: 同上（日志失败不阻断 reset）
         self.sustained.reset(_privileged=True)
         self.burst.reset(_privileged=True)
 

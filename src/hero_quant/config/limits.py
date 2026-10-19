@@ -68,7 +68,7 @@ def truncate_tool_result(result: Any, limit: int | None = None) -> str:
         try:
             s = json.dumps(result, ensure_ascii=False)
         except (TypeError, ValueError) as e:
-            logger.debug("truncate json dumps failed: %s", e, exc_info=True)
+            logger.debug("truncate json dumps failed error_code=limits_truncate_dumps_failed: %s", e, exc_info=True)  # intentional: 截断期序列化探针（失败即走 str 回退；属响应整形 garnish）
             try:
                 s = str(result)
             except (TypeError, ValueError, OverflowError) as e2:
