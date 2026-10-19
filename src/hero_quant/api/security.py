@@ -582,12 +582,25 @@ def verify_api_key(request: Any, expected_key: str | None = None) -> bool:
     """
     def _allow_insecure_dev(request: Any) -> bool:
         # HERO_ALLOW_INSECURE=1 兼容历史（tests 未设 HERO_ENV 时需在 pytest 模式下放行，生产仍要求 development）
+        # 中文：G-11——该兼容开关已废弃（后续版本删除）：命中即 DeprecationWarning + warning 可观测，
+        # 行为保持 fail-closed（非 development 且非 pytest 一律阻断），仅收口可观测性，不放宽语义。
         if os.environ.get("HERO_ALLOW_INSECURE", "").strip() == "1":
+            try:
+                import warnings as _warnings
+
+                _warnings.warn(
+                    "HERO_ALLOW_INSECURE=1 is deprecated and will be removed; "
+                    "use HERO_ENV=development with loopback for local dev",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
+            except (ValueError, TypeError, RuntimeError):
+                pass
             hero_env = (os.environ.get("HERO_ENV", "") or "").strip().lower()
             if hero_env != "development" and "PYTEST_CURRENT_TEST" not in os.environ:
                 logger.warning("security.api_key_allow_insecure_blocked_not_development")
                 return False
-            logger.warning("security.api_key_allow_insecure_legacy")
+            logger.warning("security.api_key_allow_insecure_legacy_deprecated")
             return True
         if os.environ.get("HERO_ALLOW_INSECURE_DEV", "").strip() not in ("1", "true", "True"):
             return False
