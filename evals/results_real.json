@@ -1,0 +1,6 @@
+{
+  "mode": "real",
+  "status": "skipped",
+  "reason": "no_llm_backend",
+  "detail": "LLMFactory.create() returned LLMClient wrapping inner _FallbackChat (llm/factory.py:147); no provider SDK installed, real-LLM assertions not meaningful"
+}

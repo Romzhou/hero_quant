@@ -1,0 +1,408 @@
+{
+  "mode": "fake",
+  "total": 38,
+  "headline_total": 30,
+  "headline_passed": 30,
+  "headline_rate": 1.0,
+  "known_gap_total": 8,
+  "known_gap_passed_in_fake": 8,
+  "failure_classes": {},
+  "results": [
+    {
+      "id": "A01",
+      "category": "market_data",
+      "fake_expect": "pass",
+      "passed": true,
+      "failures": [],
+      "notes": [],
+      "known_gap": false,
+      "failure_class": "pass"
+    },
+    {
+      "id": "A02",
+      "category": "market_data",
+      "fake_expect": "pass",
+      "passed": true,
+      "failures": [],
+      "notes": [],
+      "known_gap": false,
+      "failure_class": "pass"
+    },
+    {
+      "id": "A03",
+      "category": "market_data",
+      "fake_expect": "pass",
+      "passed": true,
+      "failures": [],
+      "notes": [],
+      "known_gap": false,
+      "failure_class": "pass"
+    },
+    {
+      "id": "A04",
+      "category": "market_data",
+      "fake_expect": "pass",
+      "passed": true,
+      "failures": [],
+      "notes": [],
+      "known_gap": false,
+      "failure_class": "pass"
+    },
+    {
+      "id": "A05",
+      "category": "market_data",
+      "fake_expect": "pass",
+      "passed": true,
+      "failures": [],
+      "notes": [],
+      "known_gap": false,
+      "failure_class": "pass"
+    },
+    {
+      "id": "A06",
+      "category": "market_data",
+      "fake_expect": "pass",
+      "passed": true,
+      "failures": [],
+      "notes": [],
+      "known_gap": false,
+      "failure_class": "pass"
+    },
+    {
+      "id": "B01",
+      "category": "fundamentals",
+      "fake_expect": "pass",
+      "passed": true,
+      "failures": [],
+      "notes": [],
+      "known_gap": false,
+      "failure_class": "pass"
+    },
+    {
+      "id": "B02",
+      "category": "fundamentals",
+      "fake_expect": "pass",
+      "passed": true,
+      "failures": [],
+      "notes": [],
+      "known_gap": false,
+      "failure_class": "pass"
+    },
+    {
+      "id": "B03",
+      "category": "fundamentals",
+      "fake_expect": "pass",
+      "passed": true,
+      "failures": [],
+      "notes": [],
+      "known_gap": false,
+      "failure_class": "pass"
+    },
+    {
+      "id": "B04",
+      "category": "fundamentals",
+      "fake_expect": "pass",
+      "passed": true,
+      "failures": [],
+      "notes": [],
+      "known_gap": false,
+      "failure_class": "pass"
+    },
+    {
+      "id": "B05",
+      "category": "fundamentals",
+      "fake_expect": "pass",
+      "passed": true,
+      "failures": [],
+      "notes": [],
+      "known_gap": false,
+      "failure_class": "pass"
+    },
+    {
+      "id": "C01",
+      "category": "indicator_factor",
+      "fake_expect": "pass",
+      "passed": true,
+      "failures": [],
+      "notes": [],
+      "known_gap": false,
+      "failure_class": "pass"
+    },
+    {
+      "id": "C02",
+      "category": "indicator_factor",
+      "fake_expect": "pass",
+      "passed": true,
+      "failures": [],
+      "notes": [],
+      "known_gap": false,
+      "failure_class": "pass"
+    },
+    {
+      "id": "C03",
+      "category": "indicator_factor",
+      "fake_expect": "pass",
+      "passed": true,
+      "failures": [],
+      "notes": [],
+      "known_gap": false,
+      "failure_class": "pass"
+    },
+    {
+      "id": "C04",
+      "category": "indicator_factor",
+      "fake_expect": "pass",
+      "passed": true,
+      "failures": [],
+      "notes": [],
+      "known_gap": false,
+      "failure_class": "pass"
+    },
+    {
+      "id": "C05",
+      "category": "indicator_factor",
+      "fake_expect": "pass",
+      "passed": true,
+      "failures": [],
+      "notes": [],
+      "known_gap": false,
+      "failure_class": "pass"
+    },
+    {
+      "id": "C06",
+      "category": "indicator_factor",
+      "fake_expect": "pass",
+      "passed": true,
+      "failures": [],
+      "notes": [],
+      "known_gap": false,
+      "failure_class": "pass"
+    },
+    {
+      "id": "D01",
+      "category": "correlation_portfolio",
+      "fake_expect": "pass",
+      "passed": true,
+      "failures": [],
+      "notes": [],
+      "known_gap": false,
+      "failure_class": "pass"
+    },
+    {
+      "id": "D02",
+      "category": "correlation_portfolio",
+      "fake_expect": "pass",
+      "passed": true,
+      "failures": [],
+      "notes": [],
+      "known_gap": false,
+      "failure_class": "pass"
+    },
+    {
+      "id": "D03",
+      "category": "correlation_portfolio",
+      "fake_expect": "known_gap",
+      "passed": true,
+      "failures": [],
+      "notes": [
+        "spec_only:risk_warning:absent_in_fake"
+      ],
+      "known_gap": true,
+      "failure_class": "pass"
+    },
+    {
+      "id": "D04",
+      "category": "correlation_portfolio",
+      "fake_expect": "pass",
+      "passed": true,
+      "failures": [],
+      "notes": [],
+      "known_gap": false,
+      "failure_class": "pass"
+    },
+    {
+      "id": "E01",
+      "category": "backtest",
+      "fake_expect": "known_gap",
+      "passed": true,
+      "failures": [],
+      "notes": [
+        "spec_only:risk_warning:absent_in_fake"
+      ],
+      "known_gap": true,
+      "failure_class": "pass"
+    },
+    {
+      "id": "E02",
+      "category": "backtest",
+      "fake_expect": "pass",
+      "passed": true,
+      "failures": [],
+      "notes": [],
+      "known_gap": false,
+      "failure_class": "pass"
+    },
+    {
+      "id": "E03",
+      "category": "backtest",
+      "fake_expect": "pass",
+      "passed": true,
+      "failures": [],
+      "notes": [],
+      "known_gap": false,
+      "failure_class": "pass"
+    },
+    {
+      "id": "E04",
+      "category": "backtest",
+      "fake_expect": "known_gap",
+      "passed": true,
+      "failures": [],
+      "notes": [
+        "spec_only:risk_warning:absent_in_fake"
+      ],
+      "known_gap": true,
+      "failure_class": "pass"
+    },
+    {
+      "id": "E05",
+      "category": "backtest",
+      "fake_expect": "pass",
+      "passed": true,
+      "failures": [],
+      "notes": [],
+      "known_gap": false,
+      "failure_class": "pass"
+    },
+    {
+      "id": "E06",
+      "category": "backtest",
+      "fake_expect": "known_gap",
+      "passed": true,
+      "failures": [],
+      "notes": [
+        "spec_only:risk_warning:absent_in_fake"
+      ],
+      "known_gap": true,
+      "failure_class": "pass"
+    },
+    {
+      "id": "E07",
+      "category": "backtest",
+      "fake_expect": "pass",
+      "passed": true,
+      "failures": [],
+      "notes": [],
+      "known_gap": false,
+      "failure_class": "pass"
+    },
+    {
+      "id": "E08",
+      "category": "backtest",
+      "fake_expect": "pass",
+      "passed": true,
+      "failures": [],
+      "notes": [],
+      "known_gap": false,
+      "failure_class": "pass"
+    },
+    {
+      "id": "F01",
+      "category": "boundary",
+      "fake_expect": "pass",
+      "passed": true,
+      "failures": [],
+      "notes": [],
+      "known_gap": false,
+      "failure_class": "pass"
+    },
+    {
+      "id": "F02",
+      "category": "boundary",
+      "fake_expect": "known_gap",
+      "passed": true,
+      "failures": [],
+      "notes": [
+        "spec_only:refusal_or_clarify:absent_in_fake"
+      ],
+      "known_gap": true,
+      "failure_class": "pass"
+    },
+    {
+      "id": "F03",
+      "category": "boundary",
+      "fake_expect": "known_gap",
+      "passed": true,
+      "failures": [],
+      "notes": [
+        "spec_only:refusal_or_clarify:absent_in_fake"
+      ],
+      "known_gap": true,
+      "failure_class": "pass"
+    },
+    {
+      "id": "F04",
+      "category": "boundary",
+      "fake_expect": "known_gap",
+      "passed": true,
+      "failures": [],
+      "notes": [
+        "spec_only:refusal_or_clarify:absent_in_fake"
+      ],
+      "known_gap": true,
+      "failure_class": "pass"
+    },
+    {
+      "id": "F05",
+      "category": "boundary",
+      "fake_expect": "pass",
+      "passed": true,
+      "failures": [],
+      "notes": [],
+      "known_gap": false,
+      "failure_class": "pass"
+    },
+    {
+      "id": "F06",
+      "category": "boundary",
+      "fake_expect": "pass",
+      "passed": true,
+      "failures": [],
+      "notes": [],
+      "known_gap": false,
+      "failure_class": "pass"
+    },
+    {
+      "id": "F07",
+      "category": "boundary",
+      "fake_expect": "known_gap",
+      "passed": true,
+      "failures": [],
+      "notes": [
+        "spec_only:tool_trace:absent_in_fake"
+      ],
+      "known_gap": true,
+      "failure_class": "pass"
+    },
+    {
+      "id": "F08",
+      "category": "boundary",
+      "fake_expect": "pass",
+      "passed": true,
+      "failures": [],
+      "notes": [],
+      "known_gap": false,
+      "failure_class": "pass"
+    },
+    {
+      "id": "F09",
+      "category": "boundary",
+      "fake_expect": "pass",
+      "passed": true,
+      "failures": [],
+      "notes": [],
+      "known_gap": false,
+      "failure_class": "pass"
+    }
+  ]
+}
