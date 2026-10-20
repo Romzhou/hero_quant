@@ -28,10 +28,14 @@
 | `backtest/validation.py` | 84 | 45 | 32 | 77/84 | 91.7% |
 | 合计 | 538 | 286 (53.2%) | 124 | **410/538** | **76.2%** |
 
-- 新增测试: **57 个** (`tests/mutation/test_mutation_metrics.py` 35 个,
-  `test_mutation_indicators.py` 9 个, `test_mutation_validation.py` 13 个)。
-- 验证: `pytest tests/mutation -q` → 57 passed; `ruff check tests/mutation` → clean。
+- 新增测试: **58 个** (`tests/mutation/test_mutation_metrics.py` 35 个,
+  `test_mutation_indicators.py` 9 个, `test_mutation_validation.py` 14 个)。
+- 验证: `pytest tests/mutation -q` → 58 passed(实跑记录见 `docs/mutation-audit.md` §3);
+  `ruff check tests/mutation` → clean。
 - 剩余存活 128 个, 全部归类为**等价 / 不可达防御代码 / 不值得**(第 4 节逐类给出证明或理由)。
+- 上表分数为 TEMP harness **首轮实测快照**(538/410/128, 76.2%); 其后补入 id65 匹配侧
+  pin `test_currency_single_matching_passes`(见 `docs/mutation-audit.md` §2 F1), 未重跑
+  harness, 故分数表**未重算**, 需变异 harness 复跑确认(不得据此推断新分数)。
 
 ## 3. 杀伤映射(测试 -> mutant, id 为 harness 内编号)
 
@@ -94,6 +98,9 @@
 - `test_multi_asset_zero_price_rejected` → :184-and/`<`
 - `test_multi_asset_negative_price_rejected` → :184-`==`
 - `test_currency_lexicographic_mismatch_rejected` → :213-`<=`
+- `test_currency_single_matching_passes` → :208-`>=`(id65) 单币种匹配放行 pin(补齐窄
+  oracle 缺失的"单币种放行"用例; id65 在首轮 harness 快照中已被杀, 本 pin 为回归锁,
+  分数表未重算, 见 `docs/mutation-audit.md` §2 F1)
 
 ## 4. 存活 mutant 按价值排序(全部 128 个的处置结论)
 
@@ -181,8 +188,20 @@ P1=信号正确性(RSI/MACD/布林/换手口径), P2=统计细节/鲁棒契约, 
 - `indicators.py:118 [ROR] >=`(id29)、`:119 [ROR] <=`(id37)、`:131 ×2`(id78/84):
   零增量在 gain/loss 置零语义下恒等。等价。
 - `indicators.py:129 [CONST] 0->1`(id74, `avg_loss != 1`): 需 ewm 恰为 1.0, 特设输入。不值得。
-- `validation.py:64`(id7)、`:208`(id69)、`:213 ×2`(id72/76):
-  `len>0`/`nuniq>1` 定义域下 `!=`/`>=` 与原比较符恒等(长度/基数不可能为 0/负)。等价。
+- `validation.py:64`(id7)、`validation.py:208`(id65/id69)、`validation.py:213 ×2`(id72/id76):
+  id7/id69/id72/id76 **四个均等价**, 本节原"恒等"表述对这四个 id 本来成立(是审计表把
+  编号标反了, 订正来源见 `docs/mutation-audit.md` §1/§2, 依据 TEMP harness results.json
+  原始 desc): id7 `len(args)>0` 定义域 `len>=0` ⇒ `>0 ⟺ !=0`; id69 `:208 nuniq>1`
+  (原始 desc `Cmp >->!=`) 空帧 `:72` 拒、NaN 币种 `:204-206` 拒 ⇒ `nuniq>=1`
+  ⇒ `>1 ⟺ !=1`; id72 `:213` 原始 desc `Cmp >->>=`, `len(unique_vals)>=1`(`:212` NaN
+  拦截后) ⇒ `len>=0` 与 `len>0` 同真; id76 `:213` 原始 desc `Cmp >->!=`, 同定义域
+  ⇒ `len!=0` 与 `len>0` 同真。**等价**。
+- 真正缺 pin 的非等价 mutant 是 id65(`:208 > -> >=`, 恒真会误杀单币种)与 id81
+  (`:213 == -> <=`): id65 已补 pin
+  `tests/mutation/test_mutation_validation.py::test_currency_single_matching_passes`
+  (全量 `tests/test_j2_mcp_skills_validation.py:290` 放行断言可杀), id81 由既有
+  `test_currency_lexicographic_mismatch_rejected` 覆盖; 二者均非 `src` 错, 只属
+  窄 oracle 缺口(见 `docs/mutation-audit.md` §2 F1)。
 - `validation.py:123/125`(id21/22): `utcoffset()` 抛错回落, 触发需 tz 实现抛错。不值得。
 
 ### 顺带发现(未改 src, 记账给对应专线)
@@ -210,10 +229,28 @@ P1=信号正确性(RSI/MACD/布林/换手口径), P2=统计细节/鲁棒契约, 
 
 - mutation score: 基线 53.2% (286/538) → **最终 76.2% (410/538)**;
   分文件 72.9% / 74.2% / 91.7%。
-- 新增测试: 57 个, 文件:
+- 新增测试: 58 个, 文件:
   `tests/mutation/test_mutation_metrics.py`(35)、
   `tests/mutation/test_mutation_indicators.py`(9)、
-  `tests/mutation/test_mutation_validation.py`(13)。
+  `tests/mutation/test_mutation_validation.py`(14)。
 - 报告路径: `docs/mutation-report.md`(本文件)。
-- 复现: `pytest tests/mutation -q` (57 passed) + `ruff check tests/mutation`(clean);
+- 复现: `pytest tests/mutation -q` (58 passed) + `ruff check tests/mutation`(clean);
   变异判定逻辑见 TEMP harness(未进仓, 可按需重新生成)。
+- 分数表为 harness 首轮快照(538/410/128, 76.2%), 补 id65 匹配侧 pin 后未重跑,
+  需复跑确认(见 §2 末条); id69 算子已由 harness 原始 desc 坐实为 `> -> !=`(等价),
+  id72=`> -> >=`/id76=`> -> !=` 亦等价, §4 对应行已按此回填(订正来源见
+  `docs/mutation-audit.md` §1/§2)。
+
+## 相关文档
+
+本报告是量化侧的"存活 mutant 处置"台账: 回答"哪些变异等价、哪些是真缺陷"。量化口径
+的裁决在 [docs/quant-semantics.md](quant-semantics.md), 存活结论的独立复核在
+[docs/mutation-audit.md](mutation-audit.md)(其 F1/F2 两行直接订正本报告 §4 的
+id65/id81 表述)。先看口径, 再看本报告 §4 的等价性论证; 想知道"这条结论凭什么"就顺着
+下面第一个链接跳到审计表。
+
+- [docs/quant-semantics.md §2 turnover 统一口径](quant-semantics.md) — R 线锁定的量化口径(turnover 首日语义/RSI seeding/BOLL ddof/PIT 次日执行/CAGR 跨度); 本报告 §4 顺带发现 1 的落地方案。
+- [docs/mutation-audit.md §1 结论表(15 条)](mutation-audit.md) — 15/128 存活 mutant 的独立只读复核结论表。
+- [docs/mutation-audit.md §2 真缺陷清单](mutation-audit.md) — F1(id65 缺 pin, 已补 `test_currency_single_matching_passes`)/ F2(id69 算子已坐实为 `> -> !=`, 等价)的订正来源。
+- [docs/fuzz-report.md §2 500 列表](fuzz-report.md) — API 请求面 500 归零, 与本报告同属"降级必须显式"的 fail-closed 契约。
+- [docs/agent-eval-real.md §1 结论](agent-eval-real.md) — 评测侧"无可用后端即留白"的同族 fail-closed 结论。

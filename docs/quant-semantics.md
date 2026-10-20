@@ -23,7 +23,9 @@
   `a=[1,2,3,2],b=[10,10,12,12]` 由 `0.625 → 0.8333…(=5/2/3)`；
   `[-inf,1,2,3]` DF 由 `0.333… → 0.5`。`tests/mutation` 中锁定旧稀释值
   （`test_turnover_dataframe_paths` 0.375/0.625、`test_turnover_minus_inf_paths` 1/3）
-  的两个断言已过时，需 N 线同步更新，本线无权改 `tests/mutation/**`。
+  的两个断言**已按本线口径更新**（`tests/mutation/test_mutation_metrics.py:139-144`
+  现断言 0.5 / 5/6，`:292` 现断言 0.5；另见 `docs/mutation-audit.md` §3），
+  旧稀释值断言已不存在。
 
 ## 2. turnover 统一口径（标量 `metrics.turnover`）
 
@@ -97,5 +99,19 @@ turnover = sum(|Δ|) / 2 / (n_valid - 1)
   （单列/多列/脏首行/中部缺口/稳定零换手/单点），锁定本约定。
 - `tests/validation/test_quantlib_golden.py`：12 用例（SMA/EMA/RSI/BOLL/MACD/
   MDD/Sharpe/CAGR/turnover 单边/BS/引擎次日语义）。
-- 存量 `tests/mutation` 中 `0.375/0.625/1/3` 三个 DF 稀释断言待 N 线更新，
-  更新前 `pytest tests/mutation` 会红，属预期（口径统一的必然结果）。
+- 存量 `tests/mutation` 中 `0.375/0.625/1/3` 三个 DF 稀释断言**已更新**为本线口径
+  （`tests/mutation/test_mutation_metrics.py:139-144`、`:292`），`pytest tests/mutation`
+  现为绿（58 passed，实跑记录见 `docs/mutation-audit.md` §3）。
+
+## 相关文档
+
+本文件是量化口径的**唯一裁决源**（turnover 首日语义/RSI seeding/BOLL ddof/PIT 次日
+执行/CAGR 跨度）；[docs/mutation-report.md](mutation-report.md) §4 的「顺带发现 1」
+由本文件 §1 的结论转成 patch 建议，存活结论的独立复核见
+[docs/mutation-audit.md](mutation-audit.md) §2 F1/F2。要改口径先看本文件，再去
+mutation-report 确认该口径的回归锁是否已覆盖；只想看结论就直接看 §1。
+
+- [docs/mutation-report.md §4 存活 mutant 按价值排序](mutation-report.md) — 存活 mutant 的等价性论证与「顺带发现」记账，本文件 §1 结论的上游观察源。
+- [docs/mutation-audit.md §2 真缺陷清单](mutation-audit.md) — 对上一条等价性结论的独立复核（F1/F2 订正 id65/id81 表述）。
+- [docs/fuzz-report.md §2 500 列表](fuzz-report.md) — API 侧 500 归零，与本文件同属「口径/降级必须显式」的契约族。
+- [docs/agent-eval-real.md §1 结论](agent-eval-real.md) — 评测侧「无可用后端即留白」的 fail-closed 结论。

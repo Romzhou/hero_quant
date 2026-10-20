@@ -43,3 +43,15 @@ fake 只证明评测管道与断言自洽，**不证明模型质量**；模型�
 - `python evals/run.py --mode real` → `[eval] SKIP real 模式：无可用 LLM 后端 (预检未通过)`，写 `evals/results_real.json`（skipped/no_llm_backend）。
 - `python evals/run.py --mode fake` → headline 30/30 = 100.0%，known_gap 8/8，`failure_classes={}`。
 - `ruff check evals` → All checks passed。
+
+## 相关文档
+
+本文件只回答一件事：real 模式下**本轮有没有模型质量结论**（当前没有——无可用后端，
+按 §2 留白而非伪造通过率）。它与量化口径、变异存活台账、API 模糊测试三份报告同属
+「降级必须显式」的契约族，但口径互不重叠：先看本文件 §1 确认有无模型质量结论，再按
+需要跳到量化口径或变异台账。
+
+- [docs/quant-semantics.md §1 结论先行](quant-semantics.md) — R 线锁定的量化口径（被评测链路引用的业务语义）。
+- [docs/mutation-report.md §2 分数](mutation-report.md) — 变异测试分数与存活 mutant 台账（行为契约的另一面证据）。
+- [docs/mutation-audit.md §2 真缺陷清单](mutation-audit.md) — 存活 mutant 的独立复核（F1/F2 订正 id65/id81 表述）。
+- [docs/fuzz-report.md §4 根因分类与处理](fuzz-report.md) — API 面 500 归零与 degraded 契约（fail-closed 的接口侧同族证据）。
