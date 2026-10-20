@@ -58,3 +58,17 @@ naive close复利 [1.0,1.1,1.21] 隐含bar0收盘即成交，违反PIT。属设�
 - 修复数：0（无确认bug，未动src）
 - 回归测试：`tests/validation/test_quantlib_golden.py` 12 passed
 - 报告路径：`docs/validation-report.md`（本文件）
+
+## R线补记（2026-10-20，turnover 口径统一 N→Q）
+
+- 结论：`0.5` 为约定（`sum(|Δ|)/2/(n_valid-1)`，首日剔除），`0.375` 为 DF 路径
+  `sum(axis=1)` 稀释 bug（首行 NaN→0 计入分母）。详见 `docs/quant-semantics.md §1-2`。
+- 修复：`src/hero_quant/backtest/metrics.py:156-160` DF 路径加 `min_count=1`
+  使首行保持 NaN 并被 `dropna` 剔除。单列 `[1,2,3,2]`：`0.375→0.5`；
+  双列 `a=[1,2,3,2],b=[10,10,12,12]`：`0.625→0.8333…`；
+  `[-inf,1,2,3]` DF：`0.333…→0.5`（与 Series 一致）。
+- 回归：新增 `tests/validation/test_turnover_parity.py` 6 用例
+ （DF↔Series↔weights 同输入同输出：单列/多列/脏首行/中部缺口/稳定零/单点）。
+- 待办（N线）：`tests/mutation/test_mutation_metrics.py` 中
+  `test_turnover_dataframe_paths`（0.375/0.625）与 `test_turnover_minus_inf_paths`
+  （1/3）锁定的是旧稀释行为，需同步更新为 0.5/0.8333/0.5，本线无权改 `tests/mutation/**`。

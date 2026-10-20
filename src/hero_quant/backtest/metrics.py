@@ -154,7 +154,10 @@ def turnover(
                 # 多资产：每日各标的绝对变动求和后取均值 — single-side (/2)
                 # semantics consistent with the weights fallback below
                 _pdf = positions.apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan).dropna(how="all")
-                diff = _pdf.diff().abs().sum(axis=1).dropna()
+                # R线统一口径：首行 diff 全 NaN 必须保持 NaN 并被 dropna 剔除（分母 n_valid-1，
+                # 不含首日），与 Series/weights 路径一致。sum 默认 skipna 会把首行 0 计入
+                # 分母造成稀释（单列 [1,2,3,2] 得 0.375 vs 正确 0.5），故加 min_count=1。
+                diff = _pdf.diff().abs().sum(axis=1, min_count=1).dropna()
                 if not diff.empty:
                     _m = float(diff.sum() / 2 / len(diff))
                     return _m if np.isfinite(_m) else 0.0
