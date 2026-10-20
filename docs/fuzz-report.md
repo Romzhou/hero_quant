@@ -57,7 +57,7 @@ curl -s -o /dev/null -w '%{http_code}' 'http://127.0.0.1:8899/v1/trace/events?of
 curl -s 'http://127.0.0.1:8899/v1/risk/summary' | head -c 300   # 200 + degraded:true + reason
 ```
 
-## 4. 根因分类与记账（全部只记账，零 src 落地）
+## 4. 根因分类与处理（O1/O6 已修，O2 文档确认；仅 O1/O6 触碰 src）
 
 - **500/未捕获异常：0 条，无根因。**
 - O1（degraded 标记不全，链A/D线归属）：**已修**。两处 `_FakeLLM` 模板以 `src/hero_quant/api/server.py:1444`（query 分支）为准统一 `src/hero_quant/api/server.py:1840`（stream 分支）：模板嵌入 `for query:{goal}`、尾部追加固定免责声明行 `本结果为合成占位，不构成投资建议`，并删除长模板多出的 3 行（数据来源/回测区间/等权策略跑赢基准）。body 侧 `degraded:true` + 非空 `degraded_reason` + `llm_mode=synthetic`（`src/hero_quant/api/server.py:1575-1604`），经 `_with_degraded_headers`（`src/hero_quant/api/server.py:184-192`）同步响应头 `X-Degraded/X-Degrade-Reason`；stream 首事件对应（`src/hero_quant/api/server.py:1975-1984` + 响应头 `src/hero_quant/api/server.py:2084-2089`）。`evals/run.py:39` 的 `FAKE_CHECKABLE` 加 `risk_warning` marker 与 FakeLLM 模板（`evals/run.py:52-55`）同步。回归锁：`tests/fuzz/test_o_wall_time.py:84-110`（源码级模板一致断言 + evals 对拍）。
