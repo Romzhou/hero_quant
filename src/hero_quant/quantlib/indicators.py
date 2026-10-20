@@ -1,8 +1,9 @@
 """指标库：纯 pandas/numpy 的核心技术指标（无外部依赖）。
 
-职责：提供 sma/ema/rsi/bollinger/macd/max_drawdown，供回测/研究/工具调用。
+职责：提供 sma/ema/rsi/bollinger/macd/atr/max_drawdown，供回测/研究/工具调用。
 架构位置：quantlib 基础层，被 rust/polars 上层封装复用；保证空数据/NaN/Inf 鲁棒性。
-关键设计：rsi 采用 Wilder EWM（alpha=1/n）；bollinger 以滚动均值±k·std；macd 为快慢 EMA 差。
+关键设计：rsi 采用 Wilder EWM（alpha=1/n）；bollinger 以滚动均值±k·std；macd 为快慢 EMA 差；
+atr 为 Wilder TR 平滑（首值取前 n 个 TR 均值、之后按 (prev*(n-1)+tr)/n 递推）。
 """
 from __future__ import annotations
 
@@ -215,6 +216,96 @@ def macd(series, fast: int = 12, slow: int = 26, signal: int = 9, *args, **kwarg
     hist = hist.replace([np.inf, -np.inf], np.nan)
 
     return macd_line, signal_line, hist
+
+
+def _extract_ohlc(high, low, close):
+    """归一 high/low/close 三列：支持 DataFrame 单参或三序列分参，按位置对齐。
+
+    DataFrame 须含 high/low/close 三列（大小写敏感）；三序列可为 Series/list/ndarray，
+    经 _to_series 归一（非数值→NaN、Inf→NaN）。长度不一致抛 ValueError；索引取 close
+    为主（Series/DataFrame 时保留其 index，否则取 high/low 的 index，都没有则 RangeIndex）。
+    """
+    if low is None and close is None:
+        # 单参 DataFrame 形态：atr(df)
+        if isinstance(high, pd.DataFrame):
+            missing = [c for c in ("high", "low", "close") if c not in high.columns]
+            if missing:
+                raise ValueError(f"atr: DataFrame missing columns {missing}")
+            h = _to_series(high["high"])
+            ell = _to_series(high["low"])
+            c = _to_series(high["close"])
+            return h, ell, c
+        raise ValueError("atr: requires high/low/close (or DataFrame with high/low/close columns)")
+    if low is None or close is None:
+        raise ValueError("atr: requires high, low and close together")
+    h = _to_series(high)
+    ell = _to_series(low)
+    c = _to_series(close)
+    if not (len(h) == len(ell) == len(c)):
+        raise ValueError(f"atr: length mismatch high={len(h)} low={len(ell)} close={len(c)}")
+    return h, ell, c
+
+
+def atr(high, low=None, close=None, period: int = 14, *args, **kwargs) -> pd.Series:
+    """ATR 平均真实波幅（Wilder）：TR=max(H-L, |H-prevC|, |L-prevC|)，ATR 为 Wilder 平滑。
+
+    口径：TR[0]=H-L（无 prevC）；ATR[n-1]=mean(TR[0:n])，之后按
+    ATR[i]=(ATR[i-1]*(n-1)+TR[i])/n 递推（与 TA-Lib Wilder 一致）。
+    前 n-1 个为 NaN（不足窗口诚实置空，不填 0 冒充）；有效 TR 不足 n 个时全 NaN。
+    NaN 的 TR 对应 ATR 为 NaN 且不参与平滑（状态沿用上一个有效 ATR）。
+    """
+    # 兼容别名 n/window/span
+    if "n" in kwargs:
+        period = kwargs["n"]
+    if "window" in kwargs:
+        period = kwargs["window"]
+    if "span" in kwargs:
+        period = kwargs["span"]
+    n = _validate_window(period, default=14)
+    h, ell, c = _extract_ohlc(high, low, close)
+
+    # 索引：优先 close 的 Series/DataFrame 索引，保持与输入对齐
+    idx = c.index
+    if len(h) == 0:
+        return pd.Series(dtype=float)
+
+    h_arr = h.to_numpy(dtype=float)
+    l_arr = ell.to_numpy(dtype=float)
+    c_arr = c.to_numpy(dtype=float)
+
+    import math as _math
+
+    tr = np.full(len(c_arr), np.nan)
+    for i in range(len(c_arr)):
+        hi, li, ci = h_arr[i], l_arr[i], c_arr[i]
+        if _math.isnan(hi) or _math.isnan(li) or _math.isnan(ci):
+            continue  # 任一输入 NaN → TR NaN（诚实，不插值）
+        hl = hi - li
+        if i == 0 or _math.isnan(c_arr[i - 1]):
+            tr[i] = hl
+        else:
+            pc = c_arr[i - 1]
+            tr[i] = max(hl, abs(hi - pc), abs(li - pc))
+
+    out = np.full(len(c_arr), np.nan)
+    # Wilder 递推：跳过 NaN 的 TR（状态沿用），种子为前 n 个有效 TR 均值
+    valid = [i for i, v in enumerate(tr) if not _math.isnan(v)]
+    if len(valid) >= n:
+        seed_idx = valid[n - 1]
+        seed_vals = [tr[i] for i in valid[:n]]
+        prev = float(sum(seed_vals) / n)
+        out[seed_idx] = prev
+        for i in range(seed_idx + 1, len(tr)):
+            if _math.isnan(tr[i]):
+                out[i] = np.nan  # 缺失 bar 置空，不消费状态
+                continue
+            prev = (prev * (n - 1) + float(tr[i])) / n
+            out[i] = prev
+    # Inf 保护（理论上 TR/均值不会产生 Inf，但保持与库内其他指标一致）
+    res = pd.Series(out, index=idx, dtype=float)
+    res = res.replace([np.inf, -np.inf], np.nan)
+    res.name = "atr"
+    return res
 
 
 def max_drawdown(equity) -> float:
