@@ -189,8 +189,9 @@ def test_j15_factory_exact(monkeypatch):
     # strict 下 SDK 缺席直接上传播 ImportError
     monkeypatch.setenv("HERO_LLM_PROVIDER", "openai")
     facs = F.LLMFactory(settings=None, strict=True)
-    with pytest.raises(ImportError):
-        facs.create(api_key="sk-fake", model="gpt-4o")
+    with mock.patch.dict("sys.modules", {"langchain_openai": None}):
+        with pytest.raises(ImportError):
+            facs.create(api_key="sk-fake", model="gpt-4o")
     # deepseek/anthropic env key 读取
     monkeypatch.setenv("HERO_LLM_PROVIDER", "deepseek")
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-ds-fake")
