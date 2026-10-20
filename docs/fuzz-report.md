@@ -60,19 +60,19 @@ curl -s 'http://127.0.0.1:8899/v1/risk/summary' | head -c 300   # 200 + degraded
 ## 4. 根因分类与记账（全部只记账，零 src 落地）
 
 - **500/未捕获异常：0 条，无根因。**
-- O1（degraded 标记不全，链A/D线归属）：本环境 `langchain_openai` 缺失 → `factory.py:130` dummy key + `_FallbackChat` 回显，`server.py:1419` 的 `_FakeLLM` 分支未被命中（`llm is None` 永假），导致 `llm_mode: synthetic` 缺失、`degraded_reason` 仅含 checkpoint 原因。`degraded:true` 本体仍在，不算假成功，但与“`_FakeLLM` 必须置 degraded+reason”（AGENTS §6）存在缺口。**记账**：`src/hero_quant/api/server.py` 在 K 线 diff 集合内（c8c6487/cbe6997/f68052f），O 线无权改；且任务行号（1091-1401/229-235）已漂移，实际 `_FakeLLM` 在 1420-1435。请 D 线认领。
-- O2（GET /v1/query/ticket → 404，余者 405）：SPA catch-all `GET /{full_path:path}`（`server.py:2562-2570`/`2622-2627`）的 `v1/` 守卫返回 404，fail-closed，等价安全。**记账**，不修（行为一致、无 500）。
+- O1（degraded 标记不全，链A/D线归属）：**已修**。两处 `_FakeLLM` 模板以 `src/hero_quant/api/server.py:1444`（query 分支）为准统一 `src/hero_quant/api/server.py:1840`（stream 分支）：模板嵌入 `for query:{goal}`、尾部追加固定免责声明行 `本结果为合成占位，不构成投资建议`，并删除长模板多出的 3 行（数据来源/回测区间/等权策略跑赢基准）。body 侧 `degraded:true` + 非空 `degraded_reason` + `llm_mode=synthetic`（`src/hero_quant/api/server.py:1575-1604`），经 `_with_degraded_headers`（`src/hero_quant/api/server.py:184-192`）同步响应头 `X-Degraded/X-Degrade-Reason`；stream 首事件对应（`src/hero_quant/api/server.py:1975-1984` + 响应头 `src/hero_quant/api/server.py:2084-2089`）。`evals/run.py:39` 的 `FAKE_CHECKABLE` 加 `risk_warning` marker 与 FakeLLM 模板（`evals/run.py:52-55`）同步。回归锁：`tests/fuzz/test_o_wall_time.py:84-110`（源码级模板一致断言 + evals 对拍）。
+- O2（GET /v1/query/ticket → 404，余者 405）：**不修关票**。唯一 POST 路由 `src/hero_quant/api/server.py:1614`；GET 落入 SPA catch-all（`src/hero_quant/api/server.py:2586-2594` / `src/hero_quant/api/server.py:2646-2651`）的 `v1/` 守卫（`src/hero_quant/api/server.py:2593-2594` / `src/hero_quant/api/server.py:2650-2651`）返回 404，fail-closed；PUT/DELETE 无路由命中由框架默认 405。404 与 405 均拒绝非 POST 方法，等价安全，无 500。锁定测试：`tests/fuzz/test_o_fuzz_edges.py:31-36`。
 - O3（`scope="query "` → 200）：`security.py:104` strip 归一化，有意设计。**观察**，不修。
 - O4（HERO_ENV 未设 + 无 Redis → ticket 全 429）：`infra/redis.py:220-237` 生产门禁 fail-closed，符合 G-06 精神；O 线起服用 `HERO_ENV=development` 走 fakeredis。**观察**（环境配置项，非缺陷）。
 - O5（200KB q → 400 `Invalid HTTP request received`）：uvicorn/httptools 解析层拒绝超长请求行，未进 FastAPI，无异常日志冒泡。**观察**，不修。
-- O6（`wall_time_budget=NaN/-5/1e9` → 200）：FastAPI 解析通过，AgentLoop 内消化（_FallbackChat 即时返回），无挂起无 500。语义层是否应 422 属产品决策，**记账**给 D 线，不修。
+- O6（`wall_time_budget=NaN/-5/1e9` → 200）：**已修 422**。API 边界为 `0 < x <= 3600`：`NaN/-5/0/3600.1/inf/-inf/1e9` → 422，合法 `1/3600` → 200。校验函数 `_validate_wall_time_budget`（`src/hero_quant/api/server.py:1321-1337`）置于限流（`src/hero_quant/api/server.py:1351` / `src/hero_quant/api/server.py:1721`）之后、ticket 消费（`src/hero_quant/api/server.py:1359` / stream 侧同序）之前：非法值直接 422 且不耗单次票（同一票连打非法值仍全 422、票仍可正常消费一次），无票 + 非法值时优先 422。只校验显式传入值（`None` 放行走 settings fallback：`src/hero_quant/api/server.py:1512-1514` / `src/hero_quant/api/server.py:1906-1908`，fallback 不钳制、不改默认）。`NaN` 须 `math.isnan` 显式拦截（比较符抓不住：`NaN > 0` 为 False 会落入旧归一化分支静默变 `None`，`src/hero_quant/agent/loop.py:365`；`inf` 同理经 `math.isinf` 拦截）。env 正数门保持：`src/hero_quant/config/settings.py:48-58`。回归锁：`tests/fuzz/test_o_wall_time.py:31-82`（query/stream 双端非法 422 + 合法 200 + 不耗票证据）。
 - 工具链注记：schemathesis 4.32.1 CLI 在 Windows gbk 控制台必崩（rich `✅` 编码，`_win32_console.py:402`），与被测服务无关；O 线用 `scripts/st_run.py`（`is_terminal=False` monkeypatch） headless 运行，256 cases 全过。
 
 ## 5. 修复/记账清单
 
-- src 修复：**无**（`server.py`/`security.py` 均在 K 线 diff 集合：`src/hero_quant/api/server.py`、`src/hero_quant/api/security.py`、`src/hero_quant/infra/session.py`；且 fuzz 未发现任何需 fail-closed 小修的 500）。
-- 新增文件：`docs/fuzz-report.md`（本报告）、`scripts/fuzz_repro.py`（64 用例定向 fuzz，`--only F1..F9` 可选跑）、`scripts/st_run.py`（headless schemathesis 启动器）、`tests/fuzz/test_o_fuzz_edges.py`（9 用例回归锁，`pytest` 9 passed）。
-- 记账移交：O1→D 线（链A 降级标记），O6→D 线（wall_time 语义），O2→C 线（文档可选注记 GET 票据路由 404）。
+- src 修复：**有**——O1（`src/hero_quant/api/server.py:1444` + `src/hero_quant/api/server.py:1840` 两模板统一 + `evals/run.py:39,52-55` 同步）与 O6（`src/hero_quant/api/server.py:1321-1337` 校验器 + 两处调用点 `src/hero_quant/api/server.py:1354-1355` / `src/hero_quant/api/server.py:1724-1725`），另 `src/hero_quant/api/server.py:15` 增 `import math`（NaN/inf 拦截用）。
+- 新增文件：`docs/fuzz-report.md`（本报告）、`scripts/fuzz_repro.py`（64 用例定向 fuzz，`--only F1..F9` 可选跑）、`scripts/st_run.py`（headless schemathesis 启动器）、`tests/fuzz/test_o_fuzz_edges.py`（9 用例回归锁，`pytest` 9 passed）、`tests/fuzz/test_o_wall_time.py`（5 用例：O6 双端边界 + O1 模板统一源码锁）。
+- 记账移交更新：O1→**已修**（模板统一 + degraded 头体同步 + evals marker 同步，见 §4 O1），O6→**已修**（422 边界校验，见 §4 O6），O2→**不修关票**（fail-closed 等价安全，见 §4 O2）。
 
 ## 6. 验收
 
@@ -80,3 +80,17 @@ curl -s 'http://127.0.0.1:8899/v1/risk/summary' | head -c 300   # 200 + degraded
 - 500：归零（0/330 live，0/9 pytest）。
 - 复现条数：§3 共 13 条 curl 路径，每条可独立重放。
 - 报告路径：`docs/fuzz-report.md`。
+- 第二轮（O1/O6 修后复验，见 §7）：live 64（`scripts/fuzz_repro.py` 全量，500/异常=0）+ pytest 17（`tests/fuzz` 14 + `tests/test_ready_degraded.py` 3）+ evals fake headline 30/30 + `ruff check src` 通过。
+
+## 7. 修后复验记录（O1 已修 + O6 已修 422 + O2 不修关票）
+
+- 代码提交：
+  - `cbbd73b` — `O1: unify _FakeLLM templates + risk_warning marker (fuzz-report O1 done)`（`src/hero_quant/api/server.py` 两模板 hunk + `evals/run.py` 两处同步）。
+  - `1bd8dc9` — `O6: wall_time_budget 422 boundary check + regression locks (fuzz-report O6 done)`（`src/hero_quant/api/server.py` 校验器 + 两调用点 + `import math`，`tests/fuzz/test_o_wall_time.py` 新建 5 用例）。
+  - 本报告提交即 C3（`O2/docs: ...`）。
+- 门禁数：
+  - `pytest tests/fuzz tests/test_ready_degraded.py -q`：**17 passed**（`tests/fuzz/test_o_fuzz_edges.py` 9 + `tests/fuzz/test_o_wall_time.py` 5 + `tests/test_ready_degraded.py` 3）。
+  - `python evals/run.py --mode fake`：**headline 30/30 = 100.0%**（cases=38，known_gap 8/8 通过，failure_classes={}）。
+  - `ruff check src`：**All checks passed**。
+  - live（`HERO_ENV=development`，`uvicorn hero_quant.api.server:app --port 8899`，`python scripts/fuzz_repro.py` 全量）：**total=64，status={400:15, 200:23, 429:1, 404:1, 405:7, 401:5, 422:10, 403:2}，failures(500/exc)=0**。§3 13 条 curl 逐条对照：F1 非法 scope→400（F1-9 遇 ticket 10/min 配额得 429，fail-closed 预期内）/ F1 空格归一化→200 / F2 超长 user→200×7 / F3 GET→404 + PUT/DELETE→405 / F4 401-200-401（单次语义）/ F5 200KB q→400 / F6 穿越→400×4 + 非法 wall_time→422×6 + 合法→200×2 / F8 offset -1→400 + abc→422 + 超大→200 / F9 risk→200 + degraded:true + reason。F6 非法 wall_time 现 422 属 O6 修复后预期；F3 GET 404 / PUT 405 属 O2 预期。
+- 环境注记：`/ready` 在本离线环境返回 503 degraded（pg=false、checkpoint/billing 走 memory fail-closed），系无 PG/DSN 下的正确 fail-closed 行为，与首轮一致；服务本身全功能（POST 票据 200），不影响复验结论。
