@@ -259,6 +259,41 @@ def main() -> int:
             print(f"[eval] wrote {out_path}")
             return 0
 
+        def _write_skipped(reason: str, detail: str) -> int:
+            out_path = Path(args.out) if args.out else HERE / "results_real.json"
+            out_path.write_text(
+                json.dumps(
+                    {
+                        "mode": "real",
+                        "status": "skipped",
+                        "reason": reason,
+                        "detail": detail,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            print(f"[eval] wrote {out_path}")
+            return 0
+
+        # 连通性预检：真实后端必须能回非空文本。
+        # 无有效 key / 网关不可达时 38 个用例会全部 empty_text 失败——
+        # 那不是模型质量，而是后端不可用，必须 fail-closed 跳过，不得伪造通过率。
+        preflight_error = ""
+        preflight_text = ""
+        try:
+            preflight_text = (llm.chat("ping") or "").strip()
+        except Exception as e:  # noqa: BLE001
+            preflight_error = f"{type(e).__name__}: {e}"
+        if not preflight_text:
+            detail = "LLMClient.chat('ping') returned empty text"
+            if preflight_error:
+                detail += f" (error: {preflight_error})"
+            detail += "; no usable LLM backend, real-LLM assertions are not meaningful"
+            print("[eval] SKIP real 模式：无可用 LLM 后端 (预检未通过)")
+            return _write_skipped("no_llm_backend", detail)
+
         def run_real_loop(query: str) -> dict:
             loop = AgentLoop(llm=llm, max_iterations=2, trace=False)
             t0 = time.monotonic()
