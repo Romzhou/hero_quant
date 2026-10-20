@@ -12,6 +12,7 @@ from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_
 import structlog
 import structlog.contextvars
 import hashlib
+import math
 import re
 import time
 import uuid
@@ -1317,6 +1318,25 @@ def metrics(request: Request, x_ticket: str | None = Header(None, alias="X-Ticke
     return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
+# O6：wall_time_budget 显式值有限范围校验（0 < x <= 3600），仅校验显式传入值；
+# settings fallback（wall_time_budget_seconds/wall_time_budget 默认）不钳制、不改默认。
+# 位置选择：放在限流之后、ticket 消费之前——非法参数直接 422，不消耗单次票；
+# ticket 校验仍在其后保持原顺序（无票仍 401；非法值+无票时优先 422，见下两处调用点注释）。
+def _validate_wall_time_budget(value: float | None) -> None:
+    """O6 校验：None 放行（走 settings fallback）；NaN/±inf/<=0/>3600 抛 422。
+
+    FastAPI float 解析对 NaN/inf 不抛错，故用 math.isnan/isinf 显式拦截。
+    """
+    if value is None:
+        return
+    try:
+        bad = math.isnan(value) or math.isinf(value) or not (0 < value <= 3600)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=422, detail="wall_time_budget must be in (0, 3600]")
+    if bad:
+        raise HTTPException(status_code=422, detail="wall_time_budget must be in (0, 3600]")
+
+
 @app.get("/v1/query")
 async def query(request: Request, background_tasks: BackgroundTasks, q: str = "", use_graph: bool = False, replay_path: str | None = None, trace_dir: str | None = None, wall_time_budget: float | None = None, x_ticket: str | None = Header(None, alias="X-Ticket")):
     """同步查询：组装 AgentLoop 并返回 LoopResult 聚合 JSON。"""
@@ -1331,6 +1351,8 @@ async def query(request: Request, background_tasks: BackgroundTasks, q: str = ""
     _limited = _check_rate_limit(request, "query", 20, 60)
     if _limited is not None:
         return _limited
+    # O6：显式 wall_time_budget 越界直接 422（ticket 消费之前，不耗单次票；无票+非法值时优先 422）。
+    _validate_wall_time_budget(wall_time_budget)
     # 中文：T1-3 身份闭环：/v1/query 与 stream 同等要求有效 ticket（单次消费），无票/过期票 401。
     # 顺序：限流先于鉴权（耗尽配额时仍 429，便于 test_pr1a 语义）；ticket 只走 X-Ticket 头（已移除 ?ticket= 回退）。
     # 中文：G-08——query 要求 scope=query（legacy 无分域票迁移期放行；metrics 分域票拒绝）。
@@ -1699,6 +1721,8 @@ async def query_stream(request: Request, background_tasks: BackgroundTasks, q: s
     _limited = _check_rate_limit(request, "stream", 10, 60)
     if _limited is not None:
         return _limited
+    # O6：显式 wall_time_budget 越界直接 422（ticket 消费之前，不耗单次票；无票+非法值时优先 422）。
+    _validate_wall_time_budget(wall_time_budget)
     if REQUEST_COUNTER is not None:
         try:
             REQUEST_COUNTER.labels(endpoint="/v1/query/stream").inc()
