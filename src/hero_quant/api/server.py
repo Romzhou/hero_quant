@@ -1419,7 +1419,7 @@ async def query(request: Request, background_tasks: BackgroundTasks, q: str = ""
         if llm is None:
             class _FakeLLM:
                 def stream_chat(self, goal: str, timeout=None):
-                    text = f"600519.SH close 1680.2 report metrics sharpe 1.62 grounding_verified True for query: {goal}\n（演示模式：未配置 HERO_API_KEY，数据为合成占位）\n"
+                    text = f"600519.SH close 1680.2 report metrics sharpe 1.62 grounding_verified True for query: {goal}\n（演示模式：未配置 HERO_API_KEY，数据为合成占位）\n本结果为合成占位，不构成投资建议\n"
                     yield {"type": "text", "text": text}
 
                 def invoke(self, goal: str):
@@ -1813,7 +1813,7 @@ async def query_stream(request: Request, background_tasks: BackgroundTasks, q: s
             if llm is None:
                 class _FakeLLM:
                     def stream_chat(self, goal: str, timeout=None):
-                        text = f"600519.SH close 1680.2 report metrics sharpe 1.62 grounding_verified True for query: {goal}\n数据来源 tencent(synthetic) · PIT校验通过 · Evidence verified\n回测区间 2026-07-20~2026-08-12 positions.csv 已落盘\n结论：等权策略跑赢基准\n（演示模式：未配置 HERO_API_KEY，数据为合成占位）\n"
+                        text = f"600519.SH close 1680.2 report metrics sharpe 1.62 grounding_verified True for query: {goal}\n（演示模式：未配置 HERO_API_KEY，数据为合成占位）\n本结果为合成占位，不构成投资建议\n"
                         yield {"type": "text", "text": text}
 
                     def invoke(self, goal: str):

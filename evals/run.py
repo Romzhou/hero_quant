@@ -36,6 +36,7 @@ FAKE_CHECKABLE = {
     "grounding_flag": "grounding_verified",
     "degraded_banner": "演示模式",
     "backtest_numbers": "1.62",
+    "risk_warning": "不构成投资建议",
 }
 # 仅 spec 层面的 markers：fake LLM 永远产不出，不判失败，只记录缺口
 SPEC_ONLY = {"risk_warning", "refusal_or_clarify", "tool_trace"}
@@ -51,6 +52,7 @@ class FakeLLM:
             f"600519.SH close 1680.2 report metrics sharpe 1.62 "
             f"grounding_verified True for query: {goal}\n"
             "（演示模式：未配置 HERO_API_KEY，数据为合成占位）\n"
+            "本结果为合成占位，不构成投资建议\n"
         )
         yield {"type": "text", "text": text}
 
