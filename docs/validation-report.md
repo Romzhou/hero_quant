@@ -51,12 +51,13 @@ naive close复利 [1.0,1.1,1.21] 隐含bar0收盘即成交，违反PIT。属设�
 - U2 ATR：任务书提及但quantlib无ATR实现（`__init__.py:4` 仅导出6项），属功能缺失非正确性bug，
   不修（超出“最小修”授权，且无对照基准）。
 
-## 验收
+## 验收（M线汇总 2026-10-20；Q线原文保留见 git 历史）
 
-- 对照项数：16（通过16）+ U1/U2 说明2项
-- 差异数：4（注1/注2/注3 + RSI短序列seeding差，均判定等价/设计）
-- 修复数：0（无确认bug，未动src）
-- 回归测试：`tests/validation/test_quantlib_golden.py` 12 passed
+- 对照项数：16（Q全过）+ 新增28用例（R 6 + U1 11 + U2 11）
+- 差异数：Q 4说明项（注1/注2/注3 + RSI短序列seeding差，均判定等价/设计）+ U1 窗口/别名契约说明1项 + ATR NaN/Inf诚实置空说明（均非bug，见U1/U2补记）
+- 修复数：R 1（`metrics.py:156-160` min_count=1，0.375 bug→0.5口径）；U2 功能新增1（Wilder ATR，与TA-Lib一致）；U1 0（src零改动，只读复核）
+- 回归锁：`tests/validation/test_quantlib_golden.py` 12 passed + `test_turnover_parity.py` 6 + `test_polars_parity.py` 11（9 passed, 2 skipped：需真实polars的sma数值对照）+ `test_atr_golden.py` 11 passed
+- 口径结论：`0.5` 正确（单边日均换手 `sum(|Δ|)/2/(n_valid-1)`，首日剔除），`0.375` 为DF路径稀释bug；详见 `docs/quant-semantics.md §1-2`
 - 报告路径：`docs/validation-report.md`（本文件）
 
 ## R线补记（2026-10-20，turnover 口径统一 N→Q）
@@ -72,3 +73,52 @@ naive close复利 [1.0,1.1,1.21] 隐含bar0收盘即成交，违反PIT。属设�
 - 待办（N线）：`tests/mutation/test_mutation_metrics.py` 中
   `test_turnover_dataframe_paths`（0.375/0.625）与 `test_turnover_minus_inf_paths`
   （1/3）锁定的是旧稀释行为，需同步更新为 0.5/0.8333/0.5，本线无权改 `tests/mutation/**`。
+
+## U1补记（2026-10-20，polars 路径 parity，src零改动）
+
+- 范围：`src/hero_quant/quantlib/polars_base.py`（sma_polars/ema_polars/rsi_polars）
+  vs `src/hero_quant/quantlib/indicators.py`（sma/ema/rsi）。只读复核，未改 src。
+- 方法：手算 golden + pandas 独立实现三方对照。本机无 polars 包时 sma 数值对照
+  skip，委托路径（ema/rsi）与 `_to_series/_validate_window` 接线仍实测；另用 Fake
+  `pl` 模块验证 `rolling_mean(min_samples=n)` / `min_periods` 回落接线与索引/名称保留。
+- 对照表（`tests/validation/test_polars_parity.py` 11用例，9 passed + 2 skipped）：
+
+| # | 用例 | 对照 | 结果 |
+|---|---|---|---|
+| U1-1 | sma手算golden w=3 on [1..5]→[nan,nan,2,3,4] | pandas sma | 通过 |
+| U1-2 | sma_polars==sma==golden（含扩展60点/别名n/自定义索引/超窗全NaN） | 需真实polars | skip×2（本机无polars包） |
+| U1-3 | Fake pl接线 min_samples=n + 索引/名称保留 | pandas rolling语义 | 通过 |
+| U1-4 | 旧版polars回落 min_periods重试 | 同上 | 通过 |
+| U1-5 | 空序列短路 / 缺polars fail-visible（ImportError带vector安装指引） | 语义期望 | 通过×2 |
+| U1-6 | ema_polars委托pandas：手算[1,1.5,2.25,3.125,4.0625]+别名/空/NaN/Inf | Q.ema | 通过（bit一致） |
+| U1-7 | rsi_polars委托pandas：边界100/50 + 200点Wilder收敛尾部<1e-3 | 独立Wilder实现 | 通过 |
+| U1-8 | _to_series两侧一致（close/equity/首列/list/Inf/空） | Q._to_series | 通过 |
+| U1-9 | 窗口/别名契约说明项（None/冲突别名/多余位置参数） | 说明锁定 | 通过（非缺陷，防误修） |
+
+- 结论：合法输入两侧一致；`min_samples=n` 与 pandas `min_periods=n` 对齐；
+  窗口/别名差异属说明项（polars更严格抛错，indicators兼容旧口径取末值/忽略，J1已锁定），非bug。
+- 回归：`tests/validation/test_polars_parity.py` 11用例（9 passed, 2 skipped）。
+
+## U2补记（2026-10-20，Wilder ATR 新增）
+
+- 范围：`src/hero_quant/quantlib/indicators.py:221-308`（`_extract_ohlc` + `atr`）、
+  `src/hero_quant/quantlib/__init__.py:2,4`（导出atr）。commit `3e97fda`。
+- 口径：TR=max(H-L, |H-prevC|, |L-prevC|)，TR[0]=H-L；ATR[n-1]=mean(TR[0:n])，
+  之后 ATR[i]=(ATR[i-1]*(n-1)+TR[i])/n 递推 —— 与 Wilder/TA-Lib 一致。
+  前 n-1 个为 NaN（诚实置空，不填0）；有效TR不足n个全NaN；NaN的TR对应ATR为NaN
+  且不污染后续状态（状态沿用上一个有效ATR）；Inf→NaN；别名 n/window/span 等价。
+- 对照表（`tests/validation/test_atr_golden.py` 11用例，全过，不依赖pandas-ta/TA-Lib）：
+
+| # | 用例 | 期望 | 结果 |
+|---|---|---|---|
+| U2-1 | 5 bar手算 n=3：TR=[1.0,1.5,2.0,1.5,2.5]→[nan,nan,1.5,1.5,5.5/3] | 手算 | 通过 |
+| U2-2 | TR锁定（period=1时ATR==TR）bar1=1.5/bar4=2.5 | 手算 | 通过 |
+| U2-3 | DataFrame(high/low/close)与三序列分参一致 | 互相对照 | 通过 |
+| U2-4 | 200 bar独立Wilder实现交叉 | maxabs==0.0 | 通过 |
+| U2-5 | bars<period全NaN / 空序列len0 / 非法窗口抛错 / 长度不一致抛错 | 语义期望 | 通过×4 |
+| U2-6 | 中间NaN不污染状态（seed沿用ATR[2]递推）/ Inf→NaN种子顺延 | 手算 | 通过×2 |
+| U2-7 | 别名n/window/span等价 + 包导出atr | 契约 | 通过 |
+
+- tool层：`src/hero_quant/tools/quantlib_tool.py:47` `SUPPORTED_INDICATORS` 未含atr，
+  属后续wiring（本线不扩tool面，quantlib包级可用即可）。
+- 回归：`tests/validation/test_atr_golden.py` 11 passed。
