@@ -171,3 +171,10 @@ def test_currency_lexicographic_mismatch_rejected():
     df["currency"] = "AUD"
     with pytest.raises(ValidationError):
         validate(df, currency="CNY")
+
+
+def test_currency_single_matching_passes():
+    """pin validation.py:213: 单一币种与显式 currency 一致必须放行 (id76 匹配侧缺口)."""
+    df = _frame()
+    df["currency"] = "CNY"
+    assert validate(df, currency="CNY") is None

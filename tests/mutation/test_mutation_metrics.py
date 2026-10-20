@@ -132,15 +132,16 @@ def test_annual_overflow():
 
 
 def test_turnover_dataframe_paths():
-    """杀 metrics.py:156-160 DataFrame 换手分支: 单列与多资产口径按实现语义锁定 (/2 单边, len 含首行稀释)."""
+    """锁 metrics.py:156-160 DataFrame 换手分支: 与 Series 同口径 (/2 单边, 首日剔除)."""
     from hero_quant.backtest.metrics import turnover
 
-    # 单列: diff 和为 3, len 含首行稀释为 4 -> 3/2/4 = 0.375 (与 Series 路径 0.5 存在稀释差异, 见报告)
+    # 单列: diff 和 3, 分母 n-1=3 -> 3/2/3 = 0.5 (与 Series 路径一致)
     assert turnover(positions=pd.DataFrame({"a": [1.0, 2.0, 3.0, 2.0]})) == pytest.approx(
-        0.375
+        0.5
     )
+    # 双列: diff 和 3+2=5, 分母 n-1=3 -> 5/2/3 = 5/6
     df2 = pd.DataFrame({"a": [1.0, 2.0, 3.0, 2.0], "b": [10.0, 10.0, 12.0, 12.0]})
-    assert turnover(positions=df2) == pytest.approx(0.625)
+    assert turnover(positions=df2) == pytest.approx(5.0 / 6.0)
 
 
 def test_turnover_weights_edge():
@@ -287,10 +288,8 @@ def test_turnover_minus_inf_paths():
     """杀 metrics.py:156/162 [UOR] -inf 清洗: 持仓 -inf 必须清洗后计算."""
     from hero_quant.backtest.metrics import turnover
 
-    # DataFrame 路径: 首行全 NaN 被 how="all" 吞掉 -> 2/2/3
-    assert turnover(positions=pd.DataFrame({"a": [float("-inf"), 1.0, 2.0, 3.0]})) == pytest.approx(
-        1.0 / 3.0
-    )
+    # DataFrame 路径: 首行 -inf 清洗后剔除, diff 和 3, 分母 n-1=3 -> 3/2/3 = 0.5
+    assert turnover(positions=pd.DataFrame({"a": [float("-inf"), 1.0, 2.0, 3.0]})) == pytest.approx(0.5)
     # Series 路径: [nan,1,1] -> 2/2/2
     assert turnover(positions=pd.Series([float("-inf"), 1.0, 2.0, 3.0])) == pytest.approx(0.5)
 
