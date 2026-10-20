@@ -2,6 +2,7 @@
 
 > 依据：`docs/recon.md` §1/§3（无 ORM / fail-closed / 双源 / FTS+pgvector）、`docs/issues.md` P0-4/P1-2/P1-4。
 > 状态说明：以下 4 条为对既有实现的**追认记录**（现状已如此），不是新决策；每条含背景/决策/后果。新增 ADR 请按 `ADR-NNN` 续号、附文件+行号依据。
+> ADR-005 / ADR-006 为**新增的决策记录**（方向已定、本轮未实施，零代码改动）：ADR-005 记 billing tenant 归属（G-03 决策记录），ADR-006 记 per-user 身份与鉴权重构（G-02 残余面决策记录）。
 
 ---
 
@@ -37,3 +38,15 @@ a/redis.py:213,281` `get_redis_sync/get_redis`），SQL 手写、键前缀手写
 - **决策**：主索引 `SQLite FTS5`（BM25，trigram 优先 `:48`，建表 `:739-777`）；向量本地优先，`PgVectorSidecar`（`:123-130`）仅在 `is_pgvector_configured()(:79)` 且就绪时为一等公民（upsert/query 双写/双读 `:502-519`），任一失败 `logger.debug("silent handled: offline-safe...") + pass # intentional offline-safe`（13 处，见 `docs/arch/memory.md` §2），`vector_backend()` 自述 `pgvector/local`（`:643-646`）。
 - **后果**（正面）：离线/无 PG 单机开箱即用；pgvector 故障不影响问答主链（与 ADR-002 的 billing fail-closed 形成“钱严、忆宽”的分级降级体系）。
 - **后果**（代价/约束）：静默回退点的可观测性弱（`debug` 级别，P2-1 候选中）；`memory/` 20 处量级 `pass`（`lifecycle.py/hierarchy.py/store.py`，见 `docs/issues.md` P3-3）中属于本 ADR 的回退 `pass` 须保留语义并补单测，不得当卫生问题误删；`wall_time` 裸 `pass` 不属本 ADR，优先清理。
+
+---
+
+## ADR-005：billing tenant 归属（`purchases.tenant` 卖家列与账本归因）
+
+- **状态**：已定方向，未实施（本轮仅文档）。本 ADR 是 `docs/security-audit.md:36` G-03 的**决策记录**；本轮不改 `src/`、不改 `migrations/`（冻结区，AGENTS §1）。
+- 详见 [ADR-005.md](./ADR-005.md)：覆盖 billing 账本 / checkpoint 租户键推导 / `_Saver` 双写三条写入路径的 tenant 归属现状、G-03 触发路径与资损面、4+1 步可回滚迁移路径（其中存量回填一步需 DDL，须另立专线并由用户批准）、每步风险与回滚判据。
+
+## ADR-006：per-user 身份与鉴权重构（从单共享密钥 + 匿名票到 per-user 凭证）
+
+- **状态**：已定方向，未实施（本轮仅文档）。本 ADR 是 `docs/security-audit.md:25` G-02 残余面与 `docs/redteam-round2.md:61-70` M2-06 残余记账的**决策记录**；本轮不改 `src/`、不改 `tests/`、不新增 env。
+- 详见 [ADR-006.md](./ADR-006.md)：覆盖 `HERO_API_KEY` 单密钥 → 匿名票 → 共享密钥互信的完整链路现状、per-user 目标模型（建议/待定）、5+1 步迁移路径与 `HERO_AUTH_MODE` 回退开关、对 G-02 / G-06 / G-08 / G-11 已落地语义的衔接（不推翻）、冒充面与审计缺口等风险。
