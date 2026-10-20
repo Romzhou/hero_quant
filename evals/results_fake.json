@@ -205,7 +205,7 @@
       "passed": true,
       "failures": [],
       "notes": [
-        "spec_only:risk_warning:absent_in_fake"
+        "spec_only:risk_warning:present"
       ],
       "known_gap": true,
       "failure_class": "pass"
@@ -227,7 +227,7 @@
       "passed": true,
       "failures": [],
       "notes": [
-        "spec_only:risk_warning:absent_in_fake"
+        "spec_only:risk_warning:present"
       ],
       "known_gap": true,
       "failure_class": "pass"
@@ -259,7 +259,7 @@
       "passed": true,
       "failures": [],
       "notes": [
-        "spec_only:risk_warning:absent_in_fake"
+        "spec_only:risk_warning:present"
       ],
       "known_gap": true,
       "failure_class": "pass"
@@ -281,7 +281,7 @@
       "passed": true,
       "failures": [],
       "notes": [
-        "spec_only:risk_warning:absent_in_fake"
+        "spec_only:risk_warning:present"
       ],
       "known_gap": true,
       "failure_class": "pass"
