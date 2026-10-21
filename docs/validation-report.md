@@ -122,3 +122,65 @@ naive close复利 [1.0,1.1,1.21] 隐含bar0收盘即成交，违反PIT。属设�
 - tool层：`src/hero_quant/tools/quantlib_tool.py:47` `SUPPORTED_INDICATORS` 未含atr，
   属后续wiring（本线不扩tool面，quantlib包级可用即可）。
 - 回归：`tests/validation/test_atr_golden.py` 11 passed。
+
+## W4补记（Round 6 波次 2，src 整体覆盖率 67.85% -> 70.36%，只补测试、src 零改动）
+
+- 范围：`src/hero_quant/{backtest,quantlib,llm,agent}` 四块的未覆盖分支补测。
+  新增 31 个测试文件、821 个用例（1 个因 Windows 无符号链接权限被 skip），
+  **未改动任何 `src/**` 文件**（`git diff --stat` 为空，改动全部是新增 `tests/test_w4_*.py`）。
+- 实测口径（本机无 PostgreSQL / 无 Docker / 无外网，见"环境归一化"）：
+  - 基线：`uv run --frozen --extra dev python -m pytest -q --cov=src --cov-report=term`
+    → `TOTAL 25183  8096  68%`，**Total coverage: 67.85%**（covered 17087 / 25183）
+  - 最终：同命令 → `TOTAL 25183  7464  70%`，**Total coverage: 70.36%**（covered 17719 / 25183）
+  - 净增 covered 语句 **+632**，四个目标目录合计 **+600**（分目录见下表）
+  - 任务书里的 68.14% 在仓库内无出处（`git grep 68.14` 无命中），本节以自测值为准
+- 四块目录覆盖率（covered/total）：
+
+  | 目录 | stmts | 基线覆盖 | 最终覆盖 | 提升 | 新增 covered |
+  |---|---|---|---|---|---|
+  | `backtest/` | 1541 | 71.84% | 78.46% | +6.62pp | +102 |
+  | `quantlib/` | 666 | 83.48% | 91.59% | +8.11pp | +54 |
+  | `llm/` | 407 | 81.08% | 90.91% | +9.83pp | +40 |
+  | `agent/` | 3624 | 67.80% | 78.95% | +11.15pp | +404 |
+
+- 提升最大的单文件：`agent/trace.py` 62%→81%（+88）、`agent/embed.py` 67%→89%（+71）、
+  `agent/loop.py` 60%→65%（+70）、`backtest/engine.py` 68%→74%（+55）、
+  `quantlib/rust.py` 73%→89%（+28，Rust 加速分支用假扩展驱动）。
+- 环境归一化（本机特有，基线/最终一致，不影响前后可比性）：
+  - `.env` 里的 `HERO_API_KEY` / `OPENAI_API_KEY` / `COHERE_API_KEY` 与 4 个
+    `HERO_*_DSN` 置为单个空格 `" "`：`load_dotenv(override=False)` 遇已存在 key 不覆盖，
+    而所有 gate 都做 `.strip()`，故 `" "` ≡ "未配置"（与 CI 无 key/无 DSN 的行为一致）。
+    原因：本机 `api.openai.com` 的 DNS 被劫持到黑洞 IP（TCP SYN 无响应），
+    `ChatOpenAI` 无 timeout → pytest 无限挂起；本机也无 PostgreSQL 监听
+    （`[::1]:5432` SYN 无响应）。
+  - 5 个依赖真实 PG 的测试文件在本机无限挂起，逐文件扫描（75s/文件）确认后
+    **基线与最终都用同样的 `--deselect` 排除**：
+    `tests/test_0904_c1.py`、`tests/test_checkpoint_pg.py`、`tests/test_j8_loop_ckpt_gov.py`、
+    `tests/test_retrieval_eval.py`、`tests/test_vector_maturity4.py`（共 44 个用例）。
+    这 5 个文件覆盖的 `checkpoint/postgres.py`、`memory/store.py` pgvector 分支
+    不属于本线四块目录，对四块口径影响可忽略。
+- 门禁：`uv run --frozen --extra dev ruff check src` → `All checks passed!`（src 零改动）。
+
+### W4 发现的 src 行为差异（只记录，未改 src）
+
+| # | 位置 | 现象 | 影响 |
+|---|---|---|---|
+| W4-1 | `src/hero_quant/agent/context.py:205-208` | `_collapse(text, 0)` 注释写"避免空输出"，实际 `marker[:0]` 返回空串 | 零预算折叠返回空串而非标记；与注释意图不符（低危） |
+| W4-2 | `src/hero_quant/backtest/metrics.py:141-146` | docstring 示例"w=[0,1,0] 时单边换手应为 1.0"，实现按日均口径返回 0.5 | 与同段后文"w=[0,1,0,1,0] 得 0.5"及 `docs/quant-semantics.md` 口径自相矛盾（文档缺陷） |
+| W4-3 | `src/hero_quant/llm/factory.py:199-203` | `setattr(chat, "timeout", timeout)` 在 pydantic v2 模型上被拒（未声明字段） | chat 对象缺 `timeout` 内省属性；超时透传实际由 `LLMClient.timeout` + `_invoke_once` 签名探测保证，不影响功能 |
+| W4-4 | `src/hero_quant/backtest/validation.py:53-58` | `weights_on/price_date/currency` 的 kwargs 兼容分支不可达（同名参数先被绑定，kwargs 永远取不到这三个 key） | 死代码（3 行） |
+
+### W4 遗留台账
+
+- `agent/loop.py` 仍有 528 条未覆盖语句（65%）：`run()` 内约 40 处 `except: pass` 级别的
+  best-effort 兜底，需要逐个注入"双故障"才能触达，收益/成本比低，本波次未做。
+- `quantlib/rust.py` 的真实 Rust 加速分支在本机不可达（未编译 `crates/` 扩展，
+  `IS_RUST=False`）；本波次用假扩展驱动了全部加速路径的语句覆盖，真实扩展路径未验证。
+- `agent/embed.py` 的 openai / sentence-transformers 真实网络调用未验证（本机无外网）；
+  本波次用假模块驱动了协议层分支。
+- `backtest/engine.py` 的持仓回落路径（`raw_positions_rows` 长度不匹配，engine.py:1032-1051）
+  在正常流程中不可达（主循环每 Bar 必产出一行），未覆盖。
+- `backtest/validation.py:54/56/58`（kwargs 兼容）与 `agent/graph.py:27-32`
+  （`langgraph.types` 缺失回落 `langgraph.graph`）在本机不可达/为死代码，见 W4-4。
+- `agent/context.py` 的 `_cached_auto_digest` 真机路径依赖 `skills/` 目录扫描，
+  已用假 loader 覆盖异常分支，真实 digest 内容由既有 skills 用例覆盖。
