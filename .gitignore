@@ -44,9 +44,6 @@ ocr_ws.log
 .dsh/
 .zcode/
 nul
-# frontend local tests not yet curated
-frontend/src/__tests__/Live.test.tsx
-frontend/src/__tests__/Settings.test.tsx
 # docs drafts & local run artifacts
 docs/agent-architecture.md
 docs/agentloop-deep-dive.md

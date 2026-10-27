@@ -184,7 +184,8 @@ def bollinger(series, window: int = 20, num_std: float = 2.0, *args, **kwargs):
     """布林带：优先 Rust（无别名时），失败回落 Python。"""
     if args:
         raise TypeError(f"bollinger: unexpected positional args {args}")
-    if _use_rust() and "n" not in kwargs and "k" not in kwargs:
+    # 任一别名（n/k/std/num_std）存在时必须走 Python 回落，否则 Rust 会用默认 num_std 静默算错
+    if _use_rust() and not ({"n", "k", "std", "num_std"} & set(kwargs.keys())):
         _prep = _prepare_data(series)
         if _prep is None:
             return _py_bollinger(series, window, num_std, *args, **kwargs)
@@ -211,6 +212,13 @@ def macd(series, fast: int = 12, slow: int = 26, signal: int = 9, *args, **kwarg
     """MACD：优先 Rust，失败回落 Python。"""
     if args:
         raise TypeError(f"macd: unexpected positional args {args}")
+    # 兼容 n_fast/n_slow/n_signal 别名，使 Rust 加速路径与 Python 回落口径一致
+    if "n_fast" in kwargs and "fast" not in kwargs:
+        fast = kwargs["n_fast"]
+    if "n_slow" in kwargs and "slow" not in kwargs:
+        slow = kwargs["n_slow"]
+    if "n_signal" in kwargs and "signal" not in kwargs:
+        signal = kwargs["n_signal"]
     if _use_rust():
         _prep = _prepare_data(series)
         if _prep is None:
@@ -238,7 +246,13 @@ def max_drawdown(equity) -> float:
             if isinstance(equity, pd.Series):
                 data = equity.tolist()
             elif isinstance(equity, pd.DataFrame):
-                data = equity.iloc[:, 0].tolist() if equity.shape[1] > 0 else []
+                # 与 Python 回落 _to_series 对齐：close → equity → 首列
+                if "close" in equity.columns:
+                    data = equity["close"].tolist()
+                elif "equity" in equity.columns:
+                    data = equity["equity"].tolist()
+                else:
+                    data = equity.iloc[:, 0].tolist() if equity.shape[1] > 0 else []
             else:
                 data = list(equity) if equity is not None else []
             clean = [float(x) for x in data if x is not None]
