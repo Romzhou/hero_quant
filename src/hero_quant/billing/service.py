@@ -991,12 +991,14 @@ class BillingService:
                     "idempotency_key": idempotency_key,
                 }
                 try:
-                    _inserted = self._pg_insert_purchase_sync(receipt)
+                    _inserted = self._pg_insert_purchase_sync(receipt, seller_tenant=factor.get("tenant"))
                 except Exception as e:
                     _log_warning("billing: _pg_insert_purchase_sync failed for factor_id=%s", factor_id, exc_info=e)
                     raise
                 if not _inserted:
-                    # 中文：PG UNIQUE 冲突 → 同 (factor,buyer) 只许一条有效购买，返既有收据+告警
+                    # 中文：PG UNIQUE 冲突 → 同 (factor,buyer) 只许一条有效购买，且必须回**库里真实行**。
+                    # 旧实现在读不到内存记录时直接返回新造的 receipt —— 其 purchase_id 在库中并不存在，
+                    # 属假成功；现改为读回 PG 真行并回填内存（跨进程/重启后幂等才成立）。
                     with _GLOBAL_LOCK:
                         _existing = _find_locked()
                         if _existing is not None:
@@ -1004,20 +1006,27 @@ class BillingService:
                         _existing_compat = _find_locked_compat(idempotency_key)
                         if _existing_compat is not None:
                             return _hit_to_receipt(_existing_compat)
+                    _pg_existing = self._pg_get_purchase_sync(factor_id, buyer_tenant)
+                    if _pg_existing is not None:
+                        with _GLOBAL_LOCK:
+                            if _find_locked() is None:
+                                _GLOBAL_PURCHASES[_dsn_key(self.dsn)].append(copy.deepcopy(_pg_existing))  # type: ignore
+                                self._purchases.append(copy.deepcopy(_pg_existing))
+                        return _hit_to_receipt(_pg_existing)
                     _log_warning(
-                        "billing purchase conflict but no existing receipt; returning current factor=%s buyer=%s",
+                        "billing purchase conflict but existing row unreadable factor=%s buyer=%s",
                         factor_id,
                         buyer_tenant,
                         exc_info=False,
                     )
-                    return self._decorate(receipt)
+                    raise BillingUnavailable("billing:conflict_unresolved", "insert conflicted but no readable row")
                 # 双重检查：内存侧幂等，PG 已写入则落内存
                 with _GLOBAL_LOCK:
                     _hit2 = _find_locked()
                     if _hit2 is not None:
                         # 中文：内存侧已存在（并发先落）→ 补偿删 PG 刚插入行，保证单条有效
                         try:
-                            self._pg_delete_purchase_sync(factor_id, buyer_tenant)
+                            self._pg_delete_purchase_sync(factor_id, buyer_tenant, factor.get("tenant"))
                         except Exception as _del_e:
                             _log_warning("billing compensate PG delete failed: %s", _del_e, exc_info=True)
                         return _hit_to_receipt(_hit2)
@@ -1034,7 +1043,7 @@ class BillingService:
                         _log_warning("billing: ledger.append purchase_factor failed for factor_id=%s", factor_id, exc_info=e)
                         # 中文：真 PG 路径 ledger 失败补偿删 PG 已 commit 行+内存，再入 pending_ledger 重放队列
                         try:
-                            self._pg_delete_purchase_sync(factor_id, buyer_tenant)
+                            self._pg_delete_purchase_sync(factor_id, buyer_tenant, factor.get("tenant"))
                         except Exception as _del_e:
                             _log_warning("billing compensate PG delete failed: %s", _del_e, exc_info=True)
                         with _GLOBAL_LOCK:
@@ -1118,16 +1127,23 @@ class BillingService:
                     raise
             return self._decorate(receipt)
 
-    def _pg_insert_purchase_sync(self, receipt: dict) -> bool:
+    def _pg_insert_purchase_sync(self, receipt: dict, seller_tenant: str | None = None) -> bool:
         """真 PG 幂等插入：INSERT ... ON CONFLICT (factor_id, buyer_tenant) DO NOTHING.
 
         返回 True=本次插入新行；False=冲突已存在（调用方回既有收据）。
         无 pool 时返回 True 由调用方走内存分支（不伪装成 DB 冲突）。
+
+        中文：purchases.tenant 是**卖方**列（FK → factors(factor_id, tenant)），
+        旧实现把 buyer 同时写进 buyer_tenant 与 tenant，跨租户购买必报
+        ForeignKeyViolation（Key (factor_id, tenant)=(..., buyer) is not present in table "factors"）；
+        现由调用方传 seller_tenant（因子归属租户），缺省才回退 buyer（兼容旧调用）。
+        注意 SET LOCAL 仍用 buyer：purchases_insert 策略要求 buyer_tenant = current_tenant()。
         """
         pool = getattr(self, "_pool", None)
         if not self._is_real_pg() or pool is None:
             return True
         _tenant = str(receipt.get("buyer_tenant") or receipt.get("tenant") or "default")
+        _seller = str(seller_tenant).strip() if isinstance(seller_tenant, str) and seller_tenant.strip() else _tenant
         try:
             _price_param = str(_quantize_cents(receipt.get("price", 0.0)))
         except ValueError:
@@ -1135,7 +1151,7 @@ class BillingService:
         _params = (
             str(receipt.get("factor_id")),
             _tenant,
-            _tenant,
+            _seller,
             _price_param,
             receipt.get("idempotency_key"),
         )
@@ -1192,6 +1208,72 @@ class BillingService:
                     pass  # intentional: 连接回收期清理，抛错会掩盖业务原始错误（主错已明示）
         return True
 
+    def _pg_get_purchase_sync(self, factor_id: str, buyer_tenant: str) -> dict | None:
+        """按 (factor_id, buyer_tenant) 读回已存在的购买行；读不到返回 None（fail-closed 不造数据）。
+
+        中文：幂等冲突时旧实现返回新造的 receipt（purchase_id 库里不存在）= 假成功；
+        这里读真行，purchase_id 用库内 id（格式 "factor:buyer:pg:<id>"）。
+        RLS：purchases_buyer_select 要求 buyer_tenant = current_tenant()，故以 buyer 上下文读取。
+        """
+        pool = getattr(self, "_pool", None)
+        if not self._is_real_pg() or pool is None:
+            return None
+        _buyer = str(buyer_tenant)
+        _sql = (
+            "SELECT id, factor_id, buyer_tenant, tenant, price, idempotency_key "
+            "FROM purchases WHERE factor_id = %s AND buyer_tenant = %s ORDER BY id LIMIT 1"
+        )
+        _params = (str(factor_id), _buyer)
+
+        def _run(conn):
+            self._set_local_dual_tenant(conn, _buyer)
+            try:
+                _cur = conn.execute(_sql, _params)  # type: ignore
+            except Exception:
+                with conn.cursor() as _c:  # type: ignore
+                    _cur = _c.execute(_sql, _params)
+            _row = _cur.fetchone()
+            try:
+                conn.commit()  # type: ignore
+            except Exception:
+                pass  # intentional: 只读事务提交失败不影响已取回的结果
+            return _row
+
+        try:
+            if hasattr(pool, "connection"):
+                with pool.connection() as _conn:  # type: ignore[attr-defined]
+                    _row = _run(_conn)
+            elif hasattr(pool, "getconn"):
+                _conn2 = pool.getconn()  # type: ignore
+                try:
+                    _row = _run(_conn2)
+                finally:
+                    try:
+                        pool.putconn(_conn2)  # type: ignore
+                    except Exception:
+                        pass  # intentional: 连接回收期清理
+            else:
+                return None
+        except Exception as _e:
+            _log_warning("billing _pg_get_purchase_sync failed: %s", type(_e).__name__, exc_info=False)
+            return None
+        if not _row:
+            return None
+        _pid, _fid, _bt, _seller, _price, _idem = _row
+        try:
+            _price_dec = _quantize_cents(_price)
+        except ValueError:
+            _price_dec = Decimal("0.00")
+        return {
+            "factor_id": _fid,
+            "buyer_tenant": _bt,
+            "tenant": _bt,
+            "price": _price_dec,
+            "action": "purchase_factor",
+            "purchase_id": f"{_fid}:{_bt}:pg:{_pid}",
+            "idempotency_key": _idem,
+        }
+
     def _pg_purchase_sync(self, receipt: dict) -> bool:
         """已废弃的 PG purchase 桩：无真实 PG 写入能力，一律 fail-closed 返 False。
 
@@ -1202,23 +1284,24 @@ class BillingService:
         _log_warning("PG persistence not implemented, using emulated store", exc_info=False)
         return False
 
-    def _pg_delete_purchase_sync(self, factor_id: str, buyer_tenant: str) -> bool:
+    def _pg_delete_purchase_sync(self, factor_id: str, buyer_tenant: str, seller_tenant: str | None = None) -> bool:
         """真 PG 补偿删除购买行：ledger 失败时删已提交 PG 行（最佳努力，不抛错）。中文：无 pool 时返回 False。
 
-        中文：G-04——建连接后先以 buyer 双写 SET LOCAL（与 _pg_insert_purchase_sync 对齐，
-        满足 purchases_insert 的 buyer_tenant=current_tenant()），否则 FORCE RLS 下 DELETE
-        零行匹配（静默 no-op 留孤儿行）。
+        中文：G-04——建连接后先双写 SET LOCAL，否则 FORCE RLS 下 DELETE 零行匹配（静默 no-op 留孤儿行）。
+        策略是 purchases_seller_delete USING (tenant = current_tenant())，而 tenant 存的是**卖方**租户，
+        故 current_tenant 必须设为 seller（旧实现设为 buyer → 删 0 行）；缺省无 seller 时回退 buyer 兼容旧调用。
         """
         pool = getattr(self, "_pool", None)
         if not self._is_real_pg() or pool is None:
             return False
         _buyer = str(buyer_tenant)
+        _seller = str(seller_tenant).strip() if isinstance(seller_tenant, str) and seller_tenant.strip() else _buyer
         _sql = "DELETE FROM purchases WHERE factor_id = %s AND buyer_tenant = %s"
         _params = (str(factor_id), _buyer)
         try:
             if hasattr(pool, "connection"):
                 with pool.connection() as _conn:  # type: ignore[attr-defined]
-                    self._set_local_dual_tenant(_conn, _buyer)
+                    self._set_local_dual_tenant(_conn, _seller)
                     try:
                         _conn.execute(_sql, _params)  # type: ignore
                     except Exception:
@@ -1233,8 +1316,8 @@ class BillingService:
                 _conn2 = pool.getconn()  # type: ignore
                 try:
                     with _conn2.cursor() as _c2:
-                        _c2.execute(_SET_CONFIG_TENANT_SQL, (_buyer,))
-                        _c2.execute(_SET_CONFIG_CURRENT_TENANT_SQL, (_buyer,))
+                        _c2.execute(_SET_CONFIG_TENANT_SQL, (_seller,))
+                        _c2.execute(_SET_CONFIG_CURRENT_TENANT_SQL, (_seller,))
                         _c2.execute(_sql, _params)
                     try:
                         _conn2.commit()
