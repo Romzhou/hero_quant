@@ -53,7 +53,7 @@ pip install -e ".[dev,ashare,us]"
 # ashare: tushare+akshare, us: yfinance, crypto: ccxt
 
 # 2. 配置（可选）
-cp .env.example .env  # 必须填 HERO_PG_PASSWORD，否则 DSN 渲染成空口令、/ready 如实 503（详见「Docker 单机部署」）
+cp .env.example .env  # 必须填 HERO_PG_USER + HERO_PG_PASSWORD，否则 DSN 渲染成空口令、/ready 如实 503（详见「Docker 单机部署」）
 export HERO_LLM_PROVIDER=openai
 export HERO_API_KEY=sk-...
 export HERO_DATA_MODE=live   # synthetic | live  (live 才调 qt.gtimg.cn/yahoo)
@@ -80,16 +80,18 @@ cd frontend && npm ci && npm run dev -- --host --port 5173
 
 ## Docker 单机部署
 
+前置条件：宿主上的 llm-pg / llm-redis 已在跑（它们由别的 project 创建，不归本
+compose 管，也不会被 `docker compose down` 停掉）。新克隆只需下面两条命令。
+
 ```bash
 # 0. 必做：.env 从示例复制并填 PG 口令（不填 → DSN 渲染成空口令 → /ready 如实 503）
 cp .env.example .env
-# 编辑 .env：HERO_PG_USER=<llm-pg 容器内 $POSTGRES_USER，不是 postgres>
-#            HERO_PG_PASSWORD=<真实口令，只写 .env，永不进仓库>
+# 编辑 .env，至少补齐这两项（缺 HERO_PG_PASSWORD → DSN 口令段为空 → /ready 如实 503）：
+#   HERO_PG_USER=<llm-pg 容器内 $POSTGRES_USER，不是 postgres>
+#   HERO_PG_PASSWORD=<真实口令，只写 .env，永不进仓库>
+# 主机段 .env.example 已预置为 100.114.54.26（本机 tailscale IP），一般不用改。
 
-# 1. 首次部署 / llm-pg|llm-redis 容器被重建后：接入外部网络（幂等，可重复执行）
-bash scripts/init/setup-shared-network.sh
-
-# 2. 起服务
+# 1. 起服务（一条命令；不需要先跑 scripts/init/setup-shared-network.sh —— 该脚本已 deprecated）
 docker compose up --build
 # http://127.0.0.1:8899  前后端同源（api 静态托管 frontend/dist）
 # 数据落盘：named volumes hero-runs / hero-sessions / hero-home
@@ -99,11 +101,13 @@ docker compose up --build
 docker build -t hero-quant:0.2.0 .
 ```
 
-> **主机名口径（本轮最大的坑，两种运行方式不可混用）**
-> - **宿主机直跑** `uvicorn hero_quant.api.server:app --port 8899`：PG/Redis 只能写 `100.114.54.26`。`127.0.0.1:5432/6379` **不通**——这两个实例只绑 tailscale IP。
-> - **compose 容器内**：只能写 `llm-pg` / `llm-redis`。它们由别的 compose project 创建，需先跑 `scripts/init/setup-shared-network.sh` 建 `heroquant-shared` 外部网络并连入（带别名）；容器重建后网络成员关系丢失，需重跑。
+> **主机名口径（2026-10-28 决策 D-1：宿主与容器统一，不再分叉）**
+> - **宿主机直跑**（`uvicorn hero_quant.api.server:app --port 8899`）与 **compose 容器内**：PG/Redis **都写** `100.114.54.26`。容器经默认 bridge NAT 出网可达该 IP（已实测 5432/6379 通）。
+> - `100.114.54.26` 是本机的 **tailscale IP**：换机器或该 IP 变了，要同步改 `.env` 的 `HERO_PG_HOST` / `HERO_CHECKPOINT_DSN` / `HERO_BILLING_DSN` / `HERO_VECTOR_DSN` / `HERO_REDIS_DSN`，以及 `docker-compose.yml` 中 `hero-quant.environment` 的对应项。
+> - `127.0.0.1` / `localhost` 的 `5432`、`6379` **不通**——llm-pg / llm-redis 只绑 tailscale IP。
 > - `llm-pg` 的超级用户名**不是** `postgres`，取容器内 `$POSTGRES_USER`。
 > - 外部 PG 首次使用需先建库 `heroquant` 并执行 `scripts/init/001_schema.sql`（`local-stack` profile 由 initdb 自动执行；复用 llm-pg 时手动执行一次）。
+> - 已废弃、仅保留供回滚：外部网络 `heroquant-shared` 与 `scripts/init/setup-shared-network.sh`（默认执行即 skip）。
 > - `--profile local-stack` 会另起 postgres/redis/temporal，此时必须在 `.env` 显式把主机名改成 `postgres`/`redis`——compose 的 `environment` 优先级高于 `env_file`，无法按 profile 条件覆盖。
 
 ### /ready 与容器健康
@@ -129,10 +133,10 @@ docker build -t hero-quant:0.2.0 .
 | `HERO_DATA_MODE` | `live` | `live` 调真实行情；`synthetic` **可用**，但 `provenance.source=synthetic`、A股 `unit=board_lots`，跨源 1% 比对被显式跳过并 warning（非"离线可用"） |
 | `HERO_DATA_MARKET` | `CN` | 默认市场 |
 | `HERO_BENCHMARK_TICKER` | 空 | 显式基准；空则按 `benchmark_map` 后缀映射（`.NS`→`^NSEI` 等） |
-| `HERO_PG_HOST` | `localhost` | 宿主机直跑填 `100.114.54.26`；compose 内由 compose 固定为 `llm-pg`（显式 `HERO_*_DSN` 优先） |
+| `HERO_PG_HOST` | `100.114.54.26` | 宿主与容器统一用本机 tailscale IP（决策 D-1）；换机器/IP 变了要改。显式 `HERO_*_DSN` 优先 |
 | `HERO_PG_USER` / `HERO_PG_PASSWORD` | 空 | 供 compose 的 DSN 变量插值；llm-pg 超级用户名**不是** `postgres`，取容器内 `$POSTGRES_USER`；口令只写 `.env` |
 | `HERO_PG_DSN` | 空 | checkpoint DSN 的 legacy 别名（显式 `HERO_CHECKPOINT_DSN` 优先） |
-| `HERO_CHECKPOINT_DSN` | `postgresql://localhost:5432/heroquant`（无口令） | 显式优先；compose 内渲染为 `postgresql://<user>:<password>@llm-pg:5432/heroquant`。**`.env` 不填 `HERO_PG_PASSWORD` 时口令段为空**，`/ready` 如实 503 |
+| `HERO_CHECKPOINT_DSN` | `postgresql://100.114.54.26:5432/heroquant`（无口令） | 显式优先；compose 内渲染为 `postgresql://<user>:<password>@100.114.54.26:5432/heroquant`。**`.env` 不填 `HERO_PG_PASSWORD` 时口令段为空**，`/ready` 如实 503 |
 | `HERO_CHECKPOINT_TTL_SECONDS` | `604800`（7 天） | checkpoint `expires_at` TTL |
 | `HERO_BILLING_DSN` | 空（fail-closed） | 不配即计费不可用，`publish/purchase` 抛 `BillingUnavailable` |
 | `HERO_BILLING_ALLOW_SHARED_DB` | `false` | billing 复用 checkpoint 库必须显式 opt-in，否则返回 None |
