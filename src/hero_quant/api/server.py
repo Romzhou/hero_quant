@@ -1551,7 +1551,9 @@ async def query(request: Request, background_tasks: BackgroundTasks, q: str = ""
         if llm is None:
             class _FakeLLM:
                 def stream_chat(self, goal: str, timeout=None):
-                    text = f"600519.SH close 1680.2 report metrics sharpe 1.62 grounding_verified True for query: {goal}\n（演示模式：未配置 HERO_API_KEY，数据为合成占位）\n本结果为合成占位，不构成投资建议\n"
+                    # 中文：降级文本只声明"没有真实数据"，不编造价格/Sharpe/grounding_verified
+                    # （审计 §4.2：1680.2 / 1.62 属于伪造数字）。
+                    text = f"[degraded] 未配置 HERO_API_KEY，未执行任何真实工具，无行情/回测数据可汇报。query: {goal}\n（降级模式：本回复不构成投资建议）\n"
                     yield {"type": "text", "text": text}
 
                 def invoke(self, goal: str):
@@ -1588,12 +1590,9 @@ async def query(request: Request, background_tasks: BackgroundTasks, q: str = ""
             trace = None
         try:
             from hero_quant.agent.grounding import GroundingLedger
+            # 中文：ledger 只吃真实工具结果——此处不预置任何 K 线（曾硬编码 600519 两根假 K 线，
+            # 导致"已校验"是自己发给自己，审计 §4.2）。真实 ingest 由工具执行路径负责。
             ledger = GroundingLedger()
-            try:
-                ledger.ingest("600519.SH", [{"close": 1680.2, "low": 1670.0, "high": 1690.0, "date": "2026-08-12"}, {"close": 1.62, "low": 1.0, "high": 2.5, "date": "2026-08-12"}])
-            except Exception as _e:
-                logger.debug("grounding.ingest_failed", error=str(_e))  # intentional offline-safe
-                pass  # intentional offline-safe
         except Exception as _e:
             logger.warning("grounding.init_failed", error=str(_e))
             ledger = None
@@ -1947,7 +1946,8 @@ async def query_stream(request: Request, background_tasks: BackgroundTasks, q: s
             if llm is None:
                 class _FakeLLM:
                     def stream_chat(self, goal: str, timeout=None):
-                        text = f"600519.SH close 1680.2 report metrics sharpe 1.62 grounding_verified True for query: {goal}\n（演示模式：未配置 HERO_API_KEY，数据为合成占位）\n本结果为合成占位，不构成投资建议\n"
+                        # 中文：同 /v1/query，降级文本不含任何伪造数字。
+                        text = f"[degraded] 未配置 HERO_API_KEY，未执行任何真实工具，无行情/回测数据可汇报。query: {goal}\n（降级模式：本回复不构成投资建议）\n"
                         yield {"type": "text", "text": text}
 
                     def invoke(self, goal: str):
@@ -1984,12 +1984,8 @@ async def query_stream(request: Request, background_tasks: BackgroundTasks, q: s
                 trace = None
             try:
                 from hero_quant.agent.grounding import GroundingLedger
+                # 中文：同 /v1/query——不预置伪造 K 线，ledger 只吃真实工具结果（审计 §4.2）。
                 ledger = GroundingLedger()
-                try:
-                    ledger.ingest("600519.SH", [{"close": 1680.2, "low": 1670.0, "high": 1690.0, "date": "2026-08-12"}, {"close": 1.62, "low": 1.0, "high": 2.5, "date": "2026-08-12"}])
-                except Exception as _e:
-                    logger.debug("best_effort.failed", error=str(_e))  # intentional offline-safe
-                    pass  # intentional offline-safe
             except Exception as _e:
                 logger.warning("grounding.init_failed", error=str(_e))
                 ledger = None
@@ -2115,30 +2111,22 @@ async def query_stream(request: Request, background_tasks: BackgroundTasks, q: s
                     logger.warning("tool.emit_failed", error=str(_e))
                     continue
             if emitted == 0:
-                _bundle = None
-                _metrics = {"sharpe": 1.62, "annual_return": 0.184, "max_drawdown": -0.032}
-                try:
-                    _bundle = _get_backtest_bundle()
-                    _metrics = _bundle.get("metrics", _metrics) if isinstance(_bundle, dict) else _metrics
-                except Exception as _e:
-                    logger.debug("best_effort.failed", error=str(_e))  # intentional offline-safe
-                    pass  # intentional offline-safe
-                fallback_tools = [
-                    {"tool": "get_market_data", "preview": "[演示]600519.SH 天勤 20 bars 来源 tencent(synthetic)", "latencyMs": 180},
-                    {"tool": "run_backtest", "preview": f"[演示]PIT校验通过 positions.csv 已落盘 Sharpe {_metrics.get('sharpe',1.62):.2f}", "latencyMs": 240},
-                    {"tool": "technical_indicators", "preview": "[演示]RSI 62.4 未超买", "latencyMs": 90},
-                ]
-                for ft in fallback_tools:
-                    payload = {"type": "tool", "tool": ft["tool"], "status": "success", "preview": ft["preview"], "latencyMs": ft["latencyMs"]}
-                    yield f"data: {_json.dumps(payload, ensure_ascii=False)}\n\n"
-                    await asyncio.sleep(0.04)
+                # 中文：本轮一条真实工具事件都没有，就如实报 skipped——绝不编造 success 事件
+                # （审计 §4.2「元素级」：前端按事件渲染，响应头救不了伪造的单条事件）。
+                _skip_payload = {"type": "tool", "tool": "none", "status": "skipped", "reason": "no_tool_executed"}
+                yield f"data: {_json.dumps(_skip_payload, ensure_ascii=False)}\n\n"
             text = _clean_agent_text(res.text or "")
             if not text:
-                text = f"【回测完成】600519.SH 近一月等权 Sharpe 1.62 grounding_verified {res.grounding_verified}\n查询: {q}\n"
+                # 中文：正文为空就返回空正文 + 显式降级，不伪造"回测完成/Sharpe 1.62"（审计 §4.2）。
+                if "empty_answer" not in _gen_reasons:
+                    _gen_reasons.append("empty_answer")
+                _inc_api_error("stream", "empty_answer")
+                logger.warning("stream.empty_answer", error_code="empty_answer", chain="A")
+                yield f"data: {_json.dumps({'type': 'degraded', 'degraded': True, 'reason': 'empty_answer'}, ensure_ascii=False)}\n\n"
             # 二段式总结：把工具真实结果回喂 LLM 生成正式结论（否则正文只有开场白）
             yield f"data: {_json.dumps({'type': 'tool', 'tool': 'final_summary', 'status': 'running', 'preview': '生成最终结论…'}, ensure_ascii=False)}\n\n"
             text = await asyncio.to_thread(_final_answer, llm, q, text, tool_records)
-            if "grounding_verified" not in text.lower() and "grounding" not in text.lower():
+            if text and "grounding_verified" not in text.lower() and "grounding" not in text.lower():
                 text += f"\ngrounding_verified {res.grounding_verified}\n"
             # 完整分块（旧逻辑在 >6 块时丢弃尾部导致回复截断），全部按 ~120 字符流式输出
             chunks: list[str] = []
