@@ -25,6 +25,9 @@ export default defineConfig({
       // 系统 Chrome：CHROME_PATH 优先，其次 /usr/bin/google-chrome；都没有则不指定（交给 channel/内置解析）
       // 不下载 Playwright 浏览器（本地无缓存、CI 用 runner 预装 Chrome）
       executablePath: chromePath(),
+      // 找不到已知路径时退回 channel=chrome（Playwright registry 解析系统 Chrome），
+      // 避免落到未安装的内置 chromium（本仓库禁止 npx playwright install）
+      channel: chromePath() ? undefined : 'chrome',
       args: ['--no-sandbox', '--disable-dev-shm-usage'],
     },
   },
