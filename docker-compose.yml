@@ -106,16 +106,41 @@ services:
       - path: .env
         required: false
     environment:
-      # 默认部署复用宿主机既有 llm-pg / llm-redis（127.0.0.1 的 5432/6379 不通，
-      # 必须走宿主机内网地址）。口令不进仓库：由 .env 提供 HERO_PG_PASSWORD。
-      # 库名 heroquant 与 scripts/init/001_schema.sql 建库目标一致。
-      HERO_PG_HOST: 100.114.54.26
-      HERO_CHECKPOINT_DSN: postgresql://${HERO_PG_USER:-llm}:${HERO_PG_PASSWORD:-}@100.114.54.26:5432/heroquant
-      HERO_BILLING_DSN: postgresql://${HERO_PG_USER:-llm}:${HERO_PG_PASSWORD:-}@100.114.54.26:5432/heroquant
-      HERO_VECTOR_DSN: postgresql://${HERO_PG_USER:-llm}:${HERO_PG_PASSWORD:-}@100.114.54.26:5432/heroquant
-      HERO_REDIS_DSN: redis://100.114.54.26:6379/0
+      # 默认部署复用既有 llm-pg / llm-redis，但它们不在本 compose project 的默认
+      # 网络里，因此 hero-quant 额外接入外部网络 heroquant-shared（见文件末尾
+      # networks 段），用容器级主机名 llm-pg / llm-redis 直连。
+      #
+      # 主机名口径（两种运行方式不可混用）：
+      #   - 容器内（docker compose up）：llm-pg / llm-redis
+      #     —— 依赖 ../scripts/init/setup-shared-network.sh 已把这两个容器接入
+      #        heroquant-shared 网络并起别名；容器重建后需重跑该脚本。
+      #   - 宿主机直跑（uvicorn hero_quant.api.server:app --port 8899）：100.114.54.26
+      #     —— 该地址只在宿主机 netns 有效，容器内不可达。
+      #
+      # 口令不进仓库：由 .env 提供 HERO_PG_PASSWORD。库名 heroquant 与
+      # scripts/init/001_schema.sql 建库目标一致。
+      #
+      # local-stack profile（--profile local-stack 起本地 postgres/redis）场景：
+      # 下方 environment 优先级高于 env_file，无法按 profile 条件覆盖，必须用 .env
+      # 显式把这五个键改成容器内主机名 postgres / redis，例如
+      #   HERO_PG_HOST=postgres
+      #   HERO_CHECKPOINT_DSN=postgresql://heroquant:heroquant@postgres:5432/heroquant
+      #   HERO_BILLING_DSN=postgresql://heroquant:heroquant@postgres:5432/heroquant
+      #   HERO_VECTOR_DSN=postgresql://heroquant:heroquant@postgres:5432/heroquant
+      #   HERO_REDIS_DSN=redis://redis:6379/0
+      # 这里只写注释，不做双份配置。
+      HERO_PG_HOST: llm-pg
+      HERO_CHECKPOINT_DSN: postgresql://${HERO_PG_USER:-llm}:${HERO_PG_PASSWORD:-}@llm-pg:5432/heroquant
+      HERO_BILLING_DSN: postgresql://${HERO_PG_USER:-llm}:${HERO_PG_PASSWORD:-}@llm-pg:5432/heroquant
+      HERO_VECTOR_DSN: postgresql://${HERO_PG_USER:-llm}:${HERO_PG_PASSWORD:-}@llm-pg:5432/heroquant
+      HERO_REDIS_DSN: redis://llm-redis:6379/0
       HERO_OTEL_MODE: shared
       OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318/v1/logs
+    networks:
+      # 默认网络保留 otel-collector 同 project 解析；heroquant-shared 提供
+      # llm-pg / llm-redis 的容器级解析。
+      - default
+      - heroquant-shared
     volumes:
       - hero-runs:/app/agent/runs
       - hero-sessions:/app/agent/sessions
@@ -148,3 +173,13 @@ volumes:
   hero-runs:
   hero-sessions:
   hero-home:
+
+networks:
+  # 本 project 自带网络（otel-collector 及 local-stack profile 的 postgres/redis
+  # 都在这里按服务名互相解析）。
+  default:
+  # 外部网络：由 scripts/init/setup-shared-network.sh 创建，并已把既有的
+  # llm-pg / llm-redis 容器接入（别名 llm-pg / llm-redis）。compose 不负责
+  # 创建/删除它，缺失时 compose 直接报错而非静默降级。
+  heroquant-shared:
+    external: true
