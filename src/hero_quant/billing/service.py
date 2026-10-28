@@ -67,14 +67,21 @@ except Exception:
     def _log_warning(msg, *args, **kwargs):
         _structlog.warning(msg, *args, **kwargs)
 
-# psycopg_pool 连接池（真实 PG 判据），缺包时优雅降级
+# psycopg_pool 连接池（真实 PG 判据），缺包时 fail-closed（不再伪成功）。
+# 中文：同步 API 只能用同步池；旧实现回退 AsyncConnectionPool，在同步 publish/purchase 里不可用，
+# 只会把「没有真池」伪装成「有池」，S4 一并收口。
 try:
     from psycopg_pool import ConnectionPool as _BillingPool  # type: ignore
 except Exception:
-    try:
-        from psycopg_pool import AsyncConnectionPool as _BillingPool  # type: ignore
-    except Exception:
-        _BillingPool = None  # type: ignore
+    _BillingPool = None  # type: ignore
+
+# 中文：SET LOCAL app.tenant = %s 是非法参数化语法（SET 不支持绑定参数，事务直接 abort）；
+# 正确写法是 SELECT set_config(name, value, is_local=true)，第二参数必须参数化，禁止字符串拼接。
+_SET_CONFIG_TENANT_SQL = "SELECT set_config('app.tenant', %s, true)"
+_SET_CONFIG_CURRENT_TENANT_SQL = "SELECT set_config('app.current_tenant', %s, true)"
+
+# 探活/建连上限（秒）：与 /ready 的 2s 单探针预算对齐，避免构造期阻塞请求线程
+_BILLING_PROBE_TIMEOUT = 2.0
 
 _PG_PREFIXES = ("postgresql://", "postgres://", "postgresql+psycopg://")
 
@@ -157,8 +164,10 @@ _GLOBAL_PURCHASES: Dict[str, List[dict]] = {}  # hashed_dsn -> list[purchase]
 # entry removed when the holder finishes (see _purchase_guard).
 _PURCHASE_KEY_LOCKS: Dict[tuple, threading.Lock] = {}
 _PURCHASE_KEY_LOCKS_GUARD = threading.Lock()
-_PG_WARNING_LOGGED = False
-_PG_WARNING_LOCK = threading.Lock()
+# S4：旧实现此处有 "PG persistence not implemented, using emulated store" 一次性告警，
+# 但告警之后 publish/purchase 仍返回成功 + purchase_id —— 那是假成功，不是降级。
+# 现改为：无真池 / 无 DSN 一律 BillingUnavailable（fail-closed），
+# 仅当 HERO_BILLING_ALLOW_MEMORY=1 显式开启内存降级时才落进程内存储，并在返回体打 degraded。
 _purchase_counter = 0
 _purchase_counter_lock = threading.Lock()
 # ledger 失败补偿：pending_ledger 重放队列（进程内；真 PG 路径补偿删 PG 行+内存）。
@@ -204,12 +213,38 @@ def _purchase_guard(key: tuple):
                     del _PURCHASE_KEY_LOCKS[key]
 
 
-def _log_pg_warning_once():
-    global _PG_WARNING_LOGGED
-    with _PG_WARNING_LOCK:
-        if not _PG_WARNING_LOGGED:
-            _PG_WARNING_LOGGED = True
-            _log_warning("PG persistence not implemented, using emulated store", exc_info=False)
+class BillingUnavailable(RuntimeError):
+    """计费不可用（无 DSN / 池不可用 / 未显式允许内存降级）—— fail-closed 异常。
+
+    中文：API 层应捕获本异常并转 503（body 带 {"ok": false, "error": "billing_unavailable"}），
+    绝不允许再返回 200 + purchase_id。
+    """
+
+    def __init__(self, reason: str, detail: str = "") -> None:
+        self.reason = reason
+        self.error = "billing_unavailable"
+        msg = f"billing_unavailable: {reason}"
+        if detail:
+            msg += f" ({detail})"
+        super().__init__(msg)
+
+
+def _billing_allow_memory() -> bool:
+    """内存降级显式开关（默认关闭 = fail-closed）。
+
+    中文：仅 HERO_BILLING_ALLOW_MEMORY=1/true/yes/on 时允许无 PG 走进程内存储。
+    优先读 settings 网关同名属性；该字段尚未在 settings.py 登记（不属 S4 白名单），
+    缺失时回退 os.environ —— 待 env 线在 settings.py/.env.example/README 三处登记后删除回退。
+    """
+    try:
+        from hero_quant.config.settings import get_settings
+
+        _v = getattr(get_settings(), "billing_allow_memory", None)
+        if _v is not None:
+            return str(_v).strip().lower() in ("1", "true", "yes", "on")
+    except Exception as _e:
+        _log_warning("billing: settings gateway unavailable for allow-memory flag: %s", type(_e).__name__, exc_info=False)
+    return (os.environ.get("HERO_BILLING_ALLOW_MEMORY", "") or "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _billing_dsn_from_env(explicit: str | None = None) -> str | None:
@@ -220,52 +255,127 @@ def _billing_dsn_from_env(explicit: str | None = None) -> str | None:
     否则 fail-closed 返回 None（财务与 checkpoint 混库有表冲突/资金完整性风险）。
     未 opt-in 时的回退尝试记 warning（fail-visible），不静默混库。
     """
-    if explicit and explicit.strip().startswith(_PG_PREFIXES):
+    if isinstance(explicit, str) and explicit.strip().startswith(_PG_PREFIXES):
         return explicit.strip()
-    raw_billing = os.environ.get("HERO_BILLING_DSN", "") or ""
-    if isinstance(raw_billing, str) and raw_billing.strip().startswith(_PG_PREFIXES):
-        return raw_billing.strip()
-    _opt_in = (os.environ.get("HERO_BILLING_ALLOW_SHARED_DB", "") or "").strip().lower() in ("1", "true", "yes", "on")
-    if not _opt_in:
+    # S4：唯一 env 网关是 settings（AGENTS.md §2），本模块不再直读 os.environ 取 DSN；
+    # 共享库回退与 HERO_BILLING_ALLOW_SHARED_DB opt-in 均由 settings._billing_dsn_from_env 负责。
+    try:
+        from hero_quant.config.settings import get_settings
+
+        _gateway_dsn = getattr(get_settings(), "billing_dsn", None)
+    except Exception as _e:
+        _log_warning("billing: settings gateway unavailable: %s", type(_e).__name__, exc_info=False)
         return None
-    for k in ("HERO_PG_DSN", "HERO_CHECKPOINT_DSN"):
-        raw = os.environ.get(k, "") or ""
-        if isinstance(raw, str) and raw.strip().startswith(_PG_PREFIXES):
-            _log_warning(
-                "HERO_BILLING_DSN not set, falling back to %s with shared-DB opt-in (billing/checkpoint share DB)",
-                k,
-                exc_info=False,
-            )
-            return raw.strip()
+    if isinstance(_gateway_dsn, str) and _gateway_dsn.strip().startswith(_PG_PREFIXES):
+        return _gateway_dsn.strip()
     return None
 
 
 class BillingService:
-    """因子市场服务，多租户行级隔离；PG+RLS 主路径，内存 fallback。"""
+    """因子市场服务，多租户行级隔离；PG+RLS 主路径，内存降级须显式开关。"""
 
     def __init__(self, ledger=None, dsn: str | None = None, **kwargs):
         self.ledger = ledger
-        # explicit dsn overrides env; keep None to trigger memory fallback
+        # explicit dsn overrides settings gateway; None = 未配置（fail-closed 或显式内存降级）
         env_dsn = _billing_dsn_from_env(dsn or kwargs.get("billing_dsn") or kwargs.get("pg_dsn"))
         self.dsn: str | None = env_dsn
         self._factors: Dict[str, dict] = {}
         self._purchases: List[dict] = []
         self._pool = None
-        # 允许显式注入 pool（测试探活/真实环境预建池）
+        self._pool_error: str | None = None
+        # 中文：内存降级不再默认开启（旧行为是无 PG 也返回成功+purchase_id 的假成功）
+        self._memory_allowed = _billing_allow_memory()
+        self._asyncpg = None  # 兼容旧属性，真实性不再依赖 asyncpg
+        # 允许显式注入 pool（测试/真实环境预建池）：注入即信任，不再二次探活
         injected = kwargs.get("pool")
+        self._owns_pool = injected is None
         if injected is not None:
             self._pool = injected
-        # 池为惰性创建：不立即建 psycopg 连接（避免无 PG 时仍判为真实）；探活时再建
-        self._asyncpg = None  # 兼容旧属性，真实性不再依赖 asyncpg
+        elif _is_pg_dsn(self.dsn):
+            # 中文：S4 修复——有 DSN 就在构造期建池并 SELECT 1 探活；探活失败 fail-closed
+            self._init_pool()
         if _is_pg_dsn(self.dsn):
-            # 全局 emulated 存储（hashed key，脱敏；_BillingPool 预留探活路径）
             _k = _dsn_key(self.dsn)
             with _GLOBAL_LOCK:
                 _GLOBAL_FACTORS.setdefault(_k, {})  # type: ignore
                 _GLOBAL_PURCHASES.setdefault(_k, [])  # type: ignore
-            _log_pg_warning_once()
-        else:
-            self._asyncpg = None  # type: ignore
+
+    def _init_pool(self) -> None:
+        """建 psycopg_pool 连接池并 SELECT 1 探活；失败即关池置 None（fail-closed）。
+
+        中文：旧实现 __init__ 从不建池，_pool 恒 None → 永远走 emulated 内存并伪成功。
+        min_size=0 + open=True 不在构造期阻塞建连；探活由本方法显式带 2s 上限（与 /ready 预算对齐）。
+        注入池（kwargs["pool"]）不走本方法：显式注入视为调用方已确认可用。
+        """
+        if _BillingPool is None:
+            self._pool_error = "psycopg_pool unavailable"
+            _log_warning("billing pool unavailable (%s), fail-closed", self._pool_error, exc_info=False)
+            return
+        pool = None
+        try:
+            pool = _BillingPool(
+                self.dsn,
+                min_size=0,
+                max_size=4,
+                timeout=_BILLING_PROBE_TIMEOUT,
+                open=True,
+                kwargs={"connect_timeout": int(_BILLING_PROBE_TIMEOUT)},
+            )
+            with pool.connection(timeout=_BILLING_PROBE_TIMEOUT) as _conn:
+                _cur = _conn.execute("SELECT 1")
+                _cur.fetchone()
+            self._pool = pool
+        except Exception as _e:
+            # 中文：错误详情只留类型名，避免 DSN/主机进日志
+            self._pool_error = type(_e).__name__
+            _log_warning("billing PG pool probe failed, fail-closed: %s", self._pool_error, exc_info=False)
+            if pool is not None:
+                try:
+                    pool.close()
+                except Exception as _close_e:
+                    _log_warning("billing pool close failed: %s", type(_close_e).__name__, exc_info=False)
+            self._pool = None
+
+    def close(self) -> None:
+        """释放本实例自建的池；注入池归调用方所有，不在此关闭。"""
+        pool = self._pool
+        self._pool = None
+        if pool is None or not getattr(self, "_owns_pool", False):
+            return
+        try:
+            pool.close()  # type: ignore[attr-defined]
+        except Exception as _e:
+            _log_warning("billing pool close failed: %s", type(_e).__name__, exc_info=False)
+
+    def __del__(self) -> None:  # pragma: no cover - 析构兜底
+        try:
+            self.close()
+        except Exception:
+            pass  # intentional: 析构期不得抛错
+
+    def _memory_mode(self) -> bool:
+        """是否处于显式允许的内存降级模式（非真 PG 且 HERO_BILLING_ALLOW_MEMORY 已开）。"""
+        return self._memory_allowed and not self._is_real_pg()
+
+    def _unavailable_reason(self) -> str | None:
+        """不可用原因：真 PG 可用或已显式允许内存降级时返回 None，否则返回 fail-closed 理由。"""
+        if self._is_real_pg() or self._memory_allowed:
+            return None
+        return "billing:pg_unavailable" if _is_pg_dsn(self.dsn) else "billing:no_dsn"
+
+    def _ensure_available(self) -> None:
+        """publish/purchase 入口门禁：不可用直接抛 BillingUnavailable，绝不返回假 purchase_id。"""
+        reason = self._unavailable_reason()
+        if reason is not None:
+            raise BillingUnavailable(reason, self._pool_error or "")
+
+    def _decorate(self, payload: dict) -> dict:
+        """内存降级返回体必须自带 degraded:true + reason（响应级降级标记）。"""
+        out = copy.deepcopy(payload)
+        if self._memory_mode():
+            out["degraded"] = True
+            out["reason"] = "billing:memory"
+        return out
 
     def _is_pg_mode(self) -> bool:
         """是否 PG 主路径 — 修复假 PG 持久化：仅当 DSN 为 PG 且已显式配置（非默认内存回退）时视作 PG。"""
@@ -335,7 +445,12 @@ class BillingService:
         upsert: bool = False,
         **kwargs: object,
     ) -> dict:
-        """发布因子，记录归属租户与定价。PG 优先持久化，成功后再追加 ledger（避免半提交）。"""
+        """发布因子，记录归属租户与定价。PG 优先持久化，成功后再追加 ledger（避免半提交）。
+
+        中文：无真 PG 且未显式允许内存降级时抛 BillingUnavailable（API 层转 503），
+        不得落内存后返回成功；内存降级返回体带 degraded:true + reason:"billing:memory"。
+        """
+        self._ensure_available()
         # alias handling: overwrite kw
         if kwargs.get("overwrite") is not None:
             allow_overwrite = allow_overwrite or bool(kwargs.get("overwrite"))
@@ -470,7 +585,7 @@ class BillingService:
                             price=_price_dec,
                         )
                         raise
-                return copy.deepcopy(factor)
+                return self._decorate(factor)
             self._factors[factor_id] = copy.deepcopy(factor)
             # 中文：纯内存路径无 PG 半提交风险，ledger 在内存写入后追加；失败补偿删内存并重放 pending_ledger
             if self.ledger is not None:
@@ -492,7 +607,7 @@ class BillingService:
                         price=_price_dec,
                     )
                     raise
-        return copy.deepcopy(factor)
+        return self._decorate(factor)
 
     def _real_pg_publish_sync(self, factor: dict) -> bool:
         """真 PG 同一事务内 SET LOCAL 后紧跟 INSERT INTO factors — 中文：事务级 RLS。
@@ -508,9 +623,9 @@ class BillingService:
             _log_warning("PG publish no pool tenant=%s", str(factor.get("tenant", "default")), exc_info=False)
             return False
         _tenant = str(factor.get("tenant", "default"))
-        _log_warning("PG publish SET LOCAL app.tenant=%s (dual write with app.current_tenant)", _tenant, exc_info=False)
+        _log_warning("PG publish set_config app.tenant=%s (dual write with app.current_tenant)", _tenant, exc_info=False)
         pool = getattr(self, "_pool", None)
-        # 中文：同一连接同一事务内完成 SET LOCAL + INSERT，避免瞬时连接丢弃 SET LOCAL
+        # 中文：同一连接同一事务内完成 set_config(is_local) + INSERT，避免瞬时连接丢失租户上下文
         _factor_sql = "INSERT INTO factors (factor_id, name, price, tenant, description) VALUES (%s, %s, %s, %s, %s) ON CONFLICT (factor_id) DO NOTHING"
         try:
             _price_param = str(_quantize_cents(factor.get("price", 0)))
@@ -522,8 +637,8 @@ class BillingService:
                 with pool.connection() as _conn:  # type: ignore[attr-defined]
                     # 中文：DDL_FACTORS/DDL_PURCHASES 在真实池建表（幂等），避免 INSERT 假设表存在
                     self._exec_billing_ddl(_conn)
-                    # 中文：两条 SET LOCAL 在同一连接同一事务内执行，不得每 key 新开连接
-                    for _sql, _k in [("SET LOCAL app.tenant = %s", "app.tenant"), ("SET LOCAL app.current_tenant = %s", "app.current_tenant")]:
+                    # 中文：两条 set_config 在同一连接同一事务内执行，不得每 key 新开连接
+                    for _sql, _k in [(_SET_CONFIG_TENANT_SQL, "app.tenant"), (_SET_CONFIG_CURRENT_TENANT_SQL, "app.current_tenant")]:
                         try:
                             _conn.execute(_sql, (_tenant,))  # type: ignore
                         except Exception:
@@ -549,7 +664,7 @@ class BillingService:
                     self._exec_billing_ddl(_conn2)
                     with _conn2.cursor() as _c2:
                         # 中文：两键同一事务内执行
-                        for _sql2, _k2 in [("SET LOCAL app.tenant = %s", "app.tenant"), ("SET LOCAL app.current_tenant = %s", "app.current_tenant")]:
+                        for _sql2, _k2 in [(_SET_CONFIG_TENANT_SQL, "app.tenant"), (_SET_CONFIG_CURRENT_TENANT_SQL, "app.current_tenant")]:
                             _c2.execute(_sql2, (_tenant,))
                         _c2.execute(_factor_sql, _params)
                     try:
@@ -579,8 +694,9 @@ class BillingService:
         在真实连接上幂等执行（lane-C dead-DDL 断言）。
         """
         # 中文：同一连接同一事务内完成 SET LOCAL app.tenant / app.current_tenant + INSERT INTO factors。
-        _set_local_tenant_sql = "SET LOCAL app.tenant = %s"
-        _set_local_current_sql = "SET LOCAL app.current_tenant = %s"
+        # 中文：SET LOCAL 不支持绑定参数（旧写法 ":620" 之类会 abort 事务），统一走 set_config
+        _set_local_tenant_sql = _SET_CONFIG_TENANT_SQL
+        _set_local_current_sql = _SET_CONFIG_CURRENT_TENANT_SQL
         _insert_factors_sql = "INSERT INTO factors (factor_id, name, price, tenant, description) VALUES (%s, %s, %s, %s, %s) ON CONFLICT (factor_id) DO NOTHING"
         if not self._is_real_pg():
             _log_warning("PG persistence not implemented, using emulated store", exc_info=False)
@@ -600,7 +716,7 @@ class BillingService:
         失败只告警不抛错（补偿本身最佳努力），由调用方按原语义返回。
         """
         _t = str(tenant)
-        for _sql in ("SET LOCAL app.tenant = %s", "SET LOCAL app.current_tenant = %s"):
+        for _sql in (_SET_CONFIG_TENANT_SQL, _SET_CONFIG_CURRENT_TENANT_SQL):
             try:
                 conn.execute(_sql, (_t,))  # type: ignore
                 continue
@@ -643,8 +759,8 @@ class BillingService:
                 try:
                     with _conn2.cursor() as _c2:
                         if _tenant is not None:
-                            _c2.execute("SET LOCAL app.tenant = %s", (_tenant,))
-                            _c2.execute("SET LOCAL app.current_tenant = %s", (_tenant,))
+                            _c2.execute(_SET_CONFIG_TENANT_SQL, (_tenant,))
+                            _c2.execute(_SET_CONFIG_CURRENT_TENANT_SQL, (_tenant,))
                         _c2.execute("DELETE FROM factors WHERE factor_id = %s", (str(factor_id),))
                     try:
                         _conn2.commit()
@@ -760,7 +876,10 @@ class BillingService:
         未提供显式 idempotency_key 时，同一 (factor_id, buyer_tenant) 重复调用返回同一收据，不重复计费
         （并发下按 (factor,buyer) 串行化保证仅一条记录；真 PG 另有 UNIQUE + ON CONFLICT DO NOTHING）。
         无真 pool 的 PG DSN 路径 fail-closed 拒绝售卖（不伪装持久化）。
+        中文：不可用（无 DSN / 池探活失败 / 未开 HERO_BILLING_ALLOW_MEMORY）时抛
+        BillingUnavailable，不生成 purchase_id —— 旧行为返回成功收据属假成功。
         """
+        self._ensure_available()
         if not isinstance(buyer_tenant, str) or not buyer_tenant.strip():
             raise ValueError("buyer_tenant must be non-empty str")
         _override_dec = _validate_price(price, field="price")
@@ -842,7 +961,7 @@ class BillingService:
                     buyer_tenant,
                     exc_info=False,
                 )
-            return hit
+            return self._decorate(hit)
 
         # 中文：PG DSN 无真 pool 时为 emulated 兼容路径（进程内 _GLOBAL_* 为权威，显式告警不伪装 PG）；
         # T2-1 fail-closed 拒绝售卖仅针对真实售卖语义无法保证且调用方要求强一致的场景，此处保持兼容：
@@ -891,7 +1010,7 @@ class BillingService:
                         buyer_tenant,
                         exc_info=False,
                     )
-                    return copy.deepcopy(receipt)
+                    return self._decorate(receipt)
                 # 双重检查：内存侧幂等，PG 已写入则落内存
                 with _GLOBAL_LOCK:
                     _hit2 = _find_locked()
@@ -940,7 +1059,7 @@ class BillingService:
                             price=use_price,
                         )
                         raise
-                return copy.deepcopy(receipt)
+                return self._decorate(receipt)
             with _purchase_counter_lock:
                 _purchase_counter += 1
                 pid = f"{factor_id}:{buyer_tenant}:{_purchase_counter}:{uuid.uuid4().hex[:8]}"
@@ -997,7 +1116,7 @@ class BillingService:
                         price=use_price,
                     )
                     raise
-            return copy.deepcopy(receipt)
+            return self._decorate(receipt)
 
     def _pg_insert_purchase_sync(self, receipt: dict) -> bool:
         """真 PG 幂等插入：INSERT ... ON CONFLICT (factor_id, buyer_tenant) DO NOTHING.
@@ -1025,19 +1144,19 @@ class BillingService:
             # 中文：DDL_FACTORS/DDL_PURCHASES 在真实连接上幂等建表，避免 INSERT 假设表存在
             self._exec_billing_ddl(conn)
             try:
-                conn.execute("SET LOCAL app.tenant = %s", (_tenant,))
+                conn.execute(_SET_CONFIG_TENANT_SQL, (_tenant,))
             except Exception:
                 try:
                     with conn.cursor() as _c:  # type: ignore
-                        _c.execute("SET LOCAL app.tenant = %s", (_tenant,))
+                        _c.execute(_SET_CONFIG_TENANT_SQL, (_tenant,))
                 except Exception as _e:
                     _log_warning("billing SET LOCAL app.tenant failed: %s", _e, exc_info=True)
             try:
-                conn.execute("SET LOCAL app.current_tenant = %s", (_tenant,))
+                conn.execute(_SET_CONFIG_CURRENT_TENANT_SQL, (_tenant,))
             except Exception:
                 try:
                     with conn.cursor() as _c2:  # type: ignore
-                        _c2.execute("SET LOCAL app.current_tenant = %s", (_tenant,))
+                        _c2.execute(_SET_CONFIG_CURRENT_TENANT_SQL, (_tenant,))
                 except Exception as _e:
                     _log_warning("billing SET LOCAL app.current_tenant failed: %s", _e, exc_info=True)
             try:
@@ -1114,8 +1233,8 @@ class BillingService:
                 _conn2 = pool.getconn()  # type: ignore
                 try:
                     with _conn2.cursor() as _c2:
-                        _c2.execute("SET LOCAL app.tenant = %s", (_buyer,))
-                        _c2.execute("SET LOCAL app.current_tenant = %s", (_buyer,))
+                        _c2.execute(_SET_CONFIG_TENANT_SQL, (_buyer,))
+                        _c2.execute(_SET_CONFIG_CURRENT_TENANT_SQL, (_buyer,))
                         _c2.execute(_sql, _params)
                     try:
                         _conn2.commit()
