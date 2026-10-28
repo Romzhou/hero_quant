@@ -8,6 +8,11 @@ import { test, expect, type Page } from '@playwright/test';
 
 const DEGRADED_FRAME = { degraded: true, reason: 'missing HERO_API_KEY, synthetic placeholder response' };
 
+/** Chat 自身的降级横幅（全局 /ready 横幅共用 testid，用 source 文本区分） */
+function chatBanner(page: Page) {
+  return page.locator('[data-testid="degraded-banner"]').filter({ hasText: 'Chat SSE' });
+}
+
 function sseBody(frames: unknown[]): string {
   return frames.map(f => `data: ${f === '[DONE]' ? '[DONE]' : JSON.stringify(f)}\n\n`).join('');
 }
@@ -46,7 +51,8 @@ test('发送问题 → 显示后端 degraded 横幅，而不是假装成功', as
   await page.getByPlaceholder(/输入投研问题/).fill('回测 600519.SH 近一月等权');
   await page.getByRole('button', { name: '发送' }).click();
 
-  const banner = page.getByTestId('degraded-banner');
+  // 与全局 /ready 横幅同 testid：按 source 文本收敛到 Chat SSE 这一条
+  const banner = chatBanner(page);
   await expect(banner).toBeVisible();
   await expect(banner).toContainText('synthetic placeholder response');
   await expect(banner).toContainText('Chat SSE');
@@ -67,7 +73,7 @@ test('后端推送 type=tool 时按真实 latency 渲染轨迹', async ({ page }
   await expect(page.getByText('get_market_data')).toBeVisible();
   await expect(page.getByText('77ms')).toBeVisible();
   await expect(page.getByText('600519.SH 近一月等权回测完成')).toBeVisible();
-  await expect(page.getByTestId('degraded-banner')).toHaveCount(0);
+  await expect(chatBanner(page)).toHaveCount(0);
 });
 
 test('票据接口 500 时显示错误态，不展示成功气泡', async ({ page }) => {
@@ -76,5 +82,5 @@ test('票据接口 500 时显示错误态，不展示成功气泡', async ({ pag
   await page.getByPlaceholder(/输入投研问题/).fill('回测 600519.SH');
   await page.getByRole('button', { name: '发送' }).click();
   await expect(page.getByText(/HTTP 500/).first()).toBeVisible({ timeout: 20_000 });
-  await expect(page.getByTestId('degraded-banner')).toHaveCount(0);
+  await expect(chatBanner(page)).toHaveCount(0);
 });
