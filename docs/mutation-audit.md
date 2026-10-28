@@ -47,3 +47,9 @@
 - id72/id76 算子编号订正（Round 6 W3 第二轮，harness `results.json` 原始 desc 复核）：id72 = `Cmp >->>=`、id76 = `Cmp >->!=`，**两者均等价**；F1 重新归因到 id65/id81。**未新增 pin**，`tests/mutation` 仍 58 passed。
 - 旧断言已按 R 线统一口径更新：DF 单列 `0.375→0.5`、双列 `0.625→5/6`、`-inf` 首行 `1/3→0.5`（`tests/mutation/test_mutation_metrics.py`）。
 - 本文件外未改动；`git add` 仅显式 `docs/mutation-audit.md`（由总管执行）。
+
+## 4. 交叉引用
+
+- Round 6 总账（8 commit + 终态门禁 + 10 条遗留台账）见 [round6-report.md](round6-report.md)；§2 给出门禁原始数字，§3 给覆盖率口径。
+- 覆盖率口径不在本文件另立数字：W4（`d556b08`）67.85% → 70.36%、covered 17719 / stmts 25183、31 文件 821 用例、44 例对称 deselect，均以 [validation-report.md §W4补记](validation-report.md) 原文为准（`:126-161`）；本文件只回答「存活 mutant 是否等价」。
+- 同族的接口侧证据（fail-closed / degraded 契约、500 归零）见 [fuzz-report.md §4 根因分类与处理](fuzz-report.md)；其 O3/O4/O5 与本文件的 W4-1..4 同列于 [round6-report.md §4](round6-report.md) 台账总表。

@@ -50,3 +50,7 @@ a/redis.py:213,281` `get_redis_sync/get_redis`），SQL 手写、键前缀手写
 
 - **状态**：已定方向，未实施（本轮仅文档）。本 ADR 是 `docs/security-audit.md:25` G-02 残余面与 `docs/redteam-round2.md:61-70` M2-06 残余记账的**决策记录**；本轮不改 `src/`、不改 `tests/`、不新增 env。
 - 详见 [ADR-006.md](./ADR-006.md)：覆盖 `HERO_API_KEY` 单密钥 → 匿名票 → 共享密钥互信的完整链路现状、per-user 目标模型（建议/待定）、5+1 步迁移路径与 `HERO_AUTH_MODE` 回退开关、对 G-02 / G-06 / G-08 / G-11 已落地语义的衔接（不推翻）、冒充面与审计缺口等风险。
+
+---
+
+- 台账对应（Round 6）：**ADR-005 / ADR-006 分别对应遗留台账 O3 / O4 两票**（见 [round6-report.md §4 遗留台账](../round6-report.md) 第 1、2 条）——O3 的 legacy 放行窗口（`scope` 伪造载荷按 G-08 降级为「无分域票」）需由 ADR-006 的 legacy 截止日统一口径；O4 的鉴权/限流降级门矩阵（`PYTEST_CURRENT_TEST` 下 `_require_real_redis_allowed()` 恒放行属预期）属两条 ADR 共同约束的 fail-closed 面。两条 ADR 状态均为「已定方向，未实施」，实施顺序与人拍板项以该台账为准。
