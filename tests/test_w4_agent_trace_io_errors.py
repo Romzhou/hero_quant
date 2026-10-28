@@ -22,6 +22,8 @@ import json
 import os
 from pathlib import Path
 
+import pytest
+
 
 from hero_quant.agent import trace as tr
 from hero_quant.agent.trace import TraceWriter
@@ -201,6 +203,7 @@ def test_fsync_dir_ignores_unopenable_directory(tmp_path):
 # ---------------------------------------------------------------- 路径校验
 
 
+@pytest.mark.skipif(os.name != "nt", reason="盘符冒号仅在 Windows 语义下非法（POSIX 上是合法相对文件名）")
 def test_safe_sidecar_path_rejects_windows_drive_letter(tmp_path):
     """含盘符冒号的路径被拒（防 Windows 盘符注入）。"""
     assert TraceWriter._safe_sidecar_path(tmp_path, "C:/evil.json") is None
