@@ -203,7 +203,10 @@ class ContextManager:
             logger.warning("invalid max_chars %r for _collapse: %s, using %d", max_chars, exc, len(text))
             budget = len(text)
         if budget == 0:
-            # Avoid division by zero / empty output: return marker truncated
+            # 零预算 ⇒ 空串：这是「输出长度不超过 max_chars」预算契约的直接结果，
+            # 不是遗漏。不能在此返回 marker —— 最小 marker 也有 24 字符，会突破 0 预算。
+            # 本分支只用于防除零/防越界；生产路径到不了这里（__init__ 已把
+            # max_chars<=0 钳到 100，见 context.py:103-105），仅静态直调可触发。
             marker = "[COLLAPSED head=0 tail=0]"
             return marker[: max(0, int(max_chars) if isinstance(max_chars, int) else 0)]
         if len(text) <= budget:
