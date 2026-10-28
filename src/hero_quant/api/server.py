@@ -2345,8 +2345,100 @@ _BACKTEST_DEGRADE_MARKERS: dict = {
     "reason": "backtest:synthetic_demo",
     "non_pit": True,
 }
+# R8-1：真行情算出的产物不再标 synthetic/degraded —— 旧实现无条件把真数据也标成合成降级。
+# non_pit 仍为 True：日线复权行情不等于 point-in-time 数据，不冒充 PIT。
+_BACKTEST_REAL_MARKERS: dict = {
+    "synthetic": False,
+    "degraded": False,
+    "reason": "backtest:market_data",
+    "non_pit": True,
+}
+# 真行情取不到时的空产物标记：只说明原因，不造任何 K 线。
+_BACKTEST_NO_DATA_MARKERS: dict = {
+    "synthetic": False,
+    "degraded": True,
+    "reason": "backtest:no_market_data",
+    "non_pit": True,
+}
+# 回测行情标的与目标交易日数（真行情不足 2 根即视为不可用）
+_BACKTEST_SYMBOL = "600519.SH"
+_BACKTEST_BARS_TARGET = 20
 # 空 CSV（仅表头）：positions 缺失时返回它，绝不塞具体 K 线数字。
 _BACKTEST_CSV_HEADER = "date,symbol,weight,close\n"
+
+
+def _backtest_demo_enabled() -> bool:
+    """确定性合成 demo 行情开关（HERO_BACKTEST_DEMO=1）—— 默认关闭。
+
+    R8-1：旧实现默认造 20 日合成 K 线（base=1680.0），属伪造数字（审计 §4.2）。
+    现在只有显式开关打开时才允许合成，且响应照旧标 synthetic/degraded。
+    """
+    return os.environ.get("HERO_BACKTEST_DEMO", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _load_backtest_prices(pd) -> "object | None":
+    """真行情优先：tools.get_market_data(allow_synthetic=False)；拿不到返回 None。
+
+    中文：allow_synthetic=False 让"无 loader / 网络失败"直接抛错，由调用方按空产物降级，
+    绝不静默回退合成冒充真实回测。
+    """
+    from datetime import date, timedelta
+
+    _end = date.today()
+    _start = _end - timedelta(days=_BACKTEST_BARS_TARGET * 2 + 10)  # 目标 ~20 个交易日
+    try:
+        from hero_quant.tools.market_data import get_market_data
+
+        res = get_market_data(
+            _BACKTEST_SYMBOL,
+            interval="1d",
+            start=_start.isoformat(),
+            end=_end.isoformat(),
+            allow_synthetic=False,
+        )
+    except Exception as _e:
+        logger.warning("backtest.real_market_data_unavailable symbol=%s error=%s", _BACKTEST_SYMBOL, str(_e))
+        return None
+    bars = res.get("bars") if isinstance(res, dict) else None
+    if not bars:
+        logger.warning("backtest.real_market_data_empty symbol=%s", _BACKTEST_SYMBOL)
+        return None
+    try:
+        df = pd.DataFrame(bars)
+        if "date" not in df.columns or "close" not in df.columns:
+            return None
+        df = df.dropna(subset=["close"])
+        prices = df.set_index(pd.to_datetime(df["date"]))[["close"]].sort_index().tail(_BACKTEST_BARS_TARGET)
+        prices.index.name = "date"
+    except Exception as _e:
+        logger.warning("backtest.real_market_data_parse_failed error=%s", str(_e))
+        return None
+    if len(prices) < 2:
+        return None
+    return prices
+
+
+def _demo_backtest_prices(pd) -> "object":
+    """确定性合成 demo 行情（仅 HERO_BACKTEST_DEMO=1 时使用），响应标 synthetic/degraded。"""
+    import numpy as np
+
+    dates = pd.date_range("2026-07-20", periods=_BACKTEST_BARS_TARGET, freq="D")
+    base = 1680.0
+    close_vals = [
+        base + i * 1.8 + (3.0 if i % 5 == 0 else -1.2 if i % 7 == 0 else 0.6 * np.sin(i))
+        for i in range(_BACKTEST_BARS_TARGET)
+    ]
+    prices = pd.DataFrame({"close": close_vals}, index=dates)
+    prices.index.name = "date"
+    return prices
+
+
+def _backtest_markers(bundle: dict) -> dict:
+    """响应级标记：优先取 bundle 自带的 provenance 标记，旧缓存/兜底才落到合成降级标记。"""
+    mk = bundle.get("markers")
+    if isinstance(mk, dict) and mk:
+        return dict(mk)
+    return dict(_BACKTEST_DEGRADE_MARKERS)
 
 
 def _backtest_bundle_cache_key(tenant: str | None = None) -> str:
@@ -2360,11 +2452,12 @@ def _backtest_bundle_cache_key(tenant: str | None = None) -> str:
         _t = tenant.strip() if isinstance(tenant, str) else ""
     except (ValueError, TypeError, AttributeError):
         _t = ""
-    # v2：v1 缓存里存有伪造指标（sharpe 1.62 / annual_return 0.184），换 key 让它自然失效。
+    # v3：v1 缓存存有伪造指标（sharpe 1.62 / annual_return 0.184）；v2 缓存是合成 K 线
+    # （base 1680.0）算出的指标 —— R8-1 起默认走真行情，换 key 让两级缓存自然失效。
     if _t:
-        raw = json.dumps({"v": 2, "capital": 1.0, "weights": [0.5, 0.5], "tenant": _t}, sort_keys=True)
+        raw = json.dumps({"v": 3, "capital": 1.0, "weights": [0.5, 0.5], "tenant": _t}, sort_keys=True)
     else:
-        raw = json.dumps({"v": 2, "capital": 1.0, "weights": [0.5, 0.5]}, sort_keys=True)
+        raw = json.dumps({"v": 3, "capital": 1.0, "weights": [0.5, 0.5]}, sort_keys=True)
     digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
     return f"{_BACKTEST_BUNDLE_CACHE_PREFIX}{digest}"
 
@@ -2383,9 +2476,9 @@ def _read_backtest_bundle_cache(tenant: str | None = None) -> dict | None:
         data = json.loads(raw)
         if not isinstance(data, dict) or not isinstance(data.get("metrics"), dict):
             return None
-        # 旧缓存可能缺标记：统一回填，保证缓存命中时响应仍然是显式降级。
-        for _mk, _mv in _BACKTEST_DEGRADE_MARKERS.items():
-            data.setdefault(_mk, _mv)
+        # 旧缓存可能缺标记：统一回填合成降级标记，保证缓存命中时响应仍然显式标注来源。
+        if not isinstance(data.get("markers"), dict):
+            data["markers"] = dict(_BACKTEST_DEGRADE_MARKERS)
         return data
     except Exception as _e:
         logger.debug(f"backtest.bundle_cache_read_failed error={_e}")
@@ -2404,7 +2497,7 @@ def _write_backtest_bundle_cache(bundle: dict, tenant: str | None = None) -> Non
             "metrics": bundle.get("metrics", {}),
             "csv": bundle.get("csv", ""),
             "tearsheet": bundle.get("tearsheet", ""),
-            **_BACKTEST_DEGRADE_MARKERS,
+            "markers": dict(bundle.get("markers") or _BACKTEST_DEGRADE_MARKERS),
         }
         client.set(_backtest_bundle_cache_key(tenant), json.dumps(payload, ensure_ascii=False, default=str), ex=600)
     except Exception as _e:
@@ -2412,22 +2505,40 @@ def _write_backtest_bundle_cache(bundle: dict, tenant: str | None = None) -> Non
 
 
 def _compute_backtest_bundle() -> dict:
-    """重计算 bundle（调用方已持有本地互斥；内部不再加锁，避免非重入死锁）。"""
+    """重计算 bundle（调用方已持有本地互斥；内部不再加锁，避免非重入死锁）。
+
+    R8-1：默认只吃真行情（get_market_data(allow_synthetic=False)）；拿不到就返回空指标 +
+    降级标记（reason=backtest:no_market_data），不再造 20 日合成 K 线（旧 base=1680.0
+    属伪造数字，见审计 §4.2）。合成 demo 行情仅当 HERO_BACKTEST_DEMO=1 显式开启时使用，
+    并照旧标 synthetic/degraded。
+    """
     import pandas as pd
-    import numpy as np
     from hero_quant.backtest.engine import BacktestEngine
 
-    # 确定性合成行情（20 日，类 600519.SH 走势）
-    dates = pd.date_range("2026-07-20", periods=20, freq="D")
-    # 确定性爬升叠加小幅正弦波动，无随机性
-    base = 1680.0
-    close_vals = [base + i * 1.8 + (3.0 if i % 5 == 0 else -1.2 if i % 7 == 0 else 0.6 * np.sin(i)) for i in range(20)]
-    prices = pd.DataFrame({"close": close_vals}, index=dates)
-    prices.index.name = "date"
+    prices = _load_backtest_prices(pd)
+    if prices is not None:
+        markers = dict(_BACKTEST_REAL_MARKERS)
+        synthetic = False
+    elif _backtest_demo_enabled():
+        prices = _demo_backtest_prices(pd)
+        markers = dict(_BACKTEST_DEGRADE_MARKERS)
+        synthetic = True
+    else:
+        logger.warning("backtest.bundle_no_market_data symbol=%s", _BACKTEST_SYMBOL)
+        return {**_static_backtest_bundle(), "markers": dict(_BACKTEST_NO_DATA_MARKERS)}
     eng = BacktestEngine(initial_capital=1.0)
-    # allow_synthetic=True：这是确定性 demo 行情，显式走合成通道（引擎默认 fail-closed 拒绝），
-    # 结果在响应里以 synthetic/degraded/non_pit 标记，绝不冒充真实 PIT 回测。
-    res = eng.run(prices, weights=[0.5, 0.5], allow_synthetic=True)
+    # allow_synthetic 只在显式 demo 开关下为 True：真行情走引擎的 fail-closed 通道，
+    # 且必须显式给 PIT 日期（等权权重在窗口首日确定，价格窗口截至末日），否则引擎硬抛。
+    if synthetic:
+        res = eng.run(prices, weights=[0.5, 0.5], allow_synthetic=True)
+    else:
+        res = eng.run(
+            prices,
+            weights=[0.5, 0.5],
+            allow_synthetic=False,
+            weights_on=prices.index[0],
+            price_date=prices.index[-1],
+        )
     metrics_data = res.get("metrics", {})
     if not isinstance(metrics_data, dict):
         metrics_data = {}
@@ -2449,7 +2560,13 @@ def _compute_backtest_bundle() -> dict:
     if not isinstance(tearsheet, str):
         # 引擎未产出 tearsheet 就留空，不拼假 HTML（"Sharpe 1.62" 之类）
         tearsheet = ""
-    return {"metrics": metrics_data, "positions": positions, "csv": csv_text, "tearsheet": tearsheet, **_BACKTEST_DEGRADE_MARKERS}
+    return {
+        "metrics": metrics_data,
+        "positions": positions,
+        "csv": csv_text,
+        "tearsheet": tearsheet,
+        "markers": markers,
+    }
 
 
 def _static_backtest_bundle() -> dict:
@@ -2459,7 +2576,7 @@ def _static_backtest_bundle() -> dict:
         "positions": None,
         "csv": _BACKTEST_CSV_HEADER,
         "tearsheet": "",
-        **_BACKTEST_DEGRADE_MARKERS,
+        "markers": dict(_BACKTEST_DEGRADE_MARKERS),
     }
 
 
@@ -2544,9 +2661,10 @@ def backtest_metrics(request: Request):
             logger.debug("metrics.counter_failed", error=str(_e))  # intentional offline-safe
             pass  # intentional offline-safe
     bundle = _get_backtest_bundle()
-    # 响应级标记：synthetic 行情算出的指标可以任意（但不是写死的 1.62），必须如实标注来源。
+    # 响应级标记：来源由 bundle 自带的 markers 决定（真行情不标 synthetic/degraded）。
+    markers = _backtest_markers(bundle)
     metrics_body = dict(bundle.get("metrics") or {})
-    for _mk, _mv in _BACKTEST_DEGRADE_MARKERS.items():
+    for _mk, _mv in markers.items():
         if _mk in metrics_body:
             # 键已被引擎指标占用（如 non_pit）时不覆盖真实输出，换名并存，避免歧义。
             metrics_body[f"backtest_{_mk}"] = _mv
@@ -2555,8 +2673,8 @@ def backtest_metrics(request: Request):
     return JSONResponse(
         content=metrics_body,
         headers={
-            _DEGRADED_HEADER: "true",
-            _DEGRADED_REASON_HEADER: _BACKTEST_DEGRADE_MARKERS["reason"],
+            _DEGRADED_HEADER: "true" if markers.get("degraded") else "false",
+            _DEGRADED_REASON_HEADER: str(markers.get("reason") or ""),
         },
     )
 
@@ -2574,14 +2692,15 @@ def backtest_positions(request: Request):
             logger.debug("metrics.counter_failed", error=str(_e))  # intentional offline-safe
             pass  # intentional offline-safe
     bundle = _get_backtest_bundle()
+    markers = _backtest_markers(bundle)
     csv_text = bundle.get("csv") or _BACKTEST_CSV_HEADER
     return PlainTextResponse(
         content=csv_text,
         media_type="text/csv",
         headers={
             "Content-Disposition": "inline; filename=positions.csv",
-            _DEGRADED_HEADER: "true",
-            _DEGRADED_REASON_HEADER: _BACKTEST_DEGRADE_MARKERS["reason"],
+            _DEGRADED_HEADER: "true" if markers.get("degraded") else "false",
+            _DEGRADED_REASON_HEADER: str(markers.get("reason") or ""),
         },
     )
 
@@ -2598,14 +2717,15 @@ def backtest_tearsheet(request: Request):
         logger.debug("metrics.counter_failed", error=str(_e))  # intentional offline-safe
         pass  # intentional offline-safe
     bundle = _get_backtest_bundle()
+    markers = _backtest_markers(bundle)
     # 无真实 tearsheet 就返回空正文（不拼假 HTML），并显式暴露降级头。
     html = bundle.get("tearsheet") or ""
     return Response(
         content=html,
         media_type="text/html",
         headers={
-            _DEGRADED_HEADER: "true",
-            _DEGRADED_REASON_HEADER: _BACKTEST_DEGRADE_MARKERS["reason"],
+            _DEGRADED_HEADER: "true" if markers.get("degraded") else "false",
+            _DEGRADED_REASON_HEADER: str(markers.get("reason") or ""),
         },
     )
 
