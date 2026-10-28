@@ -96,9 +96,17 @@ USER vibe
 # Default port
 EXPOSE 8899
 
-# Health check — hits /live (liveness probe)
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8899/live')" || exit 1
+# Health check — hits /ready (readiness probe), NOT /live (audit §3 L5).
+# /live only proves the process is up; "healthy" must mean dependencies are usable.
+# /ready probes PG (checkpoint + billing) and Redis with a hard <5s budget
+# (bounded probes in server.py, worst case ~2.3s when both are unreachable), so
+# --timeout=5s is sufficient. Missing DSN or an unreachable PG/Redis makes the
+# container report unhealthy — that is intended, honest fail-closed behaviour;
+# do not mask it by probing /live.
+# --start-period=30s: cold start imports pandas/numpy and warms the backend,
+# 10s is not enough on slow machines and yields false "unhealthy" flaps.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8899/ready')" || exit 1
 
 # Run API server (serves frontend/dist as static files)
 # 标准启动：uvicorn hero_quant.api.server:app --port 8899（与 README 快速开始对齐）
