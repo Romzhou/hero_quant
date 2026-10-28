@@ -318,9 +318,22 @@ def _final_answer(llm, q: str, narrative: str, tool_records: list) -> str:
     return narrative
 
 
+def _checkpoint_dsn_explicit() -> str:
+    """显式 HERO_CHECKPOINT_DSN（空 = 未配置 → memory://default）。
+
+    中文：不能用 Settings.checkpoint_dsn 判断「是否要求 PG」——它有 PG 形态兜底默认
+    （postgresql://localhost:5432/heroquant，Task7 pinning），拿它做判据会让 /ready 在
+    无 PG 的单机环境永远 degraded。判据只看调用方是否显式给了 DSN。
+    """
+    try:
+        return (os.environ.get("HERO_CHECKPOINT_DSN", "") or "").strip()
+    except (ValueError, TypeError, AttributeError):
+        return ""
+
+
 def _get_checkpoint_saver():
     """Best-effort checkpoint saver from HERO_CHECKPOINT_DSN, fallback to memory. Cached by DSN to avoid per-request PG connect blocking."""
-    dsn = os.environ.get("HERO_CHECKPOINT_DSN", "memory://default")
+    dsn = _checkpoint_dsn_explicit() or "memory://default"
     # Fast path: cached
     cached = _checkpoint_saver_cache.get(dsn)
     if cached is not None:
@@ -904,14 +917,24 @@ def _redact_dsn_api(dsn: str) -> str:
 
 
 # ---- D线 /ready 探针基础设施：全局复用池 + TTL 缓存（禁止每次新建 ThreadPoolExecutor） ----
-_READY_POOL = _cf_ready.ThreadPoolExecutor(max_workers=4, thread_name_prefix="ready-probe")
+# 中文：/ready 硬预算 <5s。探针必须全部经 _ready_run_with_timeout 有界执行，
+# 否则 PG 不可达时 pool.connection() 默认 30s 会把就绪探针拖到 30s+（审计 §3 第 4 层）。
+# 分项预算：checkpoint 1.6s + billing 1.6s + redis 0.8s + cohere 0.6s ≈ 4.6s 上界。
+_READY_POOL = _cf_ready.ThreadPoolExecutor(max_workers=8, thread_name_prefix="ready-probe")
 _READY_CACHE: dict[str, tuple[float, tuple[bool, str]]] = {}
 _READY_CACHE_LOCK = threading.Lock()
 _READY_CACHE_TTL_SECONDS = 5.0
+_READY_CHECKPOINT_TIMEOUT = 1.6
+_READY_BILLING_TIMEOUT = 1.6
+_READY_REDIS_TIMEOUT = 0.8
+_READY_COHERE_TIMEOUT = 0.6
 
 
-def _ready_cached_probe(key: str, probe) -> tuple[tuple[bool, str], bool]:
-    """readiness 缓存：TTL 内复用探针结果，避免每次 /ready 都打 PG SELECT 1。返回 (result, cached)。"""
+def _ready_cached_probe(key: str, probe, timeout: float = 2.0) -> tuple[tuple[bool, str], bool]:
+    """readiness 缓存 + 有界执行：TTL 内复用探针结果，探针本体经 _ready_run_with_timeout 限时。
+
+    超时 fail-closed 为 (False, "memory") 并缓存，避免每次 /ready 都重新等满超时。
+    """
     now = time.monotonic()
     try:
         with _READY_CACHE_LOCK:
@@ -920,7 +943,18 @@ def _ready_cached_probe(key: str, probe) -> tuple[tuple[bool, str], bool]:
                 return hit[1], True
     except (ValueError, TypeError, AttributeError, OSError, RuntimeError) as _e:
         logger.debug("ready.cache_read_failed", error=str(_e), error_code="ready_cache_read_failed", key=key)
-    result = probe()
+    try:
+        result = _ready_run_with_timeout(probe, timeout=timeout)
+    except _cf_ready.TimeoutError:
+        # 中文：探针超时 = fail-closed，绝不把"没探出来"当成就绪。
+        logger.warning(
+            "ready.probe_timeout",
+            error_code="probe_timeout",
+            probe=key,
+            timeout=timeout,
+        )
+        _inc_api_error("ready", "probe_timeout")
+        result = (False, "memory")
     try:
         with _READY_CACHE_LOCK:
             _READY_CACHE[key] = (now, result)
@@ -944,14 +978,14 @@ def _ready_run_with_timeout(fn, timeout: float = 2.0):
 
 def _check_checkpoint_pg_full() -> tuple[tuple[bool, str, str], bool]:
     """全量 checkpoint 探针：(ok, mode, reason) + 是否命中缓存。缺配/不可达一律 fail-closed 为 memory，reason 透出。"""
-    (ok, mode), cached = _ready_cached_probe("checkpoint", _check_checkpoint_pg)
+    (ok, mode), cached = _ready_cached_probe("checkpoint", _check_checkpoint_pg, timeout=_READY_CHECKPOINT_TIMEOUT)
     reason = ""
     if not ok:
         try:
             from hero_quant.config.settings import Settings
 
             _s = Settings()
-            _dsn = getattr(_s, "checkpoint_dsn", None) or ""
+            _dsn = _checkpoint_dsn_explicit()
             if not _is_pg_dsn_ready(_dsn):
                 # checkpoint/postgres.py 缺配行为透到 /ready：无 PG DSN 即 fail-closed，不静默。
                 reason = "checkpoint PG DSN 缺配 fail-closed(memory)"
@@ -970,7 +1004,7 @@ def _check_checkpoint_pg_full() -> tuple[tuple[bool, str, str], bool]:
 
 def _check_billing_pg_full() -> tuple[tuple[bool, str, str], bool]:
     """全量 billing 探针：(ok, mode, reason) + 是否命中缓存。HERO_BILLING_DSN 为空即 fail-closed，reason 透出。"""
-    (ok, mode), cached = _ready_cached_probe("billing", _check_billing_pg)
+    (ok, mode), cached = _ready_cached_probe("billing", _check_billing_pg, timeout=_READY_BILLING_TIMEOUT)
     reason = ""
     if not ok:
         try:
@@ -997,12 +1031,15 @@ def _check_checkpoint_pg() -> tuple[bool, str]:
     try:
         from hero_quant.config.settings import Settings
         s = Settings()
-        dsn = getattr(s, "checkpoint_dsn", None) or os.environ.get("HERO_CHECKPOINT_DSN", "") or ""
+        _ = s  # Settings 仅为保持既有导入路径一致；DSN 判据见 _checkpoint_dsn_explicit
+        dsn = _checkpoint_dsn_explicit()
         if not _is_pg_dsn_ready(dsn):
             return False, "memory"
-        from hero_quant.checkpoint.postgres import get_saver
-
-        saver = get_saver(dsn)
+        # 中文：复用请求路径同一个缓存 saver —— 直接 get_saver(dsn) 会在 __init__/setup 里
+        # 起池并空等 30s（审计里「冷启动 32s 才 503」的根因），且留一条 30s 僵尸线程。
+        saver = _get_checkpoint_saver()
+        if saver is None:
+            return False, "memory"
         # 唯一判据：_is_real_pg_pool
         is_real = getattr(saver, "_is_real_pg_pool", None)
         if callable(is_real):
@@ -1029,9 +1066,9 @@ def _check_checkpoint_pg() -> tuple[bool, str]:
             def _do_checkpoint_select():
                 if hasattr(pool, "connection"):
                     try:
-                        with pool.connection(timeout=2) as _conn:  # type: ignore[call-arg]
+                        with pool.connection(timeout=1) as _conn:  # type: ignore[call-arg]
                             try:
-                                _conn.execute("SELECT 1", timeout=2)  # type: ignore[call-arg]
+                                _conn.execute("SELECT 1", timeout=1)  # type: ignore[call-arg]
                             except TypeError:
                                 with _conn.cursor() as _cur:  # type: ignore
                                     _cur.execute("SELECT 1")
@@ -1043,7 +1080,7 @@ def _check_checkpoint_pg() -> tuple[bool, str]:
                             with _conn2.cursor() as _cur2:  # type: ignore
                                 _cur2.execute("SELECT 1")
                 elif hasattr(pool, "getconn"):
-                    _conn = pool.getconn(timeout=2)  # type: ignore[call-arg]
+                    _conn = pool.getconn(timeout=1)  # type: ignore[call-arg]
                     try:
                         with _conn.cursor() as _cur:
                             _cur.execute("SELECT 1")
@@ -1057,7 +1094,7 @@ def _check_checkpoint_pg() -> tuple[bool, str]:
             # 中文：超时必传，避免无超时阻塞探测（D线：复用全局 _READY_POOL，禁止每次新建池）
             fut = _READY_POOL.submit(_do_checkpoint_select)
             try:
-                fut.result(timeout=2)
+                fut.result(timeout=1)
             except _cf.TimeoutError:
                 try:
                     fut.cancel()
@@ -1120,9 +1157,9 @@ def _check_billing_pg() -> tuple[bool, str]:
             def _do_billing_select():
                 if hasattr(pool, "connection"):
                     try:
-                        with pool.connection(timeout=2) as _conn:  # type: ignore[call-arg]
+                        with pool.connection(timeout=1) as _conn:  # type: ignore[call-arg]
                             try:
-                                _conn.execute("SELECT 1", timeout=2)  # type: ignore[call-arg]
+                                _conn.execute("SELECT 1", timeout=1)  # type: ignore[call-arg]
                             except TypeError:
                                 with _conn.cursor() as _c:  # type: ignore
                                     _c.execute("SELECT 1")
@@ -1134,7 +1171,7 @@ def _check_billing_pg() -> tuple[bool, str]:
                             with _conn2.cursor() as _c2:  # type: ignore
                                 _c2.execute("SELECT 1")
                 elif hasattr(pool, "getconn"):
-                    _c2 = pool.getconn(timeout=2)  # type: ignore[call-arg]
+                    _c2 = pool.getconn(timeout=1)  # type: ignore[call-arg]
                     try:
                         with _c2.cursor() as _cur:
                             _cur.execute("SELECT 1")
@@ -1148,7 +1185,7 @@ def _check_billing_pg() -> tuple[bool, str]:
             # 中文：超时必传，避免无超时阻塞探测（D线：复用全局 _READY_POOL，禁止每次新建池）
             fut = _READY_POOL.submit(_do_billing_select)
             try:
-                fut.result(timeout=2)
+                fut.result(timeout=1)
             except _cf2.TimeoutError:
                 try:
                     fut.cancel()
@@ -1209,6 +1246,46 @@ def _check_cohere() -> bool:
         return False
 
 
+def _cohere_api_key() -> str:
+    """Cohere key 唯一来源（Settings.cohere_api_key -> COHERE_API_KEY）；只判存在，绝不回显。"""
+    try:
+        from hero_quant.config.settings import Settings
+
+        return (getattr(Settings(), "cohere_api_key", "") or os.environ.get("COHERE_API_KEY", "") or "").strip()
+    except (ImportError, ValueError, TypeError, AttributeError, OSError, RuntimeError):
+        return (os.environ.get("COHERE_API_KEY", "") or "").strip()
+
+
+def _ready_cohere_fatal() -> bool:
+    """HERO_READY_COHERE_FATAL（默认 false）：缺 key 只 warning，不降级 /ready。"""
+    try:
+        return os.environ.get("HERO_READY_COHERE_FATAL", "").strip().lower() in ("1", "true", "yes", "on")
+    except (ValueError, TypeError, AttributeError):
+        return False
+
+
+def _check_redis() -> bool:
+    """实探 Redis：DSN 缺失 / PING 失败即 False（不复用 fakeredis 回退，避免假绿）。"""
+    try:
+        from hero_quant.config.settings import Settings
+
+        dsn = getattr(Settings(), "redis_dsn", None) or os.environ.get("HERO_REDIS_DSN") or ""
+        if not dsn:
+            return False
+        import redis as _redis_mod
+
+        client = _redis_mod.Redis.from_url(dsn, socket_connect_timeout=0.4, socket_timeout=0.4)
+        try:
+            return bool(client.ping())
+        finally:
+            try:
+                client.close()
+            except (ValueError, TypeError, AttributeError, OSError):
+                pass
+    except (ImportError, ValueError, TypeError, AttributeError, OSError, RuntimeError):
+        return False
+
+
 @app.get("/ready")
 def ready(mode: str = "ready"):
     """就绪探针：聚合 degraded — probe PG (checkpoint), Cohere health, 返回 pg/checkpoint/billing。
@@ -1216,6 +1293,8 @@ def ready(mode: str = "ready"):
     liveness/readiness 分流：mode=live 仅返回进程存活（不打 PG/网络探针，恒 200，由 /live 承担纯存活语义，
     /ready?mode=live 为其轻量别名）；默认 mode=ready 做全量就绪探针（5s 缓存 + 全局池超时 fail-closed）。
     checkpoint 缺配与 billing fail-closed 以 reasons 透出；整体 degraded 时 503 + degraded:true + reason。
+    所有探针经 _ready_run_with_timeout 有界执行（<5s 硬预算）；redis 为 warning 级真实状态；
+    缺 COHERE_API_KEY 默认只 warning，HERO_READY_COHERE_FATAL=true 才降级。
     """
     if REQUEST_COUNTER is not None:
         try:
@@ -1228,38 +1307,63 @@ def ready(mode: str = "ready"):
     s = None  # 预定义避免 UnboundLocalError
     (pg_ok, checkpoint_mode, checkpoint_reason), _ckpt_cached = _check_checkpoint_pg_full()
     (billing_ok, billing_mode, billing_reason), _bill_cached = _check_billing_pg_full()
-    cohere_ok = _check_cohere()
-    # overall status: degraded if PG expected but unreachable or Cohere unhealthy
+    # Redis：限流依赖，实探 PING（不走 fakeredis 回退，避免假绿）；失败只 warning 不拦就绪。
+    try:
+        redis_ok = bool(_ready_run_with_timeout(_check_redis, timeout=_READY_REDIS_TIMEOUT))
+    except _cf_ready.TimeoutError:
+        logger.warning("ready.redis_probe_timeout", error_code="redis_probe_timeout", timeout=_READY_REDIS_TIMEOUT)
+        redis_ok = False
+    # Cohere：缺 key 默认只 warning（compose 与 .env.example 都不提供该 key），
+    # 显式 HERO_READY_COHERE_FATAL=true 才按致命处理，否则 /ready 永远无法转绿。
+    _cohere_key = _cohere_api_key()
+    _cohere_fatal = _ready_cohere_fatal()
+    if _cohere_key:
+        try:
+            cohere_ok = bool(_ready_run_with_timeout(_check_cohere, timeout=_READY_COHERE_TIMEOUT))
+        except _cf_ready.TimeoutError:
+            logger.warning("ready.cohere_probe_timeout", error_code="cohere_probe_timeout", timeout=_READY_COHERE_TIMEOUT)
+            cohere_ok = False
+        cohere_reason = "" if cohere_ok else "cohere:unhealthy(fatal)"
+    else:
+        cohere_ok = False
+        cohere_reason = "cohere:key_missing(fatal)" if _cohere_fatal else "cohere:key_missing(warning)"
+        if _cohere_fatal:
+            logger.warning("ready.cohere_key_missing_fatal", error_code="cohere_key_missing_fatal")
+        else:
+            logger.warning("ready.cohere_key_missing_warning", error_code="cohere_key_missing_warning")
+    # overall status: degraded if PG expected but unreachable, or Cohere 致命不健康
     # Determine if PG was expected
     try:
         from hero_quant.config.settings import Settings
 
         s = Settings()
-        exp_dsn = getattr(s, "checkpoint_dsn", "") or ""
-        expect_pg = _is_pg_dsn_ready(exp_dsn)
         billing_dsn = getattr(s, "billing_dsn", None) or ""
         expect_billing_pg = _is_pg_dsn_ready(billing_dsn)
     except (ValueError, TypeError, AttributeError, OSError, RuntimeError):
-        expect_pg = False
         expect_billing_pg = False
-    # If PG expected and not ok => degraded, else check cohere
-    if expect_pg and not pg_ok:
-        status = "degraded"
-    elif not cohere_ok:
-        status = "degraded"
-    elif expect_billing_pg and not billing_ok:
-        # billing degraded only if billing PG was expected but not ok
-        status = "degraded"
-    else:
-        status = "ok"
     reasons: dict[str, str] = {}
-    if checkpoint_reason:
+    if checkpoint_mode != "pg":
+        # 中文：如实标注内存模式（审计要求 /ready reason 明写 checkpoint:memory），并保留具体原因。
+        reasons["checkpoint"] = "checkpoint:memory | " + (
+            checkpoint_reason or "PG unreachable or unconfigured, fail-closed(memory)"
+        )
+    elif checkpoint_reason:
         reasons["checkpoint"] = checkpoint_reason
     if billing_reason:
         reasons["billing"] = billing_reason
-    if not cohere_ok:
-        reasons["cohere"] = "cohere unhealthy or key missing"
-    degraded = status != "ok"
+    if not redis_ok:
+        reasons["redis"] = "redis:unreachable(warning)"
+    if cohere_reason:
+        reasons["cohere"] = cohere_reason
+    # checkpoint 非真 PG（memory / emulated）= 无持久化，fail-closed 为 degraded 并在 reason 写明；
+    # billing 仅在配置了 PG 时按结果降级；Cohere 仅 fatal（缺 key 默认 warning）才降级。
+    degraded = bool(
+        (checkpoint_mode != "pg")
+        or (expect_billing_pg and not billing_ok)
+        or (_cohere_fatal and not cohere_ok)
+        or (bool(_cohere_key) and not cohere_ok)
+    )
+    status = "degraded" if degraded else "ok"
     if degraded:
         _inc_api_error("ready", "degraded")
         logger.warning(
@@ -1276,6 +1380,7 @@ def ready(mode: str = "ready"):
         "pg": pg_ok,
         "checkpoint": checkpoint_mode,
         "billing": billing_mode,
+        "redis": redis_ok,
         "reasons": reasons,
         "cached": {"checkpoint": bool(_ckpt_cached), "billing": bool(_bill_cached)},
     }
@@ -1288,7 +1393,12 @@ def ready(mode: str = "ready"):
     if status == "degraded":
         return _with_degraded_headers(
             JSONResponse(status_code=code, content=body),
-            [reasons.get("checkpoint", ""), reasons.get("billing", ""), reasons.get("cohere", "")],
+            [
+                reasons.get("checkpoint", ""),
+                reasons.get("billing", ""),
+                reasons.get("redis", ""),
+                reasons.get("cohere", ""),
+            ],
         )
     return body
 
