@@ -54,7 +54,7 @@ pip install -e ".[dev,ashare,us]"
 # ashare: tushare+akshare, us: yfinance, crypto: ccxt
 
 # 2. 配置（可选）
-cp .env.example .env  # 若无则直接 export
+cp .env.example .env  # 必须填 HERO_PG_PASSWORD，否则 DSN 渲染成空口令、/ready 如实 503（详见「Docker 单机部署」）
 export HERO_LLM_PROVIDER=openai
 export HERO_API_KEY=sk-...
 export HERO_DATA_MODE=live   # synthetic | live  (live 才调 qt.gtimg.cn/yahoo)
