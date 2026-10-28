@@ -22,7 +22,7 @@ try:
     import structlog as _structlog  # type: ignore
 
     _slog = _structlog.get_logger(__name__)
-except Exception:  # pragma: no cover — 最小环境无 structlog
+except ImportError:  # pragma: no cover — 最小环境无 structlog（缺包以外的异常应暴露，不吞）
     _slog = None  # type: ignore
 
 # 白名单单源：避免 trait/registry 双轨漂移（YAGNI 最小，复用 sources 常量）
@@ -597,7 +597,7 @@ class MarketDataRegistry:
                         unit=getattr(prov, "unit", None),
                         interval=interval,
                     )
-                except Exception:  # pragma: no cover — 结构化日志不可用不影响主链路
+                except Exception:  # pragma: no cover — 仅日志写入；processor/handler 失败面不可枚举且 stdlib 已告警
                     pass
             return
         # 模式二：以主数据源为基准，遍历其他 loader 做对照
