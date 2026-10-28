@@ -289,6 +289,28 @@ def _redis_dsn_from_env() -> str | None:
     return None
 
 
+_TRUTHY = ("1", "true", "yes", "on")
+_FALSY = ("0", "false", "no", "off", "")
+
+
+def _bool_from_env(key: str) -> bool:
+    """布尔开关统一解析：1/true/yes/on 为真，0/false/no/off/空为假，缺省假。
+
+    两个新开关（HERO_READY_COHERE_FATAL / HERO_BILLING_ALLOW_MEMORY）默认 false 的共同语义：
+    fail-open 于可用性、fail-closed 于谎报 —— 不配即不启用宽松/降级路径（该报错仍显式报错，
+    不会退化成假成功）；显式开启才允许 warning 放行或内存降级，并在响应里如实标注。
+    非法值（如 maybe）告警后按 false 处理，保持 fail-visible 而非静默。
+    """
+    raw = (os.getenv(key, "") or "").strip().lower()
+    if raw in _TRUTHY:
+        return True
+    if raw in _FALSY:
+        return False
+    warnings.warn(f"Invalid {key}={raw!r}, treating as false", UserWarning, stacklevel=2)
+    logger.warning("Invalid %s=%r, treating as false", key, raw)
+    return False
+
+
 def _llm_model_slot_from_env(key: str) -> str:
     """读取独立 LLM 槽位，未设置时回退到 legacy 模型配置；均做 strip 处理。"""
     raw = os.getenv(key, "")
@@ -359,6 +381,11 @@ class Settings:
     # PII 加密/脱敏：统一在此 gate 解析，避免 api.middleware.pii 直接读环境变量（test_config 架构门禁校验）
     pii_encryption_key: str = field(default_factory=lambda: (os.getenv("PII_ENCRYPTION_KEY", "") or "").strip(), repr=False)
     pii_allow_legacy_noenc: bool = field(default_factory=lambda: (os.getenv("PII_ALLOW_LEGACY_NOENC", "") or "").strip() == "1")
+    # /ready 与 billing 的两个降级开关：统一经本网关解析，禁止调用方直读 os.environ。
+    # 默认均为 false：fail-open 于可用性（缺 COHERE key 只 warning、/ready 不因此变红）、
+    # fail-closed 于谎报（billing 未配 DSN 仍显式不可用，绝不静默降级成假成功）。
+    ready_cohere_fatal: bool = field(default_factory=lambda: _bool_from_env("HERO_READY_COHERE_FATAL"))
+    billing_allow_memory: bool = field(default_factory=lambda: _bool_from_env("HERO_BILLING_ALLOW_MEMORY"))
 
 
 @lru_cache(maxsize=1)

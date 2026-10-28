@@ -134,6 +134,11 @@ services:
       HERO_BILLING_DSN: postgresql://${HERO_PG_USER:-llm}:${HERO_PG_PASSWORD:-}@llm-pg:5432/heroquant
       HERO_VECTOR_DSN: postgresql://${HERO_PG_USER:-llm}:${HERO_PG_PASSWORD:-}@llm-pg:5432/heroquant
       HERO_REDIS_DSN: redis://llm-redis:6379/0
+      # 可选降级开关（经 .env/env_file 透传，不写即默认 false；网关见 settings.py
+      # ready_cohere_fatal / billing_allow_memory）：
+      #   HERO_READY_COHERE_FATAL=true → 缺 COHERE_API_KEY 时 /ready 判 degraded（默认只 warning）
+      #   HERO_BILLING_ALLOW_MEMORY=1  → 允许无 PG 内存计费，响应带 degraded:true
+      # 两者默认 false 均为 fail-open 于可用性、fail-closed 于谎报：不配 DSN 仍显式失败。
       HERO_OTEL_MODE: shared
       OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318/v1/logs
     networks:
