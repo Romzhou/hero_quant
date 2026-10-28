@@ -1,11 +1,28 @@
-"""Test risk real data — Task15 Wave3 Top4 TDD."""
+"""Test risk real data — Task15 Wave3 Top4 行为断言（不再用 “!=0.62 or degraded” 恒真兜底）。"""
+import pytest
 
-def test_risk_no_hardcode():
+
+def test_risk_no_hardcode(monkeypatch):
+    """metrics 缺失 -> exposure 必须 None 且 degraded+reason；metrics 存在 -> 原值透传。"""
+    import hero_quant.api.server as srv
     from hero_quant.api.risk import risk_summary
 
+    monkeypatch.setattr(srv, "_get_backtest_bundle", lambda: {})
     r = risk_summary()
-    # 修复后不应恒返回 0.62 且无 degraded，应返回真实值或 None 并标记 degraded
-    assert r["exposure"] != 0.62 or r.get("degraded") is True
+    assert r["exposure"] is None, f"缺 metrics 时不得再返回硬编码 0.62，got {r['exposure']}"
+    assert r.get("degraded") is True
+    assert "exposure_missing" in (r.get("reason") or "")
+
+    metrics = {
+        "exposure": 0.33,
+        "turnover": 0.5,
+        "single_limit": 0.1,
+        "circuit_threshold": 0.2,
+        "reject_rate": 0.01,
+    }
+    monkeypatch.setattr(srv, "_get_backtest_bundle", lambda: {"metrics": metrics})
+    r2 = risk_summary()
+    assert r2["exposure"] == pytest.approx(0.33), "真实 exposure 必须原值透传，不得替换成 0.62"
 
 
 def test_turnover_none_degraded(monkeypatch):
