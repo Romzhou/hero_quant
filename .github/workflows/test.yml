@@ -62,9 +62,26 @@ jobs:
         uses: gitleaks/gitleaks-action@v2 # pin: sha256:2a65dd62a8f8b5afedd072f3e2aa1c8a3b6c7a0e7d0a9c
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - name: Install Playwright browsers
-        continue-on-error: true
-        run: npx playwright install --with-deps
-      - name: Run Playwright e2e (optional, non-blocking)
-        continue-on-error: true
-        run: npx playwright test --list; npx playwright test || true
+      - name: Install Playwright (root devDeps, blocking)
+        # 中文：e2e 不再是可选门。根 package.json 才有 @playwright/test，先 npm ci 再跑。
+        run: |
+          npm ci
+          npx playwright --version
+      - name: Start backend for e2e (same job)
+        # 中文：e2e 真阻断的前提是同 job 有后端；playwright webServer 只起 vite dev，/v1 代理到 8899。
+        run: |
+          python -m uvicorn hero_quant.api.server:app --port 8899 > /tmp/hero-quant-backend.log 2>&1 &
+          echo $! > /tmp/hero-quant-backend.pid
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:8899/live > /dev/null; then
+              echo "backend live after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "backend failed to become live; last log:"
+          tail -50 /tmp/hero-quant-backend.log
+          exit 1
+      - name: Run Playwright e2e (blocking)
+        # 中文：真阻断（移除 continue-on-error 与 || true），失败即 job 红。
+        run: npx playwright test
