@@ -1,23 +1,40 @@
 #!/usr/bin/env bash
 # ---------------------------------------------------------------------------
+# DEPRECATED（2026-10-28，决策 D-1）—— 保留仅为回滚参考，正常部署不要再跑。
+#
 # setup-shared-network.sh — 把既有 llm-pg / llm-redis 接入 heroquant-shared 网络
 #
-# 背景：docker-compose.yml 里的 hero-quant 服务用容器主机名 llm-pg / llm-redis
-# 连接 PG/Redis，但这俩容器由别的 project 创建，不在本 compose project 的默认
-# 网络内。本脚本创建外部网络 heroquant-shared 并把它们 connect 进来（带别名）。
+# 废弃原因：docker-compose.yml 已移除 external 网络 heroquant-shared，hero-quant
+# 容器改为直连宿主 tailscale IP 100.114.54.26:5432/6379。外部网络方案要求新克隆
+# 先跑本脚本，否则 compose 直接 network not found，违反 AGENTS §3「docker compose
+# up --build 一条命令起来」。README 已不再引用本脚本，执行它对部署无副作用
+# （只是建一个没人用的网络），但也无必要。
 #
-# 何时需要重跑（幂等，重复执行安全）：
+# 历史背景（保留以便理解脚本逻辑）：docker-compose.yml 里的 hero-quant 服务曾
+# 用容器主机名 llm-pg / llm-redis 连接 PG/Redis，但这俩容器由别的 project 创建，
+# 不在本 compose project 的默认网络内。本脚本创建外部网络 heroquant-shared 并把
+# 它们 connect 进来（带别名）。
+#
+# 何时会重跑（幂等，重复执行安全）：
 #   - 首次部署 / 换机器；
 #   - llm-pg 或 llm-redis 容器被重建（docker compose down/up、升级镜像、
 #     --force-recreate）后 —— 新建容器不会继承旧的网络成员关系，此时
 #     `docker network connect` 的别名也随之丢失；
 #   - 宿主机重启后 docker 网络仍在，但若容器被重建则同上。
 #
-# 用法：bash scripts/init/setup-shared-network.sh
-# 注意：宿主机直跑 uvicorn 时用 100.114.54.26，容器内才用 llm-pg/llm-redis，
-#       两者不可混用（100.114.54.26 只在宿主机 netns 有效）。
+# 用法（仅需回滚到旧网络方案时）：bash scripts/init/setup-shared-network.sh
+# 注意：现行口径是宿主与容器都用 100.114.54.26（本机 tailscale IP；换机器/IP 变了
+#       改 .env 与 docker-compose.yml）。127.0.0.1:5432/6379 不通。
 # ---------------------------------------------------------------------------
 set -euo pipefail
+
+if [ "${HERO_SETUP_SHARED_NETWORK_FORCE:-0}" != "1" ]; then
+  echo "[skip] DEPRECATED：heroquant-shared 外部网络已废弃（2026-10-28 决策 D-1）。" >&2
+  echo "[skip] 现行部署直连宿主 tailscale IP 100.114.54.26，无需本网络。" >&2
+  echo "[skip] 确需回滚到旧容器名方案时：HERO_SETUP_SHARED_NETWORK_FORCE=1 bash $0" >&2
+  exit 0
+fi
+echo "[warn] 已强制启用 DEPRECATED 的 heroquant-shared 网络方案（仅回滚用途）" >&2
 
 NETWORK="heroquant-shared"
 PG_CONTAINER="llm-pg"
@@ -63,3 +80,4 @@ connect "${PG_CONTAINER}" "llm-pg"
 connect "${REDIS_CONTAINER}" "llm-redis"
 
 echo "[done] ${NETWORK} 就绪：容器内可用 llm-pg:5432 / llm-redis:6379"
+echo "[note] 该网络方案已 DEPRECATED，现行部署用 100.114.54.26（见文件头）"
