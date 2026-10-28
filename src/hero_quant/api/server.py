@@ -331,10 +331,64 @@ def _checkpoint_dsn_explicit() -> str:
         return ""
 
 
+def _checkpoint_thread_for_request(request) -> tuple[str, str]:
+    """checkpoint 三段式的 (thread, tenant)。
+
+    中文：thread 取调用方 X-Request-ID（同值 = 同一线程，重启后可续写同一 seq 序列），
+    缺失/非法则用 adhoc；tenant 目前固定 default（per-user 隔离需 per-user 密钥身份，后续专线）。
+    """
+    thread = "adhoc"
+    try:
+        rid = request.headers.get("X-Request-ID", "") or ""
+        if rid and len(rid) <= 128 and _REQUEST_ID_RE.fullmatch(rid):
+            thread = rid
+    except (ValueError, TypeError, AttributeError):
+        thread = "adhoc"
+    return thread, "default"
+
+
+def _pg_dsn_hostport(dsn: str) -> tuple[str, int]:
+    """从 PG DSN 解析 (host, port)；解析失败回落 localhost:5432（仅用于探活，不参与连接）。"""
+    host, port = "localhost", 5432
+    try:
+        _after_at = dsn.split("@", 1)[-1] if "@" in dsn else dsn.split("://", 1)[-1]
+        _hostport = _after_at.split("/", 1)[0]
+        if ":" in _hostport:
+            host, _port_s = _hostport.rsplit(":", 1)
+            port = int(_port_s)
+        elif _hostport:
+            host = _hostport
+    except (ValueError, TypeError, AttributeError):
+        return "localhost", 5432
+    return host, port
+
+
+def _pg_tcp_reachable(dsn: str, timeout: float = 1.0) -> bool:
+    """1s TCP 探活：避免 psycopg_pool 在 PG 不可达时空等 30s 拖住请求。"""
+    try:
+        import socket as _sock
+
+        host, port = _pg_dsn_hostport(dsn)
+        _probe = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
+        _probe.settimeout(timeout)
+        try:
+            _probe.connect((host, port))
+            return True
+        finally:
+            _probe.close()
+    except (OSError, ValueError, TypeError):
+        return False
+
+
 def _get_checkpoint_saver():
-    """Best-effort checkpoint saver from HERO_CHECKPOINT_DSN, fallback to memory. Cached by DSN to avoid per-request PG connect blocking."""
+    """checkpoint saver：有 HERO_CHECKPOINT_DSN 就用真 PG saver，没有才 memory://default。
+
+    中文（S2/P0-3）：旧实现默认 memory://default 且非 HERO_CHECKPOINT_TRY_PG=1 一律返回
+    emulated 桩——PG 通了也不落库，checkpoint 形同装饰。现改为：显式 DSN → 真 saver
+    （1s TCP 探活兜底，不可达才退回 emulated 并 warning + /ready 透出），无 DSN → memory。
+    结果按 DSN 缓存，避免 per-request 建池。
+    """
     dsn = _checkpoint_dsn_explicit() or "memory://default"
-    # Fast path: cached
     cached = _checkpoint_saver_cache.get(dsn)
     if cached is not None:
         return cached
@@ -342,88 +396,65 @@ def _get_checkpoint_saver():
         cached = _checkpoint_saver_cache.get(dsn)
         if cached is not None:
             return cached
-        # PG DSN but PG likely unreachable in dev (no docker) — skip TCP connect and use memory directly to avoid 25s hang
-        # Only attempt real PG when explicitly opted-in via HERO_CHECKPOINT_TRY_PG=1 or when PG is known reachable
-        if dsn.startswith("postgresql://") or dsn.startswith("postgres://"):
-            # Quick probe: try TCP connect with 1s timeout to avoid blocking event loop on every request
-            try:
-                import socket as _sock
-
-                # parse host/port from DSN
-                _host, _port = "localhost", 5432
+        if dsn.startswith(("postgresql://", "postgres://")):
+            saver = None
+            if _pg_tcp_reachable(dsn, timeout=1.0):
                 try:
-                    # postgresql://user:pass@host:port/db
-                    _after_at = dsn.split("@", 1)[-1] if "@" in dsn else dsn.split("://", 1)[-1]
-                    _hostport = _after_at.split("/", 1)[0]
-                    if ":" in _hostport:
-                        _host, _port_s = _hostport.rsplit(":", 1)
-                        _port = int(_port_s)
-                    else:
-                        _host = _hostport
-                except Exception:
-                    pass
-                if os.environ.get("HERO_CHECKPOINT_TRY_PG") != "1":
-                    # In local dev without docker, PG is not running — use emulated PG store (still tenant/thread/seq schema) without TCP attempt
-                    # This avoids 25s blocking on every stream request while keeping same checkpoint semantics
+                    from hero_quant.checkpoint.postgres import get_saver as _get_saver
+
+                    saver = _get_saver(dsn)
+                except Exception as _e:  # noqa: BLE001 — 建池/建表失败必须记录后 fail-closed 兜底
+                    logger.warning(
+                        "checkpoint.wire_failed",
+                        error=str(_e),
+                        dsn=_redact_dsn_api(dsn),
+                        dsn_host=_dsn_host(dsn),
+                        error_code="checkpoint_wire_failed",
+                    )
+            else:
+                logger.warning(
+                    "checkpoint.pg_unreachable_emulated",
+                    dsn=_redact_dsn_api(dsn),
+                    dsn_host=_dsn_host(dsn),
+                    error_code="checkpoint_pg_unreachable",
+                )
+            if saver is None:
+                # 不可达：emulated 桩（仍按 tenant/thread/seq 落内存），显式 degraded，不假装落库
+                try:
                     from hero_quant.checkpoint.postgres import AsyncPostgresSaver as _Saver
 
-                    saver = _Saver(dsn)  # pool will be None, but is_pg_mode=True so global emulated store is used
-                    saver._setup_done = True  # skip setup DDL which would try to connect
-                    _checkpoint_saver_cache[dsn] = saver
-                    logger.info(
-                        "checkpoint.wired",
-                        dsn=_redact_dsn_api(dsn),
-                        dsn_host=_dsn_host(dsn),
-                        mode="pg-emulated",
-                        degraded=True,
-                        reason=_EMULATED_CHECKPOINT_REASON,
-                        error_code="checkpoint_emulated",
-                    )
-                    return saver
-                # When TRY_PG=1, do a quick 1s probe before full connect
-                _probe = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
-                _probe.settimeout(1.0)
-                try:
-                    _probe.connect((_host, _port))
-                    _probe.close()
-                except Exception:
-                    _probe.close()
-                    raise ConnectionError(f"PG at {_host}:{_port} not reachable, using emulated store")
-            except ConnectionError as _ce:
-                logger.warning("checkpoint.pg_unreachable_emulated", error=str(_ce))
-                try:
-                    from hero_quant.checkpoint.postgres import AsyncPostgresSaver as _Saver2
-
-                    saver = _Saver2(dsn)
-                    saver._setup_done = True
-                    _checkpoint_saver_cache[dsn] = saver
-                    logger.info(
-                        "checkpoint.wired",
-                        dsn=_redact_dsn_api(dsn),
-                        dsn_host=_dsn_host(dsn),
-                        mode="pg-emulated",
-                        degraded=True,
-                        reason=_EMULATED_CHECKPOINT_REASON,
-                        error_code="checkpoint_emulated",
-                    )
-                    return saver
-                except Exception:
-                    pass
-            except Exception as _e:
-                logger.debug("checkpoint.probe_failed", error=str(_e))
-        try:
-            from hero_quant.checkpoint.postgres import get_saver as _get_saver
-
-            saver = _get_saver(dsn)
+                    saver = _Saver(dsn)
+                    saver._setup_done = True  # 跳过 DDL，PG 不可达时不再空等
+                except Exception as _e:  # noqa: BLE001
+                    logger.warning("checkpoint.emulated_init_failed", error=str(_e), error_code="checkpoint_emulated_init_failed")
+                    return None
+                _checkpoint_saver_cache[dsn] = saver
+                logger.info(
+                    "checkpoint.wired",
+                    dsn=_redact_dsn_api(dsn),
+                    dsn_host=_dsn_host(dsn),
+                    mode="pg-emulated",
+                    degraded=True,
+                    reason=_EMULATED_CHECKPOINT_REASON,
+                    error_code="checkpoint_emulated",
+                )
+                return saver
             _checkpoint_saver_cache[dsn] = saver
             logger.info(
                 "checkpoint.wired",
                 dsn=_redact_dsn_api(dsn),
                 dsn_host=_dsn_host(dsn),
-                mode="pg" if "postgres" in dsn else "memory",
+                mode="pg",
             )
             return saver
-        except Exception as _e:
+        try:
+            from hero_quant.checkpoint.postgres import get_saver as _get_saver
+
+            saver = _get_saver(dsn)
+            _checkpoint_saver_cache[dsn] = saver
+            logger.info("checkpoint.wired", dsn=_redact_dsn_api(dsn), dsn_host=_dsn_host(dsn), mode="memory")
+            return saver
+        except Exception as _e:  # noqa: BLE001
             logger.warning("checkpoint.wire_failed", error=str(_e), exc_info=_e)  # intentional: fallback to memory/noop
             try:
                 from hero_quant.checkpoint.postgres import AsyncPostgresSaver
@@ -1632,6 +1663,7 @@ async def query(request: Request, background_tasks: BackgroundTasks, q: str = ""
             logger.warning("checkpoint.get_failed", error=str(_e), exc_info=_e)
             _saver = None
             _ckpt_degraded, _ckpt_reason = True, "checkpoint saver unavailable, memory fallback"
+        _ckpt_thread, _ckpt_tenant = _checkpoint_thread_for_request(request)
         loop_kwargs = dict(
             llm=llm,
             max_iterations=5,
@@ -1645,9 +1677,11 @@ async def query(request: Request, background_tasks: BackgroundTasks, q: str = ""
             retry_policy=retry,
             replay_path=replay_path,
             wall_time_budget=_wt,
+            checkpoint_tenant=_ckpt_tenant,
+            checkpoint_thread=_ckpt_thread,
         )
         if _saver is not None:
-            # AgentLoop accepts **kwargs, checkpoint will be stored in kwargs if not explicitly supported
+            # S2：AgentLoop 已显式接收 checkpoint（checkpoint/checkpointer 双别名），每轮迭代 put 一次
             loop_kwargs["checkpoint"] = _saver
             loop_kwargs["checkpointer"] = _saver
         loop = AgentLoop(**loop_kwargs)
@@ -2023,6 +2057,7 @@ async def query_stream(request: Request, background_tasks: BackgroundTasks, q: s
                 logger.warning("checkpoint.get_failed_stream", error=str(_e), exc_info=_e)
                 if "checkpoint saver unavailable, memory fallback" not in _gen_reasons:
                     _gen_reasons.append("checkpoint saver unavailable, memory fallback")
+            _ckpt_thread2, _ckpt_tenant2 = _checkpoint_thread_for_request(request)
             loop_kwargs2 = dict(
                 llm=llm,
                 max_iterations=5,
@@ -2036,6 +2071,8 @@ async def query_stream(request: Request, background_tasks: BackgroundTasks, q: s
                 retry_policy=retry,
                 replay_path=replay_path,
                 wall_time_budget=_wt,
+                checkpoint_tenant=_ckpt_tenant2,
+                checkpoint_thread=_ckpt_thread2,
             )
             if _saver2 is not None:
                 loop_kwargs2["checkpoint"] = _saver2

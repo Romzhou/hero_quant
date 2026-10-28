@@ -156,6 +156,10 @@ class AgentLoop:
         retry_policy=None,
         memory_store=None,
         skills_loader=None,
+        checkpoint=None,
+        checkpointer=None,
+        checkpoint_tenant="default",
+        checkpoint_thread=None,
         **kwargs: Any,
     ):
         self.llm = llm
@@ -236,6 +240,18 @@ class AgentLoop:
             self.skills_loader = _sl_alias
         else:
             self.skills_loader = None
+        # S2 checkpoint 显式接线：旧实现经 **kwargs 收下后直接丢弃（全文 0 处 checkpoint），
+        # saver 成了装饰。这里显式保存，并由 run() 每轮迭代结束 put 一次。
+        _ckpt_alias = checkpointer if checkpointer is not None else kwargs.pop("checkpointer", None)
+        if _ckpt_alias is None:
+            _ckpt_alias = kwargs.pop("checkpoint_saver", None)
+        self.checkpoint = checkpoint if checkpoint is not None else _ckpt_alias
+        self.checkpoint_tenant = str(checkpoint_tenant or "default").strip() or "default"
+        self.checkpoint_thread = str(checkpoint_thread or "agentloop").strip() or "agentloop"
+        # fail-closed 记账：put 失败不吞错，收尾计入 LoopResult.reason/metrics
+        self._checkpoint_errors: List[str] = []
+        self._ckpt_seq = 0
+        self._ckpt_goal_hash = ""
         # 回放兼容：支持 replay_path / replay_from / replay_file 及 replay 标志的多种写法
         _replay_path = kwargs.pop("replay_path", None)
         if _replay_path is None:
@@ -613,6 +629,84 @@ class AgentLoop:
             return [{"type": "text", "text": stream}]
         return stream  # type: ignore[return-value]
 
+    # ---- S2 checkpoint 落盘（tenant/thread/seq 三段式，签名见 checkpoint/postgres.py:1187/1285） ----
+    @staticmethod
+    def _ckpt_segment(raw: Any, default: str) -> str:
+        """线程/租户段清洗：三段式禁止 ':' 与空白，非法字符折叠为 '_'，空值回落默认。"""
+        try:
+            seg = re.sub(r"[^0-9A-Za-z_.-]+", "_", str(raw or "").strip())
+        except Exception:
+            return default
+        return seg or default
+
+    def _ckpt_thread_id(self, seq: int) -> str:
+        """workflow:run:tenant —— run 段为纯数字以命中 checkpoint 的 seq 映射。"""
+        wf = self._ckpt_segment(self.checkpoint_thread, "agentloop")
+        tenant = self._ckpt_segment(self.checkpoint_tenant, "default")
+        return f"{wf}:{int(seq)}:{tenant}"
+
+    def _checkpoint_resume_seq(self) -> int:
+        """读取同 thread 的 seq 指针（seq=0 的记录），让重启后继续递增而不是覆盖历史。
+
+        fail-closed：读失败记 warning 并计数，从 0 开始，不静默吞异常。
+        """
+        saver = getattr(self, "checkpoint", None)
+        if saver is None:
+            return 0
+        pointer_id = self._ckpt_thread_id(0)
+        try:
+            pointer = saver.get(pointer_id)
+            if isinstance(pointer, dict):
+                return max(0, int(pointer.get("latest_seq") or 0))
+        except Exception as exc:  # noqa: BLE001 — 必须记录，不 except pass
+            self._checkpoint_errors.append(f"{pointer_id}: resume_read_failed:{type(exc).__name__}")
+            _warn(
+                "checkpoint_resume_failed",
+                "checkpoint resume read failed: %s",
+                exc,
+                exc_info=True,
+            )
+        return 0
+
+    def _checkpoint_put(self, seq: int, buffer: str, reason: str, terminated: bool, iterations: int) -> None:
+        """每轮迭代结束落一次 checkpoint；失败 fail-closed 记账（不中断主循环）。"""
+        saver = getattr(self, "checkpoint", None)
+        if saver is None:
+            return
+        thread_id = self._ckpt_thread_id(seq)
+        payload = {
+            "version": int(seq),
+            "seq": int(seq),
+            "iteration": int(iterations),
+            "terminated": bool(terminated),
+            "reason": str(reason or ""),
+            "text": buffer[-4000:] if isinstance(buffer, str) else "",
+            "goal_hash": self._ckpt_goal_hash,
+        }
+        try:
+            saver.put(thread_id, payload, {"next": str(reason or "")})
+        except Exception as exc:  # noqa: BLE001 — 必须记录并升级到 LoopResult，不 except pass
+            self._checkpoint_errors.append(f"{thread_id}: {type(exc).__name__}")
+            _warn(
+                "checkpoint_put_failed",
+                "checkpoint put failed: %s",
+                exc,
+                thread=thread_id,
+                exc_info=True,
+            )
+            return
+        # seq 指针：让同 thread 的下一次启动知道从哪个 seq 续写
+        try:
+            saver.put(self._ckpt_thread_id(0), {"version": int(seq), "latest_seq": int(seq), "terminated": bool(terminated)}, {})
+        except Exception as exc:  # noqa: BLE001
+            self._checkpoint_errors.append(f"{self._ckpt_thread_id(0)}: pointer:{type(exc).__name__}")
+            _warn(
+                "checkpoint_pointer_failed",
+                "checkpoint seq pointer failed: %s",
+                exc,
+                exc_info=True,
+            )
+
     def run(self, goal: str) -> LoopResult:
         """执行主循环，驱动 LLM↔工具往返直至终止条件满足。"""
 
@@ -666,6 +760,11 @@ class AgentLoop:
                     pass
                 res.reason = "wall_time_budget_exceeded"
                 res.terminated = True
+            # S2：graph 委托路径同样落一次 checkpoint（与主循环同 thread/seq 语义）
+            self._ckpt_seq = self._checkpoint_resume_seq() + 1
+            self._checkpoint_put(self._ckpt_seq, res.text, res.reason, res.terminated, res.iterations)
+            if self._checkpoint_errors:
+                res.reason = f"{res.reason};checkpoint_put_failed"
             return res
 
         # buffer uses str concat (+=) for simplicity; iterations capped so O(n^2) acceptable, alt is list+join
@@ -682,6 +781,15 @@ class AgentLoop:
         _llm_usage_output = 0
 
         trace_writer = self._ensure_trace_writer()
+
+        # S2：同 thread 续跑——从 seq 指针接着写，不覆盖上一轮已落盘的历史。
+        self._ckpt_seq = self._checkpoint_resume_seq()
+        try:
+            import hashlib as _hashlib
+
+            self._ckpt_goal_hash = _hashlib.sha256(str(goal).encode("utf-8")).hexdigest()[:16]
+        except Exception:
+            self._ckpt_goal_hash = ""
 
         def _context_tokens() -> int:
             if self.context_manager is None:
@@ -1667,6 +1775,10 @@ class AgentLoop:
                         pass
                 break
 
+            # S2：迭代末尾落 checkpoint（只加写入，不改下面任何控制点判定）。
+            self._ckpt_seq += 1
+            self._checkpoint_put(self._ckpt_seq, buffer, reason, terminated, iterations)
+
             # 10) 终止判定：工具成功且校验通过或纯文本完成
             if tool_calls_this_iter:
                 if tool_success_this_iter and grounding_verified:
@@ -1709,6 +1821,11 @@ class AgentLoop:
         if not terminated and iterations >= self.max_iterations:
             reason = "max_iterations"
             terminated = True
+
+        # S2：终止态再落一次 checkpoint（循环内的 put 发生在终止判定之前），
+        # 保证重启后能读到最后一轮的 terminated/reason。
+        self._ckpt_seq += 1
+        self._checkpoint_put(self._ckpt_seq, buffer, reason, terminated, iterations)
 
         # 保证 token 计数与最终输出一致
         token_count = estimate_tokens(buffer)
@@ -1803,6 +1920,13 @@ class AgentLoop:
                         pass
         except Exception:
             pass
+
+        # S2 checkpoint fail-closed 记账：写盘失败必须体现在 reason + metrics，不静默丢。
+        if self._checkpoint_errors:
+            metrics = dict(metrics or {})
+            metrics["checkpoint"] = "failed"
+            metrics["checkpoint_error_count"] = len(self._checkpoint_errors)
+            reason = f"{reason};checkpoint_put_failed"
 
         return LoopResult(
             terminated=bool(terminated) if reason != "max_iterations" else True,
