@@ -143,7 +143,7 @@ docker build -t hero-quant:0.2.0 .
 | `HERO_EMBED_PROVIDER` | `offline` | `openai` / `sentence-transformers` / `offline` |
 | `HERO_OTEL_MODE` | `disabled` | `disabled`/`shared`/`private` |
 | `HERO_TRACE_*` | `50000/500` | `TOOL_RESULT_OFFLOAD/TEXT_OFFLOAD/PREVIEW` |
-| `FRONTEND_DIST` | 自动探测 | 显式设置即**唯一来源**：路径不是目录就直接 503，不再回退 `/app/frontend/dist` 等默认候选（`server.py:2814`） |
+| `FRONTEND_DIST` | 自动探测 | 显式设置即**唯一来源**：路径不存在时 fail-closed，**不回落** `/app/frontend/dist` 等默认候选（`server.py:2814`）。无产物时 `/` 与 SPA 路由返回 503 + `X-Frontend: missing|index-missing` + `Retry-After: 30` |
 
 全仓仅 `src/hero_quant/config/settings.py` 允许 `os.getenv`，CI 门禁 `tests/test_config.py:80` 校验。
 
@@ -173,7 +173,7 @@ pytest -q --cov=src/hero_quant --cov-fail-under=50  # 以 pyproject fail_under=5
 npm --prefix frontend run test:run
 ```
 
-**测试口径（唯一可信来源是本机实跑）**：硬门是 `pyproject.toml:67` 的 `fail_under = 50`，`.github/workflows/test.yml:53` 与 `ci.yml:103` 同值。2026-10-28 基线：**2767 passed / 47 skipped / 覆盖率 72.04%**（`pytest -q --cov=src`）。47 个 skip 里绝大多数是“无真 PG 时”的守卫（有 PG 时只剩 1 个 Windows-only skip），所以看到跳过数变化先看环境，不要先怀疑用例。通过数随改动漂移，引用前请重跑，不要照抄本文。
+**测试口径（唯一可信来源是本机实跑）**：硬门是 `pyproject.toml:67` 的 `fail_under = 50`，`.github/workflows/test.yml:53` 与 `ci.yml:103` 同值。2026-10-28 基线：**2767 passed / 47 skipped / 覆盖率 72.04%**（`pytest -q --cov=src`）。47 个 skip 里绝大多数是“无真 PG 时”的守卫（有 PG 时只剩 1 个 Windows-only skip），所以看到跳过数变化先看环境，不要先怀疑用例。通过数随改动漂移，引用前请重跑，不要照抄本文。前端路由用例自造临时 `dist` 来区分“有产物 200 / 无产物 503”，**不依赖** CI 先 `npm run build`。
 
 供应链：`requirements-lock.txt` 为 `uv pip compile --generate-hashes` 产物（真 sha256 非占位），`Dockerfile:32 pip install --require-hashes`，CI 校验 `pip-audit + gitleaks`（已接入真 hash 全量）。
 
