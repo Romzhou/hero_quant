@@ -41,6 +41,25 @@ _DEFAULT_PG_PORT = 5432
 # psycopg 探测 2s（settings 侧连接超时口径，见 src/hero_quant/checkpoint/postgres.py:620 的 timeout=5 注释）。
 _TCP_PROBE_TIMEOUT = 0.3
 _CONNECT_PROBE_TIMEOUT = 2
+# 中文：/ready 与 settings 的默认库名是 heroquant（docker-compose / scripts/init 口径）。
+_DEFAULT_PG_DATABASE = "heroquant"
+_ACCEPTED_PG_DATABASES = frozenset({"heroquant", "hero_quant"})
+
+# ---------------------------------------------------------------------------
+# 仓库根 .env 隔离（测试确定性）
+# ---------------------------------------------------------------------------
+# 背景：settings.py 在 import 时 load_dotenv(override=False)，仓库根 .env 若带
+# HERO_BILLING_DSN 会把「本地内存降级用例」偷偷接到真 PG，导致同一条用例
+# 「有 .env / 无 .env」结论不同。这里在 conftest 最早加载时快照真实进程 env，
+# 仅对「不是调用方显式导出」的 DSN 键写入空字符串：dotenv 的 override=False
+# 不会覆盖已存在（即使为空）的键，因此 .env 的 DSN 被确定性中和。
+# 需要真 PG 的集成用例必须显式导出 HERO_CHECKPOINT_DSN / HERO_PG_DSN（opt-in）。
+_DSN_ENV_SNAPSHOT: dict[str, str] = {k: os.environ[k] for k in _PG_DSN_ENV_KEYS if k in os.environ}
+_DSN_ENV_NEUTRALIZED: dict[str, str | None] = {}
+for _key in _PG_DSN_ENV_KEYS:
+    if _key not in _DSN_ENV_SNAPSHOT:
+        _DSN_ENV_NEUTRALIZED[_key] = os.environ.get(_key)
+        os.environ[_key] = ""
 
 
 def _redact_dsn(dsn: str) -> str:
@@ -74,7 +93,20 @@ def resolve_pg_dsn() -> str:
         if val:
             return val
     host = (os.environ.get("HERO_PG_HOST", "") or "").strip() or "localhost"
-    return f"postgresql://{host}:{_DEFAULT_PG_PORT}/hero_quant"
+    return f"postgresql://{host}:{_DEFAULT_PG_PORT}/{_DEFAULT_PG_DATABASE}"
+
+
+def pg_test_dsn(tag: str) -> str:
+    """给 PG 集成用例生成可用 DSN：沿用探测 DSN 的 host/凭据/库，用 application_name 作命名空间。
+
+    中文：老用例把 postgresql://postgres:postgres@localhost:5432/<唯一库名> 写死，既无法
+    连到 env 指定的 llm-pg（凭据/主机不同），也会在库不存在时反复重连挂死。统一改走本 helper：
+    连接目标来自 HERO_CHECKPOINT_DSN / HERO_PG_DSN / HERO_PG_HOST，tag 只用于让
+    跨 DSN 隔离类用例仍然拿到字符串不同的 DSN（同一库上以 application_name 区分）。
+    """
+    base = resolve_pg_dsn().strip()
+    sep = "&" if "?" in base else "?"
+    return f"{base}{sep}application_name={tag}"
 
 
 def _parse_host_port(dsn: str) -> tuple[str, int] | None:
@@ -137,18 +169,46 @@ def pg_guard_reason() -> str | None:
     except Exception as exc:  # pragma: no cover - 视环境而定
         return f"PG guard: psycopg 不可导入（{type(exc).__name__}），无法验证 {host}:{port} 上的真实 PG"
     try:
-        with psycopg.connect(_conninfo(dsn), connect_timeout=_CONNECT_PROBE_TIMEOUT):
-            return None
+        with psycopg.connect(_conninfo(dsn), connect_timeout=_CONNECT_PROBE_TIMEOUT) as _conn:
+            _db = (_conn.execute("SELECT current_database()").fetchone() or ("",))[0]
+            _has_hq = _conn.execute(
+                "SELECT 1 FROM pg_database WHERE datname IN ('heroquant', 'hero_quant') LIMIT 1"
+            ).fetchone()
     except Exception as exc:  # pragma: no cover - 视环境而定
         return (
             f"PG guard: psycopg 连接 {_redact_dsn(dsn)} 失败（connect_timeout={_CONNECT_PROBE_TIMEOUT}s，"
             f"{type(exc).__name__}）"
         )
+    # 中文：能连上但库里没有 heroquant/hero_quant（例如连到 postgres 维护库）不算可用，
+    # 否则 PG 用例会在错误库上建表，或直接因 schema 不存在而失败。
+    if _db not in _ACCEPTED_PG_DATABASES and not _has_hq:
+        return (
+            f"PG guard: 已连接 {_redact_dsn(dsn)}，但 current_database={_db!r} 且不存在 "
+            "heroquant/hero_quant 库；PG 集成用例跳过"
+        )
+    return None
 
 
 def pg_available() -> bool:
     """PG 是否可用（`pg_guard_reason()` 的布尔封装，供需要条件分支的用例复用）。"""
     return pg_guard_reason() is None
+
+
+@pytest.fixture
+def billing_memory(monkeypatch):
+    """显式开启 billing 内存降级（新契约：无 PG 必须 opt-in，返回体带 degraded:true）。
+
+    中文：S4 起 HERO_BILLING_ALLOW_MEMORY 是唯一降级开关，默认 fail-closed；
+    内存幂等/并发/覆盖冲突类用例必须显式 opt-in，并断言 degraded+reason=billing:memory，
+    不得在全局 conftest 默认打开（否则真 PG 语义被掩盖）。
+    """
+    monkeypatch.setenv("HERO_BILLING_ALLOW_MEMORY", "1")
+    for key in _PG_DSN_ENV_KEYS:
+        monkeypatch.setenv(key, "")
+    from hero_quant.config.settings import get_settings
+
+    get_settings.cache_clear()  # type: ignore[attr-defined]
+    yield
 
 
 @pytest.fixture(autouse=True)
@@ -185,3 +245,33 @@ def _clear_data_mode_cache():
         import logging
 
         logging.getLogger(__name__).warning("conftest get_settings cache_clear failed: %s", e, exc_info=True)
+
+
+# ---------------------------------------------------------------------------
+# PG skip 汇总 + 会话级 env 还原
+# ---------------------------------------------------------------------------
+_PG_SKIPPED_NODEIDS: list[str] = []
+
+
+def pytest_runtest_logreport(report) -> None:
+    """收集被 PG 守卫跳过的用例，session 结束时显式汇总（skip 不再藏在绿灯里）。"""
+    if not report.skipped:
+        return
+    longrepr = report.longrepr
+    reason = longrepr[2] if isinstance(longrepr, tuple) and len(longrepr) > 2 else str(longrepr)
+    if "PG guard" in reason:
+        _PG_SKIPPED_NODEIDS.append(report.nodeid)
+
+
+def pytest_sessionfinish(session, exitstatus) -> None:
+    if _PG_SKIPPED_NODEIDS:
+        print(
+            f"\n[PG GUARD] {len(_PG_SKIPPED_NODEIDS)} 个 PG 集成用例因无可用 PostgreSQL 被 skip；"
+            "显式导出 HERO_CHECKPOINT_DSN（或 HERO_PG_HOST）可让其真跑。"
+        )
+    # 还原 conftest 加载时被中和的 dotenv DSN 键（避免污染同一进程内的后续调用）
+    for key, value in _DSN_ENV_NEUTRALIZED.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value

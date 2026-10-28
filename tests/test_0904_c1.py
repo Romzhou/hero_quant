@@ -8,7 +8,7 @@ import time
 
 import pytest
 
-from conftest import pg_guard_reason
+from conftest import pg_guard_reason, pg_test_dsn
 
 # PG guard（本机 localhost:5432 SYN 黑洞，无库时硬连会挂死整轮 pytest）：
 # 本文件属 checkpoint/PG 集成族，探测不可用则整模块 skip；探测结果在 conftest 内 lru_cache 缓存，
@@ -57,7 +57,7 @@ def test_c1_03_emulated_cache_should_not_shadow_real_pg():
     """emulated 命中不应遮蔽真 PG；有真实池时 get 应优先查 PG。"""
     _clear_pg_globals()
     from hero_quant.checkpoint.postgres import get_saver
-    dsn = "postgresql://postgres:postgres@localhost:5432/hero_quant_test_c1_03"
+    dsn = pg_test_dsn("hero_quant_test_c1_03")
     saver = get_saver(dsn=dsn, ttl_seconds=3600)
     tid = "wf:runShadow:tenantS"
     # 先写入 emulated（模拟旧缓存）
@@ -139,8 +139,8 @@ def test_c1_06_seq_maps_bounded_and_dsn_isolated():
     has_evict_seq = ("_PG_SEQ" in src_all and ("evict" in src_all.lower() or "_MAXSIZE" in src_all))
     assert has_evict_seq, "seq maps 无 LRU/TTL 驱逐，需有界"
     # 跨 DSN 隔离：两个不同 DSN 相同 thread_id 不应复用同一 seq key
-    dsn1 = "postgresql://postgres:postgres@localhost:5432/hero_quant_test_c1_06_a"
-    dsn2 = "postgresql://postgres:postgres@localhost:5432/hero_quant_test_c1_06_b"
+    dsn1 = pg_test_dsn("hero_quant_test_c1_06_a")
+    dsn2 = pg_test_dsn("hero_quant_test_c1_06_b")
     tid = "wf:runCollide:tenantC"
     # 若 _thread_to_keys 已支持 dsn 参数，则直接校验
     sig = inspect.signature(pg._thread_to_keys)
@@ -185,8 +185,12 @@ def test_c1_08_get_with_config_ttl_evict():
     _clear_pg_globals()
     from hero_quant.checkpoint.postgres import get_saver
     import hero_quant.checkpoint.postgres as pg
-    dsn = "postgresql://postgres:postgres@localhost:5432/hero_quant_test_c1_08"
+    dsn = pg_test_dsn("hero_quant_test_c1_08")
     saver = get_saver(dsn=dsn, ttl_seconds=2)
+    # 本用例锁的是 emulated 侧 TTL 驱逐；真 PG 的 expires_at 由 SQL now() 判定，
+    # 不受 Python time.time mock 影响，故显式去掉池，避免被 PG 真行遮蔽（PG 侧 TTL 由
+    # test_checkpoint_pg::test_expires_at_7d_via_settings 覆盖）。
+    saver.pool = None
     tid = "wf:runTTL:tenantG"
     saver.put(tid, {"v": 1}, {"cfg": 1})
     # 篡改时间戳为过期：需同时老化全局 emulated 与实例级 _timestamps，

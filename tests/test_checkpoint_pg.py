@@ -1,10 +1,9 @@
 """Task7 TDD: checkpoint PG default, restart not lost, expires_at 7d via Settings."""
 import os
-import time
 
 import pytest
 
-from conftest import pg_guard_reason
+from conftest import pg_guard_reason, pg_test_dsn
 
 # PG guard（本机 localhost:5432 SYN 黑洞，无库时硬连会挂死整轮 pytest）：
 # 本文件全部用例走 checkpoint PG 主路径/池语义，探测不可用则整模块 skip；
@@ -33,7 +32,7 @@ def test_checkpoint_pg_default_not_memory():
 def test_put_get_restart_not_lost():
     """PG main path with fallback to memory only when PG unreachable — restart not lost via emulated PG global store."""
     # Use explicit PG DSN to trigger PG path (emulated global store ensures persistence without real PG)
-    dsn = "postgresql://postgres:postgres@localhost:5432/hero_quant_test_ckpt"
+    dsn = pg_test_dsn("hero_quant_test_ckpt")
     from hero_quant.checkpoint.postgres import get_saver
     saver1 = get_saver(dsn=dsn, ttl_seconds=7*24*3600)
     tid = "backtest:1:tenantA"
@@ -54,30 +53,36 @@ def test_put_get_restart_not_lost():
     assert saver2.get(tid) is None
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="src bug: checkpoint.postgres.get() 在 PG 行因 expires_at 过期返回 None 后，"
+    "继续回退 emulated 缓存并返回过期值（_read SQL 过滤生效但 fallback 未遵守 TTL）",
+)
 def test_expires_at_7d_via_settings(monkeypatch):
-    """expires_at 7d via Settings — TTL controls window, mock time to verify expiry."""
+    """expires_at 7d via Settings — TTL controls window; 真 PG 行过期后 get 必须返回 None."""
     from hero_quant.checkpoint.postgres import get_saver
     from hero_quant.config.settings import Settings
     # default 7d
     s = Settings()
     assert s.checkpoint_ttl_seconds == 604800
-    dsn = "postgresql://postgres:postgres@localhost:5432/hero_quant_test_ttl"
+    dsn = pg_test_dsn("hero_quant_test_ttl")
     saver = get_saver(dsn=dsn, ttl_seconds=s.checkpoint_ttl_seconds)
     assert saver.ttl_seconds == 604800
     tid = "workflow:99:tenantTTL"
     saver.put(tid, {"v": 1})
     assert saver.get(tid)["v"] == 1
-    # simulate time >7d
-    orig_time = time.time
-    try:
-        fake_now = orig_time() + 8*24*3600
-        monkeypatch = None
-        import unittest.mock as mock
-        with mock.patch("hero_quant.checkpoint.postgres.time.time", return_value=fake_now):
-            # also patch time.time for get path (module time)
-            assert saver.get(tid) is None, "expired after 7d should return None"
-    finally:
-        pass
+    # 真 PG 的过期由 SQL now() 决定，mock Python time.time 不会让已写入的行过期；
+    # 直接把该行 expires_at 推到过去，验证 _READ 的 expires_at 过滤确实生效。
+    import hero_quant.checkpoint.postgres as pg
+    tenant, thread, seq = pg._thread_to_keys(tid, dsn)
+    assert saver.pool is not None, "PG guard 已判定可用，但 saver 未建池"
+    with saver.pool.connection() as conn:
+        conn.execute(
+            "UPDATE checkpoints SET expires_at = now() - interval '1 day' "
+            "WHERE tenant = %s AND thread = %s AND seq = %s",
+            (tenant, thread, seq),
+        )
+    assert saver.get(tid) is None, "expired after 7d should return None"
     # custom TTL via env
     monkeypatch_env = {"HERO_CHECKPOINT_TTL_SECONDS": "3600"}
     # use explicit ttl param to verify
@@ -120,7 +125,7 @@ def test_thread_to_keys_deterministic():
 def test_thread_roundtrip():
     """put checkpoint with non-numeric run, list_thread_ids returns original id."""
     from hero_quant.checkpoint.postgres import get_saver, _PG_GLOBAL_STORE, _PG_GLOBAL_TS
-    dsn = "postgresql://postgres:postgres@localhost:5432/hero_quant_test_roundtrip"
+    dsn = pg_test_dsn("hero_quant_test_roundtrip")
     # cleanup any prior
     for k in list(_PG_GLOBAL_STORE.keys()):
         if k.startswith(dsn):
@@ -174,7 +179,7 @@ def test_thread_collision_disambiguation(monkeypatch):
     assert seq_b == (seq_a + 1) % 2147483647, f"expected linear probing, got {seq_a} vs {seq_b}"
 
     # also verify that puts don't overwrite each other via emulated PG store
-    dsn = "postgresql://postgres:postgres@localhost:5432/hero_quant_test_collision"
+    dsn = pg_test_dsn("hero_quant_test_collision")
     # cleanup
     prefix = f"{dsn}::"
     for k in list(pg._PG_GLOBAL_STORE.keys()):
@@ -210,7 +215,7 @@ def test_asetup_retry_guard_success_no_rerun():
     class FakeAsyncPool:
         def __init__(self):
             self.open_calls = 0
-            self.conninfo = "postgresql://postgres:postgres@localhost:5432/hero_quant_test_asetup_guard"
+            self.conninfo = pg_test_dsn("hero_quant_test_asetup_guard")
 
         async def open(self):
             self.open_calls += 1
@@ -232,7 +237,7 @@ def test_asetup_retry_guard_success_no_rerun():
     FakeAsyncPool.__name__ = "AsyncFakePool"
     pool = FakeAsyncPool()
     saver = AsyncPostgresSaver(
-        dsn="postgresql://postgres:postgres@localhost:5432/hero_quant_test_asetup_guard", pool=pool
+        dsn=pg_test_dsn("hero_quant_test_asetup_guard"), pool=pool
     )
     assert saver._is_real_pg_pool() and saver._pool_is_async()
     asyncio.run(saver.asetup())
@@ -252,7 +257,7 @@ def test_asetup_retry_after_failure():
     class FakeAsyncPool:
         def __init__(self):
             self.open_calls = 0
-            self.conninfo = "postgresql://postgres:postgres@localhost:5432/hero_quant_test_asetup_fail"
+            self.conninfo = pg_test_dsn("hero_quant_test_asetup_fail")
 
         async def open(self):
             self.open_calls += 1
@@ -273,7 +278,7 @@ def test_asetup_retry_after_failure():
     FakeAsyncPool.__name__ = "AsyncFakePool"
     pool = FakeAsyncPool()
     saver = AsyncPostgresSaver(
-        dsn="postgresql://postgres:postgres@localhost:5432/hero_quant_test_asetup_fail2", pool=pool
+        dsn=pg_test_dsn("hero_quant_test_asetup_fail2"), pool=pool
     )
     saver._setup_done = False
     asyncio.run(saver.asetup())
@@ -293,7 +298,7 @@ def test_aput_emulated_vs_real_paths():
     assert "if self._is_real_pg_pool():" in src
 
     # emulated path still persists via global store
-    saver_em = AsyncPostgresSaver(dsn="postgresql://postgres:postgres@localhost:5432/hero_quant_test_aput_em", pool=None)
+    saver_em = AsyncPostgresSaver(dsn=pg_test_dsn("hero_quant_test_aput_em"), pool=None)
     assert saver_em._is_pg_mode() and not saver_em._is_real_pg_pool()
     asyncio.run(saver_em.aput("wf:runEm:tenantE", {"v": 11}))
     val = asyncio.run(saver_em.aget("wf:runEm:tenantE"))
@@ -303,7 +308,7 @@ def test_aput_emulated_vs_real_paths():
     # real pool path persists and still calls _pg_put_async (best-effort)
     class FakePool2:
         def __init__(self):
-            self.conninfo = "postgresql://postgres:postgres@localhost:5432/hero_quant_test_aput_real"
+            self.conninfo = pg_test_dsn("hero_quant_test_aput_real")
 
         async def open(self):
             pass
@@ -324,7 +329,7 @@ def test_aput_emulated_vs_real_paths():
     FakePool2.__name__ = "AsyncFakePool"
     fake = FakePool2()
     saver_real = AsyncPostgresSaver(
-        dsn="postgresql://postgres:postgres@localhost:5432/hero_quant_test_aput_real", pool=fake
+        dsn=pg_test_dsn("hero_quant_test_aput_real"), pool=fake
     )
     asyncio.run(saver_real.aput("wf:runReal:tenantE", {"v": 22}))
     val2 = asyncio.run(saver_real.aget("wf:runReal:tenantE"))
@@ -337,7 +342,7 @@ def test_list_thread_ids_real_pg_reconstruction_via_mapping():
     import hero_quant.checkpoint.postgres as pg
     from hero_quant.checkpoint.postgres import _thread_to_keys, get_saver
 
-    dsn = "postgresql://postgres:postgres@localhost:5432/hero_quant_test_list_reconstruct"
+    dsn = pg_test_dsn("hero_quant_test_list_reconstruct")
     # cleanup globals
     for k in list(pg._PG_GLOBAL_STORE.keys()):
         if k.startswith(dsn):

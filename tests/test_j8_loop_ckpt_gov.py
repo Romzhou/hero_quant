@@ -136,16 +136,18 @@ def test_j8_ckpt_saver_offline(monkeypatch):
     monkeypatch.delenv("HERO_CHECKPOINT_DSN", raising=False)
     from hero_quant.checkpoint import postgres as P
 
-    sv = P.get_saver(dsn=None)
+    # 中文：显式 memory:// 才是真离线；dsn=None 会落到 settings 默认 PG DSN，在 PG 可用时
+    # 反而建池（旧断言 in (True, False) 又恒真，既没测到离线也会在 PG 环境挂住）。
+    sv = P.get_saver(dsn="memory://j8-offline")
     assert sv is not None
-    assert sv._is_pg_mode() in (True, False)
-    assert sv._is_real_pg_pool() in (True, False)
+    assert sv._is_pg_mode() is False
+    assert sv._is_real_pg_pool() is False
     tid = "wf:run_j8:tenant_j8"
     sv.put(tid, {"a": 1})
     got = sv.get(tid)
-    assert got is None or isinstance(got, dict)
+    assert got == {"a": 1}, f"memory saver 应读回刚写入值，got={got!r}"
     gwc = sv.get_with_config(tid)
-    assert gwc is None or isinstance(gwc, tuple)
+    assert isinstance(gwc, tuple) and gwc[0] == {"a": 1}
     sv.delete(tid)
     assert isinstance(sv.list_thread_ids(), list)
     assert P.get_run_text("t", "th", 1) is None
@@ -165,13 +167,14 @@ def test_j8_ledger_tamper_and_rotate(tmp_path):
     # 篡改尾行 -> verify 失败路径
     txt = p.read_text(encoding="utf-8")
     p.write_text(txt.replace('"action": "a"', '"action": "HACKED"'), encoding="utf-8")
-    assert led.verify() in (True, False)
-    assert L.verify_chain(p).ok in (True, False)
+    # bool in (True, False) 是恒真断言；篡改后必须明确 verify 失败（fail-closed）。
+    assert led.verify() is False, "篡改尾行后 verify 必须失败"
+    assert L.verify_chain(p).ok is False, "篡改尾行后 verify_chain 必须失败"
     # 坏 JSONL 行容错：verify 路径 fail-closed（False 或抛 LedgerCorruptionError 均接受）
     with open(p, "a", encoding="utf-8") as f:
         f.write("not json at all{{{\n")
     try:
-        assert L.verify_chain(p).ok in (True, False)
+        assert L.verify_chain(p).ok is False
     except L.LedgerCorruptionError:
         pass
     assert L._read_raw_records(p) is not None
