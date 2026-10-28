@@ -69,8 +69,9 @@ jobs:
           npx playwright --version
       - name: Start backend for e2e (same job)
         # 中文：e2e 真阻断的前提是同 job 有后端；playwright webServer 只起 vite dev，/v1 代理到 8899。
+        # HERO_ENV=development：CI 无真实 Redis 时票据/限流按开发口径放行（否则 429），生产语义不受影响。
         run: |
-          python -m uvicorn hero_quant.api.server:app --port 8899 > /tmp/hero-quant-backend.log 2>&1 &
+          HERO_ENV=development python -m uvicorn hero_quant.api.server:app --port 8899 > /tmp/hero-quant-backend.log 2>&1 &
           echo $! > /tmp/hero-quant-backend.pid
           for i in $(seq 1 60); do
             if curl -fsS http://127.0.0.1:8899/live > /dev/null; then
