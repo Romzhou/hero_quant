@@ -7,20 +7,18 @@
  * - 修复：effect 去重连风暴 — refs 镜像 offset/cost，deps 仅 [paused]；reader/abort 完整清理；无空心跳泄漏
  */
 import { useEffect, useRef, useState } from "react"
+import { isRealTraceEvent } from "../config/trace"
 
 type LiveEvent = { ts: string; offset: number; type: string; tool?: string; msg?: string; cost?: number }
 
 export default function Monitor() {
-  const [events, setEvents] = useState<LiveEvent[]>(() => [
-    { ts: new Date().toISOString(), offset: 0, type: "trace", msg: "TraceWriter init · sidecar阈值50k" },
-    { ts: new Date().toISOString(), offset: 1, type: "tool", tool: "get_market_data", msg: "600519.SH 天勤 · synthetic回退" },
-    { ts: new Date().toISOString(), offset: 2, type: "tool", tool: "run_backtest", msg: "PIT校验通过 · positions.csv 已落盘" },
-    { ts: new Date().toISOString(), offset: 3, type: "otel", msg: "OTel span: research_graph.execute 42ms" },
-  ])
-  const [offset, setOffset] = useState(4)
+  // 空态起步：不预置任何伪造事件，真实事件只能来自 /v1/trace/events
+  const [events, setEvents] = useState<LiveEvent[]>([])
+  const [offset, setOffset] = useState(0)
   const [paused, setPaused] = useState(false)
   const [cost, setCost] = useState(0)
-  // isDemo：初始 mock 为演示数据，收到第一条真实 SSE 事件后置 false
+  // isDemo：默认演示态；只有真实事件（non_synthetic:true 或 trace.jsonl 带 ts 的记录）才摘标记，
+  // 后端无 trace 时推送的合成心跳必须保留「演示数据」标记（config/trace.ts）
   const [isDemo, setIsDemo] = useState(true)
   const [errorMsg, setErrorMsg] = useState<string | null>(null)
   const costLimit = 5.0
@@ -90,7 +88,7 @@ export default function Monitor() {
                   cost: j.cost
                 }
                 setEvents(prev => [...prev.slice(-199), ev])
-                setIsDemo(false)
+                if (isRealTraceEvent(j)) setIsDemo(false)
                 if (typeof j.cost === "number" && Number.isFinite(j.cost)) {
                   costRef.current = j.cost
                   setCost(j.cost)
@@ -102,7 +100,7 @@ export default function Monitor() {
                 const next = curOffset
                 curOffset++
                 offsetRef.current = curOffset
-                setIsDemo(false)
+                // 无法解析的原始帧不构成「真实事件」证据，保留演示标记
                 setEvents(prev => [...prev.slice(-199), { ts: new Date().toISOString(), offset: next, type: "raw", msg: raw.slice(0, 160) }])
                 setOffset(curOffset)
               }
@@ -134,7 +132,7 @@ export default function Monitor() {
               const j = JSON.parse(e.data)
               const nextOffset = j.offset ?? curOffset
               setEvents(prev => [...prev.slice(-199), { ts: j.ts || new Date().toISOString(), offset: nextOffset, type: j.type || "event", msg: j.msg || e.data.slice(0, 120) }])
-              setIsDemo(false)
+              if (isRealTraceEvent(j)) setIsDemo(false)
               curOffset = nextOffset + 1
               offsetRef.current = curOffset
               setOffset(curOffset)
@@ -144,7 +142,6 @@ export default function Monitor() {
               const next = curOffset
               curOffset++
               offsetRef.current = curOffset
-              setIsDemo(false)
               setEvents(prev => [...prev.slice(-199), { ts: new Date().toISOString(), offset: next, type: "sse", msg: e.data.slice(0, 140) }])
               setOffset(curOffset)
             }
@@ -203,7 +200,7 @@ export default function Monitor() {
           <span className="rounded-full border border-white/10 bg-white/5 px-3 py-1 font-mono text-xs text-slate-300">offset: {offset}</span>
           <span className={"rounded-full border px-3 py-1 text-xs font-semibold " + (breakerState==="OPEN" ? "border-red-400/30 bg-red-400/15 text-red-300" : breakerState==="HALF_OPEN" ? "border-amber-400/30 bg-amber-400/15 text-amber-300" : "border-emerald-400/20 bg-emerald-400/10 text-emerald-300")}>{breakerState}</span>
           <button onClick={() => setPaused(p=>!p)} className={"rounded-xl px-3.5 py-1.5 text-xs font-semibold transition " + (paused ? "bg-white text-ink-900" : "bg-white/10 text-mist hover:bg-white/15")}>{paused ? "▶ 恢复" : "⏸ 暂停"}</button>
-          <button onClick={() => { setEvents([]); setIsDemo(false) }} className="rounded-xl border border-white/10 bg-white/5 px-3 py-1.5 text-xs text-slate-300 hover:bg-white/10">清空</button>
+          <button onClick={() => { setEvents([]); setIsDemo(true) }} className="rounded-xl border border-white/10 bg-white/5 px-3 py-1.5 text-xs text-slate-300 hover:bg-white/10">清空</button>
         </div>
       </div>
 

@@ -25,7 +25,7 @@ test("single valid candidate connects to trace events directly (no dead /v1/even
   render(<Monitor />)
 
   await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
-  expect(fetchMock.mock.calls[0][0]).toBe("/v1/trace/events?offset=4")
+  expect(fetchMock.mock.calls[0][0]).toBe("/v1/trace/events?offset=0")
   expect(JSON.stringify(fetchMock.mock.calls)).not.toContain("/v1/query/ticket")
   expect(JSON.stringify(fetchMock.mock.calls)).not.toContain("/v1/events?")
   expect(JSON.stringify(fetchMock.mock.calls)).not.toContain("/v1/query/stream")
@@ -235,8 +235,15 @@ test("isDemo badge shown initially and hidden after first real event", async () 
   expect(document.body.textContent).toContain("0.000")
   expect(document.body.textContent).toContain("等待真实事件")
   await waitFor(() => expect(fetchMock).toHaveBeenCalled())
+  // 合成心跳（无 ts / 无 non_synthetic）不得摘掉演示标记
   act(() => {
-    controllerRef?.enqueue(encoder.encode('data: {"offset":10,"type":"tool","msg":"real","cost":1.5}\n\n'))
+    controllerRef?.enqueue(encoder.encode('data: {"offset":10,"type":"otel","msg":"heartbeat · events.jsonl offset 10","ts":""}\n\n'))
+  })
+  await act(async () => { await new Promise(r => setTimeout(r, 30)) })
+  expect(screen.getByText("演示数据")).toBeInTheDocument()
+  // 真实 trace 事件（non_synthetic:true）才摘标记
+  act(() => {
+    controllerRef?.enqueue(encoder.encode('data: {"offset":11,"type":"tool","msg":"real","ts":"2026-10-28T10:00:00Z","non_synthetic":true,"cost":1.5}\n\n'))
   })
   await waitFor(() => {
     expect(screen.queryByText("演示数据")).toBeNull()

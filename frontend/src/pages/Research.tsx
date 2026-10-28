@@ -17,7 +17,7 @@ const MAX_CSV_CHARS = 4000
 const MAX_HTML_CHARS = 8000
 const MAX_POINTS = 30
 
-type Metrics = { sharpe?: number; annual_return?: number; max_drawdown?: number; turnover?: number; monthly?: number[] | Record<string, number> | [number, number, number][]; monthly_returns?: number[] | Record<string, number> | [number, number, number][]; isMock?: boolean; provenance?: string; synthetic?: boolean }
+type Metrics = { sharpe?: number; annual_return?: number; max_drawdown?: number; turnover?: number; monthly?: number[] | Record<string, number> | [number, number, number][]; monthly_returns?: number[] | Record<string, number> | [number, number, number][]; isMock?: boolean; provenance?: string; synthetic?: boolean; degraded?: boolean; reason?: string; non_pit?: boolean }
 type Drawdown = { start: string; end: string; depth: number; duration: number }
 
 const MOCK_POSITIONS = `date,symbol,weight,close
@@ -128,6 +128,21 @@ export function parseCumulative(csv: string): { dates: string[]; values: number[
     console.debug("[Research] parseCumulative failed:", e)
     return null
   }
+}
+
+/** positions.csv 是否含 close 列：引擎现输出 date,asset_0,asset_1 权重表，无 close 时净值曲线不可算 */
+export function csvHasCloseColumn(csv: string): boolean {
+  const lines = csv.trim().split(/\r?\n/).filter(l => l.trim())
+  if (lines.length === 0) return false
+  return parseCsvLine(lines[0]).map(h => h.toLowerCase()).includes("close")
+}
+
+/** 权重表识别：表头出现 asset_0/asset_1... 或 weight，用于把「无 close 列」与「格式损坏」区分开 */
+export function csvLooksLikeWeights(csv: string): boolean {
+  const lines = csv.trim().split(/\r?\n/).filter(l => l.trim())
+  if (lines.length === 0) return false
+  const headers = parseCsvLine(lines[0]).map(h => h.toLowerCase())
+  return headers.some(h => /^asset_\d+$/.test(h)) || headers.includes("weight")
 }
 
 // 单一真实源：热力推导统一实现，消除 deriveHeatmapForTest 与组件内重复推导的双维护
@@ -365,6 +380,11 @@ export default function Research(props: ResearchProps) {
 
   const parsed = useMemo(() => parseCumulative(csvPreview), [csvPreview])
   const hasParsed = !!parsed
+  // 诚实空态诊断：引擎输出 date,asset_N 权重表（无 close），与「格式损坏」必须区分展示
+  const positionsLacksClose = useMemo(
+    () => !!csvPreview.trim() && !csvHasCloseColumn(csvPreview) && csvLooksLikeWeights(csvPreview),
+    [csvPreview]
+  )
 
   const cumulativeOption = useMemo(() => {
     // 诚实空状态：解析失败不回退 mock 静态数据 [1.0,1.01...]，改用空序列由外层占位提示
@@ -531,6 +551,7 @@ export default function Research(props: ResearchProps) {
 
   // 净值徽标文案：if/else 替代嵌套三元
   function cumulativeBadgeText(): string {
+    if (!hasParsed && positionsLacksClose) return "无 close 列 · 仅权重表"
     if (!hasParsed) return "暂无有效数据 · 请检查文件"
     if (parsed!.truncated) return `真 positions.csv 驱动 · 仅展示最近${MAX_POINTS}点（共 ${parsed!.totalRows} 点，已截断）`
     return "真 positions.csv 驱动 · 含累积净值"
@@ -545,7 +566,11 @@ export default function Research(props: ResearchProps) {
       return (
         <div className="mt-4 flex h-[300px] flex-col items-center justify-center rounded-xl border border-dashed border-white/10 bg-ink-900/50 px-6 text-center">
           <p className="text-sm font-medium text-slate-300">暂无有效回测数据</p>
-          <p className="mt-1 max-w-md text-xs leading-5 text-slate-500">解析失败或数据不足 · 请检查 positions.csv 格式（需包含 date,close 且至少 2 行有效数据，引号包裹字段已支持）</p>
+          {positionsLacksClose ? (
+            <p className="mt-1 max-w-md text-xs leading-5 text-slate-500">positions.csv 无 close 列（引擎输出 date,asset_0,asset_1 权重表），累积净值不可计算 · 请以 metrics.json / tearsheet.html 为准</p>
+          ) : (
+            <p className="mt-1 max-w-md text-xs leading-5 text-slate-500">解析失败或数据不足 · 请检查 positions.csv 格式（需包含 date,close 且至少 2 行有效数据，引号包裹字段已支持）</p>
+          )}
         </div>
       )
     }
@@ -589,7 +614,11 @@ export default function Research(props: ResearchProps) {
         ))}
       </div>
       {metricsIsMock && !metricsLoading && (
-        <div className="mt-2 rounded-xl border border-amber-400/20 bg-amber-400/10 px-3 py-2 text-xs text-amber-200">当前指标为演示数据（合成回退，isMock=true），非真实回测</div>
+        <div className="mt-2 rounded-xl border border-amber-400/20 bg-amber-400/10 px-3 py-2 text-xs text-amber-200">
+          当前指标为演示数据（合成回退，isMock=true），非真实回测
+          {typeof metrics.reason === "string" && metrics.reason ? ` · 后端标记 reason=${metrics.reason}` : ""}
+          {metrics.degraded ? " · degraded=true" : ""}
+        </div>
       )}
 
       {/* 核心双图：累积收益 + 本月收益热力 */}

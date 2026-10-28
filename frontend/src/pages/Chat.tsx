@@ -600,19 +600,10 @@ export default function Chat() {
             </div>
           ))}
 
-          {/* 无消息时也展示一个静态 tool轨迹示例，保持设计意图（不影响测试唯一定位） */}
+          {/* 空会话不伪造工具调用与延迟：轨迹只能来自后端 type=="tool" 的 SSE 事件 */}
           {messages.length <= 1 && (
-            <div className="rounded-2xl border border-white/10 bg-gradient-to-br from-white/[0.04] to-white/[0.02] p-4 backdrop-blur">
-              <div className="flex items-center justify-between">
-                <div className="text-[11px] font-semibold tracking-widest text-slate-400">tool轨迹 · 示例</div>
-                <span className="rounded-full bg-emerald-400/10 border border-emerald-400/20 px-2 py-0.5 text-[10px] text-emerald-300">并发安全</span>
-              </div>
-              <div className="mt-2 flex flex-wrap gap-2">
-                <span className="rounded-lg border border-emerald-400/20 bg-emerald-400/10 px-2.5 py-1.5 text-xs text-emerald-200">get_market_data · 天勤 <span className="ml-1 rounded bg-white/10 px-1 text-[10px]">42ms</span></span>
-                <span className="rounded-lg border border-emerald-400/20 bg-emerald-400/10 px-2.5 py-1.5 text-xs text-emerald-200">run_backtest · PIT <span className="ml-1 rounded bg-white/10 px-1 text-[10px]">180ms</span></span>
-                <span className="rounded-lg border border-white/10 bg-white/5 px-2.5 py-1.5 text-xs text-slate-400">grounding_check · 待校验</span>
-              </div>
-              <p className="mt-2 text-[11px] text-slate-500">真实请求将流式推送 preview / latency，此为演示占位</p>
+            <div className="rounded-2xl border border-dashed border-white/10 bg-white/[0.02] p-4 text-xs text-slate-500">
+              暂无工具调用 · 发送问题后由后端 type=tool 事件实时填充 preview / latency
             </div>
           )}
 

@@ -63,8 +63,9 @@ test("清空 clears offset/cost refs", async () => {
   vi.stubGlobal("EventSource", FakeES as any)
   Object.defineProperty(HTMLElement.prototype, "scrollTo", { configurable: true, value: vi.fn() })
   render(<Live />)
-  // initial offset is 4
-  expect(screen.getByText(/offset: 4/)).toBeInTheDocument()
+  // 空态起步：不预置伪造事件，offset 从 0 开始
+  expect(screen.getByText(/offset: 0/)).toBeInTheDocument()
+  expect(screen.getByText("演示数据")).toBeInTheDocument()
   const clearBtn = screen.getByText("清空")
   act(() => { fireEvent.click(clearBtn) })
   await waitFor(() => {

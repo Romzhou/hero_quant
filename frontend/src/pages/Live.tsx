@@ -6,6 +6,7 @@
  * - 关键细节：offset/cost 用 ref 同步避免 effect 频繁重建，自清理 abort/reader/timer 防止泄漏
  */
 import { useEffect, useRef, useState } from "react"
+import { isRealTraceEvent } from "../config/trace"
 
 type LiveEvent = { ts: string; offset: number; type: string; tool?: string; msg?: string; cost?: number }
 
@@ -24,16 +25,13 @@ function getBreakerState(ratio: number): string {
 }
 
 export default function Live() {
-  const [events, setEvents] = useState<LiveEvent[]>(() => [
-    { ts: new Date().toISOString(), offset: 0, type: "trace", msg: "TraceWriter init · sidecar阈值50k" },
-    { ts: new Date().toISOString(), offset: 1, type: "tool", tool: "get_market_data", msg: "600519.SH 天勤 · synthetic回退" },
-    { ts: new Date().toISOString(), offset: 2, type: "tool", tool: "run_backtest", msg: "PIT校验通过 · positions.csv 已落盘" },
-    { ts: new Date().toISOString(), offset: 3, type: "otel", msg: "OTel span: research_graph.execute 42ms" },
-  ])
-  const [offset, setOffset] = useState(4)
+  // 空态起步：不预置任何伪造事件，真实事件只能来自 /v1/trace/events
+  const [events, setEvents] = useState<LiveEvent[]>([])
+  const [offset, setOffset] = useState(0)
   const [paused, setPaused] = useState(false)
   const [cost, setCost] = useState(0)
-  // isDemo：初始 mock 为演示数据，收到第一条真实 SSE 事件后置 false
+  // isDemo：默认演示态；只有真实事件（non_synthetic:true 或 trace.jsonl 带 ts 的记录）才摘标记，
+  // 后端在无 trace 时推送的合成心跳必须保留「演示数据」标记（config/trace.ts）
   const [isDemo, setIsDemo] = useState(true)
   const costLimit = COST_LIMIT_USD
   const ratio = Math.min(cost / costLimit, 1)
@@ -100,7 +98,7 @@ export default function Live() {
                   cost: j.cost
                 }
                 setEvents(prev => [...prev.slice(-(MAX_EVENTS - 1)), ev])
-                setIsDemo(false)
+                if (isRealTraceEvent(j)) setIsDemo(false)
                 if (typeof j.cost === "number" && Number.isFinite(j.cost)) {
                   costRef.current = j.cost
                   setCost(j.cost)
@@ -111,7 +109,7 @@ export default function Live() {
               } catch {
                 const next = curOffset++
                 offsetRef.current = curOffset
-                setIsDemo(false)
+                // 无法解析的原始帧不构成「真实事件」证据，保留演示标记
                 setEvents(prev => [...prev.slice(-(MAX_EVENTS - 1)), { ts: new Date().toISOString(), offset: next, type: "raw", msg: raw.slice(0, MAX_RAW_LEN) }])
               }
             }
@@ -135,7 +133,7 @@ export default function Live() {
             const nextOffset = j.offset ?? curOffset
             const ev: LiveEvent = { ts: j.ts || new Date().toISOString(), offset: nextOffset, type: j.type || "event", msg: j.msg || e.data.slice(0, MAX_MSG_LEN), cost: j.cost }
             setEvents(prev => [...prev.slice(-(MAX_EVENTS - 1)), ev])
-            setIsDemo(false)
+            if (isRealTraceEvent(j)) setIsDemo(false)
             if (typeof j.cost === "number" && Number.isFinite(j.cost)) {
               costRef.current = j.cost
               setCost(j.cost)
@@ -146,7 +144,6 @@ export default function Live() {
           } catch {
             const next = curOffset++
             offsetRef.current = curOffset
-            setIsDemo(false)
             setEvents(prev => [...prev.slice(-(MAX_EVENTS - 1)), { ts: new Date().toISOString(), offset: next, type: "sse", msg: e.data.slice(0, MAX_SSE_LEN) }])
           }
         }
@@ -179,7 +176,8 @@ export default function Live() {
     setEvents([])
     setOffset(0)
     setCost(0)
-    setIsDemo(false)
+    // 清空后回到「无真实证据」的演示态
+    setIsDemo(true)
     offsetRef.current = 0
     costRef.current = 0
   }
