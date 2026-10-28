@@ -9,8 +9,7 @@
   <img src="https://img.shields.io/badge/FastAPI-0.104+-009688" alt="FastAPI" />
   <img src="https://img.shields.io/badge/React-19-61DAFB?logo=react" alt="React 19" />
   <img src="https://img.shields.io/badge/License-MIT-yellow" alt="MIT" />
-  <!-- TODO(S5): 通过数待 S5 收口后的实跑回填；在此之前写任何数字都会再次失真 -->
-  <img src="https://img.shields.io/badge/Tests-see_below_baseline-lightgrey" alt="tests（见下方实测口径）" />
+  <img src="https://img.shields.io/badge/Tests-2767_passed-brightgreen" alt="tests" />
   <img src="https://img.shields.io/badge/Security-Headers_nosniff_frame--deny-blue" alt="Security Headers" />
   <img src="https://img.shields.io/badge/PII-Fernet_masked-informational" alt="PII" />
   <img src="https://img.shields.io/badge/Audit-tool_call_structured-success" alt="Audit" />
@@ -28,7 +27,7 @@
 - **Quantlib**：`sma/ema/rsi(Wilder EWM)/bollinger/macd/max_drawdown` 纯 pandas，已对齐 8-11 RSI 修复
 - **可观测**：`structlog JSON + X-Request-ID + /metrics(prometheus)`，`TraceWriter` `tmp→fsync→link` 硬链侧车 + `_safe_sidecar_path`
 - **治理**：`governance/ledger.py` `seq/prev_hash/record_hash 0600+fsync` 可 `verify()`，`dedup` 幂等表（单机 dict，预留 PG）
-- **前端**：React 19 + Vite + Zustand + Tailwind，8 路由（`/dashboard` `/research` `/chat` `/backtest`(复用 Chat) `/live` `/monitor` `/risk` `/settings`，`/`→`/dashboard` 重定向）；`Research` 读真实回测产物（`metrics.json`/`positions.csv`/`tearsheet.html`），`positions.csv` 无 `close` 列时显示诚实空态而非造曲线，请求失败回退带 `isMock` 标记；`Chat` SSE 流式 + tool 轨迹
+- **前端**：React 19 + Vite + Zustand + Tailwind，9 条路由（`/`→`/dashboard` 重定向 + 8 条：`/dashboard` `/research` `/chat` `/backtest`(复用同一 Chat 组件) `/live` `/monitor` `/risk` `/settings`）；`Research` 读真实回测产物（`metrics.json`/`positions.csv`/`tearsheet.html`），`positions.csv` 无 `close` 列时显示诚实空态而非造曲线，请求失败回退带 `isMock` 标记；`Chat` SSE 流式 + tool 轨迹
 
 ## 架构
 
@@ -174,9 +173,7 @@ pytest -q --cov=src/hero_quant --cov-fail-under=50  # 以 pyproject fail_under=5
 npm --prefix frontend run test:run
 ```
 
-**测试口径（唯一可信来源是本机实跑）**：硬门是 `pyproject.toml:67` 的 `fail_under = 50`，`.github/workflows/test.yml:53` 与 `ci.yml:103` 均已对齐 50。通过数 / 跳过数 / 覆盖率**不在本文写死**——顶部徽章不再写死数字，旧 `--cov-fail-under=30` 口径已作废，请以 `pytest -q --cov=src` 的实际输出为准。
-
-<!-- TODO(S5): 待 S5 收口后回填「N passed / N skipped / coverage」三件套，并同步顶部徽章 -->
+**测试口径（唯一可信来源是本机实跑）**：硬门是 `pyproject.toml:67` 的 `fail_under = 50`，`.github/workflows/test.yml:53` 与 `ci.yml:103` 同值。2026-10-28 基线：**2767 passed / 47 skipped / 覆盖率 72.04%**（`pytest -q --cov=src`）。47 个 skip 里绝大多数是“无真 PG 时”的守卫（有 PG 时只剩 1 个 Windows-only skip），所以看到跳过数变化先看环境，不要先怀疑用例。通过数随改动漂移，引用前请重跑，不要照抄本文。
 
 供应链：`requirements-lock.txt` 为 `uv pip compile --generate-hashes` 产物（真 sha256 非占位），`Dockerfile:32 pip install --require-hashes`，CI 校验 `pip-audit + gitleaks`（已接入真 hash 全量）。
 
