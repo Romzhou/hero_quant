@@ -1370,7 +1370,21 @@ def _cohere_api_key() -> str:
 
 
 def _ready_cohere_fatal() -> bool:
-    """HERO_READY_COHERE_FATAL（默认 false）：缺 key 只 warning，不降级 /ready。"""
+    """HERO_READY_COHERE_FATAL（默认 false）：缺 key 只 warning，不降级 /ready。
+
+    中文：优先走 Settings 网关（settings.py:387 ready_cohere_fatal，AGENTS §2 唯一 env 入口）；
+    网关不可用/字段缺失时才回退 os.environ，保证老配置不炸。
+    """
+    try:
+        from hero_quant.config.settings import Settings
+
+        _v = getattr(Settings(), "ready_cohere_fatal", None)
+        if _v is not None:
+            if isinstance(_v, bool):
+                return _v
+            return str(_v).strip().lower() in ("1", "true", "yes", "on")
+    except (ImportError, ValueError, TypeError, AttributeError, OSError, RuntimeError) as _e:
+        logger.debug("ready.cohere_fatal_gateway_failed", error=str(_e), error_code="cohere_fatal_gateway_failed")
     try:
         return os.environ.get("HERO_READY_COHERE_FATAL", "").strip().lower() in ("1", "true", "yes", "on")
     except (ValueError, TypeError, AttributeError):
@@ -2317,8 +2331,8 @@ async def query_stream(request: Request, background_tasks: BackgroundTasks, q: s
     return StreamingResponse(event_generator(), media_type="text/event-stream", headers=_stream_headers)
 
 
-# 研究页回测产物：以 BacktestEngine 合成生成，保证 metrics/sharpe/date/tearsheet 齐全
-# L1 进程内缓存 + L2 Redis 聚合（hero:cache:backtest:bundle:{hash}，ex=600）。
+# 研究页回测产物：以 BacktestEngine 在确定性合成行情上计算（非真实/PIT 数据，响应级必须标记 degraded）。
+# 引擎返回什么就透出什么，缺的指标不补默认值；L1 进程内缓存 + L2 Redis（ex=600）。
 _backtest_cache = {}
 _backtest_cache_lock = threading.Lock()
 _BACKTEST_BUNDLE_CACHE_PREFIX = "hero:cache:backtest:bundle:"
@@ -2533,7 +2547,11 @@ def backtest_metrics(request: Request):
     # 响应级标记：synthetic 行情算出的指标可以任意（但不是写死的 1.62），必须如实标注来源。
     metrics_body = dict(bundle.get("metrics") or {})
     for _mk, _mv in _BACKTEST_DEGRADE_MARKERS.items():
-        metrics_body.setdefault(_mk, _mv)
+        if _mk in metrics_body:
+            # 键已被引擎指标占用（如 non_pit）时不覆盖真实输出，换名并存，避免歧义。
+            metrics_body[f"backtest_{_mk}"] = _mv
+        else:
+            metrics_body[_mk] = _mv
     return JSONResponse(
         content=metrics_body,
         headers={
