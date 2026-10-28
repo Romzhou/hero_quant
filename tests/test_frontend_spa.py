@@ -1,51 +1,117 @@
 """Wave F frontend SPA + E2E hardening TDD red."""
+import importlib
+import os
+import pathlib
+
+import pytest
 from fastapi.testclient import TestClient
 
+FRONTEND_ROUTES = ["/", "/dashboard", "/research", "/backtest", "/risk", "/settings", "/chat"]
+INDEX_SENTINEL = "hero-spa-index-sentinel"
 
-def test_spa_routes_serve_html():
-    """SPA 路由二态断言：dist 可用 → 200 HTML；dist/index 缺失 → 503 fail-closed。
 
-    中文：CI 干净 checkout 没有 frontend/dist，D 线已把「200 占位页」改成 503；
-    不能用固定 200 或 status_code in (200,503) 的二选一（后者恒真），必须按服务端
-    实际挂载分支断言：_dist_path is None → X-Frontend: missing；
-    dist 在但 index.html 缺失 → X-Frontend: index-missing。
+@pytest.fixture
+def reload_server():
+    """把 FRONTEND_DIST 指向指定目录后重载 api.server，退出时还原 env 与模块状态。
+
+    中文：SPA 托管分支在 import 期按模块级 _dist_path 一次性注册（server.py 静态托管段），
+    因此必须"先设 env 再 reload"，不能只改模块属性；测试自造 dist 才能让 CI 干净
+    checkout（无 frontend/dist）也同时覆盖 200 与 503 两种契约。
     """
-    import pathlib
-
     import hero_quant.api.server as srv
-    from hero_quant.api.server import app
 
-    c = TestClient(app)
-    dist = getattr(srv, "_dist_path", None)
-    index_ok = bool(dist) and (pathlib.Path(dist) / "index.html").is_file()
-    routes = ["/", "/dashboard", "/research", "/backtest", "/risk", "/settings", "/chat"]
-    for path in routes:
-        r = c.get(path, headers={"Accept": "text/html"})
-        if index_ok:
-            assert r.status_code == 200, f"{path} got {r.status_code} {r.text[:200]}"
-            txt = r.text.lower()
-            assert "<div id=\"root\"" in txt or "<!doctype html" in txt, f"{path} not html: {r.text[:200]}"
-            assert "hero" in txt or "vite" in txt or "量化" in txt or "root" in txt
+    original = os.environ.get("FRONTEND_DIST")
+
+    def _load(dist):
+        os.environ["FRONTEND_DIST"] = str(dist)
+        return importlib.reload(srv)
+
+    try:
+        yield _load
+    finally:
+        if original is None:
+            os.environ.pop("FRONTEND_DIST", None)
         else:
-            expected = "missing" if dist is None else "index-missing"
-            assert r.status_code == 503, f"{path} 缺 dist/index 必须 503，got {r.status_code}"
-            assert r.headers.get("X-Frontend") == expected, (
-                f"{path} X-Frontend 应为 {expected}，got {r.headers.get('X-Frontend')}"
-            )
-            assert r.headers.get("Retry-After") == "30"
-            assert "503" in r.text, f"{path} 503 说明页缺失：{r.text[:200]}"
-    if not index_ok:
-        # JSON 探针必须看到 degraded + frontend 原因，不能假装 ok
-        expected = "missing" if dist is None else "index-missing"
-        j = c.get("/", headers={"Accept": "application/json"})
-        assert j.status_code == 503
-        body = j.json()
-        assert body.get("status") == "degraded"
-        assert body.get("frontend") == expected
-        assert j.headers.get("X-Frontend") == expected
+            os.environ["FRONTEND_DIST"] = original
+        importlib.reload(srv)
+
+
+def _make_dist(tmp_path: pathlib.Path) -> pathlib.Path:
+    """最小可用 dist：index.html + assets/app.js。"""
+    dist = tmp_path / "dist"
+    (dist / "assets").mkdir(parents=True)
+    (dist / "index.html").write_text(
+        '<!doctype html><html><body><div id="root">'
+        f"{INDEX_SENTINEL}</div>"
+        '<script src="/assets/app.js"></script></body></html>',
+        encoding="utf-8",
+    )
+    (dist / "assets" / "app.js").write_text("console.log('hero-spa');", encoding="utf-8")
+    return dist
+
+
+def test_spa_routes_serve_index_when_dist_present(tmp_path, reload_server):
+    """有 dist：7 条前端路由 200 + 返回 index.html 内容（行为不变）。"""
+    srv = reload_server(_make_dist(tmp_path))
+    c = TestClient(srv.app)
+    for path in FRONTEND_ROUTES:
+        r = c.get(path, headers={"Accept": "text/html"})
+        assert r.status_code == 200, f"{path} got {r.status_code} {r.text[:200]}"
+        assert "text/html" in r.headers.get("content-type", ""), f"{path} not html"
+        assert INDEX_SENTINEL in r.text, f"{path} 未返回 index.html: {r.text[:200]}"
+    # 静态资源按文件直出
+    js = c.get("/assets/app.js")
+    assert js.status_code == 200, f"/assets/app.js got {js.status_code}"
+    assert "hero-spa" in js.text
+    # JSON 探针在 dist 就绪时报 mounted
+    probe = c.get("/", headers={"Accept": "application/json"})
+    assert probe.status_code == 200
+    assert probe.json().get("status") == "ok"
+    assert probe.json().get("frontend") == "mounted"
+
+
+def test_spa_routes_503_when_dist_missing(tmp_path, reload_server):
+    """无 dist（CI 干净 checkout）：7 条前端路由 503 + X-Frontend: missing。"""
+    missing = tmp_path / "definitely-missing-dist"
+    assert not missing.exists()
+    srv = reload_server(missing)
+    c = TestClient(srv.app)
+    for path in FRONTEND_ROUTES:
+        r = c.get(path, headers={"Accept": "text/html"})
+        assert r.status_code == 503, f"{path} 缺 dist 必须 503，got {r.status_code}"
+        assert r.headers.get("X-Frontend") == "missing", (
+            f"{path} X-Frontend 应为 missing，got {r.headers.get('X-Frontend')}"
+        )
+        assert r.headers.get("Retry-After") == "30"
+        assert "503" in r.text, f"{path} 503 说明页缺失：{r.text[:200]}"
+    # JSON 探针必须看到 degraded，不能假装 ok
+    probe = c.get("/", headers={"Accept": "application/json"})
+    assert probe.status_code == 503
+    body = probe.json()
+    assert body.get("status") == "degraded"
+    assert body.get("frontend") == "missing"
+    assert probe.headers.get("X-Frontend") == "missing"
     # 缺失的静态资源始终 404（资源语义，不返回 index/503 说明页）
     static = c.get("/assets/definitely-missing.js")
     assert static.status_code == 404, f"missing .js must be 404, got {static.status_code}"
+
+
+def test_spa_503_when_dist_present_but_index_missing(tmp_path, reload_server):
+    """dist 在但未构建完（无 index.html）：503 + X-Frontend: index-missing。"""
+    empty = tmp_path / "dist-empty"
+    empty.mkdir()
+    srv = reload_server(empty)
+    c = TestClient(srv.app)
+    for path in FRONTEND_ROUTES:
+        r = c.get(path, headers={"Accept": "text/html"})
+        assert r.status_code == 503, f"{path} 缺 index 必须 503，got {r.status_code}"
+        assert r.headers.get("X-Frontend") == "index-missing"
+        assert r.headers.get("Retry-After") == "30"
+    probe = c.get("/", headers={"Accept": "application/json"})
+    assert probe.status_code == 503
+    assert probe.json().get("status") == "degraded"
+    assert probe.json().get("frontend") == "index-missing"
+    assert probe.headers.get("X-Frontend") == "index-missing"
 
 
 def test_health_and_metrics_and_wall_time():
