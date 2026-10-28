@@ -6,6 +6,17 @@ import logging
 import threading
 import time
 
+import pytest
+
+from conftest import pg_guard_reason
+
+# PG guard（本机 localhost:5432 SYN 黑洞，无库时硬连会挂死整轮 pytest）：
+# 本文件属 checkpoint/PG 集成族，探测不可用则整模块 skip；探测结果在 conftest 内 lru_cache 缓存，
+# 5 个 PG 文件只探一次，超时上限约 2.3s（见 tests/conftest.py 的 pg_guard_reason）。
+_PG_GUARD_REASON = pg_guard_reason()
+
+pytestmark = pytest.mark.skipif(_PG_GUARD_REASON is not None, reason=_PG_GUARD_REASON or "")
+
 # 辅助：清理全局状态
 def _clear_pg_globals():
     import hero_quant.checkpoint.postgres as pg

@@ -4,6 +4,17 @@ from __future__ import annotations
 import os
 import importlib
 
+import pytest
+
+from conftest import pg_guard_reason
+
+# PG guard（本机 localhost:5432 SYN 黑洞，无库时硬连会挂死整轮 pytest）：
+# 本文件属向量/PG 集成族（MemoryStore pgvector 分支），探测不可用则整模块 skip；
+# 探测在 conftest 内缓存（见 tests/conftest.py:pg_guard_reason）。
+_PG_GUARD_REASON = pg_guard_reason()
+
+pytestmark = pytest.mark.skipif(_PG_GUARD_REASON is not None, reason=_PG_GUARD_REASON or "")
+
 
 def test_vector_provider_seen(monkeypatch):
     """TDD red: 若设 HERO_EMBED_PROVIDER=openai 则 cosine >0.8 否则回退可用."""

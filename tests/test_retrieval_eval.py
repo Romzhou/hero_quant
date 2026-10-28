@@ -8,6 +8,15 @@ from pathlib import Path
 
 import pytest
 
+from conftest import pg_guard_reason
+
+# PG guard（本机 localhost:5432 SYN 黑洞，无库时硬连会挂死整轮 pytest）：
+# 本文件走 MemoryStore 的 pgvector 分支族，探测不可用则整模块 skip；
+# 探测在 conftest 内缓存（见 tests/conftest.py:pg_guard_reason）。
+_PG_GUARD_REASON = pg_guard_reason()
+
+pytestmark = pytest.mark.skipif(_PG_GUARD_REASON is not None, reason=_PG_GUARD_REASON or "")
+
 
 def evaluate(path: str = "tests/data/golden_retrieval.jsonl", use_rerank: bool = False, reranker=None) -> dict:
     """Evaluate retrieval over golden file.
