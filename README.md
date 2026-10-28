@@ -65,7 +65,7 @@ pytest -q
 
 # 4. 启动（唯一入口，旧式模块写法已废弃，见 Dockerfile CMD）
 uvicorn hero_quant.api.server:app --host 0.0.0.0 --port 8899
-open http://127.0.0.1:8899          # 前端：托管的是 frontend/dist 构建产物；dist 陈旧或缺失时需 cd frontend && npm run build（无 dist 时返回 200 占位页，不是真前端）
+open http://127.0.0.1:8899          # 前端：托管的是 frontend/dist 构建产物；陈旧需 cd frontend && npm run build。dist/index.html 缺失时返回 503 + X-Frontend（fail-closed，不假活）
 open http://127.0.0.1:8899/docs     # Swagger
 curl http://127.0.0.1:8899/live    # liveness
 curl http://127.0.0.1:8899/metrics # prometheus
@@ -111,7 +111,7 @@ docker build -t hero-quant:0.2.0 .
 - `/ready` 聚合探测 PG（checkpoint + billing）与 Redis，全程 <5s 有界；**缺 checkpoint DSN 或库不可达即 503** + `degraded:true` + `reasons`（这是诚实降级，不是 bug）。
 - 缺 `COHERE_API_KEY` 默认只 warning；只有 `HERO_READY_COHERE_FATAL=true` 才判致命。
 - `Dockerfile:108-109` 的 `HEALTHCHECK` 已从 `/live` 改为 `/ready`——容器 `healthy` 现在代表**依赖可用**，不再只是进程活着。
-- 前端唯一可信产物是 `frontend/dist`；dist 陈旧（缺新路由 chunk）或缺失时必须 `npm run build`，否则根路径只会返回内置占位页。
+- 前端唯一可信产物是 `frontend/dist`：dist 陈旧（缺新路由 chunk）必须 `npm run build`；**dist 目录或 `index.html` 缺失时返回 503**（`X-Frontend: missing|index-missing` + `Retry-After: 30`，`server.py:2851-2863`），不再用 200 占位页让编排层误判健康。
 
 `Dockerfile` 3 阶段：`node:22-slim` 前端构建 → `python:3.11-slim` builder(`venv+hash-lock`) → `runtime`(无编译器，`vibe:vibe-sandbox 10001` 非 root)。
 
