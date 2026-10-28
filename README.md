@@ -143,7 +143,7 @@ docker build -t hero-quant:0.2.0 .
 | `HERO_EMBED_PROVIDER` | `offline` | `openai` / `sentence-transformers` / `offline` |
 | `HERO_OTEL_MODE` | `disabled` | `disabled`/`shared`/`private` |
 | `HERO_TRACE_*` | `50000/500` | `TOOL_RESULT_OFFLOAD/TEXT_OFFLOAD/PREVIEW` |
-| `FRONTEND_DIST` | 自动探测 | 前端 dist 覆盖路径 |
+| `FRONTEND_DIST` | 自动探测 | 显式设置即**唯一来源**：路径不是目录就直接 503，不再回退 `/app/frontend/dist` 等默认候选（`server.py:2814`） |
 
 全仓仅 `src/hero_quant/config/settings.py` 允许 `os.getenv`，CI 门禁 `tests/test_config.py:80` 校验。
 
