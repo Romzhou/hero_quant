@@ -3,16 +3,49 @@ from fastapi.testclient import TestClient
 
 
 def test_spa_routes_serve_html():
+    """SPA 路由二态断言：dist 可用 → 200 HTML；dist/index 缺失 → 503 fail-closed。
+
+    中文：CI 干净 checkout 没有 frontend/dist，D 线已把「200 占位页」改成 503；
+    不能用固定 200 或 status_code in (200,503) 的二选一（后者恒真），必须按服务端
+    实际挂载分支断言：_dist_path is None → X-Frontend: missing；
+    dist 在但 index.html 缺失 → X-Frontend: index-missing。
+    """
+    import pathlib
+
+    import hero_quant.api.server as srv
     from hero_quant.api.server import app
 
     c = TestClient(app)
-    for path in ["/", "/dashboard", "/research", "/backtest", "/risk", "/settings", "/chat"]:
+    dist = getattr(srv, "_dist_path", None)
+    index_ok = bool(dist) and (pathlib.Path(dist) / "index.html").is_file()
+    routes = ["/", "/dashboard", "/research", "/backtest", "/risk", "/settings", "/chat"]
+    for path in routes:
         r = c.get(path, headers={"Accept": "text/html"})
-        assert r.status_code == 200, f"{path} got {r.status_code} {r.text[:200]}"
-        # should be HTML with root div
-        txt = r.text.lower()
-        assert "<div id=\"root\"" in txt or "<!doctype html" in txt, f"{path} not html: {r.text[:200]}"
-        assert "hero" in txt or "vite" in txt or "量化" in txt or "root" in txt
+        if index_ok:
+            assert r.status_code == 200, f"{path} got {r.status_code} {r.text[:200]}"
+            txt = r.text.lower()
+            assert "<div id=\"root\"" in txt or "<!doctype html" in txt, f"{path} not html: {r.text[:200]}"
+            assert "hero" in txt or "vite" in txt or "量化" in txt or "root" in txt
+        else:
+            expected = "missing" if dist is None else "index-missing"
+            assert r.status_code == 503, f"{path} 缺 dist/index 必须 503，got {r.status_code}"
+            assert r.headers.get("X-Frontend") == expected, (
+                f"{path} X-Frontend 应为 {expected}，got {r.headers.get('X-Frontend')}"
+            )
+            assert r.headers.get("Retry-After") == "30"
+            assert "503" in r.text, f"{path} 503 说明页缺失：{r.text[:200]}"
+    if not index_ok:
+        # JSON 探针必须看到 degraded + frontend 原因，不能假装 ok
+        expected = "missing" if dist is None else "index-missing"
+        j = c.get("/", headers={"Accept": "application/json"})
+        assert j.status_code == 503
+        body = j.json()
+        assert body.get("status") == "degraded"
+        assert body.get("frontend") == expected
+        assert j.headers.get("X-Frontend") == expected
+    # 缺失的静态资源始终 404（资源语义，不返回 index/503 说明页）
+    static = c.get("/assets/definitely-missing.js")
+    assert static.status_code == 404, f"missing .js must be 404, got {static.status_code}"
 
 
 def test_health_and_metrics_and_wall_time():
