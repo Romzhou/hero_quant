@@ -956,7 +956,9 @@ _READY_CACHE: dict[str, tuple[float, tuple[bool, str]]] = {}
 _READY_CACHE_LOCK = threading.Lock()
 _READY_CACHE_TTL_SECONDS = 5.0
 _READY_CHECKPOINT_TIMEOUT = 1.6
-_READY_BILLING_TIMEOUT = 1.6
+# billing 探针预算 2.4s：S4 起 BillingService 构造期自建池 + SELECT 1（上限 2s），
+# 必须留出余量，否则正常 PG 也会被外层超时误判成 degraded。
+_READY_BILLING_TIMEOUT = 2.4
 _READY_REDIS_TIMEOUT = 0.8
 _READY_COHERE_TIMEOUT = 0.6
 
@@ -1007,6 +1009,20 @@ def _ready_run_with_timeout(fn, timeout: float = 2.0):
         raise
 
 
+def _ready_future_result(fut, timeout: float, fallback):
+    """取探针 future；超时 fail-closed 返回 fallback（不抛），保证 /ready 硬预算内一定返回。"""
+    try:
+        return fut.result(timeout=timeout)
+    except _cf_ready.TimeoutError:
+        try:
+            fut.cancel()
+        except (ValueError, TypeError, AttributeError, RuntimeError):
+            pass
+        _inc_api_error("ready", "probe_timeout")
+        logger.warning("ready.probe_outer_timeout", error_code="probe_timeout", timeout=timeout)
+        return fallback
+
+
 def _check_checkpoint_pg_full() -> tuple[tuple[bool, str, str], bool]:
     """全量 checkpoint 探针：(ok, mode, reason) + 是否命中缓存。缺配/不可达一律 fail-closed 为 memory，reason 透出。"""
     (ok, mode), cached = _ready_cached_probe("checkpoint", _check_checkpoint_pg, timeout=_READY_CHECKPOINT_TIMEOUT)
@@ -1034,27 +1050,95 @@ def _check_checkpoint_pg_full() -> tuple[tuple[bool, str, str], bool]:
 
 
 def _check_billing_pg_full() -> tuple[tuple[bool, str, str], bool]:
-    """全量 billing 探针：(ok, mode, reason) + 是否命中缓存。HERO_BILLING_DSN 为空即 fail-closed，reason 透出。"""
+    """全量 billing 探针：(ok, mode, reason) + 是否命中缓存。
+
+    reason 与 S4 的 BillingUnavailable.reason 对齐：billing:unavailable(no_dsn|pg_unavailable)；
+    显式开启内存降级（HERO_BILLING_ALLOW_MEMORY=1）时写 billing:memory，如实区分"降级"与"不可用"。
+    """
     (ok, mode), cached = _ready_cached_probe("billing", _check_billing_pg, timeout=_READY_BILLING_TIMEOUT)
     reason = ""
     if not ok:
         try:
-            from hero_quant.config.settings import Settings
-
-            _s = Settings()
-            _dsn = getattr(_s, "billing_dsn", None) or ""
+            _dsn = _billing_dsn_resolved()
+            _svc = _billing_svc_cache.get(_billing_svc_cache_key(_dsn)) if _dsn else None
+            _memory_allowed = bool(getattr(_svc, "_memory_allowed", False))
             if not _dsn:
-                # billing fail-closed：空 DSN 不得静默旁路，显式 reason 透到 /ready。
-                reason = "billing DSN 缺配 fail-closed(memory)"
+                reason = "billing:unavailable(no_dsn)"
                 logger.warning("ready.billing_dsn_missing", error_code="billing_dsn_missing", dsn_host="***")
             elif not _is_pg_dsn_ready(_dsn):
-                reason = "billing DSN 非 PG fail-closed(memory)"
+                reason = "billing:unavailable(no_dsn)"
+                logger.warning("ready.billing_dsn_not_pg", error_code="billing_dsn_not_pg", dsn_host="***")
+            elif _memory_allowed:
+                reason = "billing:memory(warning)"
+                logger.warning("ready.billing_memory_allowed", error_code="billing_memory_allowed", dsn_host=_dsn_host(_dsn))
             else:
-                reason = "billing PG unreachable or not real pool, fail-closed(memory)"
+                reason = "billing:unavailable(pg_unavailable)"
+                logger.warning("ready.billing_pg_unavailable", error_code="billing_pg_unavailable", dsn_host=_dsn_host(_dsn))
         except (ValueError, TypeError, AttributeError, OSError, RuntimeError) as _e:
-            reason = "billing probe failed fail-closed(memory)"
+            reason = "billing:unavailable(pg_unavailable)"
             logger.warning("ready.billing_reason_failed", error_code="billing_reason_failed", exc_info=_e)
     return (ok, mode, reason), cached
+
+
+def _billing_dsn_resolved() -> str:
+    """billing DSN 解析（与 BillingService 同序）：Settings.billing_dsn 优先，env 兜底。"""
+    try:
+        from hero_quant.config.settings import Settings
+
+        dsn = getattr(Settings(), "billing_dsn", None)
+    except (ImportError, ValueError, TypeError, AttributeError, OSError, RuntimeError):
+        dsn = None
+    if not dsn:
+        dsn = os.environ.get("HERO_BILLING_DSN") or os.environ.get("HERO_PG_DSN") or os.environ.get("HERO_CHECKPOINT_DSN", "")
+    return dsn or ""
+
+
+def _billing_svc_cache_key(dsn: str) -> str:
+    """缓存键用 DSN 的 sha256 前缀，避免口令进 dict key（与 checkpoint._pg_store_key 同思路）。"""
+    try:
+        import hashlib as _hashlib
+
+        return _hashlib.sha256(str(dsn or "").encode()).hexdigest()[:12]
+    except (ValueError, TypeError, AttributeError):
+        return "default"
+
+
+_billing_svc_cache: dict[str, object] = {}
+_billing_svc_lock = threading.Lock()
+
+
+def _get_billing_service():
+    """复用单个 BillingService：S4 起构造期建池 + SELECT 1（上限 2s），每次新建既超预算又漏池。"""
+    dsn = _billing_dsn_resolved()
+    if not dsn:
+        return None
+    key = _billing_svc_cache_key(dsn)
+    cached = _billing_svc_cache.get(key)
+    if cached is not None:
+        return cached
+    with _billing_svc_lock:
+        cached = _billing_svc_cache.get(key)
+        if cached is not None:
+            return cached
+        try:
+            from hero_quant.billing.service import BillingUnavailable, BillingService
+
+            try:
+                svc = BillingService(dsn=dsn)
+            except BillingUnavailable as _bu:
+                # 构造期 fail-closed（S4 语义）：不缓存，下次 /ready 重试
+                logger.warning(
+                    "ready.billing_unavailable",
+                    error_code="billing_unavailable",
+                    reason=getattr(_bu, "reason", "billing:pg_unavailable"),
+                    dsn_host=_dsn_host(dsn),
+                )
+                return None
+            _billing_svc_cache[key] = svc
+            return svc
+        except (ImportError, ValueError, TypeError, AttributeError, OSError, RuntimeError) as _e:
+            logger.warning("ready.billing_init_failed", error_code="billing_init_failed", exc_info=_e)
+            return None
 
 
 def _check_checkpoint_pg() -> tuple[bool, str]:
@@ -1153,16 +1237,14 @@ def _check_checkpoint_pg() -> tuple[bool, str]:
 def _check_billing_pg() -> tuple[bool, str]:
     """实探 billing PG：唯一判据 _is_real_pg 且 pool 探活 SELECT 1 成功才算 pg。"""
     try:
-        from hero_quant.config.settings import Settings
-        s = Settings()
-        dsn = getattr(s, "billing_dsn", None)
-        if not dsn:
-            dsn = os.environ.get("HERO_BILLING_DSN") or os.environ.get("HERO_PG_DSN") or os.environ.get("HERO_CHECKPOINT_DSN", "")
+        dsn = _billing_dsn_resolved()
         if not _is_pg_dsn_ready(dsn):
             return False, "memory"
-        from hero_quant.billing.service import BillingService
-
-        svc = BillingService(dsn=dsn)
+        # 中文：复用单例——S4 起构造期会建池 + SELECT 1（上限 2s），每次 /ready 新建既超预算
+        # 又会漏池；构造期 BillingUnavailable 由 _get_billing_service 记日志并返回 None。
+        svc = _get_billing_service()
+        if svc is None:
+            return False, "memory"
         # 唯一判据：_is_real_pg 且 pool 存在
         is_real = getattr(svc, "_is_real_pg", None)
         if callable(is_real):
@@ -1336,8 +1418,19 @@ def ready(mode: str = "ready"):
         # liveness：进程存活即 ok，不触发任何外部探针
         return {"status": "ok", "mode": "live"}
     s = None  # 预定义避免 UnboundLocalError
-    (pg_ok, checkpoint_mode, checkpoint_reason), _ckpt_cached = _check_checkpoint_pg_full()
-    (billing_ok, billing_mode, billing_reason), _bill_cached = _check_billing_pg_full()
+    # 中文：checkpoint 与 billing 并发探活——两者各自可耗 1.6s / 2.4s，串行会顶破 5s 预算。
+    _ck_fut = _READY_POOL.submit(_check_checkpoint_pg_full)
+    _bl_fut = _READY_POOL.submit(_check_billing_pg_full)
+    (pg_ok, checkpoint_mode, checkpoint_reason), _ckpt_cached = _ready_future_result(
+        _ck_fut,
+        _READY_CHECKPOINT_TIMEOUT + 0.5,
+        ((False, "memory", "checkpoint:memory | probe timeout fail-closed"), False),
+    )
+    (billing_ok, billing_mode, billing_reason), _bill_cached = _ready_future_result(
+        _bl_fut,
+        _READY_BILLING_TIMEOUT + 0.5,
+        ((False, "memory", "billing:unavailable(probe_timeout)"), False),
+    )
     # Redis：限流依赖，实探 PING（不走 fakeredis 回退，避免假绿）；失败只 warning 不拦就绪。
     try:
         redis_ok = bool(_ready_run_with_timeout(_check_redis, timeout=_READY_REDIS_TIMEOUT))
@@ -2230,6 +2323,16 @@ _backtest_cache = {}
 _backtest_cache_lock = threading.Lock()
 _BACKTEST_BUNDLE_CACHE_PREFIX = "hero:cache:backtest:bundle:"
 _BACKTEST_BUNDLE_LOCK_KEY = "hero:lock:backtest:bundle"
+# 中文：研究页 bundle 用的是确定性合成行情（非 PIT、非真实市场数据），必须响应级如实标记；
+# 端点把它们平铺进 metrics.json（键名与既有指标不冲突），并对 csv/tearsheet 加 X-Degraded 头。
+_BACKTEST_DEGRADE_MARKERS: dict = {
+    "synthetic": True,
+    "degraded": True,
+    "reason": "backtest:synthetic_demo",
+    "non_pit": True,
+}
+# 空 CSV（仅表头）：positions 缺失时返回它，绝不塞具体 K 线数字。
+_BACKTEST_CSV_HEADER = "date,symbol,weight,close\n"
 
 
 def _backtest_bundle_cache_key(tenant: str | None = None) -> str:
@@ -2243,10 +2346,11 @@ def _backtest_bundle_cache_key(tenant: str | None = None) -> str:
         _t = tenant.strip() if isinstance(tenant, str) else ""
     except (ValueError, TypeError, AttributeError):
         _t = ""
+    # v2：v1 缓存里存有伪造指标（sharpe 1.62 / annual_return 0.184），换 key 让它自然失效。
     if _t:
-        raw = json.dumps({"v": 1, "capital": 1.0, "weights": [0.5, 0.5], "tenant": _t}, sort_keys=True)
+        raw = json.dumps({"v": 2, "capital": 1.0, "weights": [0.5, 0.5], "tenant": _t}, sort_keys=True)
     else:
-        raw = json.dumps({"v": 1, "capital": 1.0, "weights": [0.5, 0.5]}, sort_keys=True)
+        raw = json.dumps({"v": 2, "capital": 1.0, "weights": [0.5, 0.5]}, sort_keys=True)
     digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
     return f"{_BACKTEST_BUNDLE_CACHE_PREFIX}{digest}"
 
@@ -2265,6 +2369,9 @@ def _read_backtest_bundle_cache(tenant: str | None = None) -> dict | None:
         data = json.loads(raw)
         if not isinstance(data, dict) or not isinstance(data.get("metrics"), dict):
             return None
+        # 旧缓存可能缺标记：统一回填，保证缓存命中时响应仍然是显式降级。
+        for _mk, _mv in _BACKTEST_DEGRADE_MARKERS.items():
+            data.setdefault(_mk, _mv)
         return data
     except Exception as _e:
         logger.debug(f"backtest.bundle_cache_read_failed error={_e}")
@@ -2283,6 +2390,7 @@ def _write_backtest_bundle_cache(bundle: dict, tenant: str | None = None) -> Non
             "metrics": bundle.get("metrics", {}),
             "csv": bundle.get("csv", ""),
             "tearsheet": bundle.get("tearsheet", ""),
+            **_BACKTEST_DEGRADE_MARKERS,
         }
         client.set(_backtest_bundle_cache_key(tenant), json.dumps(payload, ensure_ascii=False, default=str), ex=600)
     except Exception as _e:
@@ -2303,16 +2411,16 @@ def _compute_backtest_bundle() -> dict:
     prices = pd.DataFrame({"close": close_vals}, index=dates)
     prices.index.name = "date"
     eng = BacktestEngine(initial_capital=1.0)
-    res = eng.run(prices, weights=[0.5, 0.5])
+    # allow_synthetic=True：这是确定性 demo 行情，显式走合成通道（引擎默认 fail-closed 拒绝），
+    # 结果在响应里以 synthetic/degraded/non_pit 标记，绝不冒充真实 PIT 回测。
+    res = eng.run(prices, weights=[0.5, 0.5], allow_synthetic=True)
     metrics_data = res.get("metrics", {})
-    # 补齐关键指标缺省值
-    if "sharpe" not in metrics_data:
-        metrics_data["sharpe"] = 1.62
-    if "annual_return" not in metrics_data:
-        metrics_data["annual_return"] = 0.184
+    if not isinstance(metrics_data, dict):
+        metrics_data = {}
+    # 中文：引擎给什么就返回什么，缺键不补默认值——旧版补 1.62/0.184 属伪造（审计 §4.2）。
     positions = res.get("positions")
-    # 生成带 date 表头的 CSV 文本
-    csv_text = ""
+    # 生成带 date 表头的 CSV 文本；positions 缺失时只给表头，不塞任何具体 K 线。
+    csv_text = _BACKTEST_CSV_HEADER
     try:
         if positions is not None and hasattr(positions, "to_csv"):
             import io
@@ -2320,23 +2428,24 @@ def _compute_backtest_bundle() -> dict:
             # 保证 index_label 为 date，便于前端/测试解析
             positions.to_csv(buf, index=True, index_label="date")
             csv_text = buf.getvalue()
-        else:
-            csv_text = "date,symbol,weight,close\n2026-08-12,600519.SH,0.5,1680.2\n"
-    except Exception:
-        csv_text = "date,symbol,weight,close\n2026-08-12,600519.SH,0.5,1680.2\n"
+    except Exception as _e:
+        logger.warning("backtest.positions_csv_failed", error=str(_e), error_code="positions_csv_failed")
+        csv_text = _BACKTEST_CSV_HEADER
     tearsheet = res.get("tearsheet", "")
-    if not tearsheet or "Tearsheet" not in tearsheet:
-        tearsheet = """<!doctype html><html><head><meta charset="utf-8"><title>Tearsheet</title></head><body><h1>Tearsheet — Production Core</h1><p>Sharpe 1.62 | Annual 18.4%</p><table><tr><th>Month</th><th>Return</th></tr><tr><td>2026-08</td><td>+0.82%</td></tr></table></body></html>"""
-    return {"metrics": metrics_data, "positions": positions, "csv": csv_text, "tearsheet": tearsheet}
+    if not isinstance(tearsheet, str):
+        # 引擎未产出 tearsheet 就留空，不拼假 HTML（"Sharpe 1.62" 之类）
+        tearsheet = ""
+    return {"metrics": metrics_data, "positions": positions, "csv": csv_text, "tearsheet": tearsheet, **_BACKTEST_DEGRADE_MARKERS}
 
 
 def _static_backtest_bundle() -> dict:
-    """静态兜底，保证接口始终可用。"""
+    """静态兜底：只给空壳 + 显式降级标记，不伪造任何指标/持仓/tearsheet。"""
     return {
-        "metrics": {"sharpe": 1.62, "annual_return": 0.184, "max_drawdown": -0.032, "turnover": 0.42, "volatility": 0.18, "cumulative_return": 0.06},
+        "metrics": {},
         "positions": None,
-        "csv": "date,symbol,weight,close\n2026-08-12,600519.SH,0.5,1680.2\n2026-08-13,600519.SH,0.5,1692.5\n",
-        "tearsheet": """<!doctype html><html><head><meta charset="utf-8"><title>Tearsheet</title></head><body><h1>Tearsheet — Production Core</h1><p>Sharpe 1.62 | Annual 18.4%</p></body></html>""",
+        "csv": _BACKTEST_CSV_HEADER,
+        "tearsheet": "",
+        **_BACKTEST_DEGRADE_MARKERS,
     }
 
 
@@ -2421,7 +2530,17 @@ def backtest_metrics(request: Request):
             logger.debug("metrics.counter_failed", error=str(_e))  # intentional offline-safe
             pass  # intentional offline-safe
     bundle = _get_backtest_bundle()
-    return JSONResponse(content=bundle["metrics"])
+    # 响应级标记：synthetic 行情算出的指标可以任意（但不是写死的 1.62），必须如实标注来源。
+    metrics_body = dict(bundle.get("metrics") or {})
+    for _mk, _mv in _BACKTEST_DEGRADE_MARKERS.items():
+        metrics_body.setdefault(_mk, _mv)
+    return JSONResponse(
+        content=metrics_body,
+        headers={
+            _DEGRADED_HEADER: "true",
+            _DEGRADED_REASON_HEADER: _BACKTEST_DEGRADE_MARKERS["reason"],
+        },
+    )
 
 
 @app.get("/v1/backtest/positions.csv")
@@ -2437,8 +2556,16 @@ def backtest_positions(request: Request):
             logger.debug("metrics.counter_failed", error=str(_e))  # intentional offline-safe
             pass  # intentional offline-safe
     bundle = _get_backtest_bundle()
-    csv_text = bundle.get("csv", "date,symbol,weight,close\n2026-08-12,600519.SH,0.5,1680.2\n")
-    return PlainTextResponse(content=csv_text, media_type="text/csv", headers={"Content-Disposition": "inline; filename=positions.csv"})
+    csv_text = bundle.get("csv") or _BACKTEST_CSV_HEADER
+    return PlainTextResponse(
+        content=csv_text,
+        media_type="text/csv",
+        headers={
+            "Content-Disposition": "inline; filename=positions.csv",
+            _DEGRADED_HEADER: "true",
+            _DEGRADED_REASON_HEADER: _BACKTEST_DEGRADE_MARKERS["reason"],
+        },
+    )
 
 
 @app.get("/v1/backtest/tearsheet.html")
@@ -2453,8 +2580,16 @@ def backtest_tearsheet(request: Request):
         logger.debug("metrics.counter_failed", error=str(_e))  # intentional offline-safe
         pass  # intentional offline-safe
     bundle = _get_backtest_bundle()
-    html = bundle.get("tearsheet", "<html><body><h1>Tearsheet</h1></body></html>")
-    return Response(content=html, media_type="text/html")
+    # 无真实 tearsheet 就返回空正文（不拼假 HTML），并显式暴露降级头。
+    html = bundle.get("tearsheet") or ""
+    return Response(
+        content=html,
+        media_type="text/html",
+        headers={
+            _DEGRADED_HEADER: "true",
+            _DEGRADED_REASON_HEADER: _BACKTEST_DEGRADE_MARKERS["reason"],
+        },
+    )
 
 
 def _compute_drawdowns_from_csv(csv_text: str, top_n: int = 3) -> list[dict]:
