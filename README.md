@@ -28,7 +28,7 @@
 - **Quantlib**：`sma/ema/rsi(Wilder EWM)/bollinger/macd/max_drawdown` 纯 pandas，已对齐 8-11 RSI 修复
 - **可观测**：`structlog JSON + X-Request-ID + /metrics(prometheus)`，`TraceWriter` `tmp→fsync→link` 硬链侧车 + `_safe_sidecar_path`
 - **治理**：`governance/ledger.py` `seq/prev_hash/record_hash 0600+fsync` 可 `verify()`，`dedup` 幂等表（单机 dict，预留 PG）
-- **前端**：React 19 + Vite + Zustand + Tailwind，七路由（Dashboard/Research/Chat/Live/Risk/Settings/Backtest别名），`Research` 接真实 `tearsheet`，`Chat` SSE 流式 + tool 轨迹
+- **前端**：React 19 + Vite + Zustand + Tailwind，8 路由（`/dashboard` `/research` `/chat` `/backtest`(复用 Chat) `/live` `/monitor` `/risk` `/settings`，`/`→`/dashboard` 重定向）；`Research` 读真实回测产物（`metrics.json`/`positions.csv`/`tearsheet.html`），`positions.csv` 无 `close` 列时显示诚实空态而非造曲线，请求失败回退带 `isMock` 标记；`Chat` SSE 流式 + tool 轨迹
 
 ## 架构
 
