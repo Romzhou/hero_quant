@@ -254,20 +254,29 @@ def list_markets() -> Dict[str, Any]:
     },
     output={
         "type": "object",
-        "properties": {"symbol": {"type": "string"}, "info": {"type": "object"}, "ok": {"type": "boolean"}},
+        "properties": {
+            "symbol": {"type": "string"},
+            "info": {"type": "object"},
+            "ok": {"type": "boolean"},
+            "error": {"type": "string"},
+        },
         "required": ["ok"],
         "additionalProperties": False,
     },
     is_concurrency_safe=lambda args: True,
 )
 def get_ticker_info(symbol: str) -> Dict[str, Any]:
-    """获取标的基础信息（占位实现，保持 schema 兼容）。"""
-    return {"symbol": symbol, "ok": True, "info": {}}
+    """获取标的基础信息。
+
+    中文：无外部数据源可查，返回空即 no_data（ok:False），不得用 {} + ok:True
+    让调用方把“没查到”当成“查到了空字段”。
+    """
+    return {"symbol": symbol, "ok": False, "error": "no_data", "info": {}}
 
 
 @tool(
     name="get_fundamentals",
-    description="Get fundamentals for a symbol (empty info placeholder, schema-correct).",
+    description="Get fundamentals for a symbol (no data source in this build: ok=false, error=no_data).",
     parameters={
         "type": "object",
         "properties": {"symbol": {"type": "string"}},
@@ -276,15 +285,24 @@ def get_ticker_info(symbol: str) -> Dict[str, Any]:
     },
     output={
         "type": "object",
-        "properties": {"symbol": {"type": "string"}, "info": {"type": "object"}, "ok": {"type": "boolean"}},
+        "properties": {
+            "symbol": {"type": "string"},
+            "info": {"type": "object"},
+            "ok": {"type": "boolean"},
+            "error": {"type": "string"},
+        },
         "required": ["ok"],
         "additionalProperties": False,
     },
     is_concurrency_safe=lambda args: True,
 )
 def get_fundamentals(symbol: str) -> Dict[str, Any]:
-    """获取基本面信息（占位实现，无外部依赖，保持 schema 正确）。"""
-    return {"symbol": symbol, "info": {}, "ok": True}
+    """获取基本面信息。
+
+    中文：本仓无基本面数据源，空结果必须 ok:False + error="no_data"，
+    不允许用空 dict 冒充成功（grounding 会把 {} 当已取到数据）。
+    """
+    return {"symbol": symbol, "info": {}, "ok": False, "error": "no_data"}
 
 
 @tool(
@@ -298,25 +316,26 @@ def get_fundamentals(symbol: str) -> Dict[str, Any]:
     },
     output={
         "type": "object",
-        "properties": {"symbols": {"type": "array"}, "candidates": {"type": "array"}, "ok": {"type": "boolean"}},
+        "properties": {
+            "symbols": {"type": "array"},
+            "candidates": {"type": "array"},
+            "ok": {"type": "boolean"},
+            "error": {"type": "string"},
+        },
         "required": ["ok"],
         "additionalProperties": False,
     },
     is_concurrency_safe=lambda args: True,
 )
 def search_symbols(keyword: str) -> Dict[str, Any]:
-    """按关键字搜索标的，返回模拟候选（保持离线可用）。"""
-    candidates: list[Dict[str, Any]] = []
-    # 离线环境下以关键字派生模拟候选，避免依赖外部搜索接口
+    """按关键字搜索标的。
 
-    kw = (keyword or "").strip()
-    if kw:
-        # 将关键字大写作为标的前缀，拼接常见后缀生成候选
-
-        stem = kw.upper().replace(" ", "_")
-        for suffix in [".SH", ".US", ""]:
-            candidates.append({"symbol": f"{stem}{suffix}", "name": f"{kw} mock {suffix or 'generic'}"})
-    return {"symbols": candidates, "candidates": candidates, "ok": True}
+    中文：本仓无标的搜索数据源。此前用关键字拼 "KW mock .SH" 伪造候选，
+    下游会拿假代码去拉行情；修复后无真实候选即 ok:False + error="no_data"，
+    candidates/symbols 保持空列表（schema 稳定）。
+    """
+    _logger.warning("search_symbols has no data source, returning no_data for keyword=%r", keyword)
+    return {"symbols": [], "candidates": [], "ok": False, "error": "no_data"}
 
 
 @tool(

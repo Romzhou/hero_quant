@@ -18,6 +18,13 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+try:
+    import structlog as _structlog  # type: ignore
+
+    _slog = _structlog.get_logger(__name__)
+except Exception:  # pragma: no cover — 最小环境无 structlog
+    _slog = None  # type: ignore
+
 # 白名单单源：避免 trait/registry 双轨漂移（YAGNI 最小，复用 sources 常量）
 from hero_quant.data.sources import VALID_SOURCES as _VALID_SOURCES  # noqa: E402  # 单源常量，需在 logger 之后
 
@@ -535,6 +542,24 @@ class MarketDataRegistry:
                         f"cross-source 1% check failed for {symbol}: {ref_close:.2f} vs {other_close:.2f} diff={diff*100:.2f}%"
                     )
 
+    def _mark_synthetic_provenance(self, prov, symbol: str, reason: str) -> None:
+        """synthetic 数据的 provenance 显式打标（synthetic=true + 跳过原因）。
+
+        中文：HERO_DATA_MODE=synthetic 时所有 loader 各自构造合成序列，跨源 1%
+        比对没有共同基准，必然误报；因此显式跳过比对，但必须把 synthetic 身份
+        写进 provenance.extra，禁止静默跳过（下游不得把它当 live）。
+        """
+        try:
+            extra = getattr(prov, "extra", None)
+            if not isinstance(extra, dict):
+                extra = {}
+                prov.extra = extra
+            extra["synthetic"] = True
+            extra["allow_synthetic_comparison"] = True
+            extra["cross_source_skipped"] = reason
+        except (AttributeError, TypeError) as e:
+            logger.warning("synthetic provenance mark failed for %s: %s", symbol, e, exc_info=True)
+
     def _cross_source_check(self, symbol: str, bars, prov=None, interval="1d", start=None, end=None) -> None:
         """跨源 1% 一致性校验，超阈值阻断。
 
@@ -550,6 +575,30 @@ class MarketDataRegistry:
             return
         if start is None or end is None:
             logger.warning("cross_source check skipped for %s: missing start/end", symbol)
+            return
+        # synthetic 模式显式跳过：合成序列之间不存在可比的真实基准，跨源比对必然误报。
+        # 仅对 get_bars 已打标（extra.synthetic + extra.cross_source_skipped）的 prov 生效；
+        # synthetic/live 混用仍需 allow_synthetic_comparison 显式 opt-in 且照常比对。
+        _extra = getattr(prov, "extra", None)
+        _extra = _extra if isinstance(_extra, dict) else {}
+        _skip_reason = _extra.get("cross_source_skipped")
+        if bool(_extra.get("synthetic")) and getattr(prov, "source", None) == "synthetic" and _skip_reason:
+            logger.warning(
+                "cross_source check skipped for %s: synthetic data (%s), no live comparator", symbol, _skip_reason
+            )
+            if _slog is not None:
+                try:
+                    _slog.warning(
+                        "cross_source_synthetic_skipped",
+                        error_code="cross_source_synthetic_skipped",
+                        symbol=symbol,
+                        source="synthetic",
+                        skip_reason=_skip_reason,
+                        unit=getattr(prov, "unit", None),
+                        interval=interval,
+                    )
+                except Exception:  # pragma: no cover — 结构化日志不可用不影响主链路
+                    pass
             return
         # 模式二：以主数据源为基准，遍历其他 loader 做对照
         current_source = getattr(prov, "source", "") if prov else ""  # 跳过自身避免自比
@@ -647,7 +696,10 @@ class MarketDataRegistry:
             markets = getattr(loader, "markets", [])
             # 中文：按 markets 过滤；空 markets 表示通用 loader 不跳过，避免 UNKNOWN 市场误报为缺依赖
             if markets and market not in markets:
-                last_error = ImportError(f"pip install hero-quant[us] or [ashare] for {symbol}: no loader available for market {market} (unsupported market {market})")
+                # 中文：已有真实失败原因时不得被“市场不支持”覆盖——否则断网/解析失败
+                # 会被显示成“缺 loader”，把可排查的错误变成误导性错误。
+                if last_error is None:
+                    last_error = ImportError(f"pip install hero-quant[us] or [ashare] for {symbol}: no loader available for market {market} (unsupported market {market})")
                 continue
             try:
                 result = loader.get_bars(symbol, start, end, interval)
@@ -703,6 +755,9 @@ class MarketDataRegistry:
                     f"loader {loader.__class__.__name__} provenance unit invalid: "
                     f"got {getattr(prov, 'unit', None)!r} (fail-closed, no silent default)"
                 )
+            # synthetic 数据显式打标：跨源比对无共同基准，跳过但必须留痕
+            if getattr(prov, "source", None) == "synthetic":
+                self._mark_synthetic_provenance(prov, symbol, "synthetic_mode")
             # 记录审计日志：用于追踪每次成功取数的来源与单位（有界环形缓冲，线程安全）
             audit_entry = {
                 "symbol": symbol,

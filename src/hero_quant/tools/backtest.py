@@ -42,11 +42,12 @@ def _warn(op: str, msg: str, *args: Any, **fields: Any) -> None:
 
 
 def _fetch_bars_for_backtest(symbol: str, start: str, end: str, interval: str = "1d"):
-    """为回测拉取行情，返回 (bars, provenance_dict|None)。
+    """为回测拉取行情，返回 (bars, provenance_dict|None, error|None)。
 
     中文：此前丢弃 provenance（bars, _），导致 run_backtest 无法区分真实/合成、
-    无法透传 unit/adjust。修复后返回二元组；失败返回 ([], None) 由调用方
-    经显式 allow_synthetic 决定是否合成兜底。
+    无法透传 unit/adjust。修复后返回三元组；第三项是拉取失败的原始原因，
+    调用方据此 fail-closed（断网不得用合成 bars 冒充行情）。
+    兼容旧桩：仍接受纯 bars 或二元组。
     """
     try:
         from hero_quant.data.registry import MarketDataRegistry
@@ -81,11 +82,12 @@ def _fetch_bars_for_backtest(symbol: str, start: str, end: str, interval: str = 
         except (AttributeError, TypeError, ValueError) as e:
             logger.warning("fetch provenance export failed for %s: %s", symbol, e, exc_info=True)
             prov_dict = None
-        return bars, prov_dict
-    except (ValueError, TypeError, AttributeError, ImportError, RuntimeError) as e:
+        return bars, prov_dict, None
+    except (ValueError, TypeError, AttributeError, ImportError, RuntimeError, OSError) as e:
         logger.warning("fetch bars failed for %s: %s", symbol, e, exc_info=True)
-        # 获取失败返回空，由调用方经显式 allow_synthetic 决定是否合成兜底
-        return [], None
+        # 获取失败必须把原因透出：断网/接口报错不得静默变成“无数据”，
+        # 更不得被合成 bars 顶替（run_backtest 据此返回 ok:False）。
+        return [], None, f"{type(e).__name__}: {e}"
 
 
 def _synthetic_prices_for_backtest(index, ticker: str):
@@ -129,6 +131,8 @@ def _synthetic_prices_for_backtest(index, ticker: str):
             "engine": {"type": "string"},
             "interval": {"type": "string"},
             "allow_synthetic": {"type": "boolean"},
+            "as_of": {"type": "string"},
+            "weights_on": {"type": "string"},
         },
         "required": ["symbol"],
         "additionalProperties": False,
@@ -141,6 +145,9 @@ def _synthetic_prices_for_backtest(index, ticker: str):
             "ok": {"type": "boolean"},
             "error": {"type": "string"},
             "engine": {"type": "string"},
+            "provenance": {"type": "object"},
+            "non_pit": {"type": "boolean"},
+            "pit_basis": {"type": "string"},
         },
         "required": ["ok"],
         "additionalProperties": False,
@@ -156,8 +163,18 @@ def run_backtest(
     engine: str = "default",
     interval: str = "1d",
     allow_synthetic: bool = True,
+    as_of: str | None = None,
+    weights_on: str | None = None,
 ) -> Dict[str, Any]:
     """执行 PIT 正确回测，含交易成本与多引擎支持；合成兜底需显式 allow_synthetic=True。
+
+    PIT 基准日（2026-10-28 修复）：
+    - 显式 as_of 优先；若晚于最后一根 K 线直接 {ok:False}（未来数据 fail-closed）。
+    - as_of 缺省时取 prices.index[-1] 作为 price_date 传引擎（此前恒不传，真实行情
+      100% 撞 engine.py 的 PIT fail-closed，equity 恒空）。
+    - 推断出的基准日不是调用方声明的 PIT 时点，返回体必须 non_pit=True 且
+      pit_basis="inferred_as_of"；显式 as_of 记 "explicit_as_of"。
+    - weights_on 缺省交给引擎（= price_date）；显式传入时引擎校验 weights_on<=price_date。
 
     中文：此前 is_synthetic 自动 opt-in allow_synthetic 旁路 PIT，且 provenance
     丢 unit 字段。修复后：无真实行情默认 fail-closed 返回 {ok:False}（不再静默
@@ -189,7 +206,11 @@ def run_backtest(
         桩/缺失时按 symbol 后缀推断（.SH/.SZ→board_lots，其余 shares）。
         """
         if src == "synthetic":
-            return {"source": "synthetic", "unit": "shares", "adjust": "none"}
+            # 中文：合成数据的 unit 仍须跟随标的市场口径，A 股合成序列不是 shares
+            # （board_lots vs shares 差 100 倍，统一写 shares 会把 unit 弄错）。
+            _sup = str(symbol or "").upper()
+            _sunit = "board_lots" if (_sup.endswith(".SH") or _sup.endswith(".SZ")) else "shares"
+            return {"source": "synthetic", "unit": _sunit, "adjust": "none"}
         if isinstance(live_prov, dict) and live_prov.get("source") and live_prov.get("unit") in ("board_lots", "shares"):
             out = {"source": live_prov["source"], "unit": live_prov["unit"]}
             if live_prov.get("adjust"):
@@ -203,18 +224,40 @@ def run_backtest(
         _unit = "board_lots" if (_up.endswith(".SH") or _up.endswith(".SZ")) else "shares"
         return {"source": "market", "unit": _unit, "adjust": "unknown"}
 
+    # 逗号多标的必查（即使 weights 长度为 1，也属 tickers-vs-weights 错位）。
+    # 提前到行情拉取之前：参数错位是调用方错误，不应被“拉取失败”信封掩盖。
+    is_comma_symbol = isinstance(symbol, str) and "," in symbol
+    tickers = [s.strip() for s in symbol.split(",") if s.strip()] if is_comma_symbol else []
+    if is_comma_symbol and len(tickers) != len(weights):
+        logger.warning("tickers %d vs weights %d mismatch for %s", len(tickers), len(weights), symbol)
+        return {
+            "equity": [],
+            "metrics": {},
+            "ok": False,
+            "error": f"tickers {len(tickers)} vs weights {len(weights)} mismatch",
+            "engine": engine or "default",
+            "provenance": _prov_envelope("market", None),
+        }
+
     # Narrow try blocks: date_range isolated
     import pandas as pd
 
     _fetch_res = _fetch_bars_for_backtest(symbol, start, end, interval=interval)
-    # 兼容旧桩：_fetch_bars_for_backtest 可能被单测桩为纯 bars list
-    if isinstance(_fetch_res, tuple) and len(_fetch_res) == 2:
+    # 兼容旧桩：_fetch_bars_for_backtest 可能被单测桩为纯 bars list / 二元组
+    fetch_error = None
+    if isinstance(_fetch_res, tuple) and len(_fetch_res) == 3:
+        bars, live_prov, fetch_error = _fetch_res
+    elif isinstance(_fetch_res, tuple) and len(_fetch_res) == 2:
         bars, live_prov = _fetch_res
     else:
         bars, live_prov = _fetch_res, None
     # 中文：不得静默截断——全部 bars 进入引擎，避免长区间回测被压成 50 根而不自知
     closes = []
+    bar_dates: list = []
+    dates_complete = True
     for b in bars if bars else []:
+        if not isinstance(b, dict):
+            continue
         c = b.get("close")
         if c is None:
             continue
@@ -226,7 +269,33 @@ def run_backtest(
         if v != v:
             continue
         closes.append(v)
+        # 同步收集真实 bar 日期：as_of 推断必须落在最后一根真实 K 线上，
+        # 不能拿“start + bar 数”的伪日期冒充（否则 PIT 基准日与数据错位）。
+        _raw_d = b.get("date")
+        _ts = None
+        if _raw_d is not None:
+            try:
+                _ts = pd.Timestamp(str(_raw_d)[:10])
+            except (ValueError, TypeError):
+                _ts = None
+        if _ts is None or pd.isna(_ts):
+            dates_complete = False
+            bar_dates.append(None)
+        else:
+            bar_dates.append(_ts)
     if not closes:
+        # 中文：拉取失败（断网/接口/解析错误）与“窗口内确实无数据”必须区分：
+        # 前者把原因透出并 fail-closed，绝不用合成 bars 顶替（伪造行情）。
+        if fetch_error:
+            logger.warning("market bars fetch failed for %s %s->%s: %s", symbol, start, end, fetch_error)
+            return {
+                "equity": [],
+                "metrics": {},
+                "ok": False,
+                "error": f"market data fetch failed for {symbol} {start}->{end}: {fetch_error} (fail-closed, no synthetic bars)",
+                "engine": engine or "default",
+                "provenance": _prov_envelope("market", live_prov),
+            }
         # 中文：无真实行情时默认走合成演示（存量契约：b3b/d2  pin ok:True + synthetic
         # provenance），但必须显式标记 synthetic + unit；显式 allow_synthetic=False
         # 时 fail-closed 返回 {ok:False}，杜绝合成被当真实回测用。
@@ -254,33 +323,23 @@ def run_backtest(
         closes = [100.0 + i for i in range(_n)]
     else:
         is_synthetic = False
-    # 以起始日为锚点构建 DatetimeIndex — interval aware
+    # DatetimeIndex — 真实 bar 日期优先（interval aware 的 date_range 仅作兜底）
     freq_map = {"1d": "D", "1h": "h", "1m": "min", "1w": "W", "1M": "M"}
     freq = freq_map.get(interval or "1d", "D")
-    try:
-        idx = pd.date_range(start, periods=len(closes), freq=freq)
-    except (ValueError, TypeError) as e:
-        logger.warning("date_range start parse failed: %s", e, exc_info=True)
-        idx = pd.date_range("2026-08-01", periods=len(closes), freq=freq)
+    if not is_synthetic and dates_complete and bar_dates:
+        idx = pd.DatetimeIndex(bar_dates)
+    else:
+        try:
+            idx = pd.date_range(start, periods=len(closes), freq=freq)
+        except (ValueError, TypeError) as e:
+            logger.warning("date_range start parse failed: %s", e, exc_info=True)
+            idx = pd.date_range("2026-08-01", periods=len(closes), freq=freq)
 
     # 多资产价格构造
     need_multi = len(weights) > 1
-    is_comma_symbol = isinstance(symbol, str) and "," in symbol
     prices = None
     if is_comma_symbol:
-        tickers = [s.strip() for s in symbol.split(",") if s.strip()]
-        # 中文：数量不一致走 {ok:False} 信封返回，不抛裸 ValueError 破坏工具契约；
-        # 逗号多标的必查（即使 weights 长度为 1，也属 tickers-vs-weights 错位）
-        if len(tickers) != len(weights):
-            logger.warning("tickers %d vs weights %d mismatch for %s", len(tickers), len(weights), symbol)
-            return {
-                "equity": [],
-                "metrics": {},
-                "ok": False,
-                "error": f"tickers {len(tickers)} vs weights {len(weights)} mismatch",
-                "engine": engine or "default",
-                "provenance": _prov_envelope("synthetic" if is_synthetic else "market", live_prov),
-            }
+        # 中文：tickers-vs-weights 错位已在拉取前拦截，这里只构造多资产矩阵
         # 合成每标的的 close 序列 — any matrix built from synthetic prices is
         # synthetic regardless of the initial fetch result (provenance honesty)
         price_dict: dict[str, pd.Series] = {}
@@ -309,12 +368,47 @@ def run_backtest(
     if prices is not None and "open" in prices.columns:
         prices = prices.drop(columns=["open"], errors="ignore")
 
+    # ---- PIT 基准日：显式 as_of 优先，缺省推断为最后一根 K 线 ----
+    inferred_as_of = as_of is None
+    if as_of is None:
+        price_date = prices.index[-1]
+    else:
+        try:
+            price_date = pd.Timestamp(as_of)
+        except (ValueError, TypeError) as e:
+            logger.warning("run_backtest invalid as_of %r: %s", as_of, e)
+            return {
+                "equity": [],
+                "metrics": {},
+                "ok": False,
+                "error": f"invalid as_of {as_of!r}: {e}",
+                "engine": engine or "default",
+                "provenance": _prov_envelope("synthetic" if is_synthetic else "market", live_prov),
+            }
+        if price_date > prices.index[-1]:
+            logger.warning("run_backtest as_of %s is after last bar %s", as_of, prices.index[-1])
+            return {
+                "equity": [],
+                "metrics": {},
+                "ok": False,
+                "error": (
+                    f"as_of {as_of} is after last bar {prices.index[-1]} "
+                    f"for {symbol} (future data, fail-closed)"
+                ),
+                "engine": engine or "default",
+                "provenance": _prov_envelope("synthetic" if is_synthetic else "market", live_prov),
+            }
+
     try:
         from hero_quant.backtest.engine import BacktestEngine
 
         eng = BacktestEngine()
         # 合成 PIT opt-in 需工具显式 allow_synthetic=True（防 is_synthetic 自动旁路 PIT）
         _eng_kw = {"allow_synthetic": True} if (is_synthetic and allow_synthetic) else {}
+        # 真实行情必须显式给 price_date，否则 engine.py 的 PIT fail-closed 恒抛
+        _eng_kw["price_date"] = price_date
+        if weights_on is not None:
+            _eng_kw["weights_on"] = weights_on
         res = eng.run(prices, weights=weights, costs=float(costs) if costs is not None else 0.0005, engine=engine or "default", **_eng_kw)
     except (ValueError, RuntimeError) as e:
         logger.warning("run_backtest engine failed: %s", e, exc_info=True)
@@ -332,7 +426,29 @@ def run_backtest(
         equity = list(eq) if isinstance(eq, (list, tuple)) else []
     # 中文：provenance 必传——合成兜底标 synthetic，否则沿 loader 口径（含 unit）
     provenance = _prov_envelope("synthetic" if is_synthetic else "market", live_prov)
-    return {"equity": equity, "metrics": res.get("metrics", {}), "ok": True, "engine": engine or "default", "provenance": provenance}
+    data_synthetic = is_synthetic or provenance.get("source") == "synthetic"
+    # PIT 口径诚实化：合成数据 / 推断出的 as_of 都不是调用方声明的 PIT 时点，
+    # 必须 non_pit=True；只有显式 as_of 才沿用引擎判定。
+    if data_synthetic:
+        pit_basis = "synthetic"
+        non_pit = True
+    elif inferred_as_of:
+        pit_basis = "inferred_as_of"
+        non_pit = True
+    else:
+        pit_basis = "explicit_as_of"
+        non_pit = bool(res.get("non_pit", False))
+    metrics = dict(res.get("metrics") or {})
+    metrics["non_pit"] = non_pit
+    return {
+        "equity": equity,
+        "metrics": metrics,
+        "ok": True,
+        "engine": engine or "default",
+        "provenance": provenance,
+        "non_pit": non_pit,
+        "pit_basis": pit_basis,
+    }
 
 
 @tool(
