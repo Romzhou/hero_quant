@@ -31,6 +31,28 @@ def _quantize_cents(value: object) -> Decimal:
         raise ValueError(f"price must be quantizable to cents, got {value!r}") from e
 
 
+def _row_to_factor(row: object) -> dict:
+    """PG factors 行 → 因子 dict；price 统一 Decimal 分位，与 publish_factor 入参同构。"""
+    if isinstance(row, dict):
+        factor_id, name, price = row.get("factor_id"), row.get("name"), row.get("price")
+        tenant, description = row.get("tenant"), row.get("description")
+    else:
+        seq = list(row) if not isinstance(row, (str, bytes)) else []  # type: ignore[arg-type]
+        seq += [None] * (5 - len(seq))
+        factor_id, name, price, tenant, description = seq[:5]
+    try:
+        price_dec = _quantize_cents(price)
+    except ValueError:
+        price_dec = Decimal("0.00")
+    return {
+        "factor_id": str(factor_id),
+        "name": str(name or ""),
+        "price": price_dec,
+        "tenant": str(tenant or ""),
+        "description": str(description or ""),
+    }
+
+
 def _validate_price(price: float | None, *, field: str = "price") -> Decimal | None:
     if price is None:
         return None
@@ -146,6 +168,11 @@ _BILLING_INDEX_STATEMENTS: tuple[str, ...] = (
     "CREATE INDEX IF NOT EXISTS idx_purchases_buyer ON purchases(buyer_tenant)",
     "CREATE INDEX IF NOT EXISTS idx_purchases_factor ON purchases(factor_id)",
 )
+# R8-1：factors 的真 PG 读路径（list_factors / get_factor 跨进程可见性的唯一真值来源）。
+# 排序按 factor_id：factors 表无 created_at 列，ORDER BY factor_id 保证稳定可复现。
+_FACTOR_SELECT_SQL = "SELECT factor_id, name, price, tenant, description FROM factors"
+# list_factors 的 PG 读取上限（有界，避免无界全表拉取）
+_FACTOR_LIST_LIMIT = 500
 # PR2-F: 真 PG 幂等写入 —— 幂等键 (factor_id, buyer_tenant)，冲突直接丢弃并取既有行。
 _PURCHASE_INSERT_SQL = (
     "INSERT INTO purchases (factor_id, buyer_tenant, tenant, price, idempotency_key) "
@@ -370,9 +397,14 @@ class BillingService:
             raise BillingUnavailable(reason, self._pool_error or "")
 
     def _decorate(self, payload: dict) -> dict:
-        """内存降级返回体必须自带 degraded:true + reason（响应级降级标记）。"""
+        """非真 PG 来源的返回体必须自带 degraded:true + reason（响应级降级标记）。
+
+        判据从「显式开了 HERO_BILLING_ALLOW_MEMORY」放宽为「本条结果不是真 PG 读出来的」：
+        emulated PG（有 DSN 无池）返回的同样是进程内数据，只在不显式标记时才会被误认成
+        已持久化（R8-1：禁止 PG 模式下返回内存数据冒充）。
+        """
         out = copy.deepcopy(payload)
-        if self._memory_mode():
+        if self._memory_mode() or not self._is_real_pg():
             out["degraded"] = True
             out["reason"] = "billing:memory"
         return out
@@ -810,8 +842,22 @@ class BillingService:
         return ok_count
 
     def list_factors(self, tenant: str | None = None) -> List[dict]:
-        """按租户列出因子，未指定则返回全部。PG 时通过 RLS semantics (tenant = current_setting) 过滤。"""
+        """按租户列出因子，未指定则返回全部。PG 时通过 RLS semantics (tenant = current_setting) 过滤。
+
+        R8-1：真 PG 时以 PG 查询为唯一真值（tenant 过滤 + limit 有界），另一进程 publish 的
+        因子才读得到；查询失败返回 []（fail-closed），不用进程内 dict 冒充 PG 结果。
+        无真池时维持 emulated/内存现状，但每条目带 degraded:true + reason。
+        """
         if self._is_pg_mode():
+            if tenant is not None and (not isinstance(tenant, str) or not tenant.strip()):
+                raise ValueError("tenant must be non-empty str")
+            if self._is_real_pg():
+                rows = self._pg_list_factors_sync(tenant=tenant)
+                if rows is not None:
+                    # 真 PG 查到了结果（空列表也是权威答案）
+                    return [copy.deepcopy(r) for r in rows]
+                # rows 为 None = PG 读失败：降级到进程内镜像，条目带 degraded（不冒充 PG 结果）
+                _log_warning("billing list_factors: PG read failed, degraded to in-process mirror", exc_info=False)
             # emulated RLS: filter by tenant = current_setting('app.tenant') equivalent
             with _GLOBAL_LOCK:
                 store = copy.deepcopy(_GLOBAL_FACTORS.get(_dsn_key(self.dsn), {}))  # type: ignore
@@ -824,11 +870,9 @@ class BillingService:
                     merged[k] = v
             vals = list(merged.values())
             if tenant is None:
-                return [copy.deepcopy(v) for v in vals]
-            if not isinstance(tenant, str) or not tenant.strip():
-                raise ValueError("tenant must be non-empty str")
+                return [self._decorate(copy.deepcopy(v)) for v in vals]
             # RLS isolation: only rows where tenant == requested tenant (simulates current_setting filter)
-            return [copy.deepcopy(f) for f in vals if f.get("tenant") == tenant]
+            return [self._decorate(copy.deepcopy(f)) for f in vals if f.get("tenant") == tenant]
         if tenant is None:
             return [copy.deepcopy(v) for v in self._factors.values()]
         if not isinstance(tenant, str) or not tenant.strip():
@@ -836,19 +880,35 @@ class BillingService:
         return [copy.deepcopy(f) for f in self._factors.values() if f.get("tenant") == tenant]
 
     def get_factor(self, factor_id: str, tenant: str | None = None) -> Optional[dict]:
-        """按 ID 获取因子，PG 时查 global store. If tenant supplied, enforce RLS filter."""
+        """按 ID 获取因子，PG 时查库（跨进程可见）；无真池时查进程内 store 并打 degraded。
+
+        R8-1：真 PG 时以 PG 查询为唯一真值，另一进程 publish 的因子才读得到；
+        tenant 不匹配或 PG 未命中返回 None，不用进程内 dict 冒充 PG 结果。
+        """
         if self._is_pg_mode():
+            if tenant is not None and (not isinstance(tenant, str) or not tenant.strip()):
+                raise ValueError("tenant must be non-empty str")
+            if self._is_real_pg():
+                rows = self._pg_query_factors(factor_id=factor_id, tenant=tenant, limit=1)
+                if rows is not None:
+                    # 真 PG 查到了结果（空列表也是权威答案）：不存在/租户不匹配即真 miss
+                    return rows[0] if rows else None
+                # rows 为 None = PG 读失败（连接/驱动异常）：降级到进程内镜像，但必须打 degraded，
+                # 绝不把镜像数据伪装成 PG 结果（R8-1）。
+                _log_warning(
+                    "billing get_factor: PG read failed, degraded to in-process mirror factor=%s",
+                    factor_id,
+                    exc_info=False,
+                )
             with _GLOBAL_LOCK:
                 val = _GLOBAL_FACTORS.get(_dsn_key(self.dsn), {}).get(factor_id)  # type: ignore
                 if val is not None:
                     val = copy.deepcopy(val)
             if val is not None:
                 if tenant is not None:
-                    if not isinstance(tenant, str) or not tenant.strip():
-                        raise ValueError("tenant must be non-empty str")
                     if val.get("tenant") != tenant:
                         return None
-                return copy.deepcopy(val)
+                return self._decorate(val)
         # fallback instance store
         inst = self._factors.get(factor_id)
         if inst is not None:
@@ -883,22 +943,6 @@ class BillingService:
         if not isinstance(buyer_tenant, str) or not buyer_tenant.strip():
             raise ValueError("buyer_tenant must be non-empty str")
         _override_dec = _validate_price(price, field="price")
-        # fix #5: tenant-scoped lookup — avoid tenant=None global leak; marketplace cross-tenant purchase still allowed by falling back to global after scoped miss
-        factor = self.get_factor(factor_id, tenant=buyer_tenant)
-        if factor is None:
-            # marketplace: cross-tenant purchase allowed if factor exists globally (visible to any buyer)
-            factor = self.get_factor(factor_id, tenant=None)
-        if factor is None:
-            factor = self._factors.get(factor_id)
-        if factor is None:
-            raise ValueError(f"factor not found: {factor_id}")
-        # 中文：金额一律分位舍入；覆盖价经 _validate_price(Decimal) 后 quantize，默认取因子定价（已是 Decimal）
-        try:
-            _factor_dec = factor.get("price")
-            _factor_dec = _factor_dec if isinstance(_factor_dec, Decimal) else _quantize_cents(_factor_dec)
-        except ValueError as e:
-            raise ValueError(f"factor price invalid: {factor.get('price')!r}") from e
-        use_price = _override_dec if _override_dec is not None else _factor_dec
         # idempotency: accept via explicit arg or kwargs alias
         if idempotency_key is None:
             idempotency_key = kwargs.get("idempotency_key") or kwargs.get("idem_key")  # alias
@@ -954,7 +998,8 @@ class BillingService:
                     buyer_tenant,
                     exc_info=False,
                 )
-            if use_price != hit.get("price"):
+            # 中文：幂等快路径（重复购买命中既有收据）时尚未查因子，取不到本次报价，跳过价差告警
+            if use_price is not None and use_price != hit.get("price"):
                 _log_warning(
                     "billing purchase price differs from existing receipt; returning existing receipt factor=%s buyer=%s",
                     factor_id,
@@ -971,11 +1016,30 @@ class BillingService:
         # _GLOBAL_LOCK 仅覆盖内存读写短临界区，ledger/DB IO 始终在锁外（锁不横跨 IO）。
         # 注意：按 (factor,buyer) 而非全 idempotency 三元组串行化 —— 换 key 并发重购也只一条生效。
         _guard_key = (factor_id, buyer_tenant)
+        use_price: Decimal | None = None
         with _purchase_guard(_guard_key):
             with _GLOBAL_LOCK:
                 _hit = _find_locked()
                 if _hit is not None:
                     return _hit_to_receipt(_hit)
+            # 中文：因子查库放在幂等预查之后 —— 真 PG 下 get_factor 会打 SELECT，
+            # 同 (factor,buyer) 已成交时不应再查一次因子表（重复购买不产生新查询/新记账）。
+            # fix #5: tenant-scoped lookup — avoid tenant=None global leak; marketplace cross-tenant purchase still allowed by falling back to global after scoped miss
+            factor = self.get_factor(factor_id, tenant=buyer_tenant)
+            if factor is None:
+                # marketplace: cross-tenant purchase allowed if factor exists globally (visible to any buyer)
+                factor = self.get_factor(factor_id, tenant=None)
+            if factor is None:
+                factor = self._factors.get(factor_id)
+            if factor is None:
+                raise ValueError(f"factor not found: {factor_id}")
+            # 中文：金额一律分位舍入；覆盖价经 _validate_price(Decimal) 后 quantize，默认取因子定价（已是 Decimal）
+            try:
+                _factor_dec = factor.get("price")
+                _factor_dec = _factor_dec if isinstance(_factor_dec, Decimal) else _quantize_cents(_factor_dec)
+            except ValueError as e:
+                raise ValueError(f"factor price invalid: {factor.get('price')!r}") from e
+            use_price = _override_dec if _override_dec is not None else _factor_dec
             if self._is_real_pg():
                 with _purchase_counter_lock:
                     global _purchase_counter
@@ -1334,15 +1398,89 @@ class BillingService:
             return False
         return False
 
-    def _pg_get_factor_sync(self, factor_id: str, tenant: str | None = None) -> dict | None:
-        """已废弃的 PG 查询桩：无真实 PG 读取能力，一律 fail-closed 返 None。中文：勿作成功判据。"""
-        _log_warning("PG persistence not implemented, using emulated store", exc_info=False)
-        return None
+    def _pg_list_factors_sync(self, tenant: str | None = None, limit: int = _FACTOR_LIST_LIMIT) -> list[dict] | None:
+        """真 PG 列出因子（tenant 过滤 + limit 有界）；无真池返 None，查询失败也返 None。"""
+        if not self._is_real_pg():
+            _log_warning("billing list_factors: no real PG pool, emulated store only", exc_info=False)
+            return None
+        return self._pg_query_factors(factor_id=None, tenant=tenant, limit=limit)
 
-    def _pg_list_factors_sync(self, tenant: str | None = None) -> list[dict] | None:
-        """已废弃的 PG 查询桩：无真实 PG 读取能力，一律 fail-closed 返 None。"""
-        _log_warning("PG persistence not implemented, using emulated store", exc_info=False)
-        return None
+    def _pg_query_factors(
+        self,
+        factor_id: str | None = None,
+        tenant: str | None = None,
+        limit: int = _FACTOR_LIST_LIMIT,
+    ) -> list[dict] | None:
+        """factors 表查询（唯一真 PG 读路径）；异常返回 None，绝不回退内存冒充 PG 结果。
+
+        RLS：非超级用户角色下 SET 之外的行会被策略过滤，故 tenant 非空时同一事务内
+        set_config('app.tenant', ..., true)（事务级，不污染连接），并叠加显式 WHERE tenant = %s
+        （超级用户 BYPASSRLS，仅靠 RLS 不隔离）。
+        排序：factors 表无 created_at 列，按 factor_id 排序保持稳定可复现。
+        """
+        pool = getattr(self, "_pool", None)
+        if pool is None:
+            return None
+        where: List[str] = []
+        params: List[object] = []
+        if factor_id is not None:
+            where.append("factor_id = %s")
+            params.append(str(factor_id))
+        if tenant is not None:
+            where.append("tenant = %s")
+            params.append(str(tenant))
+        # limit 有界：上限 _FACTOR_LIST_LIMIT，防止无界全表拉取
+        try:
+            _lim = max(1, min(int(limit), _FACTOR_LIST_LIMIT))
+        except (TypeError, ValueError):
+            _lim = _FACTOR_LIST_LIMIT
+        sql = _FACTOR_SELECT_SQL
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY factor_id LIMIT %s"
+        params.append(_lim)
+        try:
+            if hasattr(pool, "connection"):
+                with pool.connection() as _conn:  # type: ignore[attr-defined]
+                    self._exec_select_tenant(_conn, tenant)
+                    try:
+                        _cur = _conn.execute(sql, tuple(params))  # type: ignore
+                        rows = _cur.fetchall()  # type: ignore
+                    except Exception:
+                        with _conn.cursor() as _c:  # type: ignore
+                            _c.execute(sql, tuple(params))
+                            rows = _c.fetchall()
+            elif hasattr(pool, "getconn"):
+                _conn2 = pool.getconn()  # type: ignore
+                try:
+                    self._exec_select_tenant(_conn2, tenant)
+                    with _conn2.cursor() as _c2:
+                        _c2.execute(sql, tuple(params))
+                        rows = _c2.fetchall()
+                finally:
+                    try:
+                        pool.putconn(_conn2)  # type: ignore
+                    except Exception:
+                        pass  # intentional: 连接回收期清理，抛错会掩盖业务原始错误
+            else:
+                return None
+        except Exception as _e:
+            _log_warning("billing _pg_query_factors failed: %s", _e, exc_info=True)
+            return None
+        return [_row_to_factor(r) for r in rows]
+
+    def _exec_select_tenant(self, conn, tenant: str | None) -> None:
+        """读前在同一事务内设置 app.tenant（事务级 set_config，RLS 判据）。"""
+        if tenant is None:
+            return
+        try:
+            conn.execute(_SET_CONFIG_TENANT_SQL, (str(tenant),))  # type: ignore
+        except Exception:
+            try:
+                with conn.cursor() as _c:  # type: ignore
+                    _c.execute(_SET_CONFIG_TENANT_SQL, (str(tenant),))
+            except Exception as _e:
+                _log_warning("billing select set_config app.tenant failed: %s", _e, exc_info=True)
 
     def _pg_list_purchases_sync(self, tenant: str) -> list[dict] | None:
         """已废弃的 PG 查询桩：无真实 PG 读取能力，一律 fail-closed 返 None。"""

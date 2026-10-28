@@ -1,6 +1,4 @@
 """Task7 TDD: checkpoint PG default, restart not lost, expires_at 7d via Settings."""
-import os
-
 import pytest
 
 from conftest import pg_guard_reason, pg_test_dsn
@@ -53,11 +51,6 @@ def test_put_get_restart_not_lost():
     assert saver2.get(tid) is None
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="src bug: checkpoint.postgres.get() 在 PG 行因 expires_at 过期返回 None 后，"
-    "继续回退 emulated 缓存并返回过期值（_read SQL 过滤生效但 fallback 未遵守 TTL）",
-)
 def test_expires_at_7d_via_settings(monkeypatch):
     """expires_at 7d via Settings — TTL controls window; 真 PG 行过期后 get 必须返回 None."""
     from hero_quant.checkpoint.postgres import get_saver
@@ -77,17 +70,58 @@ def test_expires_at_7d_via_settings(monkeypatch):
     tenant, thread, seq = pg._thread_to_keys(tid, dsn)
     assert saver.pool is not None, "PG guard 已判定可用，但 saver 未建池"
     with saver.pool.connection() as conn:
+        # 真 PG 是双写（checkpoints + checkpoints_legacy 兼容镜像）：两处 expires_at 都要
+        # 推到过去，否则 legacy 行仍新鲜，get() 会经 legacy 读回已过期的 payload。
         conn.execute(
             "UPDATE checkpoints SET expires_at = now() - interval '1 day' "
             "WHERE tenant = %s AND thread = %s AND seq = %s",
             (tenant, thread, seq),
         )
+        conn.execute(
+            "UPDATE checkpoints_legacy SET expires_at = now() - interval '1 day' "
+            "WHERE thread_id = %s",
+            (tid,),
+        )
     assert saver.get(tid) is None, "expired after 7d should return None"
+    assert saver.get_with_config(tid) is None, "expired checkpoint 不应带 config 一起返回"
     # custom TTL via env
-    monkeypatch_env = {"HERO_CHECKPOINT_TTL_SECONDS": "3600"}
     # use explicit ttl param to verify
     saver2 = get_saver(dsn=dsn, ttl_seconds=3600)
     assert saver2.ttl_seconds == 3600
+
+
+def test_expired_pg_row_not_served_from_emulated_cache():
+    """R8-1：PG 行过期后不得回退 emulated 缓存返回旧 payload。
+
+    写入 → 双表 expires_at 推到过去 → get()/get_with_config() 必须返回 None，
+    即使进程内 emulated 缓存（_PG_GLOBAL_STORE）里仍有这条数据。
+    """
+    import hero_quant.checkpoint.postgres as pg
+    from hero_quant.checkpoint.postgres import _PG_GLOBAL_STORE, _pg_store_key, get_saver
+
+    dsn = pg_test_dsn("hero_quant_test_expired_no_fallback")
+    saver = get_saver(dsn=dsn, ttl_seconds=7 * 24 * 3600)
+    assert saver.pool is not None, "PG guard 已判定可用，但 saver 未建池"
+    tid = "wf:runExpired:tenantExp"
+    saver.put(tid, {"v": 1}, {"cfg": 1})
+    assert saver.get(tid)["v"] == 1
+    # 前提校验：emulated 缓存里确实有值，否则本用例证明不了"没有回退"
+    assert _pg_store_key(dsn, tid) in _PG_GLOBAL_STORE, "emulated 缓存应有该 payload"
+    tenant, thread, seq = pg._thread_to_keys(tid, dsn)
+    with saver.pool.connection() as conn:
+        conn.execute(
+            "UPDATE checkpoints SET expires_at = now() - interval '1 day' "
+            "WHERE tenant = %s AND thread = %s AND seq = %s",
+            (tenant, thread, seq),
+        )
+        conn.execute(
+            "UPDATE checkpoints_legacy SET expires_at = now() - interval '1 day' "
+            "WHERE thread_id = %s",
+            (tid,),
+        )
+    assert saver.get(tid) is None, "PG 已过期：不得回退 emulated 返回旧 payload"
+    assert saver.get_with_config(tid) is None, "PG 已过期：get_with_config 同样应 miss"
+    saver.delete(tid)
 
 
 def test_memory_fallback_when_pg_unreachable():
@@ -331,9 +365,25 @@ def test_aput_emulated_vs_real_paths():
     saver_real = AsyncPostgresSaver(
         dsn=pg_test_dsn("hero_quant_test_aput_real"), pool=fake
     )
+    # aput 必须真的走 PG 写路径（best-effort）
+    put_calls: list[str] = []
+    orig_put_async = saver_real._pg_put_async
+
+    async def spy_put_async(thread_id, checkpoint, config):
+        put_calls.append(thread_id)
+        return await orig_put_async(thread_id, checkpoint, config)
+
+    saver_real._pg_put_async = spy_put_async  # type: ignore[method-assign]
     asyncio.run(saver_real.aput("wf:runReal:tenantE", {"v": 22}))
+    assert put_calls == ["wf:runReal:tenantE"], "real pool 的 aput 未走 PG 写路径"
+
+    # R8-1：有真实池时 PG 是唯一真值 —— 假池查不到行即 miss，
+    # 不得回退 emulated 缓存吐出刚写入的 {"v": 22}。
+    from hero_quant.checkpoint.postgres import _PG_GLOBAL_STORE, _pg_store_key
+
+    assert _pg_store_key(saver_real.dsn, "wf:runReal:tenantE") in _PG_GLOBAL_STORE
     val2 = asyncio.run(saver_real.aget("wf:runReal:tenantE"))
-    assert val2 is not None and val2["v"] == 22
+    assert val2 is None, "PG 未命中不得回退 emulated 缓存"
     saver_real.delete("wf:runReal:tenantE")
 
 

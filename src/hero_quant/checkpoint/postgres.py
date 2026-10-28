@@ -1283,19 +1283,27 @@ class AsyncPostgresSaver:
         self._timestamps[thread_id] = now
 
     def get(self, thread_id: str) -> Optional[Dict[str, Any]]:
-        """读取 checkpoint，过期返回 None 并清理；优先 PG 的 expires_at 语义。"""
-        # 中文注释：有真实池时优先查 PG，再回退 emulated，避免脏缓存遮蔽新写入
+        """读取 checkpoint，过期返回 None 并清理；有真实池时 PG 是唯一真值。
+
+        R8-1：旧实现在 PG 因 expires_at 过滤返回 None 后，仍回退 emulated 缓存吐出已过期
+        的旧值。现在只要持有真实池，PG 的 None（行不存在 / 已过期 / 查询失败）一律按 miss
+        返回 None；emulated 缓存只允许在「无池」路径使用。
+        """
         _validate_thread_id(thread_id)
         if self._is_pg_mode():
-            if self._is_real_pg_pool() and not self._pool_is_async():
-                try:
-                    pg_val = self._pg_get_sync(thread_id)
-                    if pg_val is not None:
-                        return copy.deepcopy(pg_val)
-                except (OSError, RuntimeError, ValueError) as _exc:
-                    logger.warning("PG get 失败回退 emulated（%s）: %s", _redact_dsn(self.dsn), _exc)
-                except Exception as _exc:  # 兜底
-                    logger.warning("PG get 异常回退 emulated（%s）: %s", _redact_dsn(self.dsn), _exc, exc_info=True)
+            if self._is_real_pg_pool():
+                if self._pool_is_async():
+                    # 同步方法 + 异步池：无运行 loop 时委托 asyncio.run；有 loop 时阻塞会
+                    # 拖死事件循环，显式报错提示改用 aget()，绝不静默回退 emulated。
+                    try:
+                        asyncio.get_running_loop()
+                    except RuntimeError:
+                        return asyncio.run(self.aget(thread_id))
+                    raise RuntimeError(
+                        "get: async pool requires await aget() (would block the event loop)"
+                    )
+                pg_val = self._pg_get_sync(thread_id)
+                return copy.deepcopy(pg_val) if pg_val is not None else None
             key = _pg_store_key(self.dsn, thread_id)
             with _PG_GLOBAL_LOCK:
                 ts = _PG_GLOBAL_TS.get(key)
@@ -1328,15 +1336,17 @@ class AsyncPostgresSaver:
         """
         _validate_thread_id(thread_id)
         if self._is_pg_mode():
-            # 有真实池时优先查 PG
-            try:
-                pg_val = await self._pg_get_async(thread_id)
-                if pg_val is not None:
-                    return copy.deepcopy(pg_val)
-            except (OSError, RuntimeError, ValueError) as _exc:
-                logger.warning("PG aget 失败回退 emulated（%s）: %s", _redact_dsn(self.dsn), _exc)
-            except Exception as _exc:  # 兜底
-                logger.warning("PG aget 异常回退 emulated（%s）: %s", _redact_dsn(self.dsn), _exc, exc_info=True)
+            if self._is_real_pg_pool():
+                # R8-1：有真实池时 PG 是唯一真值，None 即 miss，不回退 emulated
+                try:
+                    pg_val = await self._pg_get_async(thread_id)
+                except (OSError, RuntimeError, ValueError) as _exc:
+                    logger.warning("PG aget 失败（%s）: %s", _redact_dsn(self.dsn), _exc)
+                    return None
+                except Exception as _exc:  # 兜底
+                    logger.warning("PG aget 异常（%s）: %s", _redact_dsn(self.dsn), _exc, exc_info=True)
+                    return None
+                return copy.deepcopy(pg_val) if pg_val is not None else None
             key = _pg_store_key(self.dsn, thread_id)
             with _PG_GLOBAL_LOCK:
                 ts = _PG_GLOBAL_TS.get(key)
@@ -1361,25 +1371,9 @@ class AsyncPostgresSaver:
         # 中文注释：TTL 过期需驱逐并视作 miss，不再 pass 透出脏数据
         _validate_thread_id(thread_id)
         if self._is_pg_mode():
-            key = _pg_store_key(self.dsn, thread_id)
-            expired = False
-            with _PG_GLOBAL_LOCK:
-                ts = _PG_GLOBAL_TS.get(key)
-                if ts is not None and self.ttl_seconds > 0 and time.time() - ts > self.ttl_seconds:
-                    _PG_GLOBAL_STORE.pop(key, None)
-                    _PG_GLOBAL_META.pop(key, None)
-                    _PG_GLOBAL_TS.pop(key, None)
-                    _PG_GLOBAL_VER.pop(key, None)
-                    expired = True
-                else:
-                    chk = _PG_GLOBAL_STORE.get(key)
-                    if chk is not None:
-                        cfg = copy.deepcopy(_PG_GLOBAL_META.get(key, {}))
-                        return copy.deepcopy(chk), cfg
-            if expired:
-                # 已过期，按 miss 处理，但仍尝试 PG 侧（若未过期可能有更新）
-                pass
             if self._is_real_pg_pool():
+                # R8-1：有真实池时 PG 是唯一真值 —— PG 无未过期行即 miss，绝不再回退
+                # emulated 缓存吐出已过期的旧值（旧实现 emulated 优先，遮蔽了 expires_at）。
                 if self._pool_is_async():
                     # 中文：异步池不可在同步方法内静默跳过 PG；有 loop 用异步变体，无 loop 委托执行
                     try:
@@ -1389,71 +1383,96 @@ class AsyncPostgresSaver:
                     if _loop is not None:
                         raise RuntimeError("get_with_config: async pool requires await aget_with_config() (would block the event loop)")
                     return asyncio.run(self.aget_with_config(thread_id))
-                else:
-                    try:
-                        tenant, thread, seq = _thread_to_keys(thread_id, dsn=self.dsn)
-                        row = None
-                        cfg: Dict[str, Any] = {}
-                        if hasattr(self.pool, "connection"):
-                            with self.pool.connection() as conn:  # type: ignore
-                                try:
-                                    # T2-3: 单事务 REPEATABLE READ（与 _pg_get_sync 同构）
-                                    try:
-                                        conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")  # type: ignore
-                                    except Exception:
-                                        pass
-                                    cur = conn.execute(_READ_ORDER_SQL_NEW, (tenant, thread, seq))  # type: ignore
-                                    row = cur.fetchone()  # type: ignore
-                                    if row is None:
-                                        # 中文：新表无 config 列时回退 legacy（config 真实持久处）
-                                        cur = conn.execute(_READ_ORDER_SQL_LEGACY, (thread_id,))  # type: ignore
-                                        row = cur.fetchone()  # type: ignore
-                                except (OSError, RuntimeError, ValueError) as _exc:
-                                    logger.warning("get_with_config 回退到 cursor（%s）: %s", _redact_dsn(self.dsn), _exc)
-                                    with conn.cursor() as cur:  # type: ignore
-                                        cur.execute(_READ_ORDER_SQL_NEW, (tenant, thread, seq))
-                                        row = cur.fetchone()
-                                        if row is None:
-                                            cur.execute(_READ_ORDER_SQL_LEGACY, (thread_id,))
-                                            row = cur.fetchone()
-                                except Exception as _exc:  # 兜底
-                                    logger.warning("get_with_config 异常回退（%s）: %s", _redact_dsn(self.dsn), _exc, exc_info=True)
-                                    with conn.cursor() as cur:  # type: ignore
-                                        cur.execute(_READ_ORDER_SQL_NEW, (tenant, thread, seq))
-                                        row = cur.fetchone()
-                                        if row is None:
-                                            cur.execute(_READ_ORDER_SQL_LEGACY, (thread_id,))
-                                            row = cur.fetchone()
-                        if row is not None:
-                            if isinstance(row, (list, tuple)) and len(row) > 1 and row[1] is not None:
-                                try:
-                                    cfg = row[1] if isinstance(row[1], dict) else json.loads(row[1])
-                                except (json.JSONDecodeError, ValueError, TypeError) as _exc:
-                                    logger.warning("get_with_config legacy config 解析失败（%s）: %s", _redact_dsn(self.dsn), _exc)
-                                    cfg = {}
-                            elif isinstance(row, dict) and row.get("config") is not None:
-                                try:
-                                    _c = row.get("config")
-                                    cfg = _c if isinstance(_c, dict) else json.loads(_c)
-                                except (json.JSONDecodeError, ValueError, TypeError, AttributeError) as _exc:
-                                    logger.warning("get_with_config legacy config 解析失败（%s）: %s", _redact_dsn(self.dsn), _exc)
-                                    cfg = {}
-                            chk = row[0] if isinstance(row, (list, tuple)) else row.get("checkpoint")  # type: ignore
-                            if isinstance(chk, str):
-                                try:
-                                    chk = json.loads(chk)
-                                except (json.JSONDecodeError, ValueError, TypeError) as _exc:
-                                    logger.warning("get_with_config json 解析失败（%s）: %s", _redact_dsn(self.dsn), _exc)
-                            if chk is not None:
-                                return copy.deepcopy(chk if isinstance(chk, dict) else {}), copy.deepcopy(cfg)
-                    except (OSError, RuntimeError, ValueError) as _exc:
-                        logger.warning("get_with_config PG 查询失败（%s）: %s", _redact_dsn(self.dsn), _exc)
-                    except Exception as _exc:  # 兜底
-                        logger.warning("get_with_config 异常（%s）: %s", _redact_dsn(self.dsn), _exc, exc_info=True)
+                return self._pg_get_config_sync(thread_id)
+            # 无池：emulated 路径，TTL 到期驱逐并按 miss 处理
+            key = _pg_store_key(self.dsn, thread_id)
+            with _PG_GLOBAL_LOCK:
+                ts = _PG_GLOBAL_TS.get(key)
+                if ts is not None and self.ttl_seconds > 0 and time.time() - ts > self.ttl_seconds:
+                    _PG_GLOBAL_STORE.pop(key, None)
+                    _PG_GLOBAL_META.pop(key, None)
+                    _PG_GLOBAL_TS.pop(key, None)
+                    _PG_GLOBAL_VER.pop(key, None)
+                    return None
+                chk = _PG_GLOBAL_STORE.get(key)
+                if chk is not None:
+                    cfg = copy.deepcopy(_PG_GLOBAL_META.get(key, {}))
+                    return copy.deepcopy(chk), cfg
         chk = self.get(thread_id)
         if chk is None:
             return None
         return chk, copy.deepcopy(self._meta.get(thread_id, {}))
+
+    def _pg_get_config_sync(self, thread_id: str) -> Optional[tuple[Dict[str, Any], Dict[str, Any]]]:
+        """同步池 get_with_config 的 PG 行查询；无未过期行返回 None（真 miss）。
+
+        新表 checkpoints 无 config 列时回退 checkpoints_legacy（config 真实持久处），
+        不可静默返回 {} 丢失跨重启 config。
+        T2-3: 单事务 REPEATABLE READ，与 _pg_get_sync 同构。
+        """
+        try:
+            tenant, thread, seq = _thread_to_keys(thread_id, dsn=self.dsn)
+            row = None
+            cfg: Dict[str, Any] = {}
+            if hasattr(self.pool, "connection"):
+                with self.pool.connection() as conn:  # type: ignore
+                    try:
+                        # T2-3: 单事务 REPEATABLE READ（与 _pg_get_sync 同构）
+                        try:
+                            conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")  # type: ignore
+                        except Exception:
+                            pass
+                        cur = conn.execute(_READ_ORDER_SQL_NEW, (tenant, thread, seq))  # type: ignore
+                        row = cur.fetchone()  # type: ignore
+                        if row is None:
+                            # 中文：新表无 config 列时回退 legacy（config 真实持久处）
+                            cur = conn.execute(_READ_ORDER_SQL_LEGACY, (thread_id,))  # type: ignore
+                            row = cur.fetchone()  # type: ignore
+                    except (OSError, RuntimeError, ValueError) as _exc:
+                        logger.warning("get_with_config 回退到 cursor（%s）: %s", _redact_dsn(self.dsn), _exc)
+                        with conn.cursor() as cur:  # type: ignore
+                            cur.execute(_READ_ORDER_SQL_NEW, (tenant, thread, seq))
+                            row = cur.fetchone()
+                            if row is None:
+                                cur.execute(_READ_ORDER_SQL_LEGACY, (thread_id,))
+                                row = cur.fetchone()
+                    except Exception as _exc:  # 兜底
+                        logger.warning("get_with_config 异常回退（%s）: %s", _redact_dsn(self.dsn), _exc, exc_info=True)
+                        with conn.cursor() as cur:  # type: ignore
+                            cur.execute(_READ_ORDER_SQL_NEW, (tenant, thread, seq))
+                            row = cur.fetchone()
+                            if row is None:
+                                cur.execute(_READ_ORDER_SQL_LEGACY, (thread_id,))
+                                row = cur.fetchone()
+            if row is None:
+                return None
+            if isinstance(row, (list, tuple)) and len(row) > 1 and row[1] is not None:
+                try:
+                    cfg = row[1] if isinstance(row[1], dict) else json.loads(row[1])
+                except (json.JSONDecodeError, ValueError, TypeError) as _exc:
+                    logger.warning("get_with_config legacy config 解析失败（%s）: %s", _redact_dsn(self.dsn), _exc)
+                    cfg = {}
+            elif isinstance(row, dict) and row.get("config") is not None:
+                try:
+                    _c = row.get("config")
+                    cfg = _c if isinstance(_c, dict) else json.loads(_c)
+                except (json.JSONDecodeError, ValueError, TypeError, AttributeError) as _exc:
+                    logger.warning("get_with_config legacy config 解析失败（%s）: %s", _redact_dsn(self.dsn), _exc)
+                    cfg = {}
+            chk = row[0] if isinstance(row, (list, tuple)) else row.get("checkpoint")  # type: ignore
+            if isinstance(chk, str):
+                try:
+                    chk = json.loads(chk)
+                except (json.JSONDecodeError, ValueError, TypeError) as _exc:
+                    logger.warning("get_with_config json 解析失败（%s）: %s", _redact_dsn(self.dsn), _exc)
+            if chk is None:
+                return None
+            return copy.deepcopy(chk if isinstance(chk, dict) else {}), copy.deepcopy(cfg)
+        except (OSError, RuntimeError, ValueError) as _exc:
+            logger.warning("get_with_config PG 查询失败（%s）: %s", _redact_dsn(self.dsn), _exc)
+        except Exception as _exc:  # 兜底
+            logger.warning("get_with_config 异常（%s）: %s", _redact_dsn(self.dsn), _exc, exc_info=True)
+        return None
 
     async def _pg_get_config_row_async(self, tenant: str, thread: str, seq: int, thread_id: str) -> Optional[tuple[Dict[str, Any], Dict[str, Any]]]:
         """异步池 get_with_config 的 PG 行查询（await connection + execute）。
@@ -1499,22 +1518,12 @@ class AsyncPostgresSaver:
         return copy.deepcopy(chk if isinstance(chk, dict) else {}), copy.deepcopy(cfg)
 
     async def aget_with_config(self, thread_id: str) -> Optional[tuple[Dict[str, Any], Dict[str, Any]]]:
-        """异步版 get_with_config：emulated 优先，异步池经 await 查询 PG。"""
+        """异步版 get_with_config：有真实池时 PG 是唯一真值，无池时走 emulated。
+
+        R8-1：旧实现 emulated 优先，PG 行过期被过滤后仍返回 emulated 里的旧值。
+        """
         _validate_thread_id(thread_id)
         if self._is_pg_mode():
-            key = _pg_store_key(self.dsn, thread_id)
-            with _PG_GLOBAL_LOCK:
-                ts = _PG_GLOBAL_TS.get(key)
-                if ts is not None and self.ttl_seconds > 0 and time.time() - ts > self.ttl_seconds:
-                    _PG_GLOBAL_STORE.pop(key, None)
-                    _PG_GLOBAL_META.pop(key, None)
-                    _PG_GLOBAL_TS.pop(key, None)
-                    _PG_GLOBAL_VER.pop(key, None)
-                else:
-                    chk = _PG_GLOBAL_STORE.get(key)
-                    if chk is not None:
-                        cfg = copy.deepcopy(_PG_GLOBAL_META.get(key, {}))
-                        return copy.deepcopy(chk), cfg
             if self._is_real_pg_pool():
                 if self._pool_is_async():
                     try:
@@ -1526,11 +1535,23 @@ class AsyncPostgresSaver:
                     except Exception as _exc:  # 兜底
                         logger.warning("aget_with_config 异步异常（%s）: %s", _redact_dsn(self.dsn), _exc, exc_info=True)
                         row = None
-                    if row is not None:
-                        return row
-                else:
-                    # 中文：同步池回退经 to_thread 卸载，不阻塞事件循环
-                    return await asyncio.to_thread(self.get_with_config, thread_id)
+                    return row  # PG 未命中（不存在/已过期）即真 miss，不回退 emulated
+                # 中文：同步池回退经 to_thread 卸载，不阻塞事件循环
+                return await asyncio.to_thread(self.get_with_config, thread_id)
+            # 无池：emulated 路径，TTL 到期驱逐并按 miss 处理
+            key = _pg_store_key(self.dsn, thread_id)
+            with _PG_GLOBAL_LOCK:
+                ts = _PG_GLOBAL_TS.get(key)
+                if ts is not None and self.ttl_seconds > 0 and time.time() - ts > self.ttl_seconds:
+                    _PG_GLOBAL_STORE.pop(key, None)
+                    _PG_GLOBAL_META.pop(key, None)
+                    _PG_GLOBAL_TS.pop(key, None)
+                    _PG_GLOBAL_VER.pop(key, None)
+                    return None
+                chk = _PG_GLOBAL_STORE.get(key)
+                if chk is not None:
+                    cfg = copy.deepcopy(_PG_GLOBAL_META.get(key, {}))
+                    return copy.deepcopy(chk), cfg
         chk = await asyncio.to_thread(self.get, thread_id)
         if chk is None:
             return None
