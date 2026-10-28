@@ -180,7 +180,10 @@ def _checkpoint_dsn_from_env() -> str:
     # 未配置：按 HERO_PG_HOST 回退无口令 PG 默认（本地 localhost / compose 内 postgres；
     # Task7 pinning 单测锁定 PG 形态且默认不得含 userinfo，见 test_retest271_lane_e2；
     # 运行时无池走 emulated/memory）。注意：此默认不含任何口令；fail-closed None 需先更新 pinning 单测（open item）。
-    return f"postgresql://{_pg_host_from_env()}:5432/hero_quant"
+    # 库名统一为 heroquant：与 docker-compose.yml 的 HERO_CHECKPOINT_DSN、
+    # POSTGRES_DB 及 scripts/init/001_schema.sql 的建库目标一致（曾用 hero_quant
+    # 会连到另一个库，导致建表脚本与运行时各说各话）。
+    return f"postgresql://{_pg_host_from_env()}:5432/heroquant"
 
 
 def _checkpoint_ttl_from_env() -> int:
