@@ -3,9 +3,10 @@
 另含 PostgreSQL 可用性守卫 helper（`pg_available()` / `pg_guard_reason()`），供
 `tests/test_0904_c1.py`、`tests/test_checkpoint_pg.py`、`tests/test_j8_loop_ckpt_gov.py`、
 `tests/test_retrieval_eval.py`、`tests/test_vector_maturity4.py` 这 5 个 PG 集成族文件在
-模块级 `pytestmark` 中复用（见各文件顶部）。背景：本机 `localhost:5432` 是 TCP SYN 黑洞
-（SYN 无响应、不返回 RST），直接让 psycopg 建连会无限挂起，全量 `pytest -q` 因此永远跑不完；
-故探测必须短超时 + 结果缓存，无真实 PG 时 fail-soft 成 skip 而非挂死。
+模块级 `pytestmark` 中复用（见各文件顶部）。探测口径：按 HERO_CHECKPOINT_DSN / HERO_PG_DSN /
+HERO_PG_HOST 解析 host:port（测试默认 localhost，不硬编码远端 IP），短超时探测；连不上或没有
+heroquant/hero_quant 库即 skip。真实 PG 用例统一经 `pg_test_dsn()` 取 DSN（同源 host/port + 
+connect_timeout=2），避免守卫放行、用例却硬连另一个 host 导致挂死整轮。
 """
 
 from __future__ import annotations
@@ -106,7 +107,8 @@ def pg_test_dsn(tag: str) -> str:
     """
     base = resolve_pg_dsn().strip()
     sep = "&" if "?" in base else "?"
-    return f"{base}{sep}application_name={tag}"
+    # connect_timeout=2：连接目标与 guard 同源，且任何真实 PG 连接都不允许走 OS 默认超时（防黑洞挂死）。
+    return f"{base}{sep}application_name={tag}&connect_timeout=2"
 
 
 def _parse_host_port(dsn: str) -> tuple[str, int] | None:
@@ -150,7 +152,7 @@ def pg_guard_reason() -> str | None:
 
     探测三段（全部短超时，总耗时上限约 2.3s），且 `lru_cache` 保证 5 个 PG 文件只探一次：
     1. DSN 解析（空/非法 → 直接判定不可用，不抛异常）；
-    2. `socket.create_connection`（0.3s）—— 本机 localhost:5432 SYN 黑洞的快速失败点；
+    2. `socket.create_connection`（0.3s）—— 对 env 解析出的 host:port 做快速 TCP 探测；
     3. `psycopg.connect(connect_timeout=2)` —— TCP 在听时再校验驱动是否可用、库/口令是否可连。
     仅靠 `pytest.importorskip("psycopg")` 不够：驱动装了但服务端不可达时，硬连仍会挂死。
     """
@@ -162,7 +164,7 @@ def pg_guard_reason() -> str | None:
     if not _pg_tcp_open(host, port):
         return (
             f"PG guard: PostgreSQL 不可达（{host}:{port} TCP 探测 {_TCP_PROBE_TIMEOUT}s 超时/拒绝）；"
-            "无真实库时直连会挂死 pytest（本机 localhost:5432 即为 SYN 黑洞），故 skip PG 集成族用例"
+            "按 env 探测不到真实 PG（可能未导出 HERO_CHECKPOINT_DSN/HERO_PG_DSN），故 skip PG 集成族用例"
         )
     try:
         import psycopg  # noqa: PLC0415 —— 探测期按需导入，缺驱动时降级为 skip
