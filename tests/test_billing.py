@@ -73,12 +73,13 @@ def test_ledger_rls_query_isolation(tmp_path):
     assert _rec(r2[0]).get("id") == 2
 
 
-def test_billing_factor_marketplace_list_price():
-    """Billing factor marketplace: publish/list price — 因子即资产."""
+def test_billing_factor_marketplace_list_price(billing_memory):
+    """Billing factor marketplace: publish/list price — 因子即资产（显式内存降级契约）."""
     from hero_quant.billing.service import BillingService
 
     svc = BillingService()
-    svc.publish_factor(factor_id="alpha_mom", name="Momentum Alpha", price=99.0, tenant="provider_a")
+    out = svc.publish_factor(factor_id="alpha_mom", name="Momentum Alpha", price=99.0, tenant="provider_a")
+    assert out["degraded"] is True and out["reason"] == "billing:memory"
     svc.publish_factor(factor_id="beta_rev", name="Reversal Beta", price=199.0, tenant="provider_b")
 
     factors = svc.list_factors()
@@ -91,21 +92,24 @@ def test_billing_factor_marketplace_list_price():
     assert mom["tenant"] == "provider_a"
 
 
-def test_billing_purchase_to_ledger_attribution_loop(tmp_path):
+def test_billing_purchase_to_ledger_attribution_loop(tmp_path, billing_memory):
     """Billing 计费→归因闭环: purchase appends ledger with tenant/price and attribution aggregates."""
     from hero_quant.governance.ledger import Ledger
     from hero_quant.billing.service import BillingService
 
     ledger = Ledger(tmp_path / "ledger.jsonl")
     svc = BillingService(ledger=ledger)
-    svc.publish_factor(factor_id="f1", name="F1", price=50.0, tenant="provider")
+    factor_id = "loop_f_20261028"
+    svc.publish_factor(factor_id=factor_id, name="F1", price=50.0, tenant="provider")
     # buyer purchases — should append ledger entry with buyer tenant and price
-    receipt = svc.purchase(factor_id="f1", buyer_tenant="buyer_x")
+    receipt = svc.purchase(factor_id=factor_id, buyer_tenant="buyer_x")
     assert receipt.get("tenant") == "buyer_x" or receipt.get("buyer_tenant") == "buyer_x", f"receipt tenant mismatch {receipt}"
+    # 新契约：显式内存降级必须在返回体标注，不能伪装成真 PG 成功
+    assert receipt.get("degraded") is True and receipt.get("reason") == "billing:memory"
     # ledger isolated verification
     assert ledger.verify(tenant="buyer_x") is True
     # attribution closed loop: factor revenue aggregated
-    attr = svc.attribution(factor_id="f1")
+    attr = svc.attribution(factor_id=factor_id)
     assert attr["purchases"] >= 1
     assert attr["revenue"] >= 50.0
     # RLS must be asserted unconditionally (no hasattr gate)
@@ -119,7 +123,7 @@ def test_billing_purchase_to_ledger_attribution_loop(tmp_path):
 
 # --- Task10 P1 HIGH items TDD ---
 
-def test_billing_silent_exception_not_swallowed():
+def test_billing_silent_exception_not_swallowed(billing_memory):
     """publish/purchase ledger failures must be logged and not silently swallowed (fail-closed)."""
     import inspect
     from hero_quant.billing.service import BillingService
@@ -166,23 +170,27 @@ def test_billing_global_lock_exists():
 
 
 def test_billing_pg_noop_explicit_warning():
-    """PG persistence no-op must log warning 'PG persistence not implemented, using emulated store' once."""
+    """废弃 no-op 桩必须 fail-closed（返 False），不得再以「已知 no-op + 告警」伪装成持久化成功。
+
+    中文：旧断言锁定 "PG persistence not implemented" 文案，但那段文案对应的假成功路径
+    已由 S4 移除；改为行为契约：两个兼容别名都返回 False，调用方据此 fail-closed。
+    """
     import inspect
+
     from hero_quant.billing.service import BillingService
     import hero_quant.billing.service as mod
-    src = inspect.getsource(mod.BillingService.__init__)
-    mod_src = inspect.getsource(mod)
-    assert "PG persistence not implemented" in mod_src, "warning string missing"
-    # DDL should be gated or removed, not dead no-op
-    # check _pg_publish_sync is not bare pass without warning
-    pg_src = inspect.getsource(mod.BillingService._pg_publish_sync)
-    assert "PG persistence not implemented" in pg_src or "emulated" in pg_src.lower() or "warning" in pg_src.lower()
+
+    svc = object.__new__(BillingService)
+    assert svc._pg_publish_noop({"factor_id": "x", "tenant": "t"}) is False
+    assert svc._pg_purchase_noop({"factor_id": "x"}) is False
+    # 入口门禁存在：无 DSN 且未开 ALLOW_MEMORY 时 publish 直接抛 BillingUnavailable
+    assert "BillingUnavailable" in inspect.getsource(mod.BillingService._ensure_available)
 
 
-def test_billing_attribution_dedup_single_source():
+def test_billing_attribution_dedup_single_source(billing_memory):
     """Attribution must use single source of truth and dedup by purchase_id; double-attribution not possible."""
     import inspect
-    import hashlib
+
     from hero_quant.billing.service import BillingService, _GLOBAL_PURCHASES, _GLOBAL_FACTORS, _dsn_key
     dsn = "postgresql://postgres:postgres@localhost:5432/hero_quant_billing_dedup_test"
     _dk = _dsn_key(dsn)
@@ -191,8 +199,10 @@ def test_billing_attribution_dedup_single_source():
     _GLOBAL_FACTORS.pop(_dk, None)
     _GLOBAL_PURCHASES.pop(_dk, None)
     svc = BillingService(dsn=dsn)
-    svc.publish_factor(factor_id="dedup_f", name="Dedup", price=10.0, tenant="prov")
+    pub = svc.publish_factor(factor_id="dedup_f", name="Dedup", price=10.0, tenant="prov")
+    assert pub.get("degraded") is True and pub.get("reason") == "billing:memory"
     receipt = svc.purchase(factor_id="dedup_f", buyer_tenant="buyer_x", price=10.0)
+    assert receipt.get("degraded") is True and receipt.get("reason") == "billing:memory"
     # attribution baseline
     attr1 = svc.attribution("dedup_f")
     assert attr1["purchases"] == 1
@@ -218,7 +228,7 @@ def test_billing_attribution_dedup_single_source():
     # else source-level check suffices
 
 
-def test_billing_rls_all_read_paths_filter_tenant():
+def test_billing_rls_all_read_paths_filter_tenant(billing_memory):
     """ALL factor read paths must filter by tenant: tenant B cannot read tenant A's factor."""
     from hero_quant.billing.service import BillingService, _GLOBAL_FACTORS, _GLOBAL_PURCHASES, _dsn_key
     dsn = "postgresql://postgres:postgres@localhost:5432/hero_quant_billing_rls_all"
@@ -228,7 +238,8 @@ def test_billing_rls_all_read_paths_filter_tenant():
     _GLOBAL_FACTORS.pop(_dk, None)
     _GLOBAL_PURCHASES.pop(_dk, None)
     svc = BillingService(dsn=dsn)
-    svc.publish_factor(factor_id="rls_f", name="RLS", price=99.0, tenant="tenantA")
+    pub = svc.publish_factor(factor_id="rls_f", name="RLS", price=99.0, tenant="tenantA")
+    assert pub.get("degraded") is True and pub.get("reason") == "billing:memory"
     # list_factors isolates
     assert len(svc.list_factors(tenant="tenantA")) == 1
     assert len(svc.list_factors(tenant="tenantB")) == 0
@@ -253,7 +264,7 @@ def test_billing_rls_all_read_paths_filter_tenant():
         assert "tenant" in src.lower()
 
 
-def test_publish_factor_conflict_without_flag_raises():
+def test_publish_factor_conflict_without_flag_raises(billing_memory):
     """publish_factor overwrites existing factor_id without validation → must raise unless allow_overwrite/upsert."""
     from hero_quant.billing.service import BillingService, _GLOBAL_FACTORS, _GLOBAL_PURCHASES, _dsn_key
     import inspect

@@ -104,13 +104,13 @@ def _blank_pg_env(monkeypatch):
         monkeypatch.setenv(k, "")
 
 
-def test_pr2f_billing_concurrent_double_purchase_single_record(monkeypatch):
-    """内存分支：16 并发同 (factor,buyer) 双记账仅一条。"""
-    _blank_pg_env(monkeypatch)
+def test_pr2f_billing_concurrent_double_purchase_single_record(billing_memory):
+    """内存分支：16 并发同 (factor,buyer) 双记账仅一条（显式 ALLOW_MEMORY opt-in）。"""
     from hero_quant.billing.service import BillingService
 
     svc = BillingService()
-    svc.publish_factor("pf", "PF", 10.0, tenant="prov")
+    pub = svc.publish_factor("pf", "PF", 10.0, tenant="prov")
+    assert pub["degraded"] is True and pub["reason"] == "billing:memory"
     receipts: list[dict] = []
     errors: list[Exception] = []
 
@@ -132,15 +132,16 @@ def test_pr2f_billing_concurrent_double_purchase_single_record(monkeypatch):
     assert len({r["purchase_id"] for r in receipts}) == 1
 
 
-def test_pr2f_billing_explicit_idempotency_key_replays_same_receipt(monkeypatch):
-    _blank_pg_env(monkeypatch)
+def test_pr2f_billing_explicit_idempotency_key_replays_same_receipt(billing_memory):
     from hero_quant.billing.service import BillingService
 
     svc = BillingService()
-    svc.publish_factor("pf2", "PF2", 5.0, tenant="prov")
+    pub = svc.publish_factor("pf2", "PF2", 5.0, tenant="prov")
+    assert pub["degraded"] is True and pub["reason"] == "billing:memory"
     r1 = svc.purchase("pf2", buyer_tenant="b1", idempotency_key="key-123")
     r2 = svc.purchase("pf2", buyer_tenant="b1", idempotency_key="key-123")
     assert r1["purchase_id"] == r2["purchase_id"]
+    assert r1["degraded"] is True and r1["reason"] == "billing:memory"
     assert len(svc.list_purchases("b1")) == 1
 
 

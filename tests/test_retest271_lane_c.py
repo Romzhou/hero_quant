@@ -84,10 +84,8 @@ def test_c_pg_publish_fail_compensates_ledger(tmp_path, monkeypatch):
     assert svc.get_factor("f_comp") is None
 
 
-def test_c_idempotency_race_single_ledger_append(monkeypatch):
+def test_c_idempotency_race_single_ledger_append(billing_memory):
     """Concurrent purchase must ledger-append exactly once for one (factor,buyer)."""
-    for k in ("HERO_BILLING_DSN", "HERO_PG_DSN", "HERO_CHECKPOINT_DSN"):
-        monkeypatch.setenv(k, "")
     from hero_quant.billing.service import BillingService
 
     appended: list[dict] = []
