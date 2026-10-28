@@ -28,7 +28,8 @@
 - 新增工具/数据源必须注册表登记 + provenance 全链路透传，不得私开直调。
 
 ## 6. Fail-Closed（降级必须显式，不许假成功）
-- `_FakeLLM(server.py:1091-1401)` 与 `emulated(server.py:229-235)` 必须在响应中置 `degraded:true + reason`，前端必须横幅提示。
+- `_FakeLLM`（`server.py:1690-1707` 同步 `/v1/query`、`server.py:2088-2105` 流式 `/v1/query/stream`）与 checkpoint emulated 判定（`_is_emulated_saver(server.py:124)`；降级落点 `server.py:1825-1832`、`server.py:2010-2023`）必须在响应中置 `degraded:true + reason`，前端必须横幅提示。
+- 行号随 `server.py` 改动漂移，引用前一律 `grep -n` 复核，禁止照抄本文或审计文档里的旧行号。
 - `checkpoint/postgres.py:246-248` 缺配 `raise` 与 `billing RLS` 拒绝必须透到 `/ready`，禁止 `except pass` 吞错；宽异常必须收窄 + `structlog` + 指标计数。
 
 ## 7. 风格（日志脱敏 + 行号依据）

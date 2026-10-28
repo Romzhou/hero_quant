@@ -9,7 +9,8 @@
   <img src="https://img.shields.io/badge/FastAPI-0.104+-009688" alt="FastAPI" />
   <img src="https://img.shields.io/badge/React-19-61DAFB?logo=react" alt="React 19" />
   <img src="https://img.shields.io/badge/License-MIT-yellow" alt="MIT" />
-  <img src="https://img.shields.io/badge/Tests-277_passed-brightgreen" alt="tests" />
+  <!-- TODO(S5): 通过数待 S5 收口后的实跑回填；在此之前写任何数字都会再次失真 -->
+  <img src="https://img.shields.io/badge/Tests-see_below_baseline-lightgrey" alt="tests（见下方实测口径）" />
   <img src="https://img.shields.io/badge/Security-Headers_nosniff_frame--deny-blue" alt="Security Headers" />
   <img src="https://img.shields.io/badge/PII-Fernet_masked-informational" alt="PII" />
   <img src="https://img.shields.io/badge/Audit-tool_call_structured-success" alt="Audit" />
@@ -20,7 +21,7 @@
 ## 特性
 
 - **投研闭环**：一句话完成 `600519.SH 近一月等权回测` → 自动拉行情 → PIT 校验 → 跑回测 → 出 `positions.csv/fills.csv/metrics.json/tearsheet.html` + 证据账本
-- **数据保真**：`tencent`(A股 `board_lots`) / `yahoo`(美股 `shares`) 双源 + `16 源注册表`，`provenance{source,unit}` 全链路记录，跨源收盘价 1% 阈值告警
+- **数据保真**：`tencent`(A股 `board_lots`) / `yahoo`(美股 `shares`) 双源 + `16 源注册表`，`provenance{source,unit}` 全链路记录；跨源收盘价 1% 阈值校验已实现，但默认双源市场/单位互斥，**生产路径不触发**（数据层无熔断器，注册表是顺序回退、无打分）
 - **回测正确性**：PIT `weights_on ≤ price_date` 正逻辑、非正价格/混币种拒绝、按换手计费、多标权重、月度热力 tearsheet
 - **Agent 可靠性**：10 控制点状态机（`max_iterations/token_limit/TRUNCATED/user_stop/Retry•BudgetBreaker/Tool审计/Grounding/Context折叠/Trace 50k侧车`），`LangGraph StateGraph(plan→execute→verify)` 研究团队可选（`use_graph=True`）
 - **工具**：`@tool(parameters/output/is_concurrency_safe)` 语义化合约，`get_market_data / run_backtest / technical_indicators / quantlib_call` 等 15 核心工具，读 True 写 False 并发审计
@@ -58,13 +59,14 @@ export HERO_LLM_PROVIDER=openai
 export HERO_API_KEY=sk-...
 export HERO_DATA_MODE=live   # synthetic | live  (live 才调 qt.gtimg.cn/yahoo)
 export HERO_LLM_MODEL=gpt-4o-mini
+export HERO_ENV=development  # 本地验收必须：无真 Redis 时限流器只在 development 允许 fakeredis 回退，否则 fail-closed 直接 429
 
 # 3. 跑测试
 pytest -q
 
 # 4. 启动（唯一入口，旧式模块写法已废弃，见 Dockerfile CMD）
 uvicorn hero_quant.api.server:app --host 0.0.0.0 --port 8899
-open http://127.0.0.1:8899          # 前端（若 frontend/dist 已 build）
+open http://127.0.0.1:8899          # 前端：托管的是 frontend/dist 构建产物；dist 陈旧或缺失时需 cd frontend && npm run build（无 dist 时返回 200 占位页，不是真前端）
 open http://127.0.0.1:8899/docs     # Swagger
 curl http://127.0.0.1:8899/live    # liveness
 curl http://127.0.0.1:8899/metrics # prometheus
@@ -80,15 +82,37 @@ cd frontend && npm ci && npm run dev -- --host --port 5173
 ## Docker 单机部署
 
 ```bash
+# 0. 必做：.env 从示例复制并填 PG 口令（不填 → DSN 渲染成空口令 → /ready 如实 503）
+cp .env.example .env
+# 编辑 .env：HERO_PG_USER=<llm-pg 容器内 $POSTGRES_USER，不是 postgres>
+#            HERO_PG_PASSWORD=<真实口令，只写 .env，永不进仓库>
+
+# 1. 首次部署 / llm-pg|llm-redis 容器被重建后：接入外部网络（幂等，可重复执行）
+bash scripts/init/setup-shared-network.sh
+
+# 2. 起服务
 docker compose up --build
 # http://127.0.0.1:8899  前后端同源（api 静态托管 frontend/dist）
 # 数据落盘：named volumes hero-runs / hero-sessions / hero-home
 # 硬化：cap_drop ALL + SETUID/SETGID(供沙箱) + no-new-privileges + read_only + tmpfs /tmp
 
-# 仅构建镜像
+# 仅构建镜像（单容器运行时需自行保证 PG/Redis 可达；建议直接用 compose）
 docker build -t hero-quant:0.2.0 .
-docker run -p 127.0.0.1:8899:8899 --env-file .env hero-quant:0.2.0
 ```
+
+> **主机名口径（本轮最大的坑，两种运行方式不可混用）**
+> - **宿主机直跑** `uvicorn hero_quant.api.server:app --port 8899`：PG/Redis 只能写 `100.114.54.26`。`127.0.0.1:5432/6379` **不通**——这两个实例只绑 tailscale IP。
+> - **compose 容器内**：只能写 `llm-pg` / `llm-redis`。它们由别的 compose project 创建，需先跑 `scripts/init/setup-shared-network.sh` 建 `heroquant-shared` 外部网络并连入（带别名）；容器重建后网络成员关系丢失，需重跑。
+> - `llm-pg` 的超级用户名**不是** `postgres`，取容器内 `$POSTGRES_USER`。
+> - 外部 PG 首次使用需先建库 `heroquant` 并执行 `scripts/init/001_schema.sql`（`local-stack` profile 由 initdb 自动执行；复用 llm-pg 时手动执行一次）。
+> - `--profile local-stack` 会另起 postgres/redis/temporal，此时必须在 `.env` 显式把主机名改成 `postgres`/`redis`——compose 的 `environment` 优先级高于 `env_file`，无法按 profile 条件覆盖。
+
+### /ready 与容器健康
+
+- `/ready` 聚合探测 PG（checkpoint + billing）与 Redis，全程 <5s 有界；**缺 checkpoint DSN 或库不可达即 503** + `degraded:true` + `reasons`（这是诚实降级，不是 bug）。
+- 缺 `COHERE_API_KEY` 默认只 warning；只有 `HERO_READY_COHERE_FATAL=true` 才判致命。
+- `Dockerfile:108-109` 的 `HEALTHCHECK` 已从 `/live` 改为 `/ready`——容器 `healthy` 现在代表**依赖可用**，不再只是进程活着。
+- 前端唯一可信产物是 `frontend/dist`；dist 陈旧（缺新路由 chunk）或缺失时必须 `npm run build`，否则根路径只会返回内置占位页。
 
 `Dockerfile` 3 阶段：`node:22-slim` 前端构建 → `python:3.11-slim` builder(`venv+hash-lock`) → `runtime`(无编译器，`vibe:vibe-sandbox 10001` 非 root)。
 
@@ -97,17 +121,35 @@ docker run -p 127.0.0.1:8899:8899 --env-file .env hero-quant:0.2.0
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `HERO_LLM_PROVIDER` | `openai` | `openai` / `deepseek` / `anthropic` 等 |
-| `HERO_LLM_MODEL` | `gpt-4o-mini` | 模型名 |
-| `HERO_API_KEY` | — | LLM 密钥 |
-| `HERO_DATA_MODE` | `live` | `synthetic` 本地合成（测试/离线）/`live` 调真实行情（默认 `live`） |
+| `HERO_LLM_MODEL` | `gpt-4o-mini` | 默认模型名 |
+| `HERO_LLM_MODEL_QUICK` / `HERO_LLM_MODEL_DEEP` | 空（回退 `HERO_LLM_MODEL`） | 快/深两档独立模型槽位 |
+| `HERO_API_KEY` | — | LLM 密钥；缺省走 `_FakeLLM` 合成路径，响应带 `degraded:true` |
+| `COHERE_API_KEY` | — | 缺省只 warning，不影响 `/ready` |
+| `HERO_READY_COHERE_FATAL` | `false` | `true` 才把缺 Cohere key 判为致命 degraded |
+| `HERO_ENV` | 空 | 本地验收设 `development`，无真 Redis 时才允许 fakeredis 回退；否则限流 fail-closed 直接 429 |
+| `HERO_DATA_MODE` | `live` | `live` 调真实行情；`synthetic` **可用**，但 `provenance.source=synthetic`、A股 `unit=board_lots`，跨源 1% 比对被显式跳过并 warning（非"离线可用"） |
 | `HERO_DATA_MARKET` | `CN` | 默认市场 |
-| `HERO_PG_HOST` | `localhost` | PG 主机切换：本地 `localhost` / compose 内 `postgres`（显式 `HERO_*_DSN` 优先） |
-| `HERO_CHECKPOINT_DSN` | `postgresql://localhost:5432/hero_quant` | 显式 PG DSN 优先；compose 内为 `postgresql://heroquant:heroquant@postgres:5432/heroquant` |
+| `HERO_BENCHMARK_TICKER` | 空 | 显式基准；空则按 `benchmark_map` 后缀映射（`.NS`→`^NSEI` 等） |
+| `HERO_PG_HOST` | `localhost` | 宿主机直跑填 `100.114.54.26`；compose 内由 compose 固定为 `llm-pg`（显式 `HERO_*_DSN` 优先） |
+| `HERO_PG_USER` / `HERO_PG_PASSWORD` | 空 | 供 compose 的 DSN 变量插值；llm-pg 超级用户名**不是** `postgres`，取容器内 `$POSTGRES_USER`；口令只写 `.env` |
+| `HERO_PG_DSN` | 空 | checkpoint DSN 的 legacy 别名（显式 `HERO_CHECKPOINT_DSN` 优先） |
+| `HERO_CHECKPOINT_DSN` | `postgresql://localhost:5432/heroquant`（无口令） | 显式优先；compose 内渲染为 `postgresql://<user>:<password>@llm-pg:5432/heroquant`。**`.env` 不填 `HERO_PG_PASSWORD` 时口令段为空**，`/ready` 如实 503 |
+| `HERO_CHECKPOINT_TTL_SECONDS` | `604800`（7 天） | checkpoint `expires_at` TTL |
+| `HERO_BILLING_DSN` | 空（fail-closed） | 不配即计费不可用，`publish/purchase` 抛 `BillingUnavailable` |
+| `HERO_BILLING_ALLOW_SHARED_DB` | `false` | billing 复用 checkpoint 库必须显式 opt-in，否则返回 None |
+| `HERO_BILLING_ALLOW_MEMORY` | `false` | `true` 才允许无 PG 走进程内计费，且响应必须带 `degraded:true` |
+| `HERO_REDIS_DSN` | 空 | 优先级最高；其次 `HERO_REDIS_HOST/PORT/PASSWORD/DB`（默认 `6379/0`），再次 `REDIS_URL` |
+| `HERO_VECTOR_STORE` / `HERO_VECTOR_ENABLED` / `HERO_VECTOR_DSN` | 空 | `pgvector`/`postgres`/`auto` 时复用 checkpoint DSN，否则内存回退 |
+| `HERO_VECTOR_DIM` | `32` | 8–2048，越界告警后回落默认 |
+| `HERO_EMBED_PROVIDER` | `offline` | `openai` / `sentence-transformers` / `offline` |
 | `HERO_OTEL_MODE` | `disabled` | `disabled`/`shared`/`private` |
 | `HERO_TRACE_*` | `50000/500` | `TOOL_RESULT_OFFLOAD/TEXT_OFFLOAD/PREVIEW` |
 | `FRONTEND_DIST` | 自动探测 | 前端 dist 覆盖路径 |
 
 全仓仅 `src/hero_quant/config/settings.py` 允许 `os.getenv`，CI 门禁 `tests/test_config.py:80` 校验。
+
+> **计费边界**：API 层没有任何 billing 路由，不存在"返回 200 的假成功面"；无 DSN 时 `BillingService` 直接抛 `BillingUnavailable`，内存模式必须显式 `HERO_BILLING_ALLOW_MEMORY=1` 且响应带 `degraded:true`。
+> **合成模式边界**：`HERO_DATA_MODE=synthetic` 不是"离线可用"的同义词——它可跑通，但每一根 bar 都是合成序列，`provenance.source=synthetic` 必须被下游如实消费。
 
 ## API
 
@@ -132,6 +174,10 @@ pytest -q --cov=src/hero_quant --cov-fail-under=50  # 以 pyproject fail_under=5
 npm --prefix frontend run test:run
 ```
 
+**测试口径（唯一可信来源是本机实跑）**：硬门是 `pyproject.toml:67` 的 `fail_under = 50`，`.github/workflows/test.yml:53` 与 `ci.yml:103` 均已对齐 50。通过数 / 跳过数 / 覆盖率**不在本文写死**——顶部徽章不再写死数字，旧 `--cov-fail-under=30` 口径已作废，请以 `pytest -q --cov=src` 的实际输出为准。
+
+<!-- TODO(S5): 待 S5 收口后回填「N passed / N skipped / coverage」三件套，并同步顶部徽章 -->
+
 供应链：`requirements-lock.txt` 为 `uv pip compile --generate-hashes` 产物（真 sha256 非占位），`Dockerfile:32 pip install --require-hashes`，CI 校验 `pip-audit + gitleaks`（已接入真 hash 全量）。
 
 ## 路线图
@@ -140,7 +186,7 @@ npm --prefix frontend run test:run
 - [x] 回测 PIT/多标/tearsheet
 - [x] AgentLoop 10 控制点 + LangGraph 双路由
 - [ ] Memory 多租户 namespace + Governance 跨段校验
-- [ ] Checkpoint 真 PG 落盘（settings 默认无口令 PG `postgresql://localhost:5432/hero_quant`，本地/示例口令与 compose 对齐 `postgresql://heroquant:heroquant@localhost:5432/heroquant`，compose 内主机名为 `postgres`，PG 不可达时回退 `memory://`）
+- [x] Checkpoint 接线（显式 `HERO_CHECKPOINT_DSN` → 真 PG saver，`agent/loop.py` 每轮迭代落一次；无 DSN → `memory`，DSN 不可达 → emulated 桩，`/ready` 如实标 degraded；宿主机 `100.114.54.26`、compose 内 `llm-pg`）
 - [x] `requirements-lock.txt` 真 hash 全量（已 `uv pip compile --generate-hashes` 非占位）
 
 ## 合规与免责

@@ -39,7 +39,11 @@ All notable changes to hero-quant are documented here. Format follows [Keep a Ch
 - **Governance & Security (Wave C5-C7)**: Ledger `seq/prev_hash/record_hash 0600+fsync` + `verify()` cross-segment recompute + namespace `tenant:thread` isolation, `DedupStore` PG `INSERT ... ON CONFLICT` + `FOR UPDATE` with memory fallback, credentials `0600 + REF_PATTERN` hot reload, HMAC + Host allowlist (`VIBE_TRADING_TRUST_DOCKER_LOOPBACK`), AST guard `socket/subprocess/os.system/ctypes/eval` ban, CSP `default-src 'self'` + `X-Frame-Options: DENY`, redaction `ARGUMENTS_SINK/RESULT_SINK` auto-wired in `trace/ledger`.
 - **Memory**: File + FTS5 + trigram + 30s `content_hash` sliding-window cross-key dedup, `namespace` FTS/LIKE/file isolation, lifecycle `hierarchy` + `decay Ebbinghaus 14d` + GC rotation keep-pending.
 - **MCP & Tooling**: 15+ `@tool` registry deterministic `is_concurrency_safe` audit, `mcp/router` TopK5 vector router + hybrid recall, `mcp/server` wall-time metrics.
-- **Frontend & E2E (Wave D)**: 5 routes `Dashboard/Research/Backtest/Live/Risk` + `Live` SSE/WS `<200ms on_tick` + `Reconcile` + `Billing` RLS + `Scheduled` Temporal Cron 5 playbooks, `Tearsheet` ECharts ME + drawdown, Playwright shadow reconciliation.
+- **Frontend & E2E (Wave D)**: 5 routes `Dashboard/Research/Backtest/Live/Risk` + `Live` SSE/WS `<200ms on_tick` + `Reconcile`（占位）, `Tearsheet` ECharts ME + drawdown, Playwright shadow reconciliation。
+
+> **预留 / 未接线（不是已交付能力）**：本版列出但**未完成接线**的项，勿按 "Added" 理解——
+> - `Billing` RLS：库表与 RLS policy 见 `scripts/init/001_schema.sql`，但 API 层**没有任何 billing 路由**，无 DSN 时 `publish/purchase` 直接抛 `BillingUnavailable`（fail-closed，不返回假收据）。
+> - `Scheduled` Temporal Cron 5 playbooks：`checkpoint/temporal.py` 仅为占位，未创建 workflow/cron。
 - **Supply chain & CI (Wave A3-A4)**: `requirements-lock.txt --generate-hashes` real hashes + `--require-hashes` builder, `ruff` 0 error, `pip-audit` + `gitleaks`, CI matrix `ubuntu` + 3-job `hash-lock/lint/test`.
 - **Docs & Plans**: `docs/plans/2026-08-21-hero-quant-deploy-ready.md` Wave G release harness, `2026-08-21-hero-quant-maturity3-tasks.md` 7-dim ≥3.0 roadmap, TradingAgents deep-dive annex.
 
@@ -55,7 +59,7 @@ All notable changes to hero-quant are documented here. Format follows [Keep a Ch
 - Path traversal rejected via `safe_ticker_component`, redaction before persistence, ledger tamper detection, `0600` file modes, `read_only` + `cap_drop ALL` + `no-new-privileges` runtime.
 
 ### Verification
-- `pytest -q` — 173 passed (wall-time/circuit/metrics guardrails enforced)
+- `pytest -q` — 173 passed（当时的计数，已作废；现以 `pyproject.toml` `fail_under=50` 为硬门，通过数见 README「开发」节实测口径）
 - `ruff check` — 0 error
 - `docker compose config` — valid
 - `pip install --require-hashes -r requirements-lock.txt` dry-run — ok

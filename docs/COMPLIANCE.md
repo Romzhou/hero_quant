@@ -12,16 +12,17 @@
 
 ## 2. 数据许可与来源（Data License & Attribution）
 
-- **行情源**：A股 `tencent (qt.gtimg.cn)` 为主、美股 `yahoo (yfinance)` 为主，熔断后按注册表 16 源择优；可选 `tushare / akshare / ccxt` 需用户自备合规许可与配额。
-- **单位与溯源**：A股以 `board_lots`（手）、美股以 `shares`（股）全链路 `provenance{source,unit,date}` 记录；跨源收盘价按 1% 阈值告警但不自动校正。
-- **使用约束**：用户需遵守各数据提供方的服务条款、速率限制与再分发限制；合成数据 `HERO_DATA_MODE=synthetic` 仅用于离线测试，不代表真实行情。
+- **行情源**：A股 `tencent (qt.gtimg.cn)` 为主、美股 `yahoo (yfinance)` 为主；注册表登记 16 源，但**数据层没有熔断器**——`CircuitBreaker` 只存在于 `telemetry/circuit.py`，消费方仅有 `shadow/service.py` 与 `mcp/router.py`；`data/registry.py` 的 `get_bars` 是按注册顺序回退，**无打分、无"择优"逻辑**。因此不存在"熔断后自动切到最优源"的能力，请按"顺序回退"理解。可选 `tushare / akshare / ccxt` 需用户自备合规许可与配额。
+- **单位与溯源**：A股以 `board_lots`（手）、美股以 `shares`（股）全链路 `provenance{source,unit,date}` 记录；跨源收盘价 1% 阈值校验**代码已实现，但默认双源市场/单位互斥，生产路径不触发**——`_cross_source_check` 只在同一标的拿到两个可比源时才执行，而 CN/US 双源的市场与 unit（`board_lots` vs `shares`）本就互斥，命中即 fail-closed 阻断。
+- **合成模式**：`HERO_DATA_MODE=synthetic` **可用**（不再硬失败），但产物会显式打标：`provenance.source=synthetic`、A股 `unit=board_lots`（沿用主源 unit 声明），跨源 1% 比对被**显式跳过并打 warning**（`cross_source_synthetic_skipped`）；synthetic 与 live 混用时需显式 opt-in，否则 fail-closed 拒绝。合成序列不代表真实行情。
+- **使用约束**：用户需遵守各数据提供方的服务条款、速率限制与再分发限制。
 - **引用要求**：对外发布基于本系统的结论时，应注明数据来源、时间区间与 `HERO_DATA_MODE`。
 
 ## 3. 风险揭示（Risk Disclosure）
 
 - **市场风险**：证券价格波动、流动性、汇率、杠杆及衍生品等可能导致本金损失；回测收益不预示未来表现。
 - **数据与回测局限**：存在停牌、除权除息、汇率与时区、滑点与费用（按换手计费）等偏差；PIT 校验（`weights_on ≤ price_date`）仅降低未来函数风险，不完全消除幸存者偏差。
-- **系统与运营风险**：单机部署、网络抖动、LLM 熔断、PG 未就绪回退 `memory://` 等均可能导致延迟或不一致；建议结合监控 `/metrics` 与日志 `X-Request-ID` 巡检。
+- **系统与运营风险**：单机部署、网络抖动、LLM 重试/预算断路（`agent/policies.py`）、PG 不可达时 checkpoint 回退 `memory` 或 emulated 桩、Redis 缺失时限流 fail-closed 等，均可能导致延迟、功能不可用或结果不一致；建议结合监控 `/metrics` 与日志 `X-Request-ID` 巡检。
 - **合规风险**：量化策略发布、投顾与资管业务在多地需持牌；用户需自行履行适当性、信息披露与风控义务。
 
 ## 4. 适用范围与责任边界
