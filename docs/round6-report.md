@@ -134,3 +134,57 @@ git status --porcelain
 ```
 
 > 注：§2 的 `pytest -q` / `--cov=src` 两行数字属 Round 6 收尾门禁的转记，重跑需整跑全量套件（本机约 20 分钟），且 Round 7 X1 已改 PG 守卫口径（skip 替代 deselect），复跑结果与 §2 不同属**预期**，以 Round 7 收尾报告为最终口径。
+
+
+## 8. Round 7 补记（门禁终态 + 新增台账 11-12）
+
+> 性质：docs-only 追加，不改写 §1-§7 任何结论。本节数字全部为 **2026-10-28 本机实跑**（命令见 §8.5），与 §2 的 Round 6 转记口径不同属预期。
+
+### 8.1 Round 7 的 7 条 commit
+
+| # | hash | 标题 | 线 |
+|---|---|---|---|
+| 0 | `d1715db` | chore: 基线归集 Round7 前置（quantlib rust 别名/选列修正 + 2 个 frontend 测试纳入版本 + gitignore 解禁） | 前置基线（见 §5） |
+| 1 | `5a2466b` | test: PG guard — skip PG-dependent cases when server unavailable (round7 X1) | X1 |
+| 2 | `dbb8aeb` | C: docs/round6-report 收口 v2（8 commit + 门禁数字 + 10 条台账 + 交叉引用） | X3 |
+| 3 | `63b5c53` | fix(agent/context): 订正 `_collapse` 零预算注释措辞 + 锁预算边界（round7 X2a） | X2a |
+| 4 | `c3f106e` | docs(backtest/metrics): 订正 turnover docstring 两例矛盾（round7 X2b） | X2b |
+| 5 | `597376b` | test: X4 agent/loop 分支补测（loop.py 65%→99%，全仓 70.36%→72.30%） | X4 |
+| 6 | `971379d` | test: Windows 盘符侧车用例加平台守卫（非 nt 跳过，Linux 门禁不再红） | X1 延伸（平台收敛） |
+
+### 8.2 门禁终态（本机实跑，非转记）
+
+| 门 | 结果 | 备注 |
+|---|---|---|
+| 全量测试 | **2769 passed / 0 failed / 45 skipped / 0 deselected**（347.6s） | 44 skip = 5 个 PG 族的 guard skip；1 skip = Windows 盘符用例在 Linux 上的平台 skip |
+| 覆盖率 | **72.30%**（covered 18215 / stmts 25193，missing 6978） | 基线 70.36% → +1.94pp；`agent/loop.py` 1506 stmts / 15 missing / **99%** |
+| lint（唯一真门） | `ruff check src` → **All checks passed!** | 全仓 `ruff check .` 的 413 条历史 lint 仍不在门内 |
+| 评测 | `python evals/run.py --mode fake` → headline **30/30**、known_gap **8/8**、`failure_classes={}` | 与 §2 一致，未回归 |
+
+**口径变更（X1）**：Round 6 的 44 例靠命令行 `--deselect` 排除；Round 7 起由 `tests/conftest.py` 的 `pg_guard_reason()`（TCP 0.3s 探测 + 结果缓存）在模块级 `pytestmark` 里 skip，**deselected 归零**。因此 §2 的 `2540+7+44=2591` 与本节的 `2769+45=2814` 不可直接相减——前者含 deselect，后者不含，且 X4 新增 215 用例。
+
+**环境受限（必须一起读）**：本轮 Linux 工作副本**没有 `uv.lock`**，`uv run --frozen` 直接报 `Unable to find lockfile`，故所有 pytest 均用 `.venv/bin/python -m pytest` 实跑（依赖与 pyproject 一致）；Windows 原机的 `uv run --frozen --extra dev` 口径未在本文件复验。无 Docker / 无 PostgreSQL / 无外网，PG 与 real/rust 相关结论仍只能写「环境受限」。
+
+### 8.3 新增台账（接 §4 的 10 条，编号续 11）
+
+| # | 编号 | 现象（file:line 已核验） | 当前状态 | 收口计划 | 需人拍板 |
+|---|---|---|---|---|---|
+| 11 | R7-1 | `src/hero_quant/agent/loop.py:1076-1082` 与 `:1106-1112`：`RetryPolicy` 不可用时，首次 `stream_chat` 直接抛错会按 `attempt < max_attempts` 重试，而**流中途异常**时 `should` 恒 False → 立即判不可重试，`:1110-1112` 的「无策略固定退避」分支永不执行（X4 补测后仍为 missing 行） | 未改 src；X4 只记录不锁定该不对称 | 二选一：统一按 attempt 预算重试，或显式注释该不对称并补一条 pin 测试；改 `src/` 须另派单 | 否（P3，语义澄清） |
+| 12 | R7-2 | `src/hero_quant/agent/trace.py:578-584`：docstring 称「拒绝含冒号/换行等非法字符」，实际 `:` 只在 `os.name == "nt"` 时拒绝；POSIX 上 `C:/evil.json` 是合法相对文件名 | 测试侧已按真实语义加平台守卫（`971379d`，非 nt skip），src 未改 | 订正 docstring 措辞为「Windows 下拒绝盘符冒号」，或统一跨平台拒绝（后者会改变 POSIX 行为，须评估） | 否（文档订正） |
+
+### 8.4 越界与遗留
+
+- 本轮 `src/` 改动仅 3 个文件：`agent/context.py`（X2a 注释）、`backtest/metrics.py`（X2b docstring）、`quantlib/rust.py`（**`d1715db` 前置基线归集**，非本轮 X 线产出，见 §5）。
+- `migrations/`、`.env`、`.github/`、`pyproject.toml` 零改动；密钥模式扫描无命中。
+- 未做：G-03 billing tenant 归属、per-user 鉴权（只留 ADR-005/ADR-006）、real 模式评测、Docker 验证、Rust 真扩展路径。
+
+### 8.5 复跑命令（Linux 工作副本）
+
+```bash
+.venv/bin/python -m pytest -q --cov=src --cov-report=term:skip-covered   # 期望 0 failed / 45 skipped / 0 deselected / 72.30%
+.venv/bin/python -m pytest tests/test_checkpoint_pg.py -q -rs             # 期望 12 skipped，reason 含 "PG guard"
+ruff check src                                                            # 期望 All checks passed!
+.venv/bin/python evals/run.py --mode fake                                 # 期望 30/30 + 8/8 + {}
+git diff --name-only 8301ba2..HEAD                                        # 越界核对：见 §8.4
+```
+
