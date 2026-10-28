@@ -1,12 +1,23 @@
 services:
+  # ---------------------------------------------------------------------------
+  # local-stack profile: 仅当显式 `--profile local-stack` 才启动。
+  # 默认部署复用宿主机上已有的 llm-pg / llm-redis（见 hero-quant.environment），
+  # 因此这里不再默认拉起第二套 PG/Redis；镜像 tag 固定为本地已缓存的 16-alpine，
+  # 避免 compose 因 postgres:16 触发拉取。
+  # ---------------------------------------------------------------------------
   postgres:
-    image: postgres:16
+    image: postgres:16-alpine
+    profiles: ["local-stack"]
     environment:
       POSTGRES_USER: heroquant
       POSTGRES_PASSWORD: heroquant
       POSTGRES_DB: heroquant
     volumes:
       - pgdata:/var/lib/postgresql/data
+      # DDL 入口：migrations/ 冻结区只读复制品，由 postgres 官方 entrypoint
+      # 在数据目录为空时按文件名顺序执行；随本服务同属 local-stack profile，
+      # 默认部署不会挂载。
+      - ./scripts/init:/docker-entrypoint-initdb.d:ro
     ports:
       - "127.0.0.1:5432:5432"
     healthcheck:
@@ -19,6 +30,7 @@ services:
 
   redis:
     image: redis:7-alpine
+    profiles: ["local-stack"]
     # 淘汰策略 volatile-lru：仅带 TTL 的 key 可被淘汰。
     # hero:ticket:*（security.issue_ticket SET NX EX）、hero:lock:*（RedisLock SET NX EX）
     # 均带显式 EX，自然过期且淘汰方向为 fail-closed；hero:cache:* 可任意淘汰（可重算）。
@@ -35,6 +47,10 @@ services:
 
   temporal:
     image: temporalio/auto-setup:1.26.2
+    # temporal 的后端就是 local-stack 里的 postgres：postgres 被 profile 收走
+    # 后 temporal 若留在默认集合会因 "depends on undefined service" 直接让
+    # compose 解析失败，故一并收进 local-stack。
+    profiles: ["local-stack"]
     depends_on:
       postgres:
         condition: service_healthy
@@ -69,21 +85,35 @@ services:
 
   hero-quant:
     build: .
+    # postgres/redis 被 local-stack profile 托管：默认模式下它们不存在于本
+    # project 的启动集合里。required: false 让 compose 在依赖未启用时跳过等待，
+    # 而不是报 "dependency not enabled"（compose spec 2.20+）。
     depends_on:
       postgres:
         condition: service_healthy
+        required: false
       redis:
         condition: service_healthy
+        required: false
       temporal:
         condition: service_healthy
+        required: false
     ports:
       - "127.0.0.1:8899:8899"
+    # .env 缺失不得阻断 compose 解析（仓库不提交 .env）：required: false 表示
+    # "有就读，没有就用下面的 environment 默认值"。
     env_file:
-      - .env
+      - path: .env
+        required: false
     environment:
-      HERO_PG_HOST: postgres
-      HERO_CHECKPOINT_DSN: postgresql://heroquant:heroquant@postgres:5432/heroquant
-      HERO_REDIS_DSN: redis://redis:6379/0
+      # 默认部署复用宿主机既有 llm-pg / llm-redis（127.0.0.1 的 5432/6379 不通，
+      # 必须走宿主机内网地址）。口令不进仓库：由 .env 提供 HERO_PG_PASSWORD。
+      # 库名 heroquant 与 scripts/init/001_schema.sql 建库目标一致。
+      HERO_PG_HOST: 100.114.54.26
+      HERO_CHECKPOINT_DSN: postgresql://${HERO_PG_USER:-llm}:${HERO_PG_PASSWORD:-}@100.114.54.26:5432/heroquant
+      HERO_BILLING_DSN: postgresql://${HERO_PG_USER:-llm}:${HERO_PG_PASSWORD:-}@100.114.54.26:5432/heroquant
+      HERO_VECTOR_DSN: postgresql://${HERO_PG_USER:-llm}:${HERO_PG_PASSWORD:-}@100.114.54.26:5432/heroquant
+      HERO_REDIS_DSN: redis://100.114.54.26:6379/0
       HERO_OTEL_MODE: shared
       OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318/v1/logs
     volumes:
