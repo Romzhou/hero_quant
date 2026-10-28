@@ -173,7 +173,7 @@ pytest -q --cov=src/hero_quant --cov-fail-under=50  # 以 pyproject fail_under=5
 npm --prefix frontend run test:run
 ```
 
-**测试口径（唯一可信来源是本机实跑）**：硬门是 `pyproject.toml:67` 的 `fail_under = 50`，`.github/workflows/test.yml:53` 与 `ci.yml:103` 同值。2026-10-28 基线：**2767 passed / 47 skipped / 覆盖率 72.04%**（`pytest -q --cov=src`）。47 个 skip 里绝大多数是“无真 PG 时”的守卫（有 PG 时只剩 1 个 Windows-only skip），所以看到跳过数变化先看环境，不要先怀疑用例。通过数随改动漂移，引用前请重跑，不要照抄本文。前端路由用例自造临时 `dist` 来区分“有产物 200 / 无产物 503”，**不依赖** CI 先 `npm run build`。
+**测试口径（唯一可信来源是本机实跑）**：硬门是 `pyproject.toml:67` 的 `fail_under = 50`，`.github/workflows/test.yml:53` 与 `ci.yml:103` 同值。2026-10-28 基线：**2767 passed / 47 skipped / 覆盖率 72.04%**（`pytest -q --cov=src`）。47 个 skip 里绝大多数是“无真 PG 时”的守卫（有 PG 时只剩 1 个 Windows-only skip），所以看到跳过数变化先看环境，不要先怀疑用例。通过数随改动漂移，引用前请重跑，不要照抄本文。前端路由用例按服务端**实际挂载分支**做二态断言（有 `dist` 断 200 HTML；无 `dist` 或 `index.html` 缺失断 503 + `X-Frontend: missing|index-missing`），**不依赖** CI 先 `npm run build`。
 
 供应链：`requirements-lock.txt` 为 `uv pip compile --generate-hashes` 产物（真 sha256 非占位），`Dockerfile:32 pip install --require-hashes`，CI 校验 `pip-audit + gitleaks`（已接入真 hash 全量）。
 
