@@ -1,0 +1,24 @@
+{
+  "mode": "real",
+  "status": "skipped",
+  "reason": "no_llm_backend",
+  "detail": "health_check all providers failed: openai=api_key_missing; real-LLM assertions are not meaningful",
+  "generated_at": "2026-10-29T15:01:53.502366+00:00",
+  "golden_set": {
+    "path": "/root/projects/hero-quant/.codebuddy/worktrees/bg-a22f4f02/evals/golden/golden_v1.jsonl",
+    "version": "v1",
+    "count": 50,
+    "sha256": "167f18aaa405fd8ed3c56b630c824d0c6ee2695eb18dd53b95d318bacdbc1f8b",
+    "categories": [
+      "authz_denied",
+      "backtest",
+      "correlation",
+      "fundamentals",
+      "grounding_refusal",
+      "indicator_factor",
+      "market_data",
+      "multi_tool",
+      "zh_terms"
+    ]
+  }
+}

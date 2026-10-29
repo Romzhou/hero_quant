@@ -95,15 +95,26 @@ class LLMFactory:
             strict=self.strict,
         )
 
-    def create(self, model: str | None = None, api_key: str | None = None, **kwargs):
-        """Create an LLMClient routed by provider with timeout=30."""
+    def create(
+        self,
+        model: str | None = None,
+        api_key: str | None = None,
+        provider: str | None = None,
+        base_url: str | None = None,
+        **kwargs,
+    ):
+        """Create an LLMClient routed by provider with timeout=30.
+
+        `provider` / `base_url` 为显式覆盖项（供 `llm/gateway.py` 构造降级链时逐 provider 建客户端），
+        不传时行为与历史完全一致（读 `settings.llm_provider`）。
+        """
 
         # defer import to avoid circular
         import logging as _logging
 
         from .client import LLMClient
 
-        provider = self.provider
+        provider = _normalize_provider(provider, strict=self.strict) if provider else self.provider
         # resolve model — strict mode propagates UnknownModelError
         if model is None:
             if self.strict:
@@ -139,7 +150,7 @@ class LLMFactory:
             try:
                 from langchain_openai import ChatOpenAI
 
-                chat = ChatOpenAI(model=model, api_key=key, streaming=streaming, temperature=temperature, timeout=timeout, **kwargs)
+                chat = ChatOpenAI(model=model, api_key=key, base_url=base_url, streaming=streaming, temperature=temperature, timeout=timeout, **kwargs)
             except ImportError as e:
                 if self.strict:
                     raise
@@ -154,7 +165,7 @@ class LLMFactory:
             try:
                 from langchain_openai import ChatOpenAI
 
-                base_url = os.environ.get("DEEPSEEK_API_BASE", "https://api.deepseek.com")
+                base_url = base_url or os.environ.get("DEEPSEEK_API_BASE", "https://api.deepseek.com")
                 chat = ChatOpenAI(model=model, api_key=key, base_url=base_url, streaming=streaming, temperature=temperature, timeout=timeout, **kwargs)
             except ImportError as e:
                 if self.strict:
@@ -170,13 +181,13 @@ class LLMFactory:
             try:
                 from langchain_anthropic import ChatAnthropic  # type: ignore
 
-                chat = ChatAnthropic(model=model, api_key=key, streaming=streaming, temperature=temperature, timeout=timeout, **kwargs)  # type: ignore
+                chat = ChatAnthropic(model=model, api_key=key, streaming=streaming, temperature=temperature, timeout=timeout, **({"base_url": base_url} if base_url else {}), **kwargs)  # type: ignore
             except ImportError:
                 # fallback to OpenAI-compatible if anthropic SDK missing
                 try:
                     from langchain_openai import ChatOpenAI
 
-                    chat = ChatOpenAI(model=model, api_key=key, streaming=streaming, temperature=temperature, timeout=timeout, **kwargs)
+                    chat = ChatOpenAI(model=model, api_key=key, base_url=base_url, streaming=streaming, temperature=temperature, timeout=timeout, **kwargs)
                 except ImportError as e:
                     if self.strict:
                         raise

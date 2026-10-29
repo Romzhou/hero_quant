@@ -29,3 +29,73 @@ python evals/run.py --mode real   # 需真实 LLM 后端；缺 SDK/key 时自动
 fake LLM 模板与 `src/hero_quant/api/server.py::_FakeLLM` 同口径；
 被测循环为 `AgentLoop.run`（`src/hero_quant/agent/loop.py:616`），
 工具来自 `tools/registry`，不断链、不碰线上数据。
+
+---
+
+# Golden set v1（W2-01 · PR-113/114/115）
+
+`golden/golden_v1.jsonl` 是 G1 验收口径的 50 条评测集（PR-113），配套 runner 产出
+成功率 / 工具选择 / grounding / p50·p95 / 单任务成本（PR-114），每次调用记录
+provider·model·tokens·成本（PR-115，`src/hero_quant/llm/cost.py`）。
+
+## 一键重跑
+
+```bash
+python evals/run_golden.py --mode fake     # 无需 key：只验证评测管道与断言机器
+python evals/run_golden.py --mode real     # 需真实后端；无 key 时如实 skip
+python scripts/eval_real.py                # 等价于 --mode real（PR-112 入口）
+```
+
+产物：`evals/results_golden_fake.json` / `evals/results_golden_real.json`。
+
+## 字段（每条 case）
+
+`id / category / query / expected_tools / expected_contains / expected_not_contains /
+max_latency_ms / expect_grounding / expect_refusal / expect_no_data / note`
+
+- `expected_contains` 为**大小写不敏感子串**；`expected_not_contains` 命中即失败。
+- `expect_grounding`：`true/false` 参与 grounding P/R 统计，`null` 表示该用例不判 grounding。
+- `expect_refusal`：拒答判定是**关键词启发式**（`run_golden.REFUSAL_MARKERS`），
+  报告里固定标注 `refusal_detection=keyword_heuristic`，不冒充语义判定。
+- `expect_no_data`：空数据场景必须**显式说明没数据**（`NO_DATA_MARKERS`）；
+  模型编造数值即 `no_data_not_declared`，归入 `honesty_gap`。
+
+## 分类覆盖（50 条）
+
+| category | 条数 | 覆盖点 |
+|---|---|---|
+| market_data | 8 | 单工具行情、名称→代码、指数/美股/加密 |
+| fundamentals | 4 | 本 build 无基本面源：验路由与「不编造」 |
+| indicator_factor | 8 | SMA/BOLL/RSI/MACD/sharpe/回撤/因子 |
+| correlation | 3 | 两两相关、中文名映射 |
+| backtest | 8 | 参数化策略、PIT 校验、引擎列表、成本 |
+| multi_tool | 6 | 2~3 工具编排 |
+| grounding_refusal | 6 | 预测点位/稳赚/内幕/编造/代下单/保收益 |
+| authz_denied | 3 | 跨租户导出、提示注入、凭据列举 |
+| zh_terms | 4 | 涨停/除权除息/北向资金/市盈率 |
+
+## 指标口径（`evals/metrics.py`）
+
+- 任务成功率：全部断言通过（含 within `max_latency_ms`）的用例占比。
+- 工具选择：实际执行过的工具名集合（`ToolCallRecorder` 包 `TOOL_REGISTRY.func`，退出即还原）
+  对比 `expected_tools`，给 micro precision/recall/F1 + 精确匹配率。
+- grounding：`expect_grounding` 标签 vs `LoopResult.grounding_verified`，给 P/R/F1。
+- 延迟：p50 / p95 / max（线性插值，不依赖 numpy）。
+- 成本：价目只取 `llm/catalog.py::MODEL_CATALOG`；目录外模型 `cost_usd=null` 单列
+  `unpriced_cases`，**不并入 total 冒充完整成本**。
+
+## Fail-closed 约定
+
+- fake 模式**不产出模型质量结论**（`quality_metrics=null` + `quality_note`）。
+- real 模式启动先做一次 `health_check`；整条 provider 链不可用时写
+  `status=skipped / reason=no_llm_backend`（含脱敏后的 per-provider error code），
+  **不写任何通过率**，退出码 0。
+- 回归门默认关闭；CI 要阻断时传 `--min-pass-rate 0.8`（先做 nightly 非阻断，
+  阈值以首轮真实基线 + 允许回退幅度设定）。
+
+## 待接（不在本批白名单）
+
+- CI job 需改 `.github/workflows/**`（B 线），本批未动。
+- `api/server.py` 的 `LLMGateway` 接线（启动 health_check + 响应带 `degraded/reason`）
+  按批次约定留到最后串行。
+
