@@ -199,24 +199,35 @@
 
 ---
 
-## 8. W7 部署与灾备
+## 8. W7 单机部署与灾备
 
-**现状**：单机 compose；无 K8s/Helm；无备份/PITR/多环境。
-**缺口**：容器编排、托管中间件、CI/CD、备份恢复、staging/prod。
+**现状**：只有开发用 `docker-compose.yml`（hero-quant + otel）；无反代/TLS、无生产 compose、无 systemd、无备份/PITR、无多环境。
+**缺口**：单机生产编排、反向代理、CI/CD、备份恢复、staging/prod 切换。
 
 ### 怎么做
 
-1. **Helm/清单（PR-161）**：API、worker（Phase 2 启用）、scheduler（Phase 2）、frontend、migration job；Deployment/Service/Ingress/HPA/PDB/probes/resources。
-2. **独立/托管中间件（PR-162）**：PG（HA、TLS、连接池）、Redis（TLS、持久化）；按 D3 不与应用同生命周期；分库/分 schema；连接串从 Secret 注入。
-3. **CI/CD（PR-163）**：构建镜像→扫描→签名（cosign）→推 registry→staging 部署→冒烟→人工/自动 approve→prod 灰度；回滚一键。
-4. **备份/PITR（PR-164）**：PG 每日全备 + WAL 归档；对象存储版本化；保留策略；每季度恢复演练。
-5. **多环境（PR-165）**：dev/staging/prod 配置与密钥隔离；staging 数据脱敏；发布清单与 runbook。
+1. **生产 Compose（PR-161）**
+   - 新增 `deploy/compose/docker-compose.prod.yml`：api、frontend（静态/Caddy）、keycloak、postgres、redis、otel-collector、prometheus/grafana（可选）。
+   - 数据卷独立（PG/Redis/产物/备份）；`restart: unless-stopped`；healthcheck；`deploy.resources.limits`；仅 Caddy 暴露 80/443，其余走内部网络。
+2. **反代/TLS/systemd（PR-162）**
+   - Caddy（或 Nginx）终止 TLS、自动证书、反代 API/前端/Keycloak；安全头、上传大小、SSE 超时。
+   - `deploy/systemd/hero-quant.service` 管理 compose 生命周期；日志轮转；防火墙只开 80/443；fail2ban 可选。
+3. **CI/CD（PR-163）**
+   - GitHub Actions：测试→构建镜像→扫描→推 registry→SSH 到目标机→`docker compose pull && up -d`→`/ready` 冒烟→失败自动回滚上一 tag。
+   - 迁移作为独立 job 先执行；部署记录写入审计。
+4. **备份/PITR（PR-164）**
+   - PG 每日全备 + WAL 归档到独立磁盘或对象存储；Redis RDB/AOF；产物/快照卷快照。
+   - 保留策略；恢复脚本；每月演练一次并记录 RPO/RTO。
+5. **环境与蓝绿（PR-165）**
+   - dev（本机）与 prod（独立生产机）配置/密钥隔离；同机 staging 用独立目录+端口。
+   - 蓝绿：两套 app 目录/端口，Caddy 切 upstream；DB 迁移需向后兼容，回滚只切应用。
 
 ### 验收
 
-- 从零在 staging 部署成功；prod 灰度/回滚演练通过。
+- 生产单机从零部署成功；`/ready` 绿；TLS 正常。
+- 发布失败自动回滚；蓝绿切换中断 < 10s（应用层）。
 - 备份恢复演练：RPO/RTO 达标（目标值在 PR-164 内定）。
-- 迁移 job 在部署流水线中自动执行。
+- 迁移在部署流水线中自动执行；失败不切流量。
 
 **任务**：PR-161、PR-162、PR-163、PR-164、PR-165。
 
@@ -270,4 +281,4 @@
 | 登录改造影响现有匿名调用 | 保留 feature flag：`AUTH_MODE=off|enforce`，先 staging 观察再切 enforce |
 | tenant 改造导致数据读不到 | 双写/双读过渡期；thread ID 迁移脚本可逆 |
 | 迁移框架 baseline 不一致 | 先在空库 + staging 副本演练；失败回滚到内联 DDL |
-| K8s 部署阻塞开发 | compose 保留为 dev 环境，K8s 只用于 staging/prod |
+| 单机部署与开发互相干扰 | dev compose 与生产 compose 分离；本机只做开发，生产独立主机 |
