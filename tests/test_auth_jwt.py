@@ -191,3 +191,23 @@ def test_rs256_roundtrip_and_tamper():
     with pytest.raises(InvalidToken) as exc:
         verifier.verify(f"{header}.{forged_payload}.{_b64url(signature)}")
     assert str(exc.value) == "bad_signature"
+
+
+def test_rs256_without_cryptography_fails_closed(monkeypatch):
+    import builtins
+
+    real_import = builtins.__import__
+
+    def _blocked(name, *args, **kwargs):
+        if name == "cryptography" or name.startswith("cryptography."):
+            raise ImportError("cryptography blocked for test")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _blocked)
+    header = _b64url(json.dumps({"alg": "RS256", "typ": "JWT", "kid": "k1"}, separators=(",", ":")).encode())
+    payload = _b64url(json.dumps(_base_claims(), separators=(",", ":")).encode())
+    config = JWTConfig(issuer=ISSUER, audience=AUDIENCE, algorithms=("RS256",), leeway_seconds=0)
+    verifier = JWTVerifier(lambda kid: b"not-a-real-key", config, clock=lambda: NOW)
+    with pytest.raises(AuthConfigError) as exc:
+        verifier.verify(f"{header}.{payload}.{_b64url(b'x')}")
+    assert "cryptography_not_installed" in str(exc.value)

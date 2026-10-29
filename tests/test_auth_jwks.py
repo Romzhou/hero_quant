@@ -211,3 +211,20 @@ def test_auth_enabled_requires_mode_and_oidc_config():
     assert not auth_enabled({})
     assert not auth_enabled({"HERO_AUTH_MODE": "off", "HERO_OIDC_ISSUER": ISSUER, "HERO_OIDC_AUDIENCE": AUDIENCE})
     assert auth_enabled({"HERO_OIDC_ISSUER": ISSUER, "HERO_OIDC_AUDIENCE": AUDIENCE})
+
+
+def test_jwks_rsa_without_cryptography_fails_closed(monkeypatch):
+    import builtins
+
+    real_import = builtins.__import__
+
+    def _blocked(name, *args, **kwargs):
+        if name == "cryptography" or name.startswith("cryptography."):
+            raise ImportError("cryptography blocked for test")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _blocked)
+    document = {"keys": [{"kty": "RSA", "kid": "k1", "use": "sig", "n": "AQAB", "e": "AQAB"}]}
+    with pytest.raises(AuthConfigError) as exc:
+        parse_jwks(document)
+    assert "cryptography_not_installed" in str(exc.value)

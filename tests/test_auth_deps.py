@@ -17,7 +17,7 @@ from fastapi.testclient import TestClient
 from hero_quant.auth.context import current_tenant_id, require_tenant
 from hero_quant.auth.deps import get_current_principal, install_auth_error_handlers, require_role
 from hero_quant.auth.jwt import JWTConfig, JWTVerifier
-from hero_quant.auth.middleware import AuthContextMiddleware
+from hero_quant.auth.middleware import AuthContextMiddleware, _is_public
 from hero_quant.auth.oidc import AuthMode
 from hero_quant.auth.principal import Principal, Role
 
@@ -170,3 +170,12 @@ def test_middleware_off_mode_passes_through():
     response = client.get("/secure")
     assert response.status_code == 200
     assert response.json()["tenant"] is None
+
+
+def test_public_path_matching_does_not_open_whole_site():
+    public = ("/", "/assets", "/live")
+    assert _is_public("/", public)
+    assert _is_public("/assets/app.js", public)
+    assert _is_public("/live", public)
+    assert not _is_public("/v1/query", public)
+    assert not _is_public("/livewire", public)
