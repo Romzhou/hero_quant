@@ -25,7 +25,7 @@
 
 ## 第二批已改（R8-3，2026-10-29）
 
-处理 28 个测试函数：12 个删除（同文件/他文件已有运行时行为用例，或源码锁已随实现演进失效）、16 个改为运行时断言（并发只初始化一次、caplog 告警、`inspect.signature`/`iscoroutinefunction`、failing commit、`safe_load` 产物、直接断言模块常量）。
+处理 28 个测试函数：10 个删除（同文件/他文件已有运行时行为用例，或源码锁已随实现演进失效）、18 个改为运行时断言（并发只初始化一次、caplog 告警、`inspect.signature`/`iscoroutinefunction`、failing commit、`safe_load` 产物、直接断言模块常量）。
 
 **口径修正**：原表 123 个函数中有 46 个读取的是测试产物或配置（`tmp_path`/ledger/trace/metrics.json/`.hierarchy.yaml`），不属于"源码字面量断言"，已在状态列标为"重分类"。真实源码/文档断言为 77 个函数。
 
