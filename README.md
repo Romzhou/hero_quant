@@ -98,8 +98,12 @@ docker compose up --build
 # 硬化：cap_drop ALL + SETUID/SETGID(供沙箱) + no-new-privileges + read_only + tmpfs /tmp
 
 # 仅构建镜像（单容器运行时需自行保证 PG/Redis 可达；建议直接用 compose）
-docker build -t hero-quant:0.2.0 .
+# 版本以 pyproject.toml 为唯一来源（PR-181），镜像 tag 自定；需要 OCI 版本标签时：
+docker build --build-arg HERO_QUANT_VERSION="$(python -c 'import tomllib;print(tomllib.load(open("pyproject.toml","rb"))["project"]["version"])')" -t hero-quant:local .
 ```
+
+生产单机（Caddy/TLS、systemd、备份/PITR、蓝绿发布）见 [`deploy/README.md`](deploy/README.md)；
+生产编排入口是 `deploy/compose/docker-compose.prod.yml`，与上面的开发用 `docker-compose.yml` 相互独立。
 
 > **主机名口径（2026-10-28 决策 D-1：宿主与容器统一，不再分叉）**
 > - **宿主机直跑**（`uvicorn hero_quant.api.server:app --port 8899`）与 **compose 容器内**：PG/Redis **都写** `100.114.54.26`。容器经默认 bridge NAT 出网可达该 IP（已实测 5432/6379 通）。
@@ -148,8 +152,19 @@ docker build -t hero-quant:0.2.0 .
 | `HERO_OTEL_MODE` | `disabled` | `disabled`/`shared`/`private` |
 | `HERO_TRACE_*` | `50000/500` | `TOOL_RESULT_OFFLOAD/TEXT_OFFLOAD/PREVIEW` |
 | `FRONTEND_DIST` | 自动探测 | 显式设置即**唯一来源**：路径不存在时 fail-closed，**不回落** `/app/frontend/dist` 等默认候选（`server.py:2814`）。无产物时 `/` 与 SPA 路由返回 503 + `X-Frontend: missing|index-missing` + `Retry-After: 30` |
+| `HERO_AUTH_MODE` | `enforce` | `off`=迁移期关闭强制鉴权；`enforce`=强制 Bearer（非法值也按 `enforce`）。`auth_enabled()` 还要求 issuer + audience 同时存在，缺配置时开发环境不会被打穿 |
+| `HERO_OIDC_ISSUER` | 空 | OIDC issuer，形如 `https://sso.example.com/realms/hero`（Keycloak realm） |
+| `HERO_OIDC_AUDIENCE` | 空 | 期望 `aud`；与 issuer 同为该开关键，缺一即不强制鉴权 |
+| `HERO_OIDC_JWKS_URL` | 空 | 留空按 Keycloak 约定推导 `{issuer}/protocol/openid-connect/certs` |
+| `HERO_OIDC_ALGORITHMS` | `RS256` | 只接受非对称算法；`none` / HS256 一律拒绝 |
+| `HERO_OIDC_LEEWAY_SECONDS` | `60` | 校验 `exp/nbf/iat` 的时钟偏移容忍 |
+| `HERO_OIDC_JWKS_TTL_SECONDS` | `300` | JWKS 缓存 TTL；取签失败时不静默放行 |
+| `HERO_TENANT_REQUESTS_PER_MINUTE` | `60` | 租户级 Redis 滑动窗口限流；超限 429 |
+| `HERO_TENANT_DAILY_TOKEN_BUDGET` | `2000000` | 租户日 token 预算；`<=0` 表示不限 token |
 
 全仓仅 `src/hero_quant/config/settings.py` 允许 `os.getenv`，CI 门禁 `tests/test_config.py:80` 校验。
+
+> **身份接线状态（W1）**：`src/hero_quant/auth/**` 已提供验签、租户上下文、RBAC 与配额，但 **`api/server.py` 尚未接线**——在接线完成前保持 `HERO_AUTH_MODE=off`，接线后改为 `enforce` 并补齐 issuer/audience，否则 JWKS 未配会直接 401。
 
 > **计费边界**：API 层没有任何 billing 路由，不存在"返回 200 的假成功面"；无 DSN 时 `BillingService` 直接抛 `BillingUnavailable`，内存模式必须显式 `HERO_BILLING_ALLOW_MEMORY=1` 且响应带 `degraded:true`。
 > **合成模式边界**：`HERO_DATA_MODE=synthetic` 不是"离线可用"的同义词——它可跑通，但每一根 bar 都是合成序列，`provenance.source=synthetic` 必须被下游如实消费。

@@ -59,3 +59,13 @@
 - `billing` fail-closed 持续（涉及钱）：按 ADR-002 接受降级或配 DSN，不要绕过 `_pg_publish_sync=False` 检查（`service.py:429-444` 注释点名 `test_c_emulated_pg_fail_closed` 兼容语义）。
 - `_FakeLLM` 疑似在线上生效（P1-1）：响应体/头查 `degraded`（`server.py:167-188,364,391`）；确认后按演示数口径对外声明，不要当实盘依据。
 - 宽 `except` 吞错现场（P1-3 点名 `server.py:381,607-609`、`risk.py:164,236`）：保留 `exc_info` 日志 + 指标计数后转 D 线收窄，不要本地 `except pass` 了事。
+
+## 6. 生产部署/发布/备份（W7）
+
+单机生产编排与运维脚本的入口是 [`deploy/README.md`](../deploy/README.md)：
+
+- 首次部署、CI 发布、蓝绿切换、回滚：`deploy/README.md` §2–§4
+- 备份/PITR/恢复演练、RPO/RTO 目标值：`deploy/README.md` §5
+- 发布失败与 `/ready` 503 的现场处置：先看本文 §1/§3，再按 `deploy/README.md` §7
+- 生产 compose 与开发 compose 相互独立：生产入口 `deploy/compose/docker-compose.prod.yml`，
+  本机开发仍用仓库根 `docker-compose.yml`（AGENTS §3）
