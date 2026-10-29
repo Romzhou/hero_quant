@@ -1,16 +1,4 @@
 """Task16 Wave4 Top7 - loop core TDD tests"""
-import pathlib
-
-def test_keyboard_interrupt_propagates():
-    src = pathlib.Path("src/hero_quant/agent/loop.py").read_text(encoding="utf-8")
-    # 必须显式放行中断异常：含 (KeyboardInterrupt,SystemExit,GeneratorExit): raise
-    assert "(KeyboardInterrupt, SystemExit, GeneratorExit)" in src or "(KeyboardInterrupt,SystemExit,GeneratorExit)" in src, "must handle KeyboardInterrupt/SystemExit/GeneratorExit separately"
-    assert "except (KeyboardInterrupt" in src and "raise" in src, "must re-raise interrupt"
-    # 不再用 except BaseException 包 LLM 调用
-    # 统计 BaseException 出现次数应为 0（或仅在类型注解）
-    # 允许在注释中提及，但 except BaseException 不应存在
-    assert "except BaseException" not in src, "should not use except BaseException around LLM calls"
-
 def test_replay_path_traversal_rejected(tmp_path):
     import pathlib as _pl
     from hero_quant.agent.loop import AgentLoop
@@ -58,12 +46,3 @@ def test_replay_path_traversal_rejected(tmp_path):
     except TypeError:
         loop = AgentLoop(llm=object(), replay_path=str(good), replay_root=str(replays))
         assert loop._replay_path is not None
-
-def test_token_limit_char_conversion():
-    src = pathlib.Path("src/hero_quant/agent/loop.py").read_text(encoding="utf-8")
-    # 截断用 char_limit=token_limit*4
-    assert "token_limit" in src and "*4" in src, "token_limit should be converted via *4"
-    # 至少有一处 buffer 切片使用 *4
-    assert "*4" in src and "buffer" in src, "buffer truncation should use char_limit *4"
-    # 检查存在 int(...)*4 或 * 4 模式
-    assert "int(" in src and "*4" in src

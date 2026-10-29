@@ -143,33 +143,63 @@ def test_b3a_market_batch_partial_ok_is_false(monkeypatch):
 # market_data.py :40-44 _shared_registry 无锁 check-then-act
 # ============================================================
 
-def test_b3a_market_shared_registry_has_lock():
-    """_shared_registry 访问应有锁保护：模块应暴露 _shared_lock 且为 threading.Lock/RLock。"""
+def test_b3a_market_shared_registry_has_lock(monkeypatch):
+    """并发首建只允许一次 _make_registry：证明 _shared_lock 真的在保护 check-then-act。"""
+    import threading
+    import time
+
     import hero_quant.tools.market_data as md
 
-    assert hasattr(md, "_shared_lock"), "缺 _shared_lock：并发下重复 _make_registry"
-    lk = md._shared_lock
-    # 需具备 acquire/release 且为锁类型
-    assert hasattr(lk, "acquire") and hasattr(lk, "release")
+    calls = []
+    real_make = md._make_registry
 
-    # 进一步：源码应含 with _shared_lock 路径（防止实现漂移）
-    src = (_REPO_ROOT / "src/hero_quant/tools/market_data.py").read_text(encoding="utf-8")
-    assert "_shared_lock" in src and "with _shared_lock" in src
+    def slow_make():
+        calls.append(1)
+        time.sleep(0.02)
+        return real_make()
+
+    monkeypatch.setattr(md, "_make_registry", slow_make)
+    monkeypatch.setattr(md, "_shared_registry", None)
+    out = []
+    lock = threading.Lock()
+
+    def worker():
+        reg = md._get_shared_registry()
+        with lock:
+            out.append(reg)
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(calls) == 1, f"并发下重复初始化 {len(calls)} 次，_shared_lock 失效"
+    assert len({id(r) for r in out}) == 1
+    assert md._get_shared_registry() is out[0]
 
 
 def test_b3a_market_get_market_data_reuses_shared_registry(monkeypatch):
-    """get_market_data 不应每调用新建 registry（浪费且规避 shared lock 契约）；应复用 _get_shared_registry。"""
+    """get_market_data 必须走共享 registry（而非每次 _make_registry）。"""
+    import hero_quant.tools.market_data as md
 
-    src = (_REPO_ROOT / "src/hero_quant/tools/market_data.py").read_text(encoding="utf-8")
-    # 关键修复：get_market_data 内应调用 _get_shared_registry 而非 _make_registry
-    # 允许同时存在 _make_registry 定义，但函数体内不得直接调用 _make_registry
-    # 简化断言：文件中存在 _get_shared_registry 且在 get_market_data 定义附近被调用
-    assert "_get_shared_registry" in src
-    # 粗粒度防回退：若 get_market_data 内直连 _make_registry() 则视为未修复
-    import re
+    seen = []
 
-    m = re.search(r"def get_market_data[\s\S]{0,1200}?_make_registry\(\)", src)
-    assert m is None, "get_market_data 仍直连 _make_registry()，未复用 shared registry"
+    class _Prov:
+        source = "test"
+        unit = "shares"
+        adjust = "qfq"
+
+    class _Reg:
+        def get_bars(self, symbol, start, end, interval="1d"):
+            seen.append((symbol, interval))
+            return [{"date": "2026-01-05", "close": 1.0}], _Prov()
+
+    monkeypatch.setattr(md, "_get_shared_registry", lambda: _Reg())
+    res = md.get_market_data("600519.SH", interval="1d", start="2026-01-01", end="2026-01-10")
+    assert res["ok"] is True
+    assert res["provenance"]["source"] == "test"
+    assert seen == [("600519.SH", "1d")]
 
 
 # ============================================================

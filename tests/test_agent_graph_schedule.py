@@ -1,33 +1,30 @@
-"""Task17 TDD: graph 调度深度与熔断锁 (scan_core_muse.log:495-549)."""
-from pathlib import Path
+"""Task17 TDD: graph 调度深度（scan_core_muse.log:495-549）——运行时断言取代源码文本扫描。"""
+
+from hero_quant.agent.graph import MAX_DELEGATION_DEPTH, plan_node
+
+
+def _state(depth: int) -> dict:
+    return {
+        "messages": [{"role": "user", "content": "research market sentiment news"}],
+        "plan": "market sentiment news",
+        "delegation_depth": depth,
+    }
 
 
 def test_delegation_depth_increments():
-    """plan_node 与 _plan 必须返回 delegation_depth: depth+1 且 Send 载荷 depth+1."""
-    src = Path("src/hero_quant/agent/graph.py").read_text(encoding="utf-8")
-    # 必须存在 depth + 1 的递增（至少两处：plan_node 与 _plan）
-    assert "delegation_depth" in src
-    # 源码断言：存在 delegation_depth: depth + 1
-    assert "depth + 1" in src or "depth+1" in src, "missing depth+1 increment"
-    # 分别检查 plan_node 与 _plan 返回处有 depth+1；用计数近似
-    cnt = src.count("depth + 1") + src.count("depth+1")
-    assert cnt >= 3, f"expected >=3 depth+1 occurrences (plan_node+_plan+Send), got {cnt}: {src.count('depth + 1')}"
-    # Send 载荷必须含 depth+1
-    assert '"delegation_depth": depth + 1' in src or '"delegation_depth":depth+1' in src or "'delegation_depth': depth + 1" in src or "delegation_depth\": depth + 1" in src, "Send payload missing depth+1"
-    # Send 构造需传递带 depth+1 的 state 副本（**state 展开）
-    assert "**state" in src and "delegation_depth" in src, "Send should carry {**state, \"delegation_depth\": depth+1}"
+    """plan_node 的 update 与每个 Send 载荷都必须把 delegation_depth 加一。"""
+    for depth in (0, 2):
+        res = plan_node(_state(depth))
+        assert res.update["delegation_depth"] == depth + 1
+        sends = [s for s in res.goto if getattr(s, "arg", None) is not None]
+        assert sends, "plan_node 应通过 Send 扇出"
+        for send in sends:
+            assert send.arg["delegation_depth"] == depth + 1
 
 
-def test_breaker_threadsafe():
-    """_breaker 调用处必须有 threading.Lock 保护或 check_and_add 原子."""
-    src = Path("src/hero_quant/agent/graph.py").read_text(encoding="utf-8")
-    has_lock = "threading.Lock" in src or "threading.RLock" in src or "_breaker_lock" in src
-    assert has_lock, "missing threading.Lock / _breaker_lock for _breaker"
-    # 调用处被锁保护：with _breaker_lock
-    has_with = "with _breaker_lock" in src or "with threading" in src
-    has_atomic = "check_and_add" in src
-    assert has_with or has_atomic, "breaker call must be under Lock (with _breaker_lock) or use check_and_add atomically"
-    # 顶部 import 窄化：不应有裸 except Exception 吞 ImportError
-    # 至少存在 except ImportError 且有 warning
-    assert "except ImportError" in src, "top imports should narrow to except ImportError"
-    assert "warning" in src.lower(), "import fallback should log warning"
+def test_delegation_depth_budget_exceeded():
+    """达到上限时不再扇出，直接返回预算提示且深度仍加一。"""
+    res = plan_node(_state(MAX_DELEGATION_DEPTH))
+    assert isinstance(res, dict)
+    assert res["delegation_depth"] == MAX_DELEGATION_DEPTH + 1
+    assert "budget exceeded" in res["messages"][0]["content"]

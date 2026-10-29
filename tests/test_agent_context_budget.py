@@ -1,6 +1,5 @@
 """Task27 Wave6 Top5: context budget and injection tests (TDD)."""
 
-import pathlib
 
 
 def test_total_chars_recomputed_after_microcompact():
@@ -13,19 +12,20 @@ def test_total_chars_recomputed_after_microcompact():
     assert len(r.text) <= 100, f"budget overflow: len={len(r.text)} text={r.text!r}"
 
 
-def test_extra_rules_in_fallback():
-    src = pathlib.Path("src/hero_quant/agent/context.py").read_text(encoding="utf-8")
-    # fallback paths must render extra_rules
-    assert "Extra Rules" in src, "fallback missing Extra Rules marker"
-    # at least one fallback branch should concatenate extra_rules
-    # we require the literal string used for rendering appears
-    assert '## Extra Rules' in src
-    # ensure extra_rules variable is referenced inside fallback except block
-    # simple source assertion: fallback section contains extra_rules
-    # Check that after 'except Exception:' there is handling of extra_rules
-    lowered = src.lower()
-    # must have at least two occurrences (method + module level fallback)
-    assert src.count("extra_rules") >= 4
+def test_extra_rules_in_fallback(monkeypatch):
+    """prompt 模块不可用时，模块级 fallback 仍必须渲染 extra_rules。"""
+    import hero_quant.agent.context as ctx
+    import hero_quant.agent.prompt as prompt_mod
+
+    def _boom(**kwargs):
+        raise RuntimeError("prompt unavailable")
+
+    monkeypatch.setattr(prompt_mod, "build_system_prompt", _boom)
+    out = ctx.build_system_prompt(extra_rules="只回答 A 股")
+    assert "## Extra Rules" in out
+    assert "只回答 A 股" in out
+    # fallback 仍必须带 HARD RULE 免责
+    assert "HARD RULE" in out
 
 
 def test_skill_injection_escaped():

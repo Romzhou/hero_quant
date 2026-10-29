@@ -2,7 +2,6 @@
 import json
 import re
 import threading
-from pathlib import Path
 
 
 def test_genesis_prev_hash_exists():
@@ -22,16 +21,6 @@ def test_ledger_corruption_error_exists():
     from hero_quant.governance import ledger
     assert hasattr(ledger, "LedgerCorruptionError")
     assert issubclass(ledger.LedgerCorruptionError, Exception)
-
-
-def test_flock_exclusive_critical_section():
-    from hero_quant.governance import ledger
-    src = Path(ledger.__file__).read_text(encoding="utf-8")
-    # functional check will be covered by concurrent test; keep grep but add behavioral supplement
-    assert "flock" in src.lower() or "LOCK_EX" in src
-    assert "fcntl" in src or "msvcrt" in src
-    # also verify _write uses finally for lock release
-    assert "finally" in src.lower() or "with" in src.lower(), "ledger should release lock in finally/with"
 
 
 def test_concurrent_append_no_loss(tmp_path):
@@ -171,15 +160,16 @@ def test_export_hash_stub(tmp_path):
 
 def test_rotate_64mib_constant():
     from hero_quant.governance import ledger
-    src = Path(ledger.__file__).read_text(encoding="utf-8")
-    # exact constant value required, not substring
-    assert hasattr(ledger, "DEFAULT_ROTATE_BYTES"), "missing DEFAULT_ROTATE_BYTES"
+
+    # 直接断言运行时常量值（不再读源码文本）
     assert ledger.DEFAULT_ROTATE_BYTES == 64 * 1024 * 1024, f"rotate bytes must be 64MiB, got {ledger.DEFAULT_ROTATE_BYTES}"
 
 
 def test_dedup_rls_ddl_contains_create_policy():
     from hero_quant.governance import dedup
-    src = Path(dedup.__file__).read_text(encoding="utf-8")
+
+    # RLS DDL 是模块级常量，直接断言其内容（运行时对象，不是源码文本）
+    src = dedup.DDL_RLS_PG
     assert "CREATE POLICY" in src, "missing CREATE POLICY RLS DDL"
     assert "ROW LEVEL SECURITY" in src or "ENABLE ROW LEVEL SECURITY" in src
     # verify USING/WITH CHECK tenant isolation

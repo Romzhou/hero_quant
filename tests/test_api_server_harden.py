@@ -1,25 +1,17 @@
 """Task14 TDD — server guards, SSE async, path hardening."""
 
-import pathlib
-import inspect
 
 
-def test_request_counter_none_guarded():
-    """源码断言 REQUEST_COUNTER 调用处有 None guard 或 try."""
-    src = pathlib.Path("src/hero_quant/api/server.py").read_text(encoding="utf-8")
-    # 检查 live/ready/query 路径的 REQUEST_COUNTER 调用是否有 None guard
-    # 最小要求：源码中存在对 REQUEST_COUNTER 的 None 判断或受 try 包裹
-    has_none_guard = "if REQUEST_COUNTER" in src or "REQUEST_COUNTER is not None" in src
-    has_try_guard = src.count("REQUEST_COUNTER.labels") >= 1 and "try:" in src
-    # 要求至少有显式 None guard（task 要求加 None guard）
-    assert has_none_guard, "REQUEST_COUNTER calls must have None guard (if REQUEST_COUNTER is not None)"
-    # 且 live/ready 不应裸调；检查 live 函数体内有 guard
-    # 简单校验：live 定义后的 5 行内应有 guard
-    live_idx = src.find("def live")
-    ready_idx = src.find("def ready")
-    # 取 live..ready 区间
-    segment = src[live_idx : ready_idx] if live_idx != -1 and ready_idx != -1 else src
-    assert "if REQUEST_COUNTER" in segment or "REQUEST_COUNTER is not None" in segment, "live() must guard REQUEST_COUNTER"
+def test_request_counter_none_guarded(monkeypatch):
+    """REQUEST_COUNTER 未初始化（None）时健康检查与回测端点不得崩。"""
+    import hero_quant.api.server as srv
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setattr(srv, "REQUEST_COUNTER", None, raising=False)
+    monkeypatch.setattr(srv, "_get_backtest_bundle", lambda: {"metrics": {}}, raising=False)
+    c = TestClient(srv.app)
+    assert c.get("/live").status_code == 200
+    assert c.get("/v1/backtest/metrics.json").status_code == 200
 
 
 def test_negative_offset_rejected():
@@ -59,18 +51,12 @@ def test_negative_offset_rejected():
 
 
 def test_dist_traversal_blocked():
-    """源码断言 _dist_path 处理用 resolve+is_relative_to."""
-    src = pathlib.Path("src/hero_quant/api/server.py").read_text(encoding="utf-8")
-    # 需在 serve_spa / candidate 处理处出现 resolve() 且 is_relative_to
-    assert "resolve()" in src, "must use Path.resolve() for dist traversal check"
-    assert "is_relative_to" in src, "must use is_relative_to for dist traversal check"
-    # 且 candidate 与 _dist_path / full_path 关联
-    # 检查 candidate 定义附近有 resolve+is_relative_to
-    idx = src.find("candidate")
-    # 找最近的 candidate 赋值
-    cand_idx = src.find("candidate =")
-    if cand_idx == -1:
-        cand_idx = src.find("candidate=")
-    assert cand_idx != -1, "candidate path handling not found"
-    window = src[cand_idx : cand_idx + 800]
-    assert "resolve()" in window and "is_relative_to" in window, "candidate handling must resolve+is_relative_to"
+    """编码后的 ../ 不得越出 dist，更不能把仓库文件当静态资源返回。"""
+    from fastapi.testclient import TestClient
+    from hero_quant.api.server import app
+
+    c = TestClient(app)
+    for path in ("/%2e%2e/pyproject.toml", "/..%2Fpyproject.toml", "/%2e%2e%2fpyproject.toml", "/../pyproject.toml"):
+        r = c.get(path, headers={"accept": "text/plain"})
+        assert r.status_code == 404, f"{path} 未被拒绝: {r.status_code} {r.text[:120]}"
+        assert "[project]" not in r.text and "hero-quant" not in r.text

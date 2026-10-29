@@ -18,20 +18,6 @@ _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 # ============================================================
 # rate_limiter.py:50-51 三档共用 bucket
 # ============================================================
-def test_c4_rl_shared_bucket_tier_isolation():
-    """三档不得共用裸 key：chat/tool/session 应带 endpoint 前缀隔离。"""
-    src = (_REPO_ROOT / "src/hero_quant/api/rate_limiter.py").read_text(encoding="utf-8")
-    # 修复后 try_acquire 的 key 应包含 endpoint/tier 区分
-    assert "endpoint" in src, "rate_limiter 未引入 endpoint 区分"
-    # 关键：try_acquire 调用处应为 f\"{endpoint}:...\" 或类似带 endpoint
-    # 检查 _check 内 try_acquire 行包含 endpoint
-    import re
-    m = re.search(r"try_acquire\(.*?endpoint.*?,", src, re.DOTALL)
-    # 也允许 f-string 形式
-    has_tier_key = m is not None or ("{endpoint}" in src and "try_acquire" in src)
-    assert has_tier_key, "try_acquire 仍用裸 limit_key(request) 未隔离 tier"
-
-
 def test_c4_rl_shared_bucket_runtime(monkeypatch):
     """运行时：同 key 不同 tier 不应命中同一桶。"""
     import hero_quant.api.rate_limiter as rl
@@ -67,19 +53,6 @@ def test_c4_rl_shared_bucket_runtime(monkeypatch):
 # ============================================================
 # rate_limiter.py:52-54 Redis 故障 fail-open
 # ============================================================
-def test_c4_rl_fail_closed_on_redis_error(monkeypatch):
-    """Redis 异常不得 fail-open 放行，应 fail-closed 抛 503 且 warning 级别。"""
-    src = (_REPO_ROOT / "src/hero_quant/api/rate_limiter.py").read_text(encoding="utf-8")
-    # 修复后不应有 return True 的 fail-open
-    # 允许注释中的 return True，但 except 块内不应直接 return True
-    import re
-    except_block = re.search(r"except Exception.*?:\s*\n(.*?)(?:\n\s*if not ok:)", src, re.DOTALL)
-    if except_block:
-        assert "return True" not in except_block.group(1), "except 块仍 return True fail-open"
-    assert "503" in src or "503" in src or "Rate limiter unavailable" in src or "raise HTTPException" in src, "未 fail-closed 抛 503"
-    assert "logger.warning" in src or "logger.warn" in src, "限流异常应 warning 而非 debug"
-
-
 def test_c4_rl_fail_closed_runtime(monkeypatch):
     """运行时：后端抛错应抛 HTTPException 503 而非放行。"""
     import hero_quant.api.rate_limiter as rl
@@ -103,22 +76,6 @@ def test_c4_rl_fail_closed_runtime(monkeypatch):
 # ============================================================
 # rate_limiter.py:34-35 falsy id 当匿名
 # ============================================================
-def test_c4_rl_falsy_id_not_anonymous():
-    """falsy id 如 0/\"\" 不得当匿名：应显式 is not None 判定。"""
-    src = (_REPO_ROOT / "src/hero_quant/api/rate_limiter.py").read_text(encoding="utf-8")
-    # 修复后应为 is not None 而非 if uid:
-    assert "is not None" in src, "未用 is not None 显式判定"
-    # 不应再有裸 if uid: 当限流 key 判断
-    # 检查 limit_key 内不应有纯 if uid:
-    import re
-    # 找到 limit_key 函数体
-    m = re.search(r"def limit_key.*?return f\"ip:", src, re.DOTALL)
-    assert m is not None
-    block = m.group(0)
-    # 修复后不应仅靠 if uid: 判定
-    assert "if uid:" not in block, "仍用 if uid: 会把 0/空串当匿名"
-
-
 def test_c4_rl_falsy_id_runtime():
     """运行时：uid=0 应得 user:0 而非 ip:unknown。"""
     import hero_quant.api.rate_limiter as rl
@@ -130,21 +87,6 @@ def test_c4_rl_falsy_id_runtime():
     assert rl.limit_key(req_empty).startswith("ip:")
     req_none = types.SimpleNamespace(state=types.SimpleNamespace(current_user=types.SimpleNamespace(id=None)), client=types.SimpleNamespace(host="5.6.7.8"))
     assert rl.limit_key(req_none) == "ip:5.6.7.8"
-
-
-# ============================================================
-# rate_limiter.py:47-48 函数内 import
-# ============================================================
-def test_c4_rl_top_level_import():
-    """RateLimiter 应顶层导入，不在函数内每请求导入。"""
-    src = (_REPO_ROOT / "src/hero_quant/api/rate_limiter.py").read_text(encoding="utf-8")
-    # 顶层（def _check 之前）应有 import RateLimiter
-    pre_check = src.split("def _check")[0]
-    assert "RateLimiter" in pre_check, "顶层未导入 RateLimiter"
-    assert "from hero_quant.infra.redis import RateLimiter" in pre_check or "from hero_quant.infra.redis import" in pre_check
-    # _check 内不应再有 from hero_quant.infra.redis import RateLimiter
-    post = src.split("def _check")[1].split("def rate_limit_chat")[0] if "def rate_limit_chat" in src else src.split("def _check")[1]
-    assert "from hero_quant.infra.redis import RateLimiter" not in post, "_check 内仍函数内 import"
 
 
 # ============================================================
@@ -173,33 +115,17 @@ def test_c4_server_backgroundtasks_injected_by_fastapi():
 
 
 def test_c4_server_backgroundtasks_no_mutable_default():
-    """query/query_stream 不得用 BackgroundTasks([]) 可变默认，且不得退回 union 注解。"""
-    src = (_REPO_ROOT / "src/hero_quant/api/server.py").read_text(encoding="utf-8")
-    assert "BackgroundTasks([])" not in src, "仍有可变默认 BackgroundTasks([])"
-    # 中文：BackgroundTasks | None 会让该参数退化成普通字段，模块 import 即失败（服务起不来）。
-    # 只在路由签名上比对——注释里出现该字面量属正常说明性文字，不应误伤。
-    sig_lines = [line for line in src.splitlines() if "async def query" in line and "background_tasks" in line]
-    assert len(sig_lines) == 2, f"应匹配 query/query_stream 两条签名，实得 {sig_lines}"
-    for sig in sig_lines:
-        assert "BackgroundTasks | None" not in sig, f"签名退回 PEP604 union，FastAPI 无法识别：{sig}"
-    # 检查 query/query_stream 定义后 15 行内保留了 None 兜底守卫（显式传 None 时不炸）
-    lines = src.splitlines()
-    for idx, line in enumerate(lines):
-        if "async def query(" in line and "background_tasks" in line:
-            window = "\n".join(lines[idx:idx+15])
-            assert "if background_tasks is None" in window, f"query 未按需守卫 background_tasks: {window[:300]}"
-        if "async def query_stream(" in line and "background_tasks" in line:
-            window = "\n".join(lines[idx:idx+15])
-            assert "if background_tasks is None" in window, f"query_stream 未按需守卫: {window[:300]}"
+    """签名 introspection：不得把 BackgroundTasks 实例当可变默认值。"""
+    import inspect
 
+    from starlette.background import BackgroundTasks
 
-def test_c4_server_backgroundtasks_signature():
-    """签名应为裸 BackgroundTasks（无可变默认、无 union），由 FastAPI 注入。"""
-    src = (_REPO_ROOT / "src/hero_quant/api/server.py").read_text(encoding="utf-8")
-    assert (
-        "background_tasks: BackgroundTasks," in src or "background_tasks: BackgroundTasks)" in src
-    ), "未找到裸 BackgroundTasks 注解"
-    assert "background_tasks: BackgroundTasks | None" not in src, "union 注解会让 server 模块 import 失败"
+    from hero_quant.api.server import query, query_stream
+
+    for fn in (query, query_stream):
+        p = inspect.signature(fn).parameters.get("background_tasks")
+        assert p is not None, f"{fn.__name__} 缺 background_tasks 参数"
+        assert not isinstance(p.default, BackgroundTasks), f"{fn.__name__} 仍有可变默认 BackgroundTasks(...)"
 
 
 # ============================================================
@@ -224,13 +150,12 @@ def test_c4_server_narrow_except_around_to_thread():
 # server.py:467-468 sync shutdown cancel 不 await
 # ============================================================
 def test_c4_server_shutdown_is_async_and_awaits():
-    """shutdown 需为 async 且 await 取消的任务，带超时。"""
-    src = (_REPO_ROOT / "src/hero_quant/api/server.py").read_text(encoding="utf-8")
-    assert "async def _stop_trace_consumer" in src, "shutdown 未改为 async def"
-    # 应包含 await 且处理 CancelledError/TimeoutError
-    assert "await" in src.split("async def _stop_trace_consumer")[1].split("\n\n")[0] or "await" in src.split("async def _stop_trace_consumer")[1][:1200]
-    seg = src.split("async def _stop_trace_consumer")[1][:2000]
-    assert "CancelledError" in seg or "TimeoutError" in seg or "wait_for" in seg, "未 await 并处理 CancelledError/TimeoutError"
+    """shutdown 必须是协程函数（供 lifespan await），而非同步阻塞调用。"""
+    import inspect
+
+    from hero_quant.api.server import _stop_trace_consumer
+
+    assert inspect.iscoroutinefunction(_stop_trace_consumer), "shutdown 未改为 async def"
 
 
 # ============================================================

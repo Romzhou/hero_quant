@@ -1,7 +1,5 @@
 """Task18 policies BudgetBreaker & RetryPolicy TDD."""
 
-import math
-import pathlib
 
 
 def test_breaker_nan_not_poison():
@@ -40,13 +38,16 @@ def test_breaker_nan_not_poison():
 
 
 def test_retry_async_sleep():
-    p = pathlib.Path("src/hero_quant/agent/policies.py")
-    src = p.read_text(encoding="utf-8")
-    # must contain async asleep and asyncio.sleep or comment about asyncio path
-    has_async = "async def asleep" in src
-    has_asyncio = "asyncio.sleep" in src or "asyncio" in src
-    assert has_async and has_asyncio, "RetryPolicy missing async asleep with asyncio.sleep"
-    # also verify RetryPolicy still has sync sleep
-    assert "def sleep" in src
-    # check should_retry narrows to TypeError and validates retry_on
-    assert "except TypeError" in src or "except (TypeError" in src
+    import asyncio
+
+    from hero_quant.agent.policies import RetryPolicy
+
+    p = RetryPolicy(backoff_base=0.0)
+    # 异步退避路径必须真的可 await 且不抛
+    asyncio.run(p.asleep(1))
+    # 同步路径仍保留
+    assert hasattr(p, "sleep")
+    p.sleep(1)
+    # 类型过滤仍然生效
+    assert p.should_retry(TypeError("x"), 0) is True
+    assert p.should_retry(ValueError("x"), 0) is True

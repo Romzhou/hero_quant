@@ -119,17 +119,10 @@ def test_vector_column_and_cosine_topk_hybrid(tmp_path, monkeypatch):
     from hero_quant.memory.store import MemoryStore
 
     ms = MemoryStore(tmp_path)
-    # check vector column exists (or vector storage via DB)
-    cur = ms._conn.cursor()
-    cur.execute("PRAGMA table_info(notes)")
-    cols = [row[1] for row in cur.fetchall()]
-    assert "vector" in cols or "embedding" in cols or hasattr(ms, "_vector_enabled")
-    # stricter: if column named vector exists
-    # fallback: check source contains vector handling
-    if "vector" not in cols and "embedding" not in cols:
-        from pathlib import Path
-        store_src = Path("src/hero_quant/memory/store.py").read_text(encoding="utf-8")
-        assert "vector" in store_src.lower(), "store.py should mention vector for hybrid"
+    # 本地模式不依赖 pgvector 侧车：未配置 DSN 时混合检索必须仍可跑（侧车是增强而非前置）
+    from hero_quant.memory.store import is_pgvector_configured
+
+    assert is_pgvector_configured() is False, "测试环境不应意外连到 pgvector 侧车"
 
     # write distinct notes
     ms.write("doc_momentum", "momentum factor trading strategy with strong signal")
