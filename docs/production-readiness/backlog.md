@@ -48,7 +48,7 @@
 | PR-152 | P0 | W6 安全 | 提示注入/SSRF 加固 | 信任边界、出网白名单 | 注入/SSRF 用例拦截 | — | M | 安全+后端 |
 | PR-153 | P1 | W6 安全 | 安全测试与 SBOM | CI 安全 job、SBOM | 依赖漏洞可见；用例进 CI | PR-152 | S | 安全 |
 | PR-161 | P0 | W7 部署 | Helm/部署清单 | `deploy/helm/`（API/前端/job） | staging 从零部署成功 | — | L | 平台 |
-| PR-162 | P0 | W7 部署 | 托管 PG/Redis | 连接池、TLS、分库 | 生产连接稳定；故障可切 | PR-161 | M | 平台 |
+| PR-162 | P0 | W7 部署 | 独立/托管 PG/Redis | 连接池、TLS、分库 | 生产连接稳定；故障可切 | PR-161 | M | 平台 |
 | PR-163 | P0 | W7 部署 | CI/CD 流水线 | build/scan/sign/deploy/rollback | staging→prod 发布与回滚演练 | PR-161 | L | 平台 |
 | PR-164 | P0 | W7 部署 | 备份/PITR 与恢复 | 全备+WAL、恢复脚本 | 恢复演练 RPO/RTO 达标 | PR-162 | M | 平台 |
 | PR-165 | P1 | W7 部署 | 多环境与发布 runbook | dev/staging/prod、runbook | 配置/密钥隔离；发布清单可执行 | PR-163 | M | 平台 |

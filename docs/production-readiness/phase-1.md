@@ -36,7 +36,7 @@
 ### 怎么做
 
 1. **IdP 接入（PR-101）**
-   - 选型：Keycloak（自建 OIDC）或企业现有 IdP；前端走 Authorization Code + PKCE，后端只校验 JWT。
+   - 选型：**自建 Keycloak（OIDC，已定 D5）**；前端走 Authorization Code + PKCE，后端只校验 JWT。
    - 后端新增 `src/hero_quant/auth/`：`oidc.py`（JWKS 缓存、issuer/audience/exp 校验）、`deps.py`（`get_current_user`、`require_role`）。
    - JWT claims 至少含 `sub/email/tenant_id/roles`；缺失 tenant 直接 401，不猜默认租户。
 2. **租户上下文（PR-102）**
@@ -207,7 +207,7 @@
 ### 怎么做
 
 1. **Helm/清单（PR-161）**：API、worker（Phase 2 启用）、scheduler（Phase 2）、frontend、migration job；Deployment/Service/Ingress/HPA/PDB/probes/resources。
-2. **托管中间件（PR-162）**：托管 PG（HA、TLS、连接池）、托管 Redis（TLS、持久化）；分库/分 schema；连接串从 Secret 注入。
+2. **独立/托管中间件（PR-162）**：PG（HA、TLS、连接池）、Redis（TLS、持久化）；按 D3 不与应用同生命周期；分库/分 schema；连接串从 Secret 注入。
 3. **CI/CD（PR-163）**：构建镜像→扫描→签名（cosign）→推 registry→staging 部署→冒烟→人工/自动 approve→prod 灰度；回滚一键。
 4. **备份/PITR（PR-164）**：PG 每日全备 + WAL 归档；对象存储版本化；保留策略；每季度恢复演练。
 5. **多环境（PR-165）**：dev/staging/prod 配置与密钥隔离；staging 数据脱敏；发布清单与 runbook。
