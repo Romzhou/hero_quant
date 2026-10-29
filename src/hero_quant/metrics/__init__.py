@@ -32,12 +32,20 @@ __all__ = [
     "LLM_TIMEOUT_TOTAL",
     "LLM_RETRY_COUNTER",
     "LLM_TIMEOUT_COUNTER",
+    "LLM_TOKENS_TOTAL",
+    "LLM_COST_TOTAL",
+    "LLM_LATENCY_SECONDS",
+    "LLM_FAILOVER_TOTAL",
     "observe_wall_time",
     "inc_wall_time_exceeded",
     "observe_ledger_append",
     "inc_ledger_append",
     "inc_llm_retry",
     "inc_llm_timeout",
+    "inc_llm_tokens",
+    "inc_llm_cost",
+    "observe_llm_latency",
+    "inc_llm_failover",
     "get_wall_time_metrics",
 ]
 
@@ -139,6 +147,32 @@ LLM_TIMEOUT_TOTAL = _get_or_create_counter(
 LLM_RETRY_COUNTER = LLM_RETRY_TOTAL
 LLM_TIMEOUT_COUNTER = LLM_TIMEOUT_TOTAL
 
+# LLM 用量/成本/延迟（W2 PR-115；口径：价格来自 llm/catalog.py，未定价模型不计数）
+LLM_TOKENS_TOTAL = _get_or_create_counter(
+    "hero_quant_llm_tokens_total",
+    "LLM tokens by provider/model/kind (input|output)",
+    ["provider", "model", "kind"],
+)
+
+LLM_COST_TOTAL = _get_or_create_counter(
+    "hero_quant_llm_cost_total",
+    "LLM cost in USD by provider/model (unpriced models are not counted)",
+    ["provider", "model"],
+)
+
+LLM_LATENCY_SECONDS = _get_or_create_histogram(
+    "hero_quant_llm_latency_seconds",
+    "LLM call latency in seconds by provider/model",
+    ["provider", "model"],
+    buckets=[0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0],
+)
+
+LLM_FAILOVER_TOTAL = _get_or_create_counter(
+    "hero_quant_llm_failover_total",
+    "LLM provider failover count by source/destination/reason",
+    ["src", "dst", "reason"],
+)
+
 # HTTP 指标（server 已有同名 Histogram 时复用，此处为共享回退）
 REQUEST_DURATION = _get_or_create_histogram(
     "http_request_duration_seconds",
@@ -210,6 +244,51 @@ def inc_llm_timeout(provider: str = "unknown") -> None:
             LLM_TIMEOUT_TOTAL.labels(provider=provider).inc()
     except Exception as e:  # pragma: no cover
         _logger.debug("inc_llm_timeout failed error_code=metrics_emit_failed: %s", e, exc_info=True)  # intentional: 同上（指标 best-effort）
+
+
+def inc_llm_tokens(provider: str, model: str, kind: str, tokens: int) -> None:
+    """累计 LLM token 数（kind=input|output）；非正整数直接忽略。"""
+    try:
+        if LLM_TOKENS_TOTAL is None:
+            return
+        count = int(tokens)
+        if count <= 0:
+            return
+        LLM_TOKENS_TOTAL.labels(provider=provider, model=model, kind=kind).inc(count)
+    except Exception as e:  # pragma: no cover
+        _logger.debug("inc_llm_tokens failed error_code=metrics_emit_failed: %s", e, exc_info=True)  # intentional: 指标 best-effort
+
+
+def inc_llm_cost(provider: str, model: str, usd: float) -> None:
+    """累计 LLM 成本（USD）；0/负值不计数（未定价模型应传 None 而非 0）。"""
+    try:
+        if LLM_COST_TOTAL is None:
+            return
+        amount = float(usd)
+        if amount <= 0:
+            return
+        LLM_COST_TOTAL.labels(provider=provider, model=model).inc(amount)
+    except Exception as e:  # pragma: no cover
+        _logger.debug("inc_llm_cost failed error_code=metrics_emit_failed: %s", e, exc_info=True)  # intentional: 指标 best-effort
+
+
+def observe_llm_latency(provider: str, model: str, seconds: float) -> None:
+    """记录 LLM 调用耗时（秒）。"""
+    try:
+        if LLM_LATENCY_SECONDS is None:
+            return
+        LLM_LATENCY_SECONDS.labels(provider=provider, model=model).observe(float(seconds))
+    except Exception as e:  # pragma: no cover
+        _logger.debug("observe_llm_latency failed error_code=metrics_emit_failed: %s", e, exc_info=True)  # intentional: 指标 best-effort
+
+
+def inc_llm_failover(src: str, dst: str, reason: str) -> None:
+    """累计 provider 回退次数（src→dst，reason 为脱敏后的 error code）。"""
+    try:
+        if LLM_FAILOVER_TOTAL is not None:
+            LLM_FAILOVER_TOTAL.labels(src=src, dst=dst, reason=reason).inc()
+    except Exception as e:  # pragma: no cover
+        _logger.debug("inc_llm_failover failed error_code=metrics_emit_failed: %s", e, exc_info=True)  # intentional: 指标 best-effort
 
 
 def get_wall_time_metrics() -> dict[str, Any]:

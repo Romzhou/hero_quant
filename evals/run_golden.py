@@ -413,6 +413,11 @@ def main(argv: list[str] | None = None) -> int:
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "golden_set": golden_meta,
         "provider": provider_meta,
+        "cost_accounting": {
+            "pricing_source": "hero_quant.llm.catalog.MODEL_CATALOG",
+            "unit": "USD_per_1M_tokens",
+            "unpriced_policy": "catalog 外模型 cost_usd=null，单列不计入 total",
+        },
         "refusal_detection": "keyword_heuristic",
         "metrics": metrics,
         "results": rows,

@@ -31,49 +31,6 @@ except Exception:  # pragma: no cover - 最小环境无 structlog
 PRICE_UNIT = 1_000_000
 """价目表单位：catalog 的价格是 USD / 1M tokens。"""
 
-# Prometheus 收集器（惰性注册，重复注册/未安装时降级为 None，观测不得影响业务）
-_METRICS_INIT = False
-_TOKEN_COUNTER: Any = None
-_COST_COUNTER: Any = None
-_LATENCY_HIST: Any = None
-
-
-def _init_metrics() -> None:
-    """惰性注册成本指标；任何失败都降级为 None（best-effort）。"""
-    global _METRICS_INIT, _TOKEN_COUNTER, _COST_COUNTER, _LATENCY_HIST
-    if _METRICS_INIT:
-        return
-    _METRICS_INIT = True
-    try:
-        from prometheus_client import Counter, Histogram  # type: ignore
-    except Exception:
-        return
-    try:
-        _TOKEN_COUNTER = Counter(
-            "hero_quant_llm_tokens_total",
-            "LLM tokens by provider/model/kind",
-            ["provider", "model", "kind"],
-        )
-    except Exception:
-        _TOKEN_COUNTER = None
-    try:
-        _COST_COUNTER = Counter(
-            "hero_quant_llm_cost_total",
-            "LLM cost in USD by provider/model",
-            ["provider", "model"],
-        )
-    except Exception:
-        _COST_COUNTER = None
-    try:
-        _LATENCY_HIST = Histogram(
-            "hero_quant_llm_latency_seconds",
-            "LLM call latency in seconds by provider/model",
-            ["provider", "model"],
-            buckets=[0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0],
-        )
-    except Exception:
-        _LATENCY_HIST = None
-
 
 def _pick_int(raw: Any, *names: str) -> int | None:
     """从 dict/对象里按候选名取整数；缺失或非法返回 None。"""
@@ -228,16 +185,20 @@ def build_usage(
 
 
 def record_llm_usage(usage: LLMUsage) -> None:
-    """记录单次用量：Prometheus 计数 + 结构化日志；任何失败都不得影响业务。"""
-    _init_metrics()
+    """记录单次用量：走 `hero_quant.metrics` 统一注册表 + 结构化日志。
+
+    中文：指标收集器只在 `metrics/__init__.py` 注册一处（t11 收口），本模块不再自建
+    Counter，避免同名重复注册导致整组指标静默降级为 None。
+    """
     try:
-        if _TOKEN_COUNTER is not None:
-            _TOKEN_COUNTER.labels(provider=usage.provider, model=usage.model, kind="input").inc(usage.input_tokens)
-            _TOKEN_COUNTER.labels(provider=usage.provider, model=usage.model, kind="output").inc(usage.output_tokens)
-        if _COST_COUNTER is not None and usage.cost_usd is not None:
-            _COST_COUNTER.labels(provider=usage.provider, model=usage.model).inc(float(usage.cost_usd))
-        if _LATENCY_HIST is not None and usage.latency_s is not None:
-            _LATENCY_HIST.labels(provider=usage.provider, model=usage.model).observe(float(usage.latency_s))
+        from hero_quant.metrics import inc_llm_cost, inc_llm_tokens, observe_llm_latency
+
+        inc_llm_tokens(usage.provider, usage.model, "input", usage.input_tokens)
+        inc_llm_tokens(usage.provider, usage.model, "output", usage.output_tokens)
+        if usage.cost_usd is not None:
+            inc_llm_cost(usage.provider, usage.model, usage.cost_usd)
+        if usage.latency_s is not None:
+            observe_llm_latency(usage.provider, usage.model, usage.latency_s)
     except Exception as exc:  # pragma: no cover - 观测 best-effort
         logger.debug("record_llm_usage metrics failed error_code=metrics_emit_failed: %s", exc)
     try:

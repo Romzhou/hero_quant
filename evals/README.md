@@ -83,6 +83,10 @@ max_latency_ms / expect_grounding / expect_refusal / expect_no_data / note`
 - 延迟：p50 / p95 / max（线性插值，不依赖 numpy）。
 - 成本：价目只取 `llm/catalog.py::MODEL_CATALOG`；目录外模型 `cost_usd=null` 单列
   `unpriced_cases`，**不并入 total 冒充完整成本**。
+  - `cost.by_model`：逐 provider/model 的 calls / input·output tokens / cost，各桶求和必须等于
+    `total_usd`（可对账）。
+  - `cost.estimated_cases`：后端没回 usage、由字符启发式估算的用例数；估算值不能用于对外计费对账。
+  - 结果文件另记 `cost_accounting`（pricing_source / unit / unpriced_policy），保证事后能追溯口径。
 
 ## Fail-closed 约定
 
@@ -93,9 +97,23 @@ max_latency_ms / expect_grounding / expect_refusal / expect_no_data / note`
 - 回归门默认关闭；CI 要阻断时传 `--min-pass-rate 0.8`（先做 nightly 非阻断，
   阈值以首轮真实基线 + 允许回退幅度设定）。
 
+## CI（`.github/workflows/eval.yml`）
+
+- `golden-fake`：PR 触及 `evals/**`、`src/hero_quant/llm/**`、`src/hero_quant/metrics/**` 时必跑，
+  **阻塞**。门禁三条：50 条齐全、无 `loop_crash_or_hang`、`quality_metrics` 必须为 `null`。
+- `golden-real`：nightly + 手动触发，`continue-on-error: true`（PR-114：先非阻断）。
+  有 key 才真跑；无 key 时 runner 自己写 `skipped/no_llm_backend`，作业仍是绿。
+- 转 blocking 的时机：拿到首轮真实基线后，用 `--min-pass-rate` 固定允许回退幅度，再移除 `continue-on-error`。
+
+## 成本指标归档
+
+指标收集器统一注册在 `src/hero_quant/metrics/__init__.py`：
+`hero_quant_llm_tokens_total{provider,model,kind}`、`hero_quant_llm_cost_total{provider,model}`、
+`hero_quant_llm_latency_seconds{provider,model}`、`hero_quant_llm_failover_total{src,dst,reason}`。
+`llm/cost.py` 只负责算账与调 `inc_llm_*`，不再自建 Counter（避免同名重复注册把整组指标降级为 None）。
+
 ## 待接（不在本批白名单）
 
-- CI job 需改 `.github/workflows/**`（B 线），本批未动。
 - `api/server.py` 的 `LLMGateway` 接线（启动 health_check + 响应带 `degraded/reason`）
   按批次约定留到最后串行。
 

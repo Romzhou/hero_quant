@@ -266,6 +266,22 @@ def test_from_settings_adds_fallback_only_when_provider_key_present(monkeypatch)
     assert "sk-deepseek" not in str(gw.health())
 
 
+def test_failover_emits_metric(monkeypatch):
+    import hero_quant.metrics as metrics
+
+    seen: list[dict] = []
+    monkeypatch.setattr(metrics, "inc_llm_failover", lambda **kw: seen.append(kw))
+
+    clients = {
+        "openai": StubClient(exc=ConnectionError("down")),
+        "deepseek": StubClient("secondary-ok"),
+    }
+    gw = _gateway(clients)
+
+    assert gw.chat("hi") == "secondary-ok"
+    assert seen == [{"src": "openai", "dst": "deepseek", "reason": "ConnectionError"}]
+
+
 def test_missing_key_maps_to_stable_error_code(monkeypatch):
     class FakeSettings:
         llm_provider = "openai"

@@ -189,6 +189,101 @@ def test_aggregate_real_mode_reports_cost_and_cost_completeness():
     assert quality["cost"]["cost_complete"] is False
 
 
+def test_aggregate_cost_breakdown_by_model_reconciles_with_total():
+    rows = [
+        {
+            "category": "market_data",
+            "passed": True,
+            "elapsed_ms": 1.0,
+            "failure_class": "pass",
+            "expected_tools": [],
+            "tools_called": [],
+            "expect_grounding": None,
+            "grounding_verified": False,
+            "cost_usd": 0.001,
+            "usage": {
+                "provider": "openai",
+                "model": "gpt-4o-mini",
+                "input_tokens": 1000,
+                "output_tokens": 500,
+                "total_tokens": 1500,
+            },
+        },
+        {
+            "category": "zh_terms",
+            "passed": True,
+            "elapsed_ms": 1.0,
+            "failure_class": "pass",
+            "expected_tools": [],
+            "tools_called": [],
+            "expect_grounding": None,
+            "grounding_verified": False,
+            "cost_usd": 0.002,
+            "usage": {
+                "provider": "openai",
+                "model": "gpt-4o-mini",
+                "input_tokens": 2000,
+                "output_tokens": 1000,
+                "total_tokens": 3000,
+            },
+        },
+        {
+            "category": "zh_terms",
+            "passed": True,
+            "elapsed_ms": 1.0,
+            "failure_class": "pass",
+            "expected_tools": [],
+            "tools_called": [],
+            "expect_grounding": None,
+            "grounding_verified": False,
+            "cost_usd": None,
+            "usage": {
+                "provider": "acme",
+                "model": "acme-super-model",
+                "input_tokens": 10,
+                "output_tokens": 5,
+                "total_tokens": 15,
+            },
+        },
+    ]
+
+    cost = M.aggregate(rows)["quality_metrics"]["cost"]
+
+    priced = cost["by_model"]["openai/gpt-4o-mini"]
+    assert priced["calls"] == 2
+    assert priced["total_tokens"] == 4500
+    assert priced["cost_usd"] == 0.003
+    assert priced["priced_calls"] == 2
+    assert priced["unpriced_calls"] == 0
+
+    unpriced = cost["by_model"]["acme/acme-super-model"]
+    assert unpriced["unpriced_calls"] == 1
+    assert unpriced["cost_usd"] == 0.0
+
+    assert round(sum(b["cost_usd"] for b in cost["by_model"].values()), 8) == cost["total_usd"]
+
+
+def test_cost_breakdown_flags_missing_usage_instead_of_zero():
+    rows = [
+        {
+            "category": "zh_terms",
+            "passed": True,
+            "elapsed_ms": 1.0,
+            "failure_class": "pass",
+            "expected_tools": [],
+            "tools_called": [],
+            "expect_grounding": None,
+            "grounding_verified": False,
+            "cost_usd": None,
+        }
+    ]
+
+    bucket = M.aggregate(rows)["quality_metrics"]["cost"]["by_model"]["unknown/unknown"]
+
+    assert bucket["calls"] == 1
+    assert bucket["usage_missing"] is True
+
+
 def test_tool_call_recorder_wraps_and_restores_registry():
     from hero_quant.tools.registry import TOOL_REGISTRY
 

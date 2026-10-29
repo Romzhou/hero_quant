@@ -3,7 +3,7 @@
   "status": "skipped",
   "reason": "no_llm_backend",
   "detail": "health_check all providers failed: openai=api_key_missing; real-LLM assertions are not meaningful",
-  "generated_at": "2026-10-29T15:01:53.502366+00:00",
+  "generated_at": "2026-10-29T15:24:53.521139+00:00",
   "golden_set": {
     "path": "/root/projects/hero-quant/.codebuddy/worktrees/bg-a22f4f02/evals/golden/golden_v1.jsonl",
     "version": "v1",

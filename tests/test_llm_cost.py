@@ -118,3 +118,51 @@ def test_record_llm_usage_is_best_effort():
     usage = LLMUsage("openai", "gpt-4o-mini", 10, 5, cost_usd=0.0001, latency_s=0.2)
     # 未安装 prometheus / 重复注册都不允许抛错
     record_llm_usage(usage)
+
+
+def test_metrics_module_owns_llm_cost_family():
+    import hero_quant.metrics as metrics
+
+    for name in ("LLM_TOKENS_TOTAL", "LLM_COST_TOTAL", "LLM_LATENCY_SECONDS", "LLM_FAILOVER_TOTAL"):
+        assert name in metrics.__all__, f"{name} must be registered in metrics/__init__.py"
+    for fn in ("inc_llm_tokens", "inc_llm_cost", "observe_llm_latency", "inc_llm_failover"):
+        assert fn in metrics.__all__, f"{fn} must be exported from metrics/__init__.py"
+
+
+def test_record_llm_usage_routes_through_metrics_module(monkeypatch):
+    import hero_quant.metrics as metrics
+
+    calls: dict[str, list] = {"tokens": [], "cost": [], "latency": []}
+    monkeypatch.setattr(metrics, "inc_llm_tokens", lambda p, m, k, n: calls["tokens"].append((p, m, k, n)))
+    monkeypatch.setattr(metrics, "inc_llm_cost", lambda p, m, usd: calls["cost"].append((p, m, usd)))
+    monkeypatch.setattr(metrics, "observe_llm_latency", lambda p, m, s: calls["latency"].append((p, m, s)))
+
+    usage = LLMUsage("openai", "gpt-4o-mini", 10, 5, cost_usd=0.001, latency_s=0.3)
+    record_llm_usage(usage)
+
+    assert calls["tokens"] == [
+        ("openai", "gpt-4o-mini", "input", 10),
+        ("openai", "gpt-4o-mini", "output", 5),
+    ]
+    assert calls["cost"] == [("openai", "gpt-4o-mini", 0.001)]
+    assert calls["latency"] == [("openai", "gpt-4o-mini", 0.3)]
+
+
+def test_record_llm_usage_skips_cost_for_unpriced_model(monkeypatch):
+    import hero_quant.metrics as metrics
+
+    costs: list = []
+    monkeypatch.setattr(metrics, "inc_llm_cost", lambda *a: costs.append(a))
+
+    record_llm_usage(LLMUsage("acme", "acme-super-model", 10, 5, cost_usd=None))
+
+    assert costs == [], "未定价模型不得以 0 成本计入 llm_cost_total"
+
+
+def test_metrics_ignores_zero_or_negative_amounts():
+    import hero_quant.metrics as metrics
+
+    # 不抛错即可；0/负值不应被计入（计数器存在时也不会有副作用）
+    metrics.inc_llm_tokens("openai", "gpt-4o-mini", "input", 0)
+    metrics.inc_llm_cost("openai", "gpt-4o-mini", 0.0)
+    metrics.inc_llm_failover("openai", "deepseek", "ConnectionError")

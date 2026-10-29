@@ -191,6 +191,7 @@ def aggregate(rows: Sequence[dict[str, Any]], *, quality: bool = True) -> dict[s
     )
     costs = [r.get("cost_usd") for r in rows]
     priced = [float(c) for c in costs if c is not None]
+    estimated_cases = sum(1 for r in rows if (r.get("usage") or {}).get("estimated"))
     report["quality_metrics"] = {
         "tool_selection": {k: v for k, v in tool.items() if k != "per_case"},
         "tool_selection_cases": tool["per_case"],
@@ -200,10 +201,56 @@ def aggregate(rows: Sequence[dict[str, Any]], *, quality: bool = True) -> dict[s
             "per_task_usd": round(sum(priced) / len(priced), 8) if priced else None,
             "priced_cases": len(priced),
             "unpriced_cases": total - len(priced),
+            "estimated_cases": estimated_cases,
             "cost_complete": total > 0 and len(priced) == total,
+            "by_model": _cost_by_model(rows),
         },
     }
     return report
+
+
+def _cost_by_model(rows: Sequence[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """按 provider/model 拆账：tokens 与成本可逐模型对账。
+
+    中文：per-case `usage` 缺失（旧结果文件）时仍计数 calls，但 tokens 记 0 且 bucket
+    标 `usage_missing=True`，避免把「没记录」误读成「零消耗」。
+    """
+    buckets: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        usage = row.get("usage") or {}
+        provider = str(usage.get("provider") or "unknown")
+        model = str(usage.get("model") or "unknown")
+        key = f"{provider}/{model}"
+        bucket = buckets.setdefault(
+            key,
+            {
+                "provider": provider,
+                "model": model,
+                "calls": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0,
+                "cost_usd": 0.0,
+                "priced_calls": 0,
+                "unpriced_calls": 0,
+                "usage_missing": False,
+            },
+        )
+        bucket["calls"] += 1
+        if not usage:
+            bucket["usage_missing"] = True
+        bucket["input_tokens"] += int(usage.get("input_tokens") or 0)
+        bucket["output_tokens"] += int(usage.get("output_tokens") or 0)
+        bucket["total_tokens"] += int(usage.get("total_tokens") or 0)
+        cost = row.get("cost_usd")
+        if cost is None:
+            bucket["unpriced_calls"] += 1
+        else:
+            bucket["priced_calls"] += 1
+            bucket["cost_usd"] += float(cost)
+    for bucket in buckets.values():
+        bucket["cost_usd"] = round(bucket["cost_usd"], 8)
+    return buckets
 
 
 __all__ = [

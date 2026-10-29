@@ -1,0 +1,154 @@
+name: eval
+
+# W2 评测回归门（PR-114）
+# 两段式：
+#   golden-fake  —— 每次相关 PR 必跑，阻塞门：校验 golden set 结构 + 网关/成本单测 + fake 管道不崩（不判模型质量）
+#   golden-real  —— nightly / 手动触发，暂不阻塞（PR-114：先 nightly 非阻断；有首轮真实基线后再改 blocking）
+# 无 LLM key 时 real 作业由 runner 自行写 status=skipped，不产出任何通过率数字。
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  schedule:
+    - cron: "0 16 * * *" # 每日 00:00 Asia/Shanghai
+  workflow_dispatch:
+    inputs:
+      real_min_pass_rate:
+        description: "real 回归门（0~1）；有首轮基线后再填，留空则不阻断"
+        default: ""
+  pull_request:
+    paths:
+      - "evals/**"
+      - "src/hero_quant/llm/**"
+      - "src/hero_quant/metrics/**"
+      - "scripts/eval_real.py"
+      - ".github/workflows/eval.yml"
+
+jobs:
+  golden-fake:
+    name: golden-fake (blocking)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      - name: Install locked dependencies (hash-checked, blocking)
+        run: |
+          pip install --require-hashes -r requirements-lock.txt
+          pip install -e ".[dev]"
+      - name: Lint eval + gateway + metrics
+        run: ruff check evals src/hero_quant/llm src/hero_quant/metrics
+      - name: Unit tests (gateway / cost / golden)
+        run: pytest tests/test_llm_gateway.py tests/test_llm_cost.py tests/test_evals_golden.py -q
+      - name: Golden set fake pipeline
+        # fake 不判模型质量，故不设 --min-pass-rate；门禁在下一步的三条硬断言。
+        run: python evals/run_golden.py --mode fake
+      - name: Assert fake run is a pipeline check, not a quality claim
+        # 中文：fake 只验管道。三条硬断言：50 条齐全、无 loop 崩溃、quality_metrics 必须为 null。
+        run: |
+          python - <<'PY'
+          import json
+          import sys
+
+          payload = json.load(open("evals/results_golden_fake.json", encoding="utf-8"))
+          metrics = payload["metrics"]
+          problems = []
+          if payload.get("status") != "ok":
+              problems.append(f"status={payload.get('status')}")
+          if payload["golden_set"]["count"] != 50:
+              problems.append(f"golden count={payload['golden_set']['count']} != 50")
+          if metrics.get("quality_metrics") is not None:
+              problems.append("fake mode must not emit quality_metrics")
+          crashes = metrics.get("failure_classes", {}).get("loop_crash_or_hang", 0)
+          if crashes:
+              problems.append(f"loop_crash_or_hang={crashes}")
+          if problems:
+              print("FAIL: " + "; ".join(problems), file=sys.stderr)
+              sys.exit(1)
+          print(f"fake pipeline ok: cases={metrics['total']} passed={metrics['passed']} "
+                f"sha256={payload['golden_set']['sha256'][:12]}")
+          PY
+      - name: Upload fake results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-golden-fake
+          path: evals/results_golden_fake.json
+          if-no-files-found: warn
+
+  golden-real:
+    name: golden-real (nightly, non-blocking)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    needs: golden-fake
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    # PR-114：先 nightly 非阻断，有首轮真实基线 + 允许回退幅度后再移除 continue-on-error。
+    continue-on-error: true
+    env:
+      HERO_API_KEY: ${{ secrets.HERO_API_KEY }}
+      HERO_LLM_PROVIDER: ${{ vars.HERO_LLM_PROVIDER || 'openai' }}
+      HERO_LLM_MODEL: ${{ vars.HERO_LLM_MODEL || 'gpt-4o-mini' }}
+      DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      - name: Install locked dependencies (hash-checked, blocking)
+        run: |
+          pip install --require-hashes -r requirements-lock.txt
+          pip install -e ".[dev]"
+      - name: Notice when no provider key is configured
+        if: env.HERO_API_KEY == '' && env.DEEPSEEK_API_KEY == '' && env.ANTHROPIC_API_KEY == ''
+        run: echo "::notice::未配置任何 provider key，real 作业只会写 status=skipped/no_llm_backend（这是预期，不是失败）"
+      - name: Run real eval (fails closed to skipped without key)
+        env:
+          REAL_MIN_PASS_RATE: ${{ github.event.inputs.real_min_pass_rate }}
+        run: |
+          ARGS="--mode real"
+          if [ -n "$REAL_MIN_PASS_RATE" ]; then
+            ARGS="$ARGS --min-pass-rate $REAL_MIN_PASS_RATE"
+          fi
+          python evals/run_golden.py $ARGS
+      - name: Print metric summary
+        if: always()
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import sys
+
+          path = "evals/results_golden_real.json"
+          if not os.path.exists(path):
+              print("no results file (job failed before writing)")
+              sys.exit(0)
+          payload = json.load(open(path, encoding="utf-8"))
+          print(f"status={payload.get('status')} reason={payload.get('reason')}")
+          metrics = payload.get("metrics") or {}
+          if not metrics:
+              print("no metrics: real eval produced no quality numbers (fail-closed)")
+              sys.exit(0)
+          print(f"pass_rate={metrics.get('pass_rate')} latency={metrics.get('latency_ms')}")
+          print(f"failure_classes={metrics.get('failure_classes')}")
+          quality = metrics.get("quality_metrics") or {}
+          print(f"tool_selection={quality.get('tool_selection')}")
+          print(f"grounding={quality.get('grounding')}")
+          print(f"cost={quality.get('cost')}")
+          PY
+      - name: Upload real results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-golden-real
+          path: evals/results_golden_real.json
+          if-no-files-found: warn
