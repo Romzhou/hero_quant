@@ -322,6 +322,61 @@ def _llm_model_slot_from_env(key: str) -> str:
     return "gpt-4o-mini"
 
 
+# 中文：W1 身份/配额 env 统一在此解析，auth 包不得直读 os.environ（便于审计与热更新）。
+_AUTH_MODES = ("off", "enforce")
+_DEFAULT_OIDC_ALGORITHMS = ("RS256",)
+_KEYCLOAK_CERTS_PATH = "/protocol/openid-connect/certs"
+
+
+def _auth_mode_from_env() -> str:
+    """HERO_AUTH_MODE：off/enforce；未设或非法均收敛 enforce（安全默认），非法值告警。"""
+    raw = (os.getenv("HERO_AUTH_MODE", "") or "").strip().lower()
+    if raw in _AUTH_MODES:
+        return raw
+    if raw:
+        warnings.warn(f"Invalid HERO_AUTH_MODE={raw!r}, treating as enforce", UserWarning, stacklevel=2)
+        logger.warning("Invalid HERO_AUTH_MODE=%r, treating as enforce", raw)
+    return "enforce"
+
+
+def _oidc_jwks_url_from_env() -> str:
+    """JWKS 地址：显式配置优先，否则按 Keycloak 约定从 issuer 推导。"""
+    explicit = (os.getenv("HERO_OIDC_JWKS_URL", "") or "").strip()
+    if explicit:
+        return explicit
+    issuer = (os.getenv("HERO_OIDC_ISSUER", "") or "").strip()
+    if not issuer:
+        return ""
+    return issuer.rstrip("/") + _KEYCLOAK_CERTS_PATH
+
+
+def _oidc_algorithms_from_env() -> tuple[str, ...]:
+    """HERO_OIDC_ALGORITHMS：CSV 解析并大写；空值回退 RS256。"""
+    raw = (os.getenv("HERO_OIDC_ALGORITHMS", "") or "").strip()
+    if not raw:
+        return _DEFAULT_OIDC_ALGORITHMS
+    algorithms = tuple(part.strip().upper() for part in raw.split(",") if part.strip())
+    return algorithms or _DEFAULT_OIDC_ALGORITHMS
+
+
+def _bounded_int_from_env(key: str, default: int, *, low: int, high: int) -> int:
+    """有界整数 env：缺失用默认；非法/越界告警后回默认（不把错配置带进运行态）。"""
+    raw = (os.getenv(key, "") or "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        warnings.warn(f"Invalid {key}={raw!r}, using default {default}", UserWarning, stacklevel=2)
+        logger.warning("Invalid %s=%r, using default %d", key, raw, default)
+        return default
+    if value < low or value > high:
+        warnings.warn(f"{key}={value} out of range [{low}, {high}], using default {default}", UserWarning, stacklevel=2)
+        logger.warning("%s=%d out of range [%d, %d], using default %d", key, value, low, high, default)
+        return default
+    return value
+
+
 @dataclass
 class Settings:
     """全局配置聚合，字段按分组：LLM / 数据与基准 / wall-time 治理 / 向量与嵌入 / checkpoint。"""
@@ -386,6 +441,17 @@ class Settings:
     # fail-closed 于谎报（billing 未配 DSN 仍显式不可用，绝不静默降级成假成功）。
     ready_cohere_fatal: bool = field(default_factory=lambda: _bool_from_env("HERO_READY_COHERE_FATAL"))
     billing_allow_memory: bool = field(default_factory=lambda: _bool_from_env("HERO_BILLING_ALLOW_MEMORY"))
+    # 身份/租户（W1）：OIDC 与配额 env 的唯一解析入口，auth 包只读本对象。
+    # 未配 issuer/audience 时 auth_enabled() 为 false，开发环境不会因缺配置被强制鉴权打穿。
+    auth_mode: str = field(default_factory=_auth_mode_from_env)
+    oidc_issuer: str = field(default_factory=lambda: (os.getenv("HERO_OIDC_ISSUER", "") or "").strip())
+    oidc_audience: str = field(default_factory=lambda: (os.getenv("HERO_OIDC_AUDIENCE", "") or "").strip())
+    oidc_jwks_url: str = field(default_factory=_oidc_jwks_url_from_env)
+    oidc_algorithms: tuple[str, ...] = field(default_factory=_oidc_algorithms_from_env)
+    oidc_leeway_seconds: int = field(default_factory=lambda: _bounded_int_from_env("HERO_OIDC_LEEWAY_SECONDS", 60, low=0, high=600))
+    oidc_jwks_ttl_seconds: int = field(default_factory=lambda: _bounded_int_from_env("HERO_OIDC_JWKS_TTL_SECONDS", 300, low=30, high=3600))
+    tenant_requests_per_minute: int = field(default_factory=lambda: _bounded_int_from_env("HERO_TENANT_REQUESTS_PER_MINUTE", 60, low=1, high=1_000_000))
+    tenant_daily_token_budget: int = field(default_factory=lambda: _bounded_int_from_env("HERO_TENANT_DAILY_TOKEN_BUDGET", 2_000_000, low=0, high=10**12))
 
 
 @lru_cache(maxsize=1)
