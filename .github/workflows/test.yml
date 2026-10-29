@@ -50,7 +50,20 @@ jobs:
           npm run test:run --prefix frontend
       - name: Run tests
         # Coverage gate: Wave5 收口 50% (48.99% -> 50)；低频 retrieval_eval 标记为 retrieval 仅周跑，不计入此门
-        run: pytest -q --cov=src --cov-report=term --cov-fail-under=50
+        # -rs 落盘 skip 原因，供下一步断言 PG 守卫没有静默跳过
+        run: |
+          set -o pipefail
+          pytest -q --cov=src --cov-report=term --cov-fail-under=50 -rs | tee /tmp/pytest-rs.log
+      - name: Assert PostgreSQL guards did not skip
+        # 中文：CI 已提供 postgres service，PG 守卫用例必须真跑；出现 "PG guard" skip 直接红。
+        # HERO_RLS_TEST_DSN（非 superuser 角色）不在 CI 提供，3 条 RLS 用例按设计 skip。
+        run: |
+          if grep -q "PG guard" /tmp/pytest-rs.log; then
+            echo "PG guard skips found — CI PostgreSQL not wired to tests"
+            grep "PG guard" /tmp/pytest-rs.log
+            exit 1
+          fi
+          echo "no PG guard skips"
       - name: Pin setuptools for audit (PYSEC-2026-3447)
         # CI python3.11 镜像预装 setuptools 79.0.1（pip-audit 误报源）；lock 约束 setuptools>=83.0.0，此处先升级再审计
         run: pip install -U "setuptools>=83.0.0"
@@ -64,8 +77,10 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Install Playwright (root devDeps, blocking)
         # 中文：e2e 不再是可选门。根 package.json 才有 @playwright/test，先 npm ci 再跑。
+        # 显式安装自带 chromium（与 @playwright/test 版本对齐），CI 内允许联网。
         run: |
           npm ci
+          npx playwright install --with-deps chromium
           npx playwright --version
       - name: Start backend for e2e (same job)
         # 中文：e2e 真阻断的前提是同 job 有后端；playwright webServer 只起 vite dev，/v1 代理到 8899。

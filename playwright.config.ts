@@ -3,7 +3,8 @@ import { existsSync } from 'node:fs';
 
 /**
  * Playwright 配置（E线）
- * - 真浏览器：复用宿主 /usr/bin/google-chrome（无 ~/.cache/ms-playwright，禁止 npx playwright install）
+ * - 浏览器：本地优先复用系统 Chrome（CHROME_PATH / /usr/bin/google-chrome）；CI 用
+ *   `npx playwright install chromium` 装的自带 chromium（版本与 @playwright/test 对齐）
  * - webServer：起 vite dev（proxy /v1 → localhost:8899）。后端缺席时各 spec 断言错误/空态，不冒充成功
  * - 4 个 project 全部真调度，无 test.skip
  */
@@ -11,6 +12,8 @@ function chromePath(): string | undefined {
   const candidates = [process.env.CHROME_PATH, '/usr/bin/google-chrome', '/opt/google/chrome/chrome'];
   return candidates.find(p => !!p && existsSync(p));
 }
+
+const useBundledChromium = !!process.env.CI;
 
 export default defineConfig({
   testDir: 'e2e',
@@ -22,12 +25,10 @@ export default defineConfig({
     baseURL: 'http://127.0.0.1:5173',
     trace: 'off',
     launchOptions: {
-      // 系统 Chrome：CHROME_PATH 优先，其次 /usr/bin/google-chrome；都没有则不指定（交给 channel/内置解析）
-      // 不下载 Playwright 浏览器（本地无缓存、CI 用 runner 预装 Chrome）
-      executablePath: chromePath(),
-      // 找不到已知路径时退回 channel=chrome（Playwright registry 解析系统 Chrome），
-      // 避免落到未安装的内置 chromium（本仓库禁止 npx playwright install）
-      channel: chromePath() ? undefined : 'chrome',
+      // CI：不指定 executablePath/channel，走 playwright 自带 chromium（workflow 显式安装）
+      // 本地：系统 Chrome 优先；都找不到才退回 channel=chrome
+      executablePath: useBundledChromium ? undefined : chromePath(),
+      channel: useBundledChromium || chromePath() ? undefined : 'chrome',
       args: ['--no-sandbox', '--disable-dev-shm-usage'],
     },
   },
