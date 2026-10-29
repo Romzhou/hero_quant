@@ -1,6 +1,6 @@
 # Phase 1 · 上线底座（内部团队可用）
 
-> 目标：内部团队可登录使用；Chat 与 Research/回测两条链在云上稳定运行；真模型可评测；数据可复现；故障可恢复；行为可审计。
+> 目标：内部团队可登录使用；Chat 与 Research/回测两条链在**单台 Linux** 上稳定运行；真模型可评测；数据可复现；故障可恢复；行为可审计。
 > 非目标（放 Phase 2/3）：实盘/交易指令、对外注册与支付、Billing 用户面、Temporal 调度、RAG 深度调优、多地域 HA。
 > 验收门：`README.md` §4 的 **G1**。
 
@@ -13,16 +13,19 @@
 | **M1 止血** | 真模型跑通、运行态对齐 HEAD、版本单源、密钥退出 `.env`、golden set v1、身份 ADR | 先把“能不能真跑”变成证据，避免在沙子上盖楼 |
 | **M2 底座** | W1 身份/租户、W2 评测、W3 快照/PIT、W4 会话/迁移、W5 可观测、W6 安全、W7 部署、W8 审计 | 达到 G1，可给内部团队试用 |
 
-### M1 启动包（建议第一个迭代）
+### M1 启动包（本机先做；需要 key/生产机的项已标注）
 
-| # | 动作 | 对应任务 | 完成标志 |
-|---|---|---|---|
-| M1-1 | 配 `HERO_API_KEY`，跑 50 条 golden query，记录 trace/usage/成本 | PR-111、PR-112、PR-113、PR-114（先跑通再补 CI） | `evals/results_real.json` 不再 `skipped` |
-| M1-2 | 重建 compose 镜像，运行态对齐 HEAD | 无（运维） | 8899 返回 `sample/sharpe_basis/warnings`，不再是旧 synthetic |
-| M1-3 | 版本单源 | PR-181 | `__version__ == pyproject.version` |
-| M1-4 | 密钥基线：生产密钥进 Secret Manager，`.env` 退出生产 | PR-151（先做只读接入） | 生产环境无明文密钥 |
-| M1-5 | golden set v1 落库 | PR-113 | 50 条含期望工具/断言/分类 |
-| M1-6 | 身份/租户 ADR + IdP 选型 | PR-101（前置） | ADR 批准，IdP 确定 |
+> 本机执行顺序与环境规范见 [`local-plan.md`](local-plan.md)。M1-1 依赖 LLM key；其余可先做。
+
+| # | 动作 | 对应任务 | 完成标志 | 阻塞 |
+|---|---|---|---|---|
+| M1-0 | 磁盘≥2GB、基线 `ruff+pytest` 全绿、记录 PG 真跑方式 | — | 基线数字入报告 | 无 |
+| M1-1 | 配 `HERO_API_KEY`，跑 50 条 golden query，记录 trace/usage/成本 | PR-111、PR-112、PR-113、PR-114 | `evals/results_real.json` 不再 `skipped` | **等 key** |
+| M1-2 | 重建 compose 镜像，运行态对齐 HEAD | 无（运维） | 8899 返回 `sample/sharpe_basis/warnings` | 磁盘/可选 |
+| M1-3 | 版本单源 | PR-181 | `__version__ == pyproject.version` | 无 |
+| M1-4 | 密钥基线：Secret Manager 接入，`.env` 退出生产 | PR-151（先只读接入） | 生产环境无明文密钥 | 等生产机 |
+| M1-5 | golden set v1 落库 | PR-113 | 50 条含期望工具/断言/分类 | 领域专家确认 |
+| M1-6 | Keycloak 接入 ADR + compose 服务定义 | PR-101（前置） | ADR 批准；配置可启动 | 无（本机不启动） |
 
 依赖关系：M1 可与 W1 的 IdP 选型并行；W2 评测依赖 M1 的 key；W3 快照先于 W4 会话；W7 部署可与 W1~W6 并行搭骨架，最后统一联调。
 
@@ -268,7 +271,7 @@
 - [ ] 未登录 401；角色矩阵通过；跨租户读写全部拒绝并有审计。
 - [ ] 真模型 50 条 golden set 有基线；CI eval 可回归；无 key 时如实 skip。
 - [ ] 回测同 snapshot+commit+config 重跑 hash 一致；默认窗口 ≥60。
-- [ ] 云上从零部署；staging→prod 灰度/回滚；PG 恢复演练通过。
+- [ ] 生产单机从零部署；staging→prod 蓝绿/回滚；PG 恢复演练通过。
 - [ ] LLM/工具/队列/PG/Redis 看板与告警可用；告警测试触发。
 - [ ] 审计可按 run_id 查询；kill switch 生效。
 - [ ] `ruff + pytest（PG 真跑）+ e2e + eval` 全绿；版本单源。

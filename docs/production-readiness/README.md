@@ -17,6 +17,7 @@
 | D5 | **自建 Keycloak（OIDC）** 作为团队 IdP | Phase 1 以 compose 服务部署 Keycloak，后端只校验 JWT；不接外部 IdP |
 | D6 | **多 provider 路由**：OpenAI / DeepSeek / 国内合规模型，按租户/任务路由 | LLM Gateway 需 provider 列表、failover、成本归集；A/B 放 Phase 2 |
 | D7 | **数据源：公开源内部用**（akshare/tushare/yahoo），文档写明限制，不对外分发 | 内部研究可用；对外功能前必须采购合规源（Phase 3 PR-322） |
+| D8 | **本机优先开发**：先在当前 4C/8G 机器完成代码、测试、评测与单机部署脚本；生产机后置 | 本机只做开发/预发，不承载生产；G1 的部署/恢复验收需生产机到位 |
 
 ### 1.1 仍需补充的参数（不阻塞开工）
 
@@ -67,13 +68,13 @@
 
 ---
 
-## 3. 目标架构
+## 3. 目标架构（单机）
 
 ```
 Client (Web)
-   │  TLS / WAF / Ingress
+   │  HTTPS
    ▼
-Auth (OIDC) ──► Tenant Context (contextvar) ──► RBAC
+Caddy/Nginx（TLS/反代）──► Keycloak (OIDC)
    │
    ▼
 API (FastAPI) ── SSE Gateway ──► Agent Runtime (Loop/Graph)
@@ -83,12 +84,11 @@ API (FastAPI) ── SSE Gateway ──► Agent Runtime (Loop/Graph)
    │                                ├─ Memory/RAG (FTS5 + pgvector + rerank)
    │                                └─ Grounding / Trace
    ▼
-Data Plane: PG (checkpoint/billing/sessions/audit) · Redis (cache/ratelimit/ticket)
-            Object Storage (artifacts/traces/snapshots) · PIT Store (Parquet/DuckDB)
-   │
-   ▼
-Observability: OTel → Collector → Metrics/Logs/Traces → Grafana/Alerting
-Background: Worker (long runs) · Scheduler (Temporal) · Migration Job
+单机 Docker Compose：
+  API · frontend · Keycloak · PostgreSQL · Redis · OTel Collector · Prometheus/Grafana
+  数据卷：PG / Redis / artifacts / traces / snapshots（独立磁盘）
+  备份：pg_dump + WAL 归档 → 备份盘/对象存储
+Background: worker（Phase 2）· scheduler（Phase 2）· migration job
 ```
 
 关键原则：
@@ -109,11 +109,11 @@ Background: Worker (long runs) · Scheduler (Temporal) · Migration Job
 
 ### G1（Phase 1 完成定义）
 
-1. 未登录访问 API 返回 401；tenant A 无法读写 tenant B 的会话/checkpoint/billing/memory（自动化测试覆盖）。
-2. 真模型 E2E 跑通：50 条 golden set 产出基线（成功率/工具正确率/grounding 精确率/p95/单任务成本），CI 有回归门。
-3. 回测可复现：同一 `snapshot_id + commit + config_hash` 重跑结果 hash 一致；默认窗口 ≥60 根。
-4. 生产单机从零部署成功；staging→prod 发布/回滚演练通过；PG 备份恢复演练通过。
-5. 仪表盘与告警可用：LLM 错误率/延迟/成本、工具失败、队列积压、PG/Redis 健康；告警测试触发。
+1. 未登录访问 API 返回 401；tenant A 无法读写 tenant B 的会话/checkpoint/billing/memory（401/403/隔离矩阵 100% 覆盖）。
+2. 真模型 E2E 跑通：50 条 golden set 产出基线（成功率/工具正确率/grounding 精确率/p95/单任务成本）；回归门：成功率下降 ≤5%、p95 上升 ≤20%、单任务成本上升 ≤20%；无 key 时如实 skip。
+3. 回测可复现：同一 `snapshot_id + commit + config_hash` 重跑结果 hash 一致（浮点容差 1e-9）；默认窗口 ≥60 根。
+4. 生产单机从零部署成功；staging→prod 蓝绿/回滚演练通过（应用层中断 <10s）；PG 备份恢复演练通过（RPO ≤15min、RTO ≤4h）。
+5. 仪表盘与告警可用：LLM 错误率/延迟/成本、工具失败、队列积压、PG/Redis 健康；故障注入后 5 分钟内告警。
 6. 审计日志可按 tenant/user/run 查询；kill switch 可一键停用某租户/模型/工具。
 7. `ruff + pytest（含 PG 真跑）+ e2e + eval` 全绿；版本单一来源。
 
@@ -154,6 +154,7 @@ Background: Worker (long runs) · Scheduler (Temporal) · Migration Job
 ## 6. 任务索引
 
 - 总清单（67 项，含依赖/规模/验收摘要）：[`backlog.md`](backlog.md)
+- 本机开发执行计划（4C/8G 机器能做什么、批次、文件归属）：[`local-plan.md`](local-plan.md)
 - 非代码准备清单（硬件/账号/密钥/预算/人员/数据）：[`prerequisites.md`](prerequisites.md)
 - 第一期详细执行书：[`phase-1.md`](phase-1.md)
 - 第二期详细执行书：[`phase-2.md`](phase-2.md)
