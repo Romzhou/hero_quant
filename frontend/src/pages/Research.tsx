@@ -11,6 +11,8 @@
 import { useEffect, useMemo, useRef, useState } from "react"
 import ReactECharts from "echarts-for-react"
 import { API_METRICS, API_POSITIONS, API_TEARSHEET, API_DRAWDOWNS } from "../config/api"
+import DegradedBanner from "../components/DegradedBanner"
+import { describeHttpFailure, type HttpFailure } from "../config/degraded"
 
 // 集中管理：后端回测产物路径统一由 src/config/api 维护（避免跨页硬编码漂移）；截断上限保留本地
 const MAX_CSV_CHARS = 4000
@@ -241,6 +243,8 @@ export default function Research(props: ResearchProps) {
   const [csvIsMock, setCsvIsMock] = useState<boolean>(!props.csvPreview)
   const [csvLoading, setCsvLoading] = useState<boolean>(!props.csvPreview)
   const [metricsLoading, setMetricsLoading] = useState<boolean>(!props.metrics)
+  // 系统级失败（401/403/429/kill switch 503/5xx）：置位后顶部红色横幅，不再只留 isMock 徽标
+  const [failure, setFailure] = useState<HttpFailure | null>(null)
   const [tearsheetLoaded, setTearsheetLoaded] = useState(false)
   const [tearsheetIsSynthetic, setTearsheetIsSynthetic] = useState<boolean>(true)
 
@@ -281,11 +285,32 @@ export default function Research(props: ResearchProps) {
     const fetchNoStore = (url: string) => fetch(url, { cache: "no-store", signal })
     const isAlive = () => !aborted && !signal.aborted
 
+    // 失败语义（t14）：401/403/429/kill switch 503 是 D 线接线后的真实拒绝。
+    // 命中即置失败横幅并返回 true —— 页面继续展示合成数据，但必须同时声明「取不到真数据的原因」，
+    // 不允许只留一个 isMock 徽标把熔断/未登录伪装成「演示模式」。
+    const markFailure = async (r: Response): Promise<boolean> => {
+      if (r.ok) return false
+      let body: unknown = null
+      try {
+        body = await r.json()
+      } catch {
+        body = null
+      }
+      const f = describeHttpFailure(
+        r.status,
+        body,
+        typeof r.headers?.get === "function" ? r.headers.get("Retry-After") : null,
+      )
+      if (f && isAlive()) setFailure(f)
+      return f !== null
+    }
+
     async function fetchArtifact(path: string, setter: (v: string) => void, onReal: () => void, maxChars: number) {
       const myId = ++csvReqIdRef.current
       if (!props.csvPreview) setCsvLoading(true)
       try {
         const r = await fetchNoStore(path)
+        if (await markFailure(r)) return
         if (!r.ok) throw new Error(String(r.status))
         const txt = await r.text()
         // 过期响应丢弃：props 已同步更新时不再覆盖
@@ -306,6 +331,10 @@ export default function Research(props: ResearchProps) {
       setMetricsLoading(true)
       try {
         const r = await fetchNoStore(API_METRICS)
+        if (await markFailure(r)) {
+          if (isAlive()) setMetricsIsMock(true)
+          return
+        }
         if (!r.ok) throw new Error(String(r.status))
         const j = await r.json() as Record<string, unknown>
         if (!isAlive()) return
@@ -324,6 +353,10 @@ export default function Research(props: ResearchProps) {
       if (props.drawdowns) return
       try {
         const r = await fetchNoStore(API_DRAWDOWNS)
+        if (await markFailure(r)) {
+          if (isAlive()) setDrawdownsIsMock(true)
+          return
+        }
         if (!r.ok) throw new Error(String(r.status))
         const j = await r.json() as unknown
         if (!isAlive()) return
@@ -357,6 +390,7 @@ export default function Research(props: ResearchProps) {
     async function fetchTearsheet() {
       try {
         const r = await fetchNoStore(API_TEARSHEET)
+        if (await markFailure(r)) return
         if (!r.ok) throw new Error(String(r.status))
         const html = await r.text()
         if (!isAlive()) return
@@ -590,6 +624,9 @@ export default function Research(props: ResearchProps) {
           <a href={API_TEARSHEET} target="_blank" rel="noopener noreferrer" className="rounded-full bg-amber-500 px-3.5 py-1 text-xs font-semibold text-ink-900 hover:bg-amber-400 transition">打开 tearsheet.html ↗</a>
         </div>
       </div>
+
+      {/* 失败横幅：取数被拒绝/服务不可用，与「演示数据」区分，必须显式告知原因 */}
+      {failure ? <div className="mt-4"><DegradedBanner failure={failure} source="Research 回测产物" /></div> : null}
 
       {/* 指标卡：数值经 toFiniteNumber 归一，字符串数字不抛错 */}
       <div className="mt-6 grid grid-cols-2 gap-3 md:grid-cols-4">

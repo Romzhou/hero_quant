@@ -9,7 +9,13 @@
 import { useEffect, useRef, useState } from "react"
 import { useChatStore } from "../store/chat"
 import DegradedBanner from "../components/DegradedBanner"
-import { detectDegradedFromText, extractDegradedReason, isDegradedPayload } from "../config/degraded"
+import {
+  describeHttpFailure,
+  detectDegradedFromText,
+  extractDegradedReason,
+  isDegradedPayload,
+  type HttpFailure,
+} from "../config/degraded"
 
 type ToolCall = { id: string; tool: string; status: "pending" | "success" | "error"; latencyMs?: number; preview?: string }
 
@@ -94,6 +100,8 @@ export default function Chat() {
   const [error, setError] = useState<string | null>(null)
   // 降级横幅：收到 degraded 载荷或命中合成演示文本标记时置位，send() 开新一轮时清零
   const [degraded, setDegraded] = useState<string | null>(null)
+  // 失败横幅：401/403/429/kill switch 503/5xx。必须显式展示，不能退化成「演示数据」
+  const [failure, setFailure] = useState<HttpFailure | null>(null)
   const [traceByMsgId, setTraceByMsgId] = useState<Record<string, ToolCall[]>>({})
   // 活跃消息 id 用 state 而非 ref：render 期读取 ref 不会触发重渲染，占位条会 stale
   const [activeAid, setActiveAid] = useState<string | null>(null)
@@ -203,6 +211,7 @@ export default function Chat() {
     setStreaming(true)
     setError(null)
     setDegraded(null)
+    setFailure(null)
 
     const aid = safeUUID()
     push({ id: aid, role: "assistant", content: "" })
@@ -224,13 +233,35 @@ export default function Chat() {
     }
     controller.signal.addEventListener("abort", onAbort)
 
+    // 失败语义（t14）：401/403/429/kill switch 503 是真实拒绝，不能退化成「演示数据」横幅。
+    // 统一在此分类并置红色失败横幅，再抛给原有错误分支复用其收尾逻辑。
+    const failOnHttpError = async (resp: Response) => {
+      if (resp.ok) return
+      let body: unknown = null
+      try {
+        body = await resp.json()
+      } catch {
+        body = null
+      }
+      const f: HttpFailure | null = describeHttpFailure(
+        resp.status,
+        body,
+        typeof resp.headers?.get === "function" ? resp.headers.get("Retry-After") : null,
+      )
+      if (f && isAlive()) {
+        setFailure(f)
+        setError(`HTTP ${resp.status}：${f.message}`)
+      }
+      throw new Error(f ? `HTTP ${resp.status}（${f.kind}）` : `HTTP ${resp.status}`)
+    }
+
     const issueSseTicket = async () => {
       const resp = await fetch(API_ENDPOINTS.TICKET, {
         method: "POST",
         headers: { Accept: "application/json" },
         signal: controller.signal,
       })
-      if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
+      await failOnHttpError(resp)
       // 严格票据校验：不使用 any，使用 unknown + 显式类型守卫
       const payload: unknown = await resp.json()
       if (!payload || typeof payload !== "object" || !("ticket" in payload)) throw new Error("SSE ticket missing")
@@ -324,7 +355,8 @@ export default function Chat() {
         headers: { Accept: "text/event-stream", "X-Ticket": ticket },
         signal: controller.signal,
       })
-      if (!resp.ok || !resp.body) throw new Error(`HTTP ${resp.status}`)
+      await failOnHttpError(resp)
+      if (!resp.body) throw new Error("stream body missing")
       const reader = resp.body.getReader()
       const decoder = new TextDecoder()
       let buffer = ""
@@ -533,6 +565,8 @@ export default function Chat() {
         <div className="mx-auto flex max-w-3xl flex-col gap-4">
           {/* 降级横幅：degraded:true（D线）或合成演示文本兜底时展示 */}
           {degraded ? <DegradedBanner reason={degraded} source="Chat SSE" /> : null}
+          {/* 失败横幅：被拒绝/不可用，与「降级」区分颜色，禁止显示为演示数据 */}
+          {failure ? <DegradedBanner failure={failure} source="Chat HTTP" /> : null}
           {messages.map(m => (
             <div key={m.id} className={m.role === "user" ? "flex justify-end" : "flex justify-start"}>
               <div
