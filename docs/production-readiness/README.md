@@ -151,6 +151,7 @@ Background: Worker (long runs) · Scheduler (Temporal) · Migration Job
 ## 6. 任务索引
 
 - 总清单（67 项，含依赖/规模/验收摘要）：[`backlog.md`](backlog.md)
+- 非代码准备清单（硬件/账号/密钥/预算/人员/数据）：[`prerequisites.md`](prerequisites.md)
 - 第一期详细执行书：[`phase-1.md`](phase-1.md)
 - 第二期详细执行书：[`phase-2.md`](phase-2.md)
 - 第三期详细执行书：[`phase-3.md`](phase-3.md)
