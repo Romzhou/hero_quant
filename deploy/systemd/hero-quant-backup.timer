@@ -1,0 +1,13 @@
+[Unit]
+Description=Daily hero-quant backup timer
+Documentation=file:/opt/hero-quant/deploy/README.md
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+# 单机重启后补跑错过的备份（Persistent），随机延迟避免与其他定时任务撞 IO
+Persistent=true
+RandomizedDelaySec=15m
+Unit=hero-quant-backup.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,262 @@
+name: deploy
+
+# 单机发布流水线（PR-163）：
+#   preflight -> build/push -> migrate（SSH，独立 job）-> deploy（SSH，切流）-> 失败 rollback
+# 任何一步失败都不会把流量切到新版本；secrets 缺失时 preflight 直接红，不静默跳过。
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "已存在的不可变镜像 tag（git sha）；留空则重新构建当前 ref"
+        required: false
+        default: ""
+      rollback:
+        description: "只回滚到上一版本，不构建不迁移"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: deploy-prod
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  preflight:
+    name: preflight
+    runs-on: ubuntu-latest
+    steps:
+      - name: Required secrets are present
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          GHCR_PULL_TOKEN: ${{ secrets.GHCR_PULL_TOKEN }}
+        run: |
+          set -euo pipefail
+          missing=0
+          for name in DEPLOY_HOST DEPLOY_USER DEPLOY_SSH_KEY GHCR_PULL_TOKEN; do
+            if [ -z "${!name:-}" ]; then
+              echo "::error::missing repository secret: ${name}"
+              missing=1
+            fi
+          done
+          exit "$missing"
+
+  build:
+    name: build-and-push
+    needs: preflight
+    if: ${{ github.event_name != 'workflow_dispatch' || !inputs.rollback }}
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Resolve immutable tag and version
+        id: meta
+        run: |
+          set -euo pipefail
+          tag="${{ inputs.image_tag }}"
+          if [ -z "$tag" ]; then tag="${GITHUB_SHA}"; fi
+          # deploy.sh 拒绝 latest；这里再守一道，禁止移动 tag
+          case "$tag" in
+            latest|"") echo "::error::refuse mutable tag '$tag'"; exit 1 ;;
+          esac
+          version="$(python3 -c "import tomllib;print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")"
+          {
+            echo "tag=$tag"
+            echo "version=$version"
+            echo "image=${IMAGE}:${tag}"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ env.IMAGE }}:${{ steps.meta.outputs.tag }}
+          build-args: |
+            HERO_QUANT_VERSION=${{ steps.meta.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  migrate:
+    name: migrate
+    needs: build
+    if: ${{ github.event_name != 'workflow_dispatch' || !inputs.rollback }}
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+      DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+      DEPLOY_PORT: ${{ secrets.DEPLOY_PORT || '22' }}
+      DEPLOY_PATH: ${{ vars.DEPLOY_PATH || '/opt/hero-quant' }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Configure SSH
+        run: |
+          set -euo pipefail
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          if [ -n "${{ secrets.DEPLOY_KNOWN_HOSTS }}" ]; then
+            printf '%s\n' "${{ secrets.DEPLOY_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+          else
+            ssh-keyscan -p "$DEPLOY_PORT" -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+          fi
+
+      - name: Check out release on target and migrate
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.build.outputs.tag }}"
+          ssh -i ~/.ssh/id_ed25519 -p "$DEPLOY_PORT" "$DEPLOY_USER@$DEPLOY_HOST" \
+            "set -euo pipefail
+             cd '$DEPLOY_PATH'
+             git fetch --all --tags --prune --force
+             git checkout --force '$TAG'
+             HERO_ENV_FILE=/etc/hero-quant/hero-quant.env ./scripts/deploy/migrate.sh --tag '$TAG'"
+
+  deploy:
+    name: deploy
+    needs: [build, migrate]
+    if: ${{ github.event_name != 'workflow_dispatch' || !inputs.rollback }}
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+      DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+      DEPLOY_PORT: ${{ secrets.DEPLOY_PORT || '22' }}
+      DEPLOY_PATH: ${{ vars.DEPLOY_PATH || '/opt/hero-quant' }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Configure SSH
+        run: |
+          set -euo pipefail
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          if [ -n "${{ secrets.DEPLOY_KNOWN_HOSTS }}" ]; then
+            printf '%s\n' "${{ secrets.DEPLOY_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+          else
+            ssh-keyscan -p "$DEPLOY_PORT" -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+          fi
+
+      - name: Pull credential on target (stdin, not argv)
+        run: |
+          set -euo pipefail
+          printf '%s' "${{ secrets.GHCR_PULL_TOKEN }}" | \
+            ssh -i ~/.ssh/id_ed25519 -p "$DEPLOY_PORT" "$DEPLOY_USER@$DEPLOY_HOST" \
+              "docker login ghcr.io -u '${{ github.actor }}' --password-stdin"
+
+      - name: Deploy and switch traffic
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.build.outputs.tag }}"
+          ssh -i ~/.ssh/id_ed25519 -p "$DEPLOY_PORT" "$DEPLOY_USER@$DEPLOY_HOST" \
+            "set -euo pipefail
+             cd '$DEPLOY_PATH'
+             git fetch --all --tags --prune --force
+             git checkout --force '$TAG'
+             remote_image=\$(sed -n 's/^HERO_IMAGE=//p' /etc/hero-quant/hero-quant.env | head -n1)
+             if [ \"\$remote_image\" != '${{ env.IMAGE }}' ]; then
+               echo \"::error::HERO_IMAGE(\$remote_image) != pipeline IMAGE(${{ env.IMAGE }})\"; exit 1
+             fi
+             HERO_ENV_FILE=/etc/hero-quant/hero-quant.env ./scripts/deploy/deploy.sh --tag '$TAG' --skip-migrate"
+
+      - name: Deployment summary
+        if: always()
+        run: |
+          {
+            echo "### hero-quant deploy"
+            echo "- image: \`${{ env.IMAGE }}:${{ needs.build.outputs.tag }}\`"
+            echo "- version: \`${{ needs.build.outputs.version }}\`"
+            echo "- result: \`${{ job.status }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  rollback:
+    name: rollback-on-deploy-failure
+    needs: [build, migrate, deploy]
+    # 只有 deploy 失败才回滚；migrate 失败时没有切流量，无需回滚
+    if: ${{ failure() && needs.deploy.result == 'failure' }}
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+      DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+      DEPLOY_PORT: ${{ secrets.DEPLOY_PORT || '22' }}
+      DEPLOY_PATH: ${{ vars.DEPLOY_PATH || '/opt/hero-quant' }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Configure SSH
+        run: |
+          set -euo pipefail
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          if [ -n "${{ secrets.DEPLOY_KNOWN_HOSTS }}" ]; then
+            printf '%s\n' "${{ secrets.DEPLOY_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+          else
+            ssh-keyscan -p "$DEPLOY_PORT" -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+          fi
+
+      - name: Roll back to previous release
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/id_ed25519 -p "$DEPLOY_PORT" "$DEPLOY_USER@$DEPLOY_HOST" \
+            "set -euo pipefail
+             cd '$DEPLOY_PATH'
+             HERO_ENV_FILE=/etc/hero-quant/hero-quant.env ./scripts/deploy/rollback.sh"
+
+  manual-rollback:
+    name: manual-rollback
+    if: ${{ inputs.rollback }}
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+      DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+      DEPLOY_PORT: ${{ secrets.DEPLOY_PORT || '22' }}
+      DEPLOY_PATH: ${{ vars.DEPLOY_PATH || '/opt/hero-quant' }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Configure SSH
+        run: |
+          set -euo pipefail
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          if [ -n "${{ secrets.DEPLOY_KNOWN_HOSTS }}" ]; then
+            printf '%s\n' "${{ secrets.DEPLOY_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+          else
+            ssh-keyscan -p "$DEPLOY_PORT" -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+          fi
+
+      - name: Roll back
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/id_ed25519 -p "$DEPLOY_PORT" "$DEPLOY_USER@$DEPLOY_HOST" \
+            "set -euo pipefail
+             cd '$DEPLOY_PATH'
+             git fetch --all --tags --prune --force
+             HERO_ENV_FILE=/etc/hero-quant/hero-quant.env ./scripts/deploy/rollback.sh"

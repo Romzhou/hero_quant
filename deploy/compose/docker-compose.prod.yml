@@ -1,0 +1,296 @@
+# ============================================================================
+# hero-quant 生产单机编排（W7 / PR-161）
+#
+# 与仓库根的 docker-compose.yml（开发用，复用宿主 llm-pg/llm-redis）完全独立：
+#   - 这里自带 postgres/redis，全部走内部网络，宿主机不暴露 5432/6379/8899；
+#   - 只有 caddy 暴露 80/443；TLS 由 Caddy 自动签发（PR-162）；
+#   - app-blue / app-green 双色，同一时刻只允许一色接流量（PR-165 蓝绿）。
+#
+# 用法（所有变量来自单一 env 文件，模板见 deploy/env/prod.env.example）：
+#   cp deploy/env/prod.env.example /opt/hero-quant/.env.prod   # 填值、chmod 600
+#   HERO_ENV_FILE=/opt/hero-quant/.env.prod \
+#     docker compose -f deploy/compose/docker-compose.prod.yml --profile blue config
+#   HERO_ENV_FILE=... docker compose -f deploy/compose/docker-compose.prod.yml --profile blue up -d
+#
+# 不用 `docker compose up` 裸起：没有 --profile 时 app 不会启动（故意的，
+# 防止"起了一半"被当成部署成功）。
+# ============================================================================
+name: ${COMPOSE_PROJECT_NAME:-hero-quant}
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
+
+x-app: &app-base
+  image: ${HERO_IMAGE:?HERO_IMAGE required (registry/repo)}:${HERO_IMAGE_TAG:?HERO_IMAGE_TAG required (immutable tag, not latest)}
+  env_file:
+    - path: ${HERO_ENV_FILE:?HERO_ENV_FILE required (path to prod env file)}
+      required: true
+  environment:
+    # 由 env 文件决定（production/staging/development）；缺省 production 是安全侧默认：
+    # 非 development 时限流器不允许 fakeredis 回退（fail-closed）。
+    HERO_ENV: ${HERO_ENV:-production}
+    # compose 内部主机名：与开发 compose 的 tailscale IP 口径隔离，
+    # 只在这里覆盖，app 代码仍走 settings.py 单一网关。
+    HERO_CHECKPOINT_DSN: ${HERO_DB_DSN:?HERO_DB_DSN required}
+    HERO_BILLING_DSN: ${HERO_DB_DSN:?HERO_DB_DSN required}
+    HERO_VECTOR_DSN: ${HERO_DB_DSN:?HERO_DB_DSN required}
+    # 单库单租户列：billing 复用 checkpoint 库必须显式 opt-in（默认 fail-closed）
+    HERO_BILLING_ALLOW_SHARED_DB: "true"
+    HERO_REDIS_DSN: ${HERO_REDIS_DSN:?HERO_REDIS_DSN required}
+    FRONTEND_DIST: /app/frontend/dist
+    HERO_OTEL_MODE: shared
+    OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318/v1/logs
+  volumes:
+    - hero-runs:/app/agent/runs
+    - hero-sessions:/app/agent/sessions
+    - hero-home:/home/vibe/.hero-quant
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+    otel-collector:
+      condition: service_started
+  networks:
+    - edge
+    - internal
+  logging: *default-logging
+  restart: unless-stopped
+  stop_grace_period: 30s
+  # 与开发 compose 相同的运行时硬化：非 root、只读根、丢弃全部 capability，
+  # 只为 LLM 代码沙箱保留 SETUID/SETGID（镜像内 vibe-sandbox uid 10001）。
+  cap_drop:
+    - ALL
+  cap_add:
+    - SETUID
+    - SETGID
+  security_opt:
+    - "no-new-privileges:true"
+  read_only: true
+  tmpfs:
+    - /tmp
+    - /home/vibe/.cache
+  healthcheck:
+    test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8899/ready', timeout=4)"]
+    interval: 15s
+    timeout: 6s
+    retries: 4
+    start_period: 60s
+  deploy:
+    resources:
+      limits:
+        cpus: "2.0"
+        memory: 4G
+
+services:
+  # --------------------------------------------------------------------------
+  # 边缘：唯一暴露公网的组件（80/443 + HTTP/3）
+  # --------------------------------------------------------------------------
+  caddy:
+    image: caddy:2.8.4-alpine
+    command: ["caddy", "run", "--config", "/etc/caddy-src/Caddyfile", "--adapter", "caddyfile"]
+    environment:
+      HERO_DOMAIN: ${HERO_DOMAIN:?HERO_DOMAIN required}
+      ACME_EMAIL: ${ACME_EMAIL:-}
+    ports:
+      - "${HERO_HTTP_PORT:-80}:80"
+      - "${HERO_HTTPS_PORT:-443}:443"
+      - "${HERO_HTTPS_PORT:-443}:443/udp"
+    volumes:
+      # Caddyfile 跟仓库走（改配置要 reload）；upstream.caddy 跟运行状态走，
+      # 放仓库外，避免部署时 git checkout 把绿/蓝切换结果冲掉。
+      # 两者都用目录挂载：原子替换文件（mv）后容器内才能看到新 inode。
+      - ../caddy:/etc/caddy-src:ro
+      - ${HERO_CADDY_STATE_DIR:?HERO_CADDY_STATE_DIR required}:/etc/caddy-src/upstream:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - edge
+    logging: *default-logging
+    restart: unless-stopped
+    healthcheck:
+      # admin API 可用 = 进程在跑且配置已加载；cert 失败时 Caddy 仍会启动，
+      # 证书问题由 deploy.sh 的外部 HTTPS 探针暴露，不用 healthcheck 假装。
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:2019/config/ >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+
+  # --------------------------------------------------------------------------
+  # 应用：蓝绿两色，共用数据服务与卷；只允许一色接流量。
+  # --------------------------------------------------------------------------
+  app-blue:
+    <<: *app-base
+    profiles: ["blue"]
+
+  app-green:
+    <<: *app-base
+    profiles: ["green"]
+
+  # --------------------------------------------------------------------------
+  # 可选身份提供方（W1 联调用）。默认不启动，OIDC 代码合入后再开：
+  #   docker compose ... --profile blue --profile auth up -d
+  # 前置：postgres 里先建 keycloak 库（scripts/deploy/migrate.sh --init-keycloak-db）。
+  # --------------------------------------------------------------------------
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.0
+    profiles: ["auth"]
+    command: ["start"]
+    environment:
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://postgres:5432/keycloak
+      KC_DB_USERNAME: ${POSTGRES_USER:?POSTGRES_USER required}
+      KC_DB_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD required}
+      KC_HOSTNAME: https://auth.${HERO_DOMAIN:?HERO_DOMAIN required}
+      KC_HOSTNAME_STRICT: "true"
+      KC_PROXY_HEADERS: xforwarded
+      KC_HTTP_ENABLED: "true"
+      KC_HEALTH_ENABLED: "true"
+      KC_METRICS_ENABLED: "true"
+      KEYCLOAK_ADMIN: ${KEYCLOAK_ADMIN:-}
+      KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - edge
+      - internal
+    logging: *default-logging
+    restart: unless-stopped
+    # 不写 healthcheck：Keycloak 26 的 health 在管理端口 9000，镜像内没有
+    # 可依赖的 curl/wget；写一个未实测的 /dev/tcp 探针会制造误报。
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
+
+  # --------------------------------------------------------------------------
+  # 数据层：只在 internal 网络，无宿主端口
+  # --------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER required}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD required}
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB required}
+    # PITR：WAL 连续归档到宿主备份盘（bind mount），archive_timeout=60s
+    # 决定 RPO 上限（≤1 分钟 WAL + 每日全备，见 deploy/README.md）。
+    command:
+      - postgres
+      - -c
+      - wal_level=replica
+      - -c
+      - archive_mode=on
+      - -c
+      - archive_timeout=60
+      - -c
+      - max_wal_senders=3
+      - -c
+      - max_replication_slots=3
+      - -c
+      - archive_command=test ! -f /var/lib/postgresql/wal-archive/%f && cp %p /var/lib/postgresql/wal-archive/%f
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ${HERO_BACKUP_DIR:?HERO_BACKUP_DIR required}/wal:/var/lib/postgresql/wal-archive
+    shm_size: 256mb
+    networks:
+      - internal
+    logging: *default-logging
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 4G
+
+  redis:
+    image: redis:7-alpine
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD required}
+    # AOF everysec：最多丢 1s 缓存/限流状态；这些状态可重算，PG 才是真相源。
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --maxmemory
+      - 512mb
+      - --maxmemory-policy
+      - volatile-lru
+      - --requirepass
+      - ${REDIS_PASSWORD:?REDIS_PASSWORD required}
+    volumes:
+      - redisdata:/data
+    networks:
+      - internal
+    logging: *default-logging
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "REDISCLI_AUTH=\"$$REDIS_PASSWORD\" redis-cli ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.128.0
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    volumes:
+      - ../otel-collector-config.yaml:/etc/otelcol-contrib/config.yaml:ro
+    networks:
+      - internal
+    logging: *default-logging
+    restart: unless-stopped
+    healthcheck:
+      # 镜像无 shell/curl；validate 只能证明配置可加载（不证明 pipeline 通畅），
+      # 这是该镜像上唯一可用的本地探针。
+      test: ["CMD", "/otelcol-contrib", "validate", "--config=/etc/otelcol-contrib/config.yaml"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+
+networks:
+  # 边缘网络有出网能力（app 需要访问 LLM/行情 API）。
+  edge:
+    driver: bridge
+  # 数据网络禁止出网：postgres/redis 只被 app 访问。
+  internal:
+    driver: bridge
+    internal: true
+
+volumes:
+  pgdata:
+  redisdata:
+  hero-runs:
+  hero-sessions:
+  hero-home:
+  caddy_data:
+  caddy_config:

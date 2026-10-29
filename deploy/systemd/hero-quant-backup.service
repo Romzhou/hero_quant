@@ -1,0 +1,14 @@
+[Unit]
+Description=hero-quant backup (PG base+logical, WAL retention, Redis RDB)
+Documentation=file:/opt/hero-quant/deploy/README.md
+After=hero-quant.service docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/hero-quant
+EnvironmentFile=/etc/hero-quant/hero-quant.env
+Environment=HERO_ENV_FILE=/etc/hero-quant/hero-quant.env
+TimeoutStartSec=3600
+# 失败必须显式失败（systemd + journal 可见），不做吞错重试掩盖。
+ExecStart=/opt/hero-quant/scripts/deploy/backup.sh

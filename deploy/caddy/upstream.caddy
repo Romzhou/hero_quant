@@ -1,0 +1,6 @@
+# 当前生效的上游（blue/green 切换点）——由 scripts/deploy/bluegreen.sh 改写。
+# 手工改也可，但改完必须：docker compose exec caddy caddy reload --config /etc/caddy-src/Caddyfile
+# flush_interval -1：SSE（/v1/query/stream）与 WS 消息立即下发，不做缓冲。
+reverse_proxy app-blue:8899 {
+	flush_interval -1
+}

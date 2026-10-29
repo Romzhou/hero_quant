@@ -45,9 +45,13 @@ RUN pip install --no-cache-dir --no-deps -e .
 FROM python:3.11-slim@sha256:e031123e3d85762b141ad1cbc56452ba69c6e722ebf2f042cc0dc86c47c0d8b3 AS runtime
 # python:3.11-slim digest resolved 2026-07-13
 
+# 版本唯一来源是 pyproject.toml（PR-181）；CI/发布脚本用
+# `--build-arg HERO_QUANT_VERSION=$(python -c ...)` 注入。默认 "dev" 是显式
+# 未知值，不复制一个会漂移的字面版本。
+ARG HERO_QUANT_VERSION=dev
 LABEL org.opencontainers.image.title="hero-quant" \
     org.opencontainers.image.description="hero-quant - minimal quant research agent (single-machine Docker)" \
-    org.opencontainers.image.version="0.2.0" \
+    org.opencontainers.image.version="${HERO_QUANT_VERSION}" \
     org.opencontainers.image.source="https://github.com/your-org/hero-quant" \
     org.opencontainers.image.licenses="MIT"
 

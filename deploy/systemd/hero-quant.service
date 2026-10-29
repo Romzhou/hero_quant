@@ -1,0 +1,30 @@
+[Unit]
+Description=hero-quant production stack (single-machine docker compose)
+Documentation=file:/opt/hero-quant/deploy/README.md
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+# 开机自启 = compose 全栈拉起（数据卷/网络都由 compose 幂等管理）
+StartLimitBurst=3
+StartLimitIntervalSec=300
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/hero-quant
+# 密码/DSN 只放这里：chmod 600，绝不进 git，也不写进 unit。
+EnvironmentFile=/etc/hero-quant/hero-quant.env
+Environment=HERO_ENV_FILE=/etc/hero-quant/hero-quant.env
+# 蓝绿当前颜色：deploy.sh / bluegreen.sh 会改写这里（或由管理员 environment.d 覆盖）。
+Environment=COMPOSE_PROFILES=blue
+TimeoutStartSec=900
+TimeoutStopSec=300
+Restart=on-failure
+RestartSec=30s
+
+ExecStart=/usr/bin/docker compose --env-file ${HERO_ENV_FILE} -f /opt/hero-quant/deploy/compose/docker-compose.prod.yml --profile ${COMPOSE_PROFILES} up -d --remove-orphans
+ExecReload=/usr/bin/docker compose --env-file ${HERO_ENV_FILE} -f /opt/hero-quant/deploy/compose/docker-compose.prod.yml --profile ${COMPOSE_PROFILES} up -d --remove-orphans
+ExecStop=/usr/bin/docker compose --env-file ${HERO_ENV_FILE} -f /opt/hero-quant/deploy/compose/docker-compose.prod.yml --profile ${COMPOSE_PROFILES} stop
+
+[Install]
+WantedBy=multi-user.target
