@@ -1,7 +1,6 @@
 """Task28 Wave6 Top8: prompt escape + trace durability (TDD)."""
 
 import hashlib
-import pathlib
 
 
 def test_prompt_injection_escaped():
@@ -20,9 +19,6 @@ def test_prompt_injection_escaped():
 
 def test_trace_threshold_validation(tmp_path):
     from hero_quant.agent.trace import TraceWriter
-
-    src = pathlib.Path("src/hero_quant/agent/trace.py").read_text(encoding="utf-8")
-    assert "_validate_threshold" in src, "_validate_threshold helper missing in trace.py"
 
     # -1 should raise ValueError or fallback to default with warning (both acceptable)
     # We accept either behavior: raise OR not raise but clamp to default

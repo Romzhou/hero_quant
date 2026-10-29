@@ -1,5 +1,4 @@
 """Task18 ingest deterministic key + loop prompt digest."""
-import pathlib
 import hashlib
 
 
@@ -37,21 +36,13 @@ def test_ingest_deterministic_key(tmp_path):
         int(hexpart, 16)
     # Verify not using built-in hash (which would be platform dependent)
     piece = "# Hello\nWorld content for ingest test."
-    # ingest splits by heading then overlapping, but single chunk; compute expected sha256[:16]
-    # The piece stored may be trimmed, but ensure at least one key matches sha256 of some piece
+    # 每个 key 的后缀必须等于其存储内容的 sha256[:16]（不是随机 hash()）
     expected = hashlib.sha256(piece.strip().encode()).hexdigest()[:16]
-    # At least one key should contain a sha256-derived hex (not random)
     assert any(expected in k or len(k.split(":")[-1]) == 16 for k in store1.keys)
-
-
-def test_ingest_key_is_sha256_not_hash(tmp_path):
-    """Ensure key generation does not use Python hash() which is randomized."""
-    import hero_quant.memory.ingest as ingest_mod
-    src = pathlib.Path(ingest_mod.__file__).read_text(encoding="utf-8")
-    assert "hashlib.sha256" in src
-    assert "hash(piece)" not in src or "hashlib" in src  # ensure sha256 used
-    # Ensure the file uses deterministic import
-    assert "hashlib" in src
+    for k, content in zip(store1.keys, store1.contents):
+        assert k.split(":")[-1] == hashlib.sha256(content.encode("utf-8")).hexdigest()[:16], (
+            f"key suffix 不是内容 sha256[:16]: {k} vs {content!r}"
+        )
 
 
 def test_loop_prompt_contains_digest():

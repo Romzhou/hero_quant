@@ -114,21 +114,35 @@ def test_lane_f_router_score_snapshot_compat():
     assert isinstance(s, float)
 
 
-def test_lane_f_router_fusion_logs(caplog):
+def test_lane_f_router_fusion_logs(caplog, monkeypatch):
+    """rank_fusion 故障时必须 warning 并回退 BM25，而不是静默降级。"""
     import hero_quant.mcp.router as R
-    src = Path("src/hero_quant/mcp/router.py").read_text(encoding="utf-8")
-    assert "logger.warning" in src.split("def router_hybrid_scores")[1].split("def ")[0] or \
-        "logger.warning" in src.split("def route(")[1].split("def ")[0], \
-        "fusion fallback must log"
+    import hero_quant.memory.rank_fusion as rf
 
+    def _boom(*args, **kwargs):
+        raise RuntimeError("fusion down")
 
-def test_lane_f_router_embed_logs(caplog):
-    import hero_quant.mcp.router as R
+    monkeypatch.setattr(rf, "fuse", _boom)
     with caplog.at_level(logging.WARNING):
-        R._get_query_embedding(None)
-    src = Path("src/hero_quant/mcp/router.py").read_text(encoding="utf-8")
-    seg = src.split("def _get_query_embedding")[1].split("def ")[0]
-    assert "logger" in seg and "except Exception as" in seg
+        out = R.router_hybrid_scores("momentum factor", ["compute_factor"])
+    assert "compute_factor" in out
+    assert any("rank_fusion" in rec.message for rec in caplog.records), "fusion fallback must log"
+
+
+def test_lane_f_router_embed_logs(caplog, monkeypatch):
+    """embed 抛错时必须 warning 并返回 None，不把异常抛给路由主流程。"""
+    import hero_quant.agent.embed as E
+    import hero_quant.mcp.router as R
+
+    monkeypatch.setattr(R, "_is_router_vector_enabled", lambda: True)
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("embed down")
+
+    monkeypatch.setattr(E, "embed", _boom)
+    with caplog.at_level(logging.WARNING):
+        assert R._get_query_embedding("momentum") is None
+    assert any("embed" in rec.message.lower() for rec in caplog.records), "embed failure must log warning"
 
 
 def test_lane_f_router_corpus_registry_lock():
