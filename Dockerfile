@@ -84,6 +84,11 @@ COPY --from=builder /opt/venv /opt/venv
 # built frontend static assets.
 COPY pyproject.toml README.md ./
 COPY src/ src/
+# 迁移 SQL 必须进镜像：`python -m hero_quant.db upgrade`（部署前独立步骤，
+# 见 scripts/deploy/migrate.sh）从 <repo>/db/migrations 加载，缺省解析到
+# /app/db/migrations（db/loader.py:40-49）。少了这一步，容器内迁移会以
+# MigrationLoadError 失败，部署在切流量前就被拦住。
+COPY db/ db/
 COPY --from=frontend-build /app/frontend/dist frontend/dist
 
 # Runtime should not run as root. `vibe` owns the writable app-data dirs so

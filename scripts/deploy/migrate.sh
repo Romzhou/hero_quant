@@ -49,6 +49,12 @@ probe_runner() {
     "import importlib.util,sys; sys.exit(0 if importlib.util.find_spec('$1') else 1)" >/dev/null 2>&1
 }
 
+# 前置（storage 线提醒）：迁移 SQL 随镜像进 /app/db/migrations（Dockerfile `COPY db/ db/`）。
+# 若镜像里没有该目录，这里会以 MigrationLoadError 失败——这是**预期拦截**，
+# 不要改成"跳过迁移继续发"，否则 schema 与代码版本会静默脱节。
+# 另：DSN 用户必须是表 owner（baseline 含 `ALTER TABLE ... FORCE ROW LEVEL SECURITY`，
+# 非 owner 执行会失败），用受限角色跑迁移前先把权限给对。
+
 # 1) W4 已合入的入口（storage 线交付）：python -m hero_quant.db upgrade
 if probe_runner "hero_quant.db.__main__"; then
   log "执行版本化迁移: python -m hero_quant.db upgrade（tag=${TAG}, color=${COLOR}）"
