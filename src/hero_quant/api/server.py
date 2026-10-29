@@ -2363,6 +2363,8 @@ _BACKTEST_NO_DATA_MARKERS: dict = {
 # 回测行情标的与目标交易日数（真行情不足 2 根即视为不可用）
 _BACKTEST_SYMBOL = "600519.SH"
 _BACKTEST_BARS_TARGET = 20
+# R8-1b：年化 Sharpe 需要足够样本；低于该根数只披露样本量，不输出年化口径。
+_BACKTEST_MIN_SHARPE_BARS = 60
 # 空 CSV（仅表头）：positions 缺失时返回它，绝不塞具体 K 线数字。
 _BACKTEST_CSV_HEADER = "date,symbol,weight,close\n"
 
@@ -2433,6 +2435,34 @@ def _demo_backtest_prices(pd) -> "object":
     return prices
 
 
+def _backtest_sample(prices) -> dict:
+    """样本口径：K 线根数与起止日期；无行情返回零样本，不编造日期。"""
+    if prices is None or len(prices) == 0:
+        return {"bars": 0, "start": None, "end": None}
+    idx = prices.index
+    try:
+        start = idx[0].date().isoformat() if hasattr(idx[0], "date") else str(idx[0])
+        end = idx[-1].date().isoformat() if hasattr(idx[-1], "date") else str(idx[-1])
+    except Exception as _e:
+        logger.warning("backtest.sample_index_failed error=%s", str(_e))
+        return {"bars": int(len(prices)), "start": None, "end": None}
+    return {"bars": int(len(prices)), "start": start, "end": end}
+
+
+def _apply_metrics_disclosure(metrics: dict, sample: dict) -> tuple[dict, "str | None", list]:
+    """R8-1b：样本不足 60 根时年化 Sharpe 无统计意义，置 None 并显式披露。
+
+    中文：sharpe=null 但保留 key（schema 稳定），cumulative_return / volatility /
+    max_drawdown 等不依赖年化的指标照旧透出；metrics.py 的 √252 公式本身正确，不改。
+    """
+    warnings: list = []
+    if sample.get("bars", 0) < _BACKTEST_MIN_SHARPE_BARS:
+        metrics["sharpe"] = None
+        warnings.append("insufficient_sample")
+        return metrics, None, warnings
+    return metrics, "annualized_252", warnings
+
+
 def _backtest_markers(bundle: dict) -> dict:
     """响应级标记：优先取 bundle 自带的 provenance 标记，旧缓存/兜底才落到合成降级标记。"""
     mk = bundle.get("markers")
@@ -2452,12 +2482,12 @@ def _backtest_bundle_cache_key(tenant: str | None = None) -> str:
         _t = tenant.strip() if isinstance(tenant, str) else ""
     except (ValueError, TypeError, AttributeError):
         _t = ""
-    # v3：v1 缓存存有伪造指标（sharpe 1.62 / annual_return 0.184）；v2 缓存是合成 K 线
-    # （base 1680.0）算出的指标 —— R8-1 起默认走真行情，换 key 让两级缓存自然失效。
+    # v4：R8-1b 起响应体新增 sample / sharpe_basis / warnings（<60 根 sharpe 置 null），
+    # 旧缓存没有这些字段，换 key 避免把 v3 的裸 sharpe 当权威指标返回。
     if _t:
-        raw = json.dumps({"v": 3, "capital": 1.0, "weights": [0.5, 0.5], "tenant": _t}, sort_keys=True)
+        raw = json.dumps({"v": 4, "capital": 1.0, "weights": [0.5, 0.5], "tenant": _t}, sort_keys=True)
     else:
-        raw = json.dumps({"v": 3, "capital": 1.0, "weights": [0.5, 0.5]}, sort_keys=True)
+        raw = json.dumps({"v": 4, "capital": 1.0, "weights": [0.5, 0.5]}, sort_keys=True)
     digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
     return f"{_BACKTEST_BUNDLE_CACHE_PREFIX}{digest}"
 
@@ -2498,6 +2528,9 @@ def _write_backtest_bundle_cache(bundle: dict, tenant: str | None = None) -> Non
             "csv": bundle.get("csv", ""),
             "tearsheet": bundle.get("tearsheet", ""),
             "markers": dict(bundle.get("markers") or _BACKTEST_DEGRADE_MARKERS),
+            "sample": dict(bundle.get("sample") or {"bars": 0, "start": None, "end": None}),
+            "sharpe_basis": bundle.get("sharpe_basis"),
+            "warnings": list(bundle.get("warnings") or []),
         }
         client.set(_backtest_bundle_cache_key(tenant), json.dumps(payload, ensure_ascii=False, default=str), ex=600)
     except Exception as _e:
@@ -2525,7 +2558,11 @@ def _compute_backtest_bundle() -> dict:
         synthetic = True
     else:
         logger.warning("backtest.bundle_no_market_data symbol=%s", _BACKTEST_SYMBOL)
-        return {**_static_backtest_bundle(), "markers": dict(_BACKTEST_NO_DATA_MARKERS)}
+        return {
+            **_static_backtest_bundle(),
+            "markers": dict(_BACKTEST_NO_DATA_MARKERS),
+            "warnings": ["no_market_data"],
+        }
     eng = BacktestEngine(initial_capital=1.0)
     # allow_synthetic 只在显式 demo 开关下为 True：真行情走引擎的 fail-closed 通道，
     # 且必须显式给 PIT 日期（等权权重在窗口首日确定，价格窗口截至末日），否则引擎硬抛。
@@ -2542,6 +2579,9 @@ def _compute_backtest_bundle() -> dict:
     metrics_data = res.get("metrics", {})
     if not isinstance(metrics_data, dict):
         metrics_data = {}
+    # R8-1b：样本量决定 sharpe 口径；口径不成立时置 null 并写 warnings，不静默年化。
+    sample = _backtest_sample(prices)
+    metrics_data, sharpe_basis, warnings = _apply_metrics_disclosure(dict(metrics_data), sample)
     # 中文：引擎给什么就返回什么，缺键不补默认值——旧版补 1.62/0.184 属伪造（审计 §4.2）。
     positions = res.get("positions")
     # 生成带 date 表头的 CSV 文本；positions 缺失时只给表头，不塞任何具体 K 线。
@@ -2566,6 +2606,9 @@ def _compute_backtest_bundle() -> dict:
         "csv": csv_text,
         "tearsheet": tearsheet,
         "markers": markers,
+        "sample": sample,
+        "sharpe_basis": sharpe_basis,
+        "warnings": warnings,
     }
 
 
@@ -2577,6 +2620,9 @@ def _static_backtest_bundle() -> dict:
         "csv": _BACKTEST_CSV_HEADER,
         "tearsheet": "",
         "markers": dict(_BACKTEST_DEGRADE_MARKERS),
+        "sample": {"bars": 0, "start": None, "end": None},
+        "sharpe_basis": None,
+        "warnings": [],
     }
 
 
@@ -2670,6 +2716,10 @@ def backtest_metrics(request: Request):
             metrics_body[f"backtest_{_mk}"] = _mv
         else:
             metrics_body[_mk] = _mv
+    # R8-1b：披露样本量与年化口径；无行情时 bars=0 且不给日期，绝不编造。
+    metrics_body["sample"] = dict(bundle.get("sample") or {"bars": 0, "start": None, "end": None})
+    metrics_body["sharpe_basis"] = bundle.get("sharpe_basis")
+    metrics_body["warnings"] = list(bundle.get("warnings") or [])
     return JSONResponse(
         content=metrics_body,
         headers={
