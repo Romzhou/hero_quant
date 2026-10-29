@@ -170,7 +170,16 @@ print(json.dumps(report))
 `;
   fs.writeFileSync(pyFile, pyScript, 'utf-8');
 
-  const out = execFileSync(pythonBin(), [pyFile], { encoding: 'utf-8', cwd: path.join(process.cwd()) });
+  // 无 .venv（如 worktree）时 pythonBin 回退 python3 —— 此时包未安装，必须显式带 src 上 PYTHONPATH，
+  // 否则用例因 ModuleNotFoundError 变红，掩盖的是环境问题而非对账逻辑问题。
+  const out = execFileSync(pythonBin(), [pyFile], {
+    encoding: 'utf-8',
+    cwd: path.join(process.cwd()),
+    env: {
+      ...process.env,
+      PYTHONPATH: [path.join(process.cwd(), 'src'), process.env.PYTHONPATH].filter(Boolean).join(path.delimiter),
+    },
+  });
   const report = JSON.parse(out.trim().split('\n').pop() || '{}');
   expect(report.zero_diff).toBe(true);
   expect(report.total_diff).toBe(0);

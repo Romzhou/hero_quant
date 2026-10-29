@@ -8,6 +8,7 @@ import { Suspense, lazy, useEffect, useState } from "react"
 import { NavLink, Route, Routes, Navigate } from "react-router-dom"
 import DegradedBanner from "./components/DegradedBanner"
 import { NO_DIST_503_HINT, isServiceUnavailable } from "./config/degraded"
+import { APP_VERSION } from "./config/version"
 
 const Dashboard = lazy(() => import("./pages/Dashboard"))
 const Research = lazy(() => import("./pages/Research"))
@@ -79,7 +80,7 @@ function Shell() {
               <div className="font-serif text-sm font-extrabold tracking-wide text-mist">真英雄量化</div>
               <div className="font-mono text-[10px] tracking-[0.18em] text-slate-400">HERO QUANT</div>
             </div>
-            <span className="ml-2 hidden items-center gap-1.5 rounded-full border border-white/10 bg-white/5 px-2.5 py-1 text-xs text-slate-300 md:inline-flex"><span className="h-1.5 w-1.5 rounded-full bg-emerald-400 animate-pulse shadow-[0_0_6px_rgba(52,211,153,0.8)]" />0.2.0 · demo-ready</span>
+            <span className="ml-2 hidden items-center gap-1.5 rounded-full border border-white/10 bg-white/5 px-2.5 py-1 text-xs text-slate-300 md:inline-flex"><span className="h-1.5 w-1.5 rounded-full bg-emerald-400 animate-pulse shadow-[0_0_6px_rgba(52,211,153,0.8)]" />{APP_VERSION} · demo-ready</span>
           </div>
 
           <nav aria-label="Primary" className="flex max-w-[60vw] items-center gap-1 overflow-x-auto rounded-2xl border border-white/10 bg-white/[0.04] p-1 backdrop-blur scrollbar-none md:max-w-none">
