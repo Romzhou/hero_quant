@@ -8,6 +8,35 @@ All notable changes to hero-quant are documented here. Format follows [Keep a Ch
 
 > 收口 2026-08-28 supplement 审计 12 项遗漏中的 P0/P1 细节：D1 文档诚信 + B1 sma/on_bar + C1/C2 前端去 mock + D2/E1 ingest/coverage。基于 `7559422+f639a78+e79dfc2` (302 passed, 48.99% cov) 增量。
 
+### Round 8 (2026-10-29) — 正确性 / 可移植性 / 测试真实性
+
+> 汇总 0.2.0 之后未发布的 Round 8 收口；门禁与未闭环项见 `docs/round8-report.md`。
+
+#### Added
+- 回测指标响应新增 `sample {bars,start,end}` / `sharpe_basis` / `warnings`；`<60` 根 K 线不输出年化 Sharpe（`sharpe=null` + `insufficient_sample`），无行情 `no_market_data`。
+- `tests/test_billing_rls_real.py`：用非 superuser 角色实证 billing RLS 隔离（`HERO_RLS_TEST_DSN` 门控）。
+- `tests/SKIP_INVENTORY.md`：skip 按 PG 守卫 / RLS opt-in / 平台依赖分类。
+
+#### Changed
+- 回测产物默认真行情（`get_market_data(allow_synthetic=False)` + 显式 PIT 日期），合成 demo 需 `HERO_BACKTEST_DEMO=1`；缓存键 v3→v4。
+- docker compose 去掉 `heroquant-shared` 外部网络，容器直连宿主 `100.114.54.26`；新克隆 `docker compose up --build` 一条命令起全栈。
+- CI 使用 Playwright 自带 chromium；`pytest -rs` 落盘 skip 原因，新增 "no PG guard skips" 断言。
+- 28 个源码字符串断言改为运行时行为断言或删除；源码/文档 `read_text` 断言点降至 55。
+
+#### Fixed
+- checkpoint 过期后不再回退 emulated 缓存，有 PG 池时以 PG 为唯一真值。
+- billing `list_factors/get_factor` 在 PG 模式下真查库，跨进程可见；无池降级带 `degraded`。
+- 回测指标不再用 20 根样本年化出 Sharpe 5.44 这类无统计意义数字。
+
+#### Removed
+- 回测产物默认路径的合成 K 线（base 1680.0）；仅显式 demo 开关保留。
+- 10 处锁死源码文案的冗余测试（行为已由运行时用例覆盖）。
+
+#### Known limitations
+- 默认真行情仍只取 20 根（`_BACKTEST_BARS_TARGET=20`），按新口径 `sharpe` 恒为 null；是否提高到 ≥60 待产品决策。
+- CI e2e 首次真跑结果待 GitHub Actions 确认。
+- 3 条 RLS 用例需显式 `HERO_RLS_TEST_DSN` 才运行；47 条 PG 用例本机无 PG 时 skip。
+
 ### Added
 - **Docs honesty (D1)**: `README:56,100` `HERO_DATA_MODE` `synthetic→live` 与 `Settings` 一致；`README:137` `memory://→PG (fallback memory)`；`README:129` `hash占位→real hashes` 真 sha256；`docs/retrieval_eval.md` 追加 32/128/768 维度 ablation stub。
 - **Backtest detail (B1)**: `engine.py` `sma_crossover` 熊市返回 0 权重（`bear→0`）；`BacktestEngine.run` 串联 `on_bar` `aligned_price` 至 `equity` 计算（`cum*(1+aligned_ret)`，保留 close 兼容）；新增 `tests/test_golden_backtest.py` 固定 5 日 oracle 对拍 `metrics.sharpe`。
