@@ -76,6 +76,7 @@ skip 构成（53）：47 PG 守卫（未配 `HERO_CHECKPOINT_DSN`）、3 RLS（�
 | 5 | `evals/run.py` 假数字残留 | 已知限制（R7 起） | 不在 R8 白名单 |
 | 6 | `.codebuddy/` 未跟踪 | 工具产物 | 会话 worktree 目录；`.omc/` 同为未跟踪 |
 | 7 | 前端 `metrics.sharpe` 为 null 的展示 | **E 线待办** | Research 页若直接展示 sharpe，需要显示 "—"；本轮不动 frontend |
+| 8 | 包版本双源不一致 | **已知限制** | `pyproject.toml` 已升 0.3.0，但 `src/hero_quant/__init__.py:7` 的 `__version__` 仍为 0.2.0，`tests/test_bootstrap.py:4` 锁定该值；R8-4 白名单禁止改 `src/`、`tests/`，需下一轮同步 |
 
 ## 5. 推送前检查清单（未执行 push）
 
