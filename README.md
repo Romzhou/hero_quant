@@ -164,7 +164,8 @@ docker build --build-arg HERO_QUANT_VERSION="$(python -c 'import tomllib;print(t
 
 全仓仅 `src/hero_quant/config/settings.py` 允许 `os.getenv`，CI 门禁 `tests/test_config.py:80` 校验。
 
-> **身份接线状态（W1）**：`src/hero_quant/auth/**` 已提供验签、租户上下文、RBAC 与配额，但 **`api/server.py` 尚未接线**——在接线完成前保持 `HERO_AUTH_MODE=off`，接线后改为 `enforce` 并补齐 issuer/audience，否则 JWKS 未配会直接 401。
+> **身份接线状态（W1，已接线）**：`api/server.py:534` 的 `_wire_auth()` 在 app 创建时挂载 `AuthContextMiddleware` + 统一 `AuthError` 映射；判据是 `auth_enabled()`（模式非 off **且** issuer/audience 齐备），因此**未配 OIDC 的环境不会被打穿**。挂载后：`/v1/query`、`/v1/query/stream`、`/v1/query/ticket` 需 analyst，`/v1/sessions*` 需 viewer；无 token 401 + `WWW-Authenticate`，错签名 401，配置故障 503（不伪装成 401 诱导重登）。`/health` `/ready` `/metrics` `/docs` 保持公开。验签失败一律 fail-closed：OIDC 配了但不全，进程直接启动失败。
+> **租户边界口径**：已认证请求的 tenant 来自 JWT claim，贯穿 checkpoint thread（`_checkpoint_thread_for_request`）与会话接口；**会话接口未绑定租户时 503，绝不回退 `default`**。kill switch（租户/模型/工具）命中或 Redis 不可用同样 503，不静默放行。
 
 > **计费边界**：API 层没有任何 billing 路由，不存在"返回 200 的假成功面"；无 DSN 时 `BillingService` 直接抛 `BillingUnavailable`，内存模式必须显式 `HERO_BILLING_ALLOW_MEMORY=1` 且响应带 `degraded:true`。
 > **合成模式边界**：`HERO_DATA_MODE=synthetic` 不是"离线可用"的同义词——它可跑通，但每一根 bar 都是合成序列，`provenance.source=synthetic` 必须被下游如实消费。
@@ -173,6 +174,8 @@ docker build --build-arg HERO_QUANT_VERSION="$(python -c 'import tomllib;print(t
 
 - `GET /live` 存活、`GET /ready` 就绪、`GET /metrics` Prometheus、`GET /v1/query?q=...` 同步、`GET /v1/query/stream?q=...` SSE 流式
 - `POST /v1/query/ticket` SSE 票据签发、`GET /v1/backtest/metrics.json` 回测指标、`GET /v1/backtest/positions.csv` 持仓、`GET /v1/backtest/tearsheet.html` 报告、`GET /v1/trace/events` 追踪事件、`GET /v1/risk/summary` 风险摘要（+ 别名 `/risk/summary`）、`WS /ws/trace` 与 `WS /ws/query` 进度推送
+- `GET /v1/sessions`（列表）、`GET /v1/sessions/{id}`（详情）、`POST /v1/sessions/{id}/resume?after_id=&limit=`（断线/重启续跑，返回增量消息 + `last_event_id` 游标）：全部按当前租户取数，未绑定租户 503；不存在 404、存储不可用 503、入参非法 400
+- **降级口径**：`_FakeLLM` / checkpoint emulated / LLM gateway failover 三种降级都会落进响应的 `degraded:true` + `degraded_reason`（多来源以 `; ` 拼接），前端必须横幅提示；gateway 全挂由 `_FakeLLM` 路径负责，failover 只报 `llm_gateway:*`
 - `X-Request-ID` 贯穿日志（`TraceIdMiddleware` 透传 `x-request-id`/`x-trace-id` 并回写响应头），安全头 `X-Content-Type-Options: nosniff` + `X-Frame-Options: DENY`（`SecurityHeadersMiddleware`），审计 `api.audit` 结构化 tool 调用，PII 经 `PII_ENCRYPTION_KEY` Fernet 加密（缺失回退掩码）
 - `POST /v1/query` 接受 `{query, stream:true}`（前端 `Chat.tsx:29` 已接 SSE + tool 轨迹水位）
 

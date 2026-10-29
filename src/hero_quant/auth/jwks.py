@@ -91,7 +91,14 @@ def parse_jwks(document: Mapping[str, Any]) -> dict[str, Any]:
             continue
         try:
             public_key = _public_key_from_jwk(jwk)
-        except (AuthConfigError, ValueError, TypeError) as e:
+        except AuthConfigError as e:
+            # 中文：缺 cryptography 是服务端依赖缺失（503），不能降级成「跳过该键」后
+            # 以空 JWKS 收敛成 401，让客户端误以为 token 无效。
+            if "cryptography_not_installed" in str(e):
+                raise
+            logger.warning("auth.jwks_key_unusable kid=%s error=%s", kid, e)
+            continue
+        except (ValueError, TypeError) as e:
             logger.warning("auth.jwks_key_unusable kid=%s error=%s", kid, e)
             continue
         if kid in keys:

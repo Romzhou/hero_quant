@@ -25,6 +25,7 @@ from hero_quant.auth.principal import Principal
 logger = logging.getLogger(__name__)
 
 DEFAULT_PUBLIC_PATHS: tuple[str, ...] = (
+    "/live",
     "/health",
     "/healthz",
     "/ready",
@@ -32,13 +33,26 @@ DEFAULT_PUBLIC_PATHS: tuple[str, ...] = (
     "/docs",
     "/redoc",
     "/openapi.json",
+    # 中文：SPA 壳与静态资源必须匿名可取，否则登录页本身都加载不出来；
+    # 数据仍由 /v1/* 的 Bearer 校验保护。
+    "/",
+    "/index.html",
+    "/assets",
+    "/static",
+    "/favicon.ico",
+    "/vite.svg",
 )
 
 
 def _is_public(path: str, public_paths: Iterable[str]) -> bool:
-    """精确匹配或子路径匹配（`/health` 覆盖 `/health/live`，不覆盖 `/healthz-extra`）。"""
+    """精确匹配或子路径匹配（`/health` 覆盖 `/health/live`，不覆盖 `/healthz-extra`）。
+
+    中文：前缀 "/" 只做精确匹配，否则等价于全站放行。
+    """
     for prefix in public_paths:
-        if path == prefix or path.startswith(prefix.rstrip("/") + "/"):
+        if path == prefix:
+            return True
+        if prefix != "/" and path.startswith(prefix.rstrip("/") + "/"):
             return True
     return False
 

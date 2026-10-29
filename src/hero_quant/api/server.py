@@ -5,7 +5,7 @@
 关键设计：最小 CSP（default-src 'self'）+ DNS rebinding 回环白名单；X-Request-ID 透传与 OTel 占位；Prometheus Counter/Histogram 与 wall-time 观测；SPA 回退仅在 API 路由之后生效。
 """
 
-from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request, Response
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse, FileResponse, PlainTextResponse
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
 
@@ -335,7 +335,8 @@ def _checkpoint_thread_for_request(request) -> tuple[str, str]:
     """checkpoint 三段式的 (thread, tenant)。
 
     中文：thread 取调用方 X-Request-ID（同值 = 同一线程，重启后可续写同一 seq 序列），
-    缺失/非法则用 adhoc；tenant 目前固定 default（per-user 隔离需 per-user 密钥身份，后续专线）。
+    缺失/非法则用 adhoc；tenant 优先取已认证租户（auth 中间件绑定），未启用身份时
+    回退 default 以保留既有匿名链路。
     """
     thread = "adhoc"
     try:
@@ -344,7 +345,16 @@ def _checkpoint_thread_for_request(request) -> tuple[str, str]:
             thread = rid
     except (ValueError, TypeError, AttributeError):
         thread = "adhoc"
-    return thread, "default"
+    tenant = "default"
+    try:
+        from hero_quant.auth.context import current_tenant_id
+
+        scoped = current_tenant_id()
+        if scoped:
+            tenant = scoped
+    except Exception:
+        tenant = "default"
+    return thread, tenant
 
 
 def _pg_dsn_hostport(dsn: str) -> tuple[str, int]:
@@ -511,6 +521,147 @@ except Exception as _e:
 
 
 app = FastAPI(title="hero-quant")
+
+
+# ---------------------------------------------------------------------------
+# D 线接线（serial）：W1 身份 -> W2 gateway -> W4/W8 session / killswitch
+# 中文：这些 helper 在 app 创建后、HTTP 中间件装饰器之前定义并调用，
+# 保证 auth 中间件位于安全头/请求 ID 之内（401 也带安全头）。
+# ---------------------------------------------------------------------------
+_AUTH_WIRED = False
+
+
+def _wire_auth(app: FastAPI, *, enabled: bool | None = None, verifier: object | None = None) -> bool:
+    """挂载 W1 身份：auth_enabled() 为真时启用 Bearer 中间件与统一错误映射。
+
+    enabled/verifier 仅供测试注入；生产走 config.settings。配置了 OIDC 但验签器构
+    建失败必须启动失败（fail-closed），不得静默退回匿名。
+    """
+    global _AUTH_WIRED
+    from hero_quant.auth.deps import install_auth_error_handlers
+    from hero_quant.auth.middleware import AuthContextMiddleware
+    from hero_quant.auth.oidc import OIDCSettings, auth_enabled, build_verifier, get_auth_mode
+
+    on = auth_enabled() if enabled is None else bool(enabled)
+    if not on:
+        logger.info("auth.wiring_disabled")
+        return False
+    try:
+        auth_verifier = verifier if verifier is not None else build_verifier(OIDCSettings.from_env())
+        mode = get_auth_mode()
+        app.state.auth_verifier = auth_verifier
+        install_auth_error_handlers(app)
+        app.add_middleware(AuthContextMiddleware, verifier=auth_verifier, mode=mode)
+    except Exception as _e:
+        logger.error("auth.wiring_failed", error=str(_e), exc_info=_e)
+        raise
+    _AUTH_WIRED = True
+    logger.info("auth.wiring_enabled mode=%s", mode.value)
+    return True
+
+
+def _role_dependency(role: str):
+    """端点 RBAC：auth 未启用时 no-op（保留 dev/旧测试的匿名调用语义）。"""
+    if not _AUTH_WIRED:
+
+        async def _noop() -> None:
+            return None
+
+        return Depends(_noop)
+    from hero_quant.auth.deps import require_role
+
+    return Depends(require_role(role))
+
+
+def _request_tenant() -> str | None:
+    """当前请求租户；auth 未启用时为 None（调用方自行决定是否 fail-closed）。"""
+    try:
+        from hero_quant.auth.context import current_tenant_id
+
+        return current_tenant_id()
+    except Exception:
+        return None
+
+
+def _session_scope() -> tuple[str, str | None]:
+    """会话接口的 (tenant, user)；未认证/未绑定租户时 503，绝不回退 default。"""
+    from hero_quant.auth.context import current_principal, require_tenant
+    from hero_quant.auth.errors import MissingTenant
+
+    try:
+        tenant = require_tenant()
+    except MissingTenant as exc:
+        raise HTTPException(status_code=503, detail={"reason": "auth_required_for_sessions"}) from exc
+    principal = current_principal()
+    return tenant, (principal.subject if principal is not None else None)
+
+
+async def _enforce_kill_switch(tenant_id: str | None, *, model: str | None = None, tool: str | None = None) -> None:
+    """租户/模型/工具 kill switch 前置检查：命中或后端不可用一律 503（fail-closed）。"""
+    from hero_quant.killswitch.switch import KillSwitch, KillSwitchActive, KillSwitchUnavailable
+
+    if not tenant_id:
+        return
+    switch = KillSwitch()
+    try:
+        await switch.check("tenant", tenant_id)
+        if model:
+            await switch.check("model", model, tenant_id=tenant_id)
+        if tool:
+            await switch.check("tool", tool, tenant_id=tenant_id)
+    except KillSwitchActive as exc:
+        # 中文：reason 必须是稳定机器码；人类可读原因放 kill_reason，避免被覆盖后无法区分。
+        detail = exc.to_dict()
+        detail["kill_reason"] = detail.pop("reason", "disabled")
+        raise HTTPException(status_code=503, detail={"reason": "killswitch_active", **detail}) from exc
+    except KillSwitchUnavailable as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={"reason": "killswitch_unavailable", "detail": exc.reason},
+        ) from exc
+
+
+def _llm_key_configured() -> bool:
+    """任一 provider key 存在才做启动 ping，避免无 key 环境产生无意义网络/延迟。"""
+    for key in ("HERO_API_KEY", "OPENAI_API_KEY", "DEEPSEEK_API_KEY", "ANTHROPIC_API_KEY", "CLAUDE_API_KEY"):
+        if (os.environ.get(key) or "").strip():
+            return True
+    return False
+
+
+def _gateway_degraded_reason() -> str | None:
+    """仅 failover 降级（primary 失败但备可用）上报；全挂由 _FakeLLM 路径负责。"""
+    try:
+        health = getattr(app.state, "llm_health", None)
+        if isinstance(health, dict) and health.get("degraded") is True:
+            return f"llm_gateway:{health.get('degraded_reason') or 'degraded'}"
+    except Exception:
+        return None
+    return None
+
+
+async def _warm_llm_gateway() -> None:
+    """启动构建 LLM gateway 并按需 ping；任何失败只记录，不阻塞启动。"""
+    try:
+        from hero_quant.config.settings import get_settings
+        from hero_quant.llm.gateway import LLMGateway
+
+        gateway = await asyncio.to_thread(LLMGateway.from_settings, get_settings())
+        health = gateway.health()
+        if _llm_key_configured():
+            health = await asyncio.to_thread(gateway.health_check)
+        app.state.llm_gateway = gateway
+        app.state.llm_health = health
+        logger.info(
+            "llm.gateway_ready degraded=%s reason=%s",
+            health.get("degraded"),
+            health.get("degraded_reason"),
+        )
+    except Exception as _e:
+        logger.warning("llm.gateway_warm_failed", error=str(_e))
+
+
+_wire_auth(app)
 
 
 def warm_checkpoint_at_startup() -> int:
@@ -718,6 +869,7 @@ async def _lifespan(app):
     shutdown：置位 stop_event 并取消消费者。各步骤内部已捕获异常，不阻断启动。
     """
     _warm_checkpoint_maps_on_startup()
+    await _warm_llm_gateway()
     await _start_ws_heartbeat()
     _inject_r1_state_on_startup()
     await _start_trace_consumer()
@@ -1586,7 +1738,7 @@ def _validate_wall_time_budget(value: float | None) -> None:
 
 
 @app.get("/v1/query")
-async def query(request: Request, background_tasks: BackgroundTasks, q: str = "", use_graph: bool = False, replay_path: str | None = None, trace_dir: str | None = None, wall_time_budget: float | None = None, x_ticket: str | None = Header(None, alias="X-Ticket")):
+async def query(request: Request, background_tasks: BackgroundTasks, q: str = "", use_graph: bool = False, replay_path: str | None = None, trace_dir: str | None = None, wall_time_budget: float | None = None, x_ticket: str | None = Header(None, alias="X-Ticket"), _authz: object = _role_dependency("analyst")):
     """同步查询：组装 AgentLoop 并返回 LoopResult 聚合 JSON。"""
     # 中文：background_tasks 注解必须是裸 BackgroundTasks，不能写成 `BackgroundTasks | None`。
     # FastAPI 判该参数靠 lenient_issubclass(annotation, StarletteBackgroundTasks)，
@@ -1771,6 +1923,7 @@ async def query(request: Request, background_tasks: BackgroundTasks, q: str = ""
             _saver = None
             _ckpt_degraded, _ckpt_reason = True, "checkpoint saver unavailable, memory fallback"
         _ckpt_thread, _ckpt_tenant = _checkpoint_thread_for_request(request)
+        await _enforce_kill_switch(_request_tenant(), model=model_name)
         loop_kwargs = dict(
             llm=llm,
             max_iterations=5,
@@ -1830,6 +1983,10 @@ async def query(request: Request, background_tasks: BackgroundTasks, q: str = ""
         if _ckpt_degraded:
             _degrade_reasons.append(_ckpt_reason or _EMULATED_CHECKPOINT_REASON)
             out["checkpoint_mode"] = "emulated"
+        _gw_reason = _gateway_degraded_reason()
+        if _gw_reason:
+            _degrade_reasons.append(_gw_reason)
+            out.setdefault("llm_mode", "failover")
         if _degrade_reasons:
             out["degraded"] = True
             out["degraded_reason"] = "; ".join(_degrade_reasons)
@@ -1862,7 +2019,7 @@ async def query(request: Request, background_tasks: BackgroundTasks, q: str = ""
 
 
 @app.post("/v1/query/ticket")
-def query_ticket(request: Request, user: str | None = None, scope: str | None = None):
+def query_ticket(request: Request, user: str | None = None, scope: str | None = None, _authz: object = _role_dependency("analyst")):
     """签发一个短时、单次消费的 SSE 查询票据（带滑动窗口限流；绑定鉴权后 user）。
 
     中文：G-08——scope 分域可选（query/metrics/stream；缺省 query）。query 分域票可用于
@@ -1963,7 +2120,7 @@ def query_ticket(request: Request, user: str | None = None, scope: str | None = 
 
 
 @app.get("/v1/query/stream")
-async def query_stream(request: Request, background_tasks: BackgroundTasks, q: str = "", x_ticket: str | None = Header(None, alias="X-Ticket"), use_graph: bool = False, replay_path: str | None = None, trace_dir: str | None = None, wall_time_budget: float | None = None):
+async def query_stream(request: Request, background_tasks: BackgroundTasks, q: str = "", x_ticket: str | None = Header(None, alias="X-Ticket"), use_graph: bool = False, replay_path: str | None = None, trace_dir: str | None = None, wall_time_budget: float | None = None, _authz: object = _role_dependency("analyst")):
     """SSE 查询流：真实 AgentLoop 驱动，产出 tool 轨迹 + 流式 delta + [DONE]。"""
     # 中文：同 query()，注解必须是裸 BackgroundTasks（union 写法会让模块 import 失败）。
     if background_tasks is None:
@@ -2029,6 +2186,18 @@ async def query_stream(request: Request, background_tasks: BackgroundTasks, q: s
     except (ValueError, TypeError, AttributeError, OSError, RuntimeError) as _e:
         logger.warning("stream.checkpoint_precheck_failed", error_code="checkpoint_precheck_failed", exc_info=_e)
         _stream_degrade_reasons.append("checkpoint saver unavailable, memory fallback")
+    _stream_gw_reason = _gateway_degraded_reason()
+    if _stream_gw_reason:
+        _stream_degrade_reasons.append(_stream_gw_reason)
+    # 中文：kill switch 必须在响应头发出前判定，才能以 503 短路；流内抛错已无法改状态码。
+    _stream_model: str | None = None
+    try:
+        from hero_quant.config.settings import Settings as _KsSettings
+
+        _stream_model = _KsSettings().llm_model
+    except Exception:
+        _stream_model = None
+    await _enforce_kill_switch(_request_tenant(), model=_stream_model)
 
     async def event_generator():
         import json as _json
@@ -2695,7 +2864,7 @@ def _get_backtest_bundle():
 
 
 @app.get("/v1/backtest/metrics.json")
-def backtest_metrics(request: Request):
+def backtest_metrics(request: Request, _authz: object = _role_dependency("viewer")):
     """返回回测核心指标 JSON。"""
     _limited = _check_rate_limit(request, "backtest", 30, 60)
     if _limited is not None:
@@ -2730,7 +2899,7 @@ def backtest_metrics(request: Request):
 
 
 @app.get("/v1/backtest/positions.csv")
-def backtest_positions(request: Request):
+def backtest_positions(request: Request, _authz: object = _role_dependency("viewer")):
     """返回持仓 CSV，表头包含 date 列。"""
     _limited = _check_rate_limit(request, "backtest", 30, 60)
     if _limited is not None:
@@ -2756,7 +2925,7 @@ def backtest_positions(request: Request):
 
 
 @app.get("/v1/backtest/tearsheet.html")
-def backtest_tearsheet(request: Request):
+def backtest_tearsheet(request: Request, _authz: object = _role_dependency("viewer")):
     """返回回测 tearsheet HTML。"""
     _limited = _check_rate_limit(request, "backtest", 30, 60)
     if _limited is not None:
@@ -2868,7 +3037,7 @@ def _compute_drawdowns_from_csv(csv_text: str, top_n: int = 3) -> list[dict]:
 
 
 @app.get("/v1/backtest/drawdowns.json")
-def backtest_drawdowns(request: Request):
+def backtest_drawdowns(request: Request, _authz: object = _role_dependency("viewer")):
     """返回回撤 Top3 区间 JSON（裸数组；与 Research 页 Drawdown 类型对齐，depth 为百分比）。"""
     _limited = _check_rate_limit(request, "backtest", 30, 60)
     if _limited is not None:
@@ -2890,6 +3059,76 @@ def backtest_drawdowns(request: Request):
 
 
 # 链路追踪事件 SSE（监控/实时页）：支持 offset 分页，优先读取真实 trace.jsonl
+def _list_sessions_sync(tenant: str, user_id: str | None, limit: int, offset: int):
+    from hero_quant.session.store import get_session_store
+
+    return get_session_store().list_sessions(tenant, user_id=user_id, limit=limit, offset=offset)
+
+
+def _get_session_sync(tenant: str, session_id: str):
+    from hero_quant.session.store import get_session_store
+
+    return get_session_store().get_session(tenant, session_id)
+
+
+def _resume_session_sync(tenant: str, session_id: str, after_id: int, limit: int):
+    from hero_quant.session.store import get_session_store
+
+    return get_session_store().resume_session(tenant, session_id, after_id=after_id, limit=limit)
+
+
+def _session_error_response(exc: Exception) -> HTTPException:
+    """SessionStore 错误 -> HTTP：404 不存在、503 不可用、400 入参非法。"""
+    from hero_quant.session.store import SessionError, SessionNotFound, SessionStoreUnavailable
+
+    if isinstance(exc, SessionNotFound):
+        return HTTPException(status_code=404, detail={"reason": exc.reason})
+    if isinstance(exc, SessionStoreUnavailable):
+        return HTTPException(status_code=503, detail={"reason": exc.reason})
+    if isinstance(exc, SessionError):
+        return HTTPException(status_code=400, detail={"reason": exc.reason})
+    return HTTPException(status_code=400, detail={"reason": "session_invalid_request"})
+
+
+@app.get("/v1/sessions")
+async def list_sessions(limit: int = 50, offset: int = 0, _authz: object = _role_dependency("viewer")):
+    """当前租户的会话列表（按 updated_at 倒序）。"""
+    from hero_quant.session.store import SessionError
+
+    tenant, user_id = _session_scope()
+    try:
+        rows = await asyncio.to_thread(_list_sessions_sync, tenant, user_id, limit, offset)
+    except (SessionError, ValueError, TypeError) as exc:
+        raise _session_error_response(exc) from exc
+    return {"sessions": rows}
+
+
+@app.get("/v1/sessions/{session_id}")
+async def get_session(session_id: str, _authz: object = _role_dependency("viewer")):
+    """会话详情（仅返回当前租户可见行）。"""
+    from hero_quant.session.store import SessionError
+
+    tenant, _user_id = _session_scope()
+    try:
+        row = await asyncio.to_thread(_get_session_sync, tenant, session_id)
+    except (SessionError, ValueError, TypeError) as exc:
+        raise _session_error_response(exc) from exc
+    return row
+
+
+@app.post("/v1/sessions/{session_id}/resume")
+async def resume_session(session_id: str, after_id: int = 0, limit: int = 200, _authz: object = _role_dependency("viewer")):
+    """断线/重启后续跑：返回会话 + 增量消息 + 最近 runs + SSE 游标。"""
+    from hero_quant.session.store import SessionError
+
+    tenant, _user_id = _session_scope()
+    try:
+        payload = await asyncio.to_thread(_resume_session_sync, tenant, session_id, after_id, limit)
+    except (SessionError, ValueError, TypeError) as exc:
+        raise _session_error_response(exc) from exc
+    return payload
+
+
 @app.get("/v1/trace/events")
 def trace_events(request: Request, offset: int = 0):
     """按 offset 返回追踪事件；Accept 为 text/event-stream 时以 SSE 流式返回。"""
