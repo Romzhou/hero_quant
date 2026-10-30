@@ -573,6 +573,23 @@ def _role_dependency(role: str):
     return Depends(require_role(role))
 
 
+def _quota_dependency():
+    """端点租户限流：auth 未启用时 no-op；启用后超限 429（由 AuthError 处理器统一映射）。
+
+    中文：后端不可用（Redis 挂）走 AuthConfigError → 503，不伪装成 429——用户超限与
+    服务端故障必须区分，否则会把故障甩锅给租户。
+    """
+    if not _AUTH_WIRED:
+
+        async def _noop() -> None:
+            return None
+
+        return Depends(_noop)
+    from hero_quant.auth.quota import tenant_rate_limit
+
+    return Depends(tenant_rate_limit)
+
+
 def _request_tenant() -> str | None:
     """当前请求租户；auth 未启用时为 None（调用方自行决定是否 fail-closed）。"""
     try:
@@ -1738,7 +1755,7 @@ def _validate_wall_time_budget(value: float | None) -> None:
 
 
 @app.get("/v1/query")
-async def query(request: Request, background_tasks: BackgroundTasks, q: str = "", use_graph: bool = False, replay_path: str | None = None, trace_dir: str | None = None, wall_time_budget: float | None = None, x_ticket: str | None = Header(None, alias="X-Ticket"), _authz: object = _role_dependency("analyst")):
+async def query(request: Request, background_tasks: BackgroundTasks, q: str = "", use_graph: bool = False, replay_path: str | None = None, trace_dir: str | None = None, wall_time_budget: float | None = None, x_ticket: str | None = Header(None, alias="X-Ticket"), _authz: object = _role_dependency("analyst"), _quota: object = _quota_dependency()):
     """同步查询：组装 AgentLoop 并返回 LoopResult 聚合 JSON。"""
     # 中文：background_tasks 注解必须是裸 BackgroundTasks，不能写成 `BackgroundTasks | None`。
     # FastAPI 判该参数靠 lenient_issubclass(annotation, StarletteBackgroundTasks)，
@@ -2019,7 +2036,7 @@ async def query(request: Request, background_tasks: BackgroundTasks, q: str = ""
 
 
 @app.post("/v1/query/ticket")
-def query_ticket(request: Request, user: str | None = None, scope: str | None = None, _authz: object = _role_dependency("analyst")):
+def query_ticket(request: Request, user: str | None = None, scope: str | None = None, _authz: object = _role_dependency("analyst"), _quota: object = _quota_dependency()):
     """签发一个短时、单次消费的 SSE 查询票据（带滑动窗口限流；绑定鉴权后 user）。
 
     中文：G-08——scope 分域可选（query/metrics/stream；缺省 query）。query 分域票可用于
@@ -2120,7 +2137,7 @@ def query_ticket(request: Request, user: str | None = None, scope: str | None = 
 
 
 @app.get("/v1/query/stream")
-async def query_stream(request: Request, background_tasks: BackgroundTasks, q: str = "", x_ticket: str | None = Header(None, alias="X-Ticket"), use_graph: bool = False, replay_path: str | None = None, trace_dir: str | None = None, wall_time_budget: float | None = None, _authz: object = _role_dependency("analyst")):
+async def query_stream(request: Request, background_tasks: BackgroundTasks, q: str = "", x_ticket: str | None = Header(None, alias="X-Ticket"), use_graph: bool = False, replay_path: str | None = None, trace_dir: str | None = None, wall_time_budget: float | None = None, _authz: object = _role_dependency("analyst"), _quota: object = _quota_dependency()):
     """SSE 查询流：真实 AgentLoop 驱动，产出 tool 轨迹 + 流式 delta + [DONE]。"""
     # 中文：同 query()，注解必须是裸 BackgroundTasks（union 写法会让模块 import 失败）。
     if background_tasks is None:

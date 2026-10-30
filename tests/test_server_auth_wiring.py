@@ -183,6 +183,80 @@ def test_sessions_error_mapping(monkeypatch, sessions_client):
     assert down.json()["detail"]["reason"] == "pg_unreachable"
 
 
+# ---------------------------------------------------------------------------
+# 租户配额（PR-105 的一半：速率限流；token 预算记账待 gateway 接进调用链）
+# ---------------------------------------------------------------------------
+
+
+def test_quota_dependency_is_noop_when_auth_off():
+    """auth 未启用时不做限流（保留匿名链路语义）。"""
+    dep = srv._quota_dependency()
+    assert dep.dependency.__name__ == "_noop"
+
+
+def test_quota_exceeded_maps_to_429_with_retry_after(monkeypatch):
+    """超限 429 + Retry-After；错误码 `quota_exceeded`，不放行也不 500。"""
+    from hero_quant.auth import quota as quota_mod
+    from hero_quant.auth.errors import QuotaExceeded
+
+    class _Exhausted:
+        async def check_request(self, tenant_id: str) -> None:
+            raise QuotaExceeded("tenant_rate_limit_exceeded", retry_after=30)
+
+    monkeypatch.setattr(quota_mod, "default_quota", lambda: _Exhausted())
+
+    class _StubVerifier:
+        def verify(self, token: str) -> dict:
+            return {"sub": "user-1", "tenant_id": "tenant-a", "roles": ["analyst"]}
+
+    app = FastAPI()
+    saved = srv._AUTH_WIRED
+    try:
+        assert srv._wire_auth(app, enabled=True, verifier=_StubVerifier()) is True
+
+        @app.get("/limited", dependencies=[srv._quota_dependency()])
+        async def _limited() -> dict:
+            return {"ok": True}
+
+        resp = TestClient(app).get("/limited", headers={"Authorization": "Bearer analyst"})
+    finally:
+        srv._AUTH_WIRED = saved
+    assert resp.status_code == 429
+    assert resp.json()["code"] == "quota_exceeded"
+    assert resp.headers["retry-after"] == "30"
+
+
+def test_quota_backend_unavailable_maps_to_503_not_429(monkeypatch):
+    """Redis 挂掉是服务端故障（503），不能伪装成 429 把锅甩给租户。"""
+    from hero_quant.auth import quota as quota_mod
+    from hero_quant.auth.errors import AuthConfigError
+
+    class _NoBackend:
+        async def check_request(self, tenant_id: str) -> None:
+            raise AuthConfigError("quota_backend_unavailable")
+
+    monkeypatch.setattr(quota_mod, "default_quota", lambda: _NoBackend())
+
+    class _StubVerifier:
+        def verify(self, token: str) -> dict:
+            return {"sub": "user-1", "tenant_id": "tenant-a", "roles": ["analyst"]}
+
+    app = FastAPI()
+    saved = srv._AUTH_WIRED
+    try:
+        srv._wire_auth(app, enabled=True, verifier=_StubVerifier())
+
+        @app.get("/limited", dependencies=[srv._quota_dependency()])
+        async def _limited() -> dict:
+            return {"ok": True}
+
+        resp = TestClient(app).get("/limited", headers={"Authorization": "Bearer analyst"})
+    finally:
+        srv._AUTH_WIRED = saved
+    assert resp.status_code == 503
+    assert resp.json()["code"] == "auth_config_error"
+
+
 def test_llm_key_configured_detects_any_provider_key(monkeypatch):
     """无 key 时不做无谓的启动 ping；任一 provider key 存在才 ping。"""
     for key in ("HERO_API_KEY", "OPENAI_API_KEY", "DEEPSEEK_API_KEY", "ANTHROPIC_API_KEY", "CLAUDE_API_KEY"):

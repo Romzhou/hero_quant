@@ -166,6 +166,7 @@ docker build --build-arg HERO_QUANT_VERSION="$(python -c 'import tomllib;print(t
 
 > **身份接线状态（W1，已接线）**：`api/server.py:534` 的 `_wire_auth()` 在 app 创建时挂载 `AuthContextMiddleware` + 统一 `AuthError` 映射；判据是 `auth_enabled()`（模式非 off **且** issuer/audience 齐备），因此**未配 OIDC 的环境不会被打穿**。挂载后：`/v1/query`、`/v1/query/stream`、`/v1/query/ticket` 需 analyst，`/v1/sessions*` 需 viewer；无 token 401 + `WWW-Authenticate`，错签名 401，配置故障 503（不伪装成 401 诱导重登）。`/health` `/ready` `/metrics` `/docs` 保持公开。验签失败一律 fail-closed：OIDC 配了但不全，进程直接启动失败。
 > **租户边界口径**：已认证请求的 tenant 来自 JWT claim，贯穿 checkpoint thread（`_checkpoint_thread_for_request`）与会话接口；**会话接口未绑定租户时 503，绝不回退 `default`**。kill switch（租户/模型/工具）命中或 Redis 不可用同样 503，不静默放行。
+> **配额口径（PR-105 速率部分）**：`/v1/query`、`/v1/query/ticket`、`/v1/query/stream` 已挂租户滑动窗口限流，超限 429 + `Retry-After`；**Redis 不可用是 503（`auth_config_error`）而非 429**，用户超限与服务端故障不混为一谈。日 token 预算（`HERO_TENANT_DAILY_TOKEN_BUDGET`）的记账尚未接线——需要先把 LLM gateway 接进实际调用链拿到 usage，在此之前该变量只影响策略对象、不产生扣减。
 
 > **计费边界**：API 层没有任何 billing 路由，不存在"返回 200 的假成功面"；无 DSN 时 `BillingService` 直接抛 `BillingUnavailable`，内存模式必须显式 `HERO_BILLING_ALLOW_MEMORY=1` 且响应带 `degraded:true`。
 > **合成模式边界**：`HERO_DATA_MODE=synthetic` 不是"离线可用"的同义词——它可跑通，但每一根 bar 都是合成序列，`provenance.source=synthetic` 必须被下游如实消费。
