@@ -23,6 +23,7 @@ from contextlib import contextmanager
 from datetime import date, datetime, timezone
 from typing import Any
 
+from hero_quant.data.quality import DataQualityError, assert_quality, check_bars
 from hero_quant.db.pool import DatabaseUnavailable, get_pool
 from hero_quant.db.rows import execute, executemany, fetch_all, fetch_one
 
@@ -97,6 +98,21 @@ class SnapshotValidationError(SnapshotError):
 
     error = "snapshot_invalid"
     status_code = 400
+
+
+class SnapshotQualityError(SnapshotValidationError):
+    """数据质量门阻断 —— 400；`reason` 是 quality.py 的稳定机器码。
+
+    继承 SnapshotValidationError：既有调用方/测试按原类型捕获即可，行为不变。
+    """
+
+    error = "snapshot_invalid"
+    status_code = 400
+
+    def __init__(self, reason: str, detail: str = "", codes: Sequence[str] = ()) -> None:
+        self.detail = detail
+        self.codes = tuple(codes)
+        super().__init__(reason, detail)
 
 
 def _text(value: Any, field: str, max_len: int, *, required: bool = True) -> str | None:
@@ -213,6 +229,26 @@ def normalize_bars(
     return rows
 
 
+def _enforce_quality(
+    rows: Sequence[Mapping[str, Any]],
+    symbols: Sequence[str],
+    start: date,
+    end: date,
+) -> None:
+    """质量门：在 digest/入库之前阻断坏数据，坏数据不产生 snapshot_id。
+
+    逐根字段级校验已由 `normalize_bars` 完成；这里只跑它覆盖不到的时序/跨源层面
+    （`data.quality`）。完整性有两条路：横截面覆盖率（标的间互相比，不需要日历，
+    本路径始终生效）+ 区间缺口/首尾（需显式 calendar；仓库没有交易日历源，用工作日
+    估算会把长假整段判成缺口，是假阳性，所以不在本处开启）。
+    """
+    report = check_bars(rows, symbols=symbols, start=start, end=end)
+    try:
+        assert_quality(report)
+    except DataQualityError as exc:
+        raise SnapshotQualityError(exc.reason, exc.detail, exc.codes) from exc
+
+
 def snapshot_digest(
     tenant_id: str,
     vendor: str,
@@ -314,6 +350,7 @@ class SnapshotStore:
             raise SnapshotValidationError("symbols_mismatch_bars")
 
         rows = normalize_bars(bars_by_symbol, start_date, end_date)
+        _enforce_quality(rows, symbol_list, start_date, end_date)
         snapshot_id, digest = snapshot_digest(
             tenant, vendor_name, adjust_name or "unknown", symbol_list, start_date, end_date, rows
         )
@@ -561,6 +598,7 @@ __all__ = [
     "SNAPSHOT_ID_PREFIX",
     "SnapshotError",
     "SnapshotNotFound",
+    "SnapshotQualityError",
     "SnapshotStore",
     "SnapshotUnavailable",
     "SnapshotValidationError",

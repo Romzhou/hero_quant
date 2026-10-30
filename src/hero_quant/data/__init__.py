@@ -5,8 +5,28 @@
 （仅当双源、非 synthetic 且提供起止时间时触发）。
 """
 
+from hero_quant.data.quality import (
+    DataQualityError,
+    Finding,
+    QualityReport,
+    QualityThresholds,
+    assert_quality,
+    check_bars,
+)
 from hero_quant.data.registry import CrossSourceError, MarketDataRegistry, Provenance
 from hero_quant.data.sources import VALID_SOURCES
 from hero_quant.data.trait import SourceTrait
 
-__all__ = ["MarketDataRegistry", "SourceTrait", "Provenance", "CrossSourceError", "VALID_SOURCES"]
+__all__ = [
+    "MarketDataRegistry",
+    "SourceTrait",
+    "Provenance",
+    "CrossSourceError",
+    "VALID_SOURCES",
+    "DataQualityError",
+    "Finding",
+    "QualityReport",
+    "QualityThresholds",
+    "assert_quality",
+    "check_bars",
+]
