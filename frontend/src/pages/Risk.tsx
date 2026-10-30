@@ -4,6 +4,7 @@
  * - 数据流：GET /v1/risk/summary 拉真实指标（turnover/cross_source/pit/circuit），失败回退静态占位；所有决策以 ledger.verify() 为可追溯锚点
  */
 import { useEffect, useState } from "react"
+import { authHeaders } from "../config/auth"
 
 type RiskSummary = {
   turnover?: number
@@ -57,7 +58,7 @@ export default function Risk() {
       setLoading(true)
       setError(null)
       try {
-        const r = await fetch(API_RISK_SUMMARY, { cache: "no-store" })
+        const r = await fetch(API_RISK_SUMMARY, { cache: "no-store", headers: authHeaders() })
         if (!r.ok) throw new Error(String(r.status))
         const j = await r.json()
         if (aborted) return

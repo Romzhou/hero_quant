@@ -7,6 +7,7 @@
  */
 import { useEffect, useRef, useState } from "react"
 import { isRealTraceEvent } from "../config/trace"
+import { authHeaders } from "../config/auth"
 
 type LiveEvent = { ts: string; offset: number; type: string; tool?: string; msg?: string; cost?: number }
 
@@ -70,7 +71,7 @@ export default function Live() {
         abortRef.current = controller
         let reader: ReadableStreamDefaultReader<Uint8Array> | null = null
         try {
-          const resp = await fetch(url, { headers: { Accept: "text/event-stream" }, signal: controller.signal })
+          const resp = await fetch(url, { headers: authHeaders({ Accept: "text/event-stream" }), signal: controller.signal })
           if (!resp.ok || !resp.body) continue
           reader = resp.body.getReader()
           readerRef.current = reader

@@ -13,6 +13,7 @@ import ReactECharts from "echarts-for-react"
 import { API_METRICS, API_POSITIONS, API_TEARSHEET, API_DRAWDOWNS } from "../config/api"
 import DegradedBanner from "../components/DegradedBanner"
 import { describeHttpFailure, type HttpFailure } from "../config/degraded"
+import { authHeaders } from "../config/auth"
 
 // 集中管理：后端回测产物路径统一由 src/config/api 维护（避免跨页硬编码漂移）；截断上限保留本地
 const MAX_CSV_CHARS = 4000
@@ -282,7 +283,7 @@ export default function Research(props: ResearchProps) {
     const { signal } = controller
     let aborted = false
     // 共享 fetcher：统一 cache 策略、signal 与 aborted 守卫，消除重复 boilerplate
-    const fetchNoStore = (url: string) => fetch(url, { cache: "no-store", signal })
+    const fetchNoStore = (url: string) => fetch(url, { cache: "no-store", signal, headers: authHeaders() })
     const isAlive = () => !aborted && !signal.aborted
 
     // 失败语义（t14）：401/403/429/kill switch 503 是 D 线接线后的真实拒绝。

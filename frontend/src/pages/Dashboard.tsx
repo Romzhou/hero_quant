@@ -8,6 +8,7 @@ import { useEffect, useState } from "react"
 import { useNavigate, Link } from "react-router-dom"
 import { useChatStore } from "../store/chat"
 import { API_METRICS, ROUTES } from "../config/api"
+import { authHeaders } from "../config/auth"
 
 type Metrics = { annual_return?: number; sharpe?: number; max_drawdown?: number; turnover?: number; total_equity?: number }
 
@@ -59,7 +60,7 @@ export default function Dashboard() {
       setError(null)
       setLoading(true)
       try {
-        const r = await fetch(API_METRICS, { cache: "no-store", signal })
+        const r = await fetch(API_METRICS, { cache: "no-store", signal, headers: authHeaders() })
         if (!r.ok) throw new Error(String(r.status))
         const j: unknown = await r.json()
         if (!signal.aborted && typeof j === "object" && j !== null && !Array.isArray(j)) {

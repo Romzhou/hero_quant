@@ -7,6 +7,7 @@
 import { useEffect, useRef, useState } from "react"
 import { useSettingsStore } from "../store/settings"
 import { RAW_API_PATHS } from "../config/api"
+import { authHeaders, clearToken, getToken, inspectToken, setToken } from "../config/auth"
 
 type Check = { ok: boolean | null; latency?: number; status?: number }
 
@@ -92,6 +93,24 @@ export default function Settings() {
   const [metrics, setMetrics] = useState<Check>({ ok: null })
   const [apiBaseError, setApiBaseError] = useState<string | null>(null)
   const [draftApiBase, setDraftApiBase] = useState(apiBase)
+  // 身份令牌（E 线 t14 批次2）：只存本机、只挂请求头；解析结果仅供展示，不验签。
+  const [tokenDraft, setTokenDraft] = useState("")
+  const [savedToken, setSavedToken] = useState<string | null>(() => getToken())
+  const tokenInfo = inspectToken(savedToken)
+
+  const handleSaveToken = () => {
+    const value = tokenDraft.trim()
+    if (!value) return
+    setToken(value)
+    setSavedToken(getToken())
+    setTokenDraft("")
+  }
+
+  const handleClearToken = () => {
+    clearToken()
+    setSavedToken(null)
+    setTokenDraft("")
+  }
 
   // draft 同步守卫：仅当外部持久化与 draft 实质不同时回写，避免防抖提交 normalize 时冲掉正在输入的内容
   useEffect(() => {
@@ -129,7 +148,7 @@ export default function Settings() {
         }
       }
       try {
-        const r = await fetch(url, { cache: "no-store", signal: combined })
+        const r = await fetch(url, { cache: "no-store", signal: combined, headers: authHeaders() })
         const dt = Math.round(performance.now() - t0)
         // 仅当 generation/round 仍为最新才写状态，丢弃过期响应
         if (!aborted && !signal.aborted && round === probeSeqRef.current) setter({ ok: r.ok, latency: dt, status: r.status })
@@ -250,6 +269,65 @@ export default function Settings() {
           />
           {apiBaseError && <p className="mt-2 text-xs text-red-300">{apiBaseError}</p>}
           <p className="mt-2 text-xs text-slate-500">用于覆盖 fetch 基路径，默认走 Vite proxy 到 localhost:8899</p>
+        </div>
+
+        <div className="rounded-2xl border border-white/10 bg-ink-800/60 p-5 backdrop-blur">
+          <div className="flex items-center justify-between">
+            <label className="text-xs font-semibold tracking-widest text-slate-400">身份令牌</label>
+            <span data-testid="token-status" className={"text-[11px] " + (savedToken ? "text-emerald-300" : "text-slate-500")}>
+              {savedToken ? "已配置" : "未配置"}
+            </span>
+          </div>
+          <input
+            type="password"
+            autoComplete="off"
+            value={tokenDraft}
+            onChange={e => setTokenDraft(e.target.value)}
+            onKeyDown={e => {
+              if (e.key === "Enter") handleSaveToken()
+            }}
+            placeholder="粘贴 JWT（仅存本机 localStorage，不上传）"
+            className="mt-2 w-full rounded-xl border border-white/10 bg-ink-900 px-3 py-2.5 font-mono text-xs text-mist placeholder:text-slate-500 outline-none focus:border-amber-500/40"
+          />
+          <div className="mt-2 flex gap-2">
+            <button
+              type="button"
+              onClick={handleSaveToken}
+              disabled={!tokenDraft.trim()}
+              className="rounded-lg border border-amber-500/30 bg-amber-500/15 px-2.5 py-1 text-xs text-amber-200 hover:bg-amber-500/25 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              保存令牌
+            </button>
+            <button
+              type="button"
+              onClick={handleClearToken}
+              disabled={!savedToken}
+              className="rounded-lg border border-white/10 bg-white/5 px-2.5 py-1 text-xs text-mist hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              清除
+            </button>
+          </div>
+          {savedToken && (
+            <div className="mt-3 rounded-xl border border-white/10 bg-ink-900/60 px-3 py-2 font-mono text-[11px] leading-5 text-slate-300">
+              <div>
+                租户：<span data-testid="token-tenant">{tokenInfo.tenant ?? "—"}</span>
+                <span className="mx-2 text-slate-600">·</span>
+                用户：<span data-testid="token-subject">{tokenInfo.subject ?? "—"}</span>
+              </div>
+              <div>
+                到期：
+                <span className={tokenInfo.expired ? "text-red-300" : ""}>
+                  {tokenInfo.expiresAt ? new Date(tokenInfo.expiresAt * 1000).toLocaleString() : "—"}
+                  {tokenInfo.expired ? "（已过期）" : ""}
+                </span>
+              </div>
+              {tokenInfo.error && <div className="text-red-300">{tokenInfo.error}</div>}
+            </div>
+          )}
+          <p className="mt-2 text-xs leading-5 text-slate-500">
+            以上信息来自令牌声明，<span className="text-slate-300">未经服务端确认</span>；令牌是否有效、租户与角色是否被接受，一律由后端裁决。
+            配置后所有请求自动携带 <span className="font-mono text-slate-300">Authorization: Bearer</span>；清除后回到匿名链路。
+          </p>
         </div>
 
         <div className="rounded-2xl border border-white/10 bg-ink-800/60 p-5 backdrop-blur">

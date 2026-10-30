@@ -16,6 +16,7 @@ import {
   isDegradedPayload,
   type HttpFailure,
 } from "../config/degraded"
+import { authHeaders, hasToken } from "../config/auth"
 
 type ToolCall = { id: string; tool: string; status: "pending" | "success" | "error"; latencyMs?: number; preview?: string }
 
@@ -258,7 +259,7 @@ export default function Chat() {
     const issueSseTicket = async () => {
       const resp = await fetch(API_ENDPOINTS.TICKET, {
         method: "POST",
-        headers: { Accept: "application/json" },
+        headers: authHeaders({ Accept: "application/json" }),
         signal: controller.signal,
       })
       await failOnHttpError(resp)
@@ -352,7 +353,7 @@ export default function Chat() {
       const url = `${API_ENDPOINTS.STREAM}?q=${encodeURIComponent(q)}`
       const resp = await fetch(url, {
         method: "GET",
-        headers: { Accept: "text/event-stream", "X-Ticket": ticket },
+        headers: authHeaders({ Accept: "text/event-stream", "X-Ticket": ticket }),
         signal: controller.signal,
       })
       await failOnHttpError(resp)
@@ -493,7 +494,10 @@ export default function Chat() {
     }
 
     try {
-      await tryEventSource()
+      // 已配置令牌时 EventSource 带不上 Authorization（必被 401），直接走可带请求头的 fetch 流；
+      // 匿名态沿用原 EventSource 路径（?ticket=），行为不变。
+      if (hasToken()) await fetchFallback()
+      else await tryEventSource()
       // 正常结算：未见 [DONE] 即视为截断（有 delta 标注截断，无内容走空兜底）
       if (isAlive()) {
         if (hasDelta && !gotDone) markTruncated()

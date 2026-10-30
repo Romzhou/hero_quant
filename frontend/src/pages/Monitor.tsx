@@ -8,6 +8,7 @@
  */
 import { useEffect, useRef, useState } from "react"
 import { isRealTraceEvent } from "../config/trace"
+import { authHeaders } from "../config/auth"
 
 type LiveEvent = { ts: string; offset: number; type: string; tool?: string; msg?: string; cost?: number }
 
@@ -56,7 +57,7 @@ export default function Monitor() {
           const url = candidate
           const controller = new AbortController()
           abortRef.current = controller
-          const headers: Record<string, string> = { Accept: "text/event-stream" }
+          const headers = authHeaders({ Accept: "text/event-stream" })
           const resp = await fetch(url, { headers, signal: controller.signal })
           if (!resp.ok || !resp.body) {
             console.warn(`[Monitor] SSE candidate failed: ${candidate} status ${resp.status}`)
