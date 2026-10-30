@@ -183,11 +183,11 @@ services:
     profiles: ["observability"]
     command:
       - --config.file=/etc/prometheus/prometheus.yml
-      - --storage.tsv.path=/prometheus
+      - --storage.tsdb.path=/prometheus
       # 默认 35d 不是随手写的：deploy/monitoring/slo.yml 的 SLO/错误预算规则用 30 天
       # 窗口，保留期 <30d 时那些序列会给出偏小甚至空的值——看起来像 SLO 很好，
       # 实际是窗口不够（docs/slo.md §硬前提）。调小前先确认 SLO 是否还需要。
-      - --storage.tsv.retention.time=${HERO_PROM_RETENTION:-35d}
+      - --storage.tsdb.retention.time=${HERO_PROM_RETENTION:-35d}
       - --web.enable-lifecycle
     volumes:
       # 单文件挂载即可：这两个文件不会像 upstream.caddy 那样被脚本改写。

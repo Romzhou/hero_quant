@@ -151,6 +151,7 @@ PITR 前提：基线与 WAL 覆盖目标时间；`wal` 目录属主 70:70；恢�
 - **没接真实告警投递**：Alertmanager 默认接收端是 `unconfigured`，什么都不发（故意的，
   配假 webhook 会让告警静默丢失）。主机/容器/PG exporter 归 PR-301，本期也没有——
   缺它们时告警只覆盖应用层，**没告警不等于没故障**。
+  监控配置「验过什么 / 没验什么」见 §8.1。
 
 ## 6.1 容量压测与故障演练
 
@@ -185,13 +186,82 @@ scripts/perf/fault-drill.sh --case redis-down --confirm   # 注入→观测→�
 
 | 项 | 命令 | 结果 |
 |---|---|---|
-| compose 解析（blue+green+auth+observability） | `HERO_ENV_FILE=<abs> docker compose --env-file <abs> -f deploy/compose/docker-compose.prod.yml --profile '*' config` | 通过（8 个服务） |
+| compose 解析（blue+green+auth+observability） | `HERO_ENV_FILE=<abs> docker compose --env-file <abs> -f deploy/compose/docker-compose.prod.yml --profile '*' config --services` | 通过（10 个服务） |
 | 脚本语法 | `bash -n scripts/deploy/*.sh scripts/perf/*.sh` | 全部通过 |
 | 压测脚本 | `node --check`（k6 ESM 语法） | 通过 |
-| 监控配置 | `python3 -c "yaml.safe_load(...)"` + 规则结构校验 + `json.load` 看板 | yaml ok × 6；dashboard 8 面板；rules ok（13 告警 / 9 记录规则） |
-| 告警 PromQL | `promtool check rules` | **未验证**（本机无 promtool，未拉镜像；首次接线必须补） |
+| 监控配置 | YAML/JSON 解析 + 规则结构 + 指标名/label/uid 闭合 | 通过（6 个 yaml + 1 个 dashboard；13 告警 / 9 记录规则）；细则见 §8.1 |
+| 告警 PromQL 语义 | `promtool check config` / `promtool check rules` / `amtool check-config` | **未验证**（本机无 promtool/amtool，未拉镜像）——见 §8.1 |
 | 版本单源 | `pytest -q tests/test_bootstrap.py` | 2 passed |
 | 真实启动/TLS/迁移/备份恢复/蓝绿时延/压测/演练 | 需生产机与域名 | **未验证**（首次上线按第 2 节逐步走，不跳步） |
+
+## 8.1 监控验证状态（2026-10-31）
+
+范围：`deploy/monitoring/**` + `docs/slo.md`。本机 `which promtool` / `which amtool` 都是空，
+且按纪律不装包、不拉镜像，所以**分成「静态验过」与「未验证」两栏，不混写**。
+
+**已做（可复现，纯静态）**
+
+| 检查 | 手段 | 结果 |
+|---|---|---|
+| YAML 可解析 | `yaml.safe_load` × 6（prometheus/alerts/slo/alertmanager/2 个 provisioning） | 通过 |
+| Dashboard JSON 可解析 | `json.load` | 通过（8 面板） |
+| 规则结构 | 每条 `alert` 有 expr/for/labels/annotations/severity；`for` 是「整数或小数 + ms/s/m/h/d/w/y 单位」；record 名含 `:` | 通过（13 告警 / 9 记录规则，无重名） |
+| **指标名闭合** | 从 `src/**/*.py` 提取所有 `Counter/Gauge/Histogram/_get_or_create_*` 注册名（含 prometheus_client 的 `_total`/`_bucket`/`_count`/`_sum` 后缀规则），再比对规则表达式里的每个标识符 | 通过（发现并修掉 1 处：`rerank_fallback_total` → `hero_quant_rerank_fallback_total`） |
+| **label 闭合** | 表达式 `by(...)` 的 label 与被聚合指标的 label 集比对（`le` 由直方图提供） | 通过（endpoint/provider/model 均存在） |
+| job / 目标闭合 | 规则里的 `job="..."` ⊂ `prometheus.yml` 的 `job_name`；scrape 目标 `app-blue:8899`/`app-green:8899` 在 compose 有同名服务；`alertmanager:9093` 存在 | 通过 |
+| rule_files 与挂载一致 | `rule_files: /etc/prometheus/rules/*.yml` ↔ compose 的 `alerts.yml`/`slo.yml` 挂载点 | 通过 |
+| Alertmanager 闭合 | route 的 3 个子路由 + 根路由都指向 `receivers` 里存在的 `unconfigured`；`inhibit_rules` 的 `alertname` 是真实告警 | 通过 |
+| Grafana | 面板 `datasource.uid=hero-quant-prom` 能在 provisioning 的 datasources 解析到；无 `__inputs`、无 templating 变量；面板查询指标全部存在于 src | 通过 |
+
+**未验证（及原因）**
+
+1. **`promtool check config`（prometheus.yml）**——本机无 promtool，且不拉镜像。它会额外检查
+   `rule_files` glob 可加载、`alerting`/`scrape_configs` 的字段拼写、relabel 正则编译。
+   目前这些只做了「人工对照 + 服务名闭合」，**不算通过**。
+2. **`promtool check rules`（alerts.yml / slo.yml）**——PromQL 的**类型检查**（如
+   `histogram_quantile` 参数、`and on()` 的向量匹配、`increase()` 只接计数器）只有 promtool 能判。
+   我做的只是「指标名/label 是否存在」的闭合，**不等于表达式语义正确**。
+3. **`amtool check-config`（alertmanager.yml）**——`matchers` 语法、空 `receivers` 条目
+   （`unconfigured` 没有任何 configs）是否被接受、`inhibit_rules.equal` 的字段名，都需 amtool 确认。
+4. **运行时行为**：抓取是否真的成功、告警是否真的从 `pending → firing`、Grafana 面板是否出图，
+   都需要起栈（本机不跑 `docker compose up`）。
+
+在有工具的机器上补齐（二选一）：
+
+```bash
+# A. 镜像（路径与容器内一致，不用改配置文件）
+docker run --rm -v "$PWD/deploy/monitoring:/etc/prom:ro" prom/prometheus:v3.1.0 \
+  promtool check config /etc/prom/prometheus.yml
+docker run --rm -v "$PWD/deploy/monitoring:/etc/prom:ro" prom/prometheus:v3.1.0 \
+  promtool check rules /etc/prom/alerts.yml /etc/prom/slo.yml
+docker run --rm -v "$PWD/deploy/monitoring:/etc/am:ro" prom/alertmanager:v0.28.0 \
+  amtool check-config /etc/am/alertmanager.yml
+
+# B. 本机二进制（先把文件摆成 rule_files 里的绝对路径布局）
+sudo install -d /etc/prometheus/rules
+sudo install -m 644 deploy/monitoring/prometheus.yml /etc/prometheus/prometheus.yml
+sudo install -m 644 deploy/monitoring/alerts.yml deploy/monitoring/slo.yml /etc/prometheus/rules/
+promtool check config /etc/prometheus/prometheus.yml
+promtool check rules /etc/prometheus/rules/alerts.yml /etc/prometheus/rules/slo.yml
+amtool check-config deploy/monitoring/alertmanager.yml
+```
+
+**`unconfigured` 的行为（必须明确说清）**
+
+Alertmanager 的根路由和三个 severity 子路由都指向 `unconfigured`，这个 receiver **没有配任何
+`webhook_configs`/`email_configs`**，所以它 **不投递任何消息**——不发给群、不发邮件、不发工单。
+告警只出现在两个地方：Prometheus 的 `/alerts` 页、Alertmanager 的 UI（9093，仅宿主回环）。
+这是**故意**的：配一个假 webhook 会让告警静默丢失，比"看得见没人收"更危险。
+要真正投递，解开 `alertmanager.yml` 里 `im-webhook` 注释段、填地址（地址不进仓库），
+再把路由 receiver 改过去。
+
+**已发现并修复的不一致（compose 旗标拼写）**
+
+`deploy/compose/docker-compose.prod.yml:186,190` 原先把 Prometheus 的存储旗标
+`--storage.tsdb.path` / `--storage.tsdb.retention.time` 里的 `tsdb` 误写成三个字母相近的 `tsv`。
+按原写法 Prometheus 会以 `unknown long flag` 直接退出，整个观测栈起不来。
+**已修**：只改这两个旗标（`tsv` → `tsdb`），端口/卷/profile/资源限制一律未动；
+改动已落在工作区，**commit 待总管统一提交**。（`grep -rn "storage\.tsv"` 现在应为空。）
 
 ## 9. 安全要点
 

@@ -1,18 +1,22 @@
 # ============================================================================
 # 告警/记录规则（PR-302/303）——只对**真实存在的指标**写表达式。
 #
-# 指标来源（不改代码，照现有注册名写）：
-#   hero_quant_requests_total{endpoint}                  server.py:883
-#   http_request_duration_seconds{endpoint}              server.py:911 / metrics/__init__.py:177
-#   hero_quant_api_errors_total{endpoint,error_code}     server.py:89
+# 指标来源（不改代码，照现有注册名写；行号 2026-10-31 复核，改 src 后须重新 grep）：
+#   hero_quant_requests_total{endpoint}                  api/server.py:1064 / metrics/__init__.py:184
+#   http_request_duration_seconds{endpoint}              api/server.py:1092 / metrics/__init__.py:178
+#   hero_quant_api_errors_total{endpoint,error_code}     api/server.py:89-90
 #   circuit_state (0 closed / 1 half_open / 2 open)      telemetry/circuit.py:21
 #   data_source_circuit_open_total{source}               telemetry/circuit.py:36
 #   hero_quant_risk_errors_total{op,error_code}          api/risk.py:43
-#   hero_quant_llm_{retry,timeout,tokens,cost,total}*    metrics/__init__.py:134-175
-#   hero_quant_governance_wall_time_exceeded_total       metrics/__init__.py:107
+#   hero_quant_llm_{retry,timeout,tokens,cost,failover}_total   metrics/__init__.py:134-174
+#   hero_quant_llm_latency_seconds{provider,model}       metrics/__init__.py:163
+#   hero_quant_governance_wall_time_exceeded_total{operation}  metrics/__init__.py:107
+#   hero_quant_rerank_fallback_total（无 label）          memory/rerank.py:17
 #
 # 调阈值：改本文件的数值即可，别改字段名；所有金额阈值都要按真实预算复核。
-# 未接 Alertmanager 前，这些规则只在 Prometheus UI 的 Alerts 页可见（不静默：页面就是证据）。
+# Alertmanager 已接（prometheus.yml 的 alerting 段），但默认 receiver 是 `unconfigured`，
+# 它**不投递任何消息**：这些规则只在 Prometheus UI 的 Alerts 页与 Alertmanager UI 可见
+# （不静默：页面就是证据，见 deploy/README.md「监控验证状态」）。
 # ============================================================================
 groups:
   - name: hero-quant-availability
@@ -44,6 +48,8 @@ groups:
 
       - alert: HeroQuantApiErrorRateHigh
         # 分母做 clamp_min：没有流量时不会除零告警；有错有流量才命中。
+        # 分子口径偏差见 slo.yml 同名注释：hero_quant_api_errors_total 还含 /ready 探针与
+        # 后台事件，所以本告警同样偏悲观（宁可早报，不假装健康）。
         expr: (sum(rate(hero_quant_api_errors_total[10m])) / clamp_min(sum(rate(hero_quant_requests_total[10m])), 0.01)) > 0.05
         for: 10m
         labels:
@@ -78,7 +84,9 @@ groups:
           description: "反复开合说明上游不稳定或阈值过紧；看 docs/RESILIENCE.md 的阈值来源，别直接放宽到失效。"
 
       - alert: HeroQuantMemoryRerankFallbackSpike
-        expr: sum(increase(rerank_fallback_total[15m])) > 10
+        # 真实注册名是 hero_quant_rerank_fallback_total（memory/rerank.py:17，无 label）；
+        # 写成 rerank_fallback_total 会永远匹配不到序列（静默失效）。
+        expr: sum(increase(hero_quant_rerank_fallback_total[15m])) > 10
         for: 0m
         labels:
           severity: info
@@ -151,11 +159,13 @@ groups:
 
       - alert: HeroQuantTrafficDropToZero
         # 兜底：白天窗口完全没流量，可能是边缘挂了而不是业务没人用（内部工具需要这条）。
-        expr: (heroquant:request_qps == 0) and on() (hour() >= 9 and hour() < 23)
+        # 注意 hour() 返回 **UTC** 小时（PromQL 规定，容器也没设 TZ）：
+        # UTC 01–15 时 = 北京时间 09:00–23:00；写 9–23 会在北京夜里报警、白天静默。
+        expr: (heroquant:request_qps == 0) and on() (hour() >= 1 and hour() < 15)
         for: 30m
         labels:
           severity: info
           service: hero-quant
         annotations:
-          summary: "工作时段 30 分钟零请求"
+          summary: "工作时段（北京时间 09:00–23:00）30 分钟零请求"
           description: "可能是 Caddy/上游断了，也可能真没人用。先看 /ready 与 Caddy 日志，别直接当正常。"

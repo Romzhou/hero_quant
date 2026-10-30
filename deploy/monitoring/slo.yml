@@ -1,9 +1,11 @@
 # ============================================================================
 # SLI / 错误预算记录规则（PR-144）
 #
-# 重要前提：**保留期必须够长**。下面用 30d 窗口，Prometheus 的
-# `HERO_PROM_RETENTION` 默认只有 15d，那样这些规则只会产出空序列——
-# 想真的算月度 SLO，先把保留期调成 >=35d 并确认磁盘够（TSDB 会变胖）。
+# 重要前提：**保留期必须够长**。下面用 30d 窗口；生产 compose 与 prod 模板的
+# `HERO_PROM_RETENTION` 默认已是 35d（docker-compose.prod.yml:190、prod.env.example:36），
+# 但 staging/dev 模板是 3d/1d（staging.env.example:30、dev.env.example:30）——按这些值
+# 起 Prometheus 时本文件的 30d 规则只会产出空/偏小值。要真算月度 SLO：>=35d 且磁盘够
+# （TSDB 会变胖），preflight.sh:107-125 会在 <30d 时打 WARN。
 #
 # 目标值是**提案**（99% 可用性 / p95 < 5s），批复前不要拿它对外承诺，
 # 见 docs/slo.md。
@@ -13,6 +15,12 @@ groups:
     interval: 1m
     rules:
       # --- 可用性 SLI：1 - 错误率（错误率口径与 HeroQuantApiErrorRateHigh 一致）---
+      # 口径警告（2026-10-31 复核 src 后补）：分子 hero_quant_api_errors_total 不只统计
+      # 请求失败——server.py 同一计数器还用于 /ready 探针（endpoint="ready"）、后台事件
+      # （"checkpoint"/"warmup"/"otel"）以及"已降级但成功"的响应
+      # （error_code="degraded_response"，server.py:2193、server.py:2622）。
+      # 因此本 SLI 是**偏悲观的下界**，不等于纯请求错误率；要严格口径需在 src 另拆一个
+      # 只记请求失败的计数器（不在 W5 监控轮范围，见 docs/slo.md §2「口径偏差」）。
       - record: heroquant:sli_availability:ratio5m
         expr: 1 - (sum(rate(hero_quant_api_errors_total[5m])) / clamp_min(sum(rate(hero_quant_requests_total[5m])), 0.01))
 

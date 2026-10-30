@@ -8,7 +8,8 @@
 # 边界（诚实）：这里只抓得到 **应用层** 指标。PG/Redis/磁盘/容器的细粒度指标
 # 需要 node_exporter / postgres_exporter / cadvisor（PR-301 补），文件末尾给了
 # 注释好的 job；没有那些 exporter 时对应的告警不会触发，不要以为没报就是没故障。
-# Alertmanager 也不在本批次内，规则先写 `alertmanager-independent`。
+# Alertmanager 已接线（见下方 alerting 段），但默认 receiver 是 `unconfigured`：
+# 告警只出现在 Prometheus / Alertmanager 的 UI 里，**不投递到任何群/邮件**。
 # ============================================================================
 global:
   scrape_interval: 15s

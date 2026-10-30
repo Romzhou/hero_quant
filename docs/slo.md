@@ -13,8 +13,8 @@
 
 | SLI | 口径 | 目标（提案） | 窗口 |
 |---|---|---|---|
-| 可用性 | `1 - 错误率`，错误率 = API 已处理错误 / 请求数 | 99% | 30 天滚动 |
-| 延迟 | 各端点 p95（秒） | p95 < 5s | 30 天滚动 |
+| 可用性 | `1 - 错误率`，错误率 = `hero_quant_api_errors_total` / `hero_quant_requests_total` | 99% | 30 天滚动 |
+| 延迟 | 各端点 p95（秒） | p95 < 5s | 5 分钟滚动（**30d 汇总未实现**，见 §2 口径偏差） |
 | 降级可见性 | 响应带 `degraded:true` 的比例 | 仅观测，暂不设目标 | — |
 
 排除项（**待确认**，先写清楚再谈数字）：
@@ -38,9 +38,26 @@
 | `heroquant:error_budget_consumed:ratio30d` | 预算消耗比例（SLO 99% ⇒ 1% 为满额） |
 | `heroquant:error_budget_remaining:ratio30d` | 剩余预算，1=没动，0=耗尽 |
 
-**硬前提**：这些规则用 30 天窗口，而 `HERO_PROM_RETENTION` 默认只有 15 天。
-保留期不足时规则产出的是**偏小甚至空的值**，看起来像"SLO 很好"，实际是数据窗口不够。
-要真算月度 SLO：`HERO_PROM_RETENTION=35d`（并确认备份盘/数据盘容量）。
+**硬前提**：这些规则用 30 天窗口。生产 compose（`deploy/compose/docker-compose.prod.yml:190`）
+与 `deploy/env/prod.env.example:36` 的 `HERO_PROM_RETENTION` 默认是 **35d**；但
+`staging.env.example` / `dev.env.example` 是 **3d / 1d**——按它们起 Prometheus 时规则产出的是
+**偏小甚至空的值**，看起来像"SLO 很好"，实际是数据窗口不够。要真算月度 SLO：
+`HERO_PROM_RETENTION=35d`（并确认备份盘/数据盘容量）。`preflight.sh`（`scripts/deploy/preflight.sh:107-125`）
+在 <30d 时打 WARN，但**不阻断**。
+
+### 口径偏差（2026-10-31 复核 src 后补，读数字前必看）
+
+1. **可用性分子不是纯请求错误**。`hero_quant_api_errors_total` 与请求计数器同一套写法，
+   但 `api/server.py` 还用它计：`/ready` 探针（`endpoint="ready"`，:1319/:1351/:1836）、
+   后台事件（`endpoint="checkpoint"/"warmup"/"otel"`，:135/:949/:1153）、以及"已显式降级但
+   HTTP 成功"的响应（`error_code="degraded_response"`，:2193/:2622）。所以这个可用性 SLI 是
+   **偏悲观的下界**：它不会虚高（不会把故障算成正常），但会把降级成功算成错误。
+   要严格口径得在 src 另拆一个只记请求失败的计数器（本次监控轮不动 src）。
+2. **延迟只有 5 分钟记录规则**（`heroquant:sli_latency_p95:5m`），没有 30 天 p95 聚合。
+   月度报告里只能写"采样时点的 5m p95"，**不是月度 p95**；要月度 p95 得另加 recording rule
+   （并用直方图分位做 30d 聚合，成本高、失真大，本期不做）。
+3. **30d 窗口依赖 `increase()` 外推**：Prometheus 重启/抓取中断会在 `increase` 上留下缺口，
+   数值偏小。看数字前先确认目标连续在线、保留期 ≥35d。
 
 ## 3. 错误预算策略
 
