@@ -1,0 +1,14 @@
+# 看板自动供给：从只读挂载的目录加载 JSON，重启即生效，不用在 UI 里手点。
+apiVersion: 1
+
+providers:
+  - name: hero-quant
+    orgId: 1
+    folder: hero-quant
+    type: file
+    disableDeletion: true
+    updateIntervalSeconds: 60
+    allowUiUpdates: false
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

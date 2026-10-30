@@ -175,6 +175,94 @@ services:
           memory: 2G
 
   # --------------------------------------------------------------------------
+  # 观测（PR-302/303）：profile observability。只绑宿主回环，公网不可达。
+  # 需要在 --profile 里显式打开：单机资源有限，默认不跑观测栈。
+  # --------------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    profiles: ["observability"]
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsv.path=/prometheus
+      # 默认 35d 不是随手写的：deploy/monitoring/slo.yml 的 SLO/错误预算规则用 30 天
+      # 窗口，保留期 <30d 时那些序列会给出偏小甚至空的值——看起来像 SLO 很好，
+      # 实际是窗口不够（docs/slo.md §硬前提）。调小前先确认 SLO 是否还需要。
+      - --storage.tsv.retention.time=${HERO_PROM_RETENTION:-35d}
+      - --web.enable-lifecycle
+    volumes:
+      # 单文件挂载即可：这两个文件不会像 upstream.caddy 那样被脚本改写。
+      - ../monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ../monitoring/alerts.yml:/etc/prometheus/rules/alerts.yml:ro
+      - ../monitoring/slo.yml:/etc/prometheus/rules/slo.yml:ro
+      - prom_data:/prometheus
+    ports:
+      - "127.0.0.1:${HERO_PROM_PORT:-9090}:9090"
+    networks:
+      - internal
+    logging: *default-logging
+    restart: unless-stopped
+    # 不写 healthcheck：prom/prometheus 镜像里没有可用的 http 客户端（curl/wget），
+    # 写 /-/healthy 探针需要 shell + 客户端，未实测前不放进来制造误报。
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+
+  # 告警路由（PR-143）：默认接收端是 unconfigured，**什么都不会发**，
+  # 真实 webhook 要解开 alertmanager.yml 里的注释段再填地址（地址不进仓库）。
+  alertmanager:
+    image: prom/alertmanager:v0.28.0
+    profiles: ["observability"]
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+    volumes:
+      - ../monitoring/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - am_data:/alertmanager
+    ports:
+      - "127.0.0.1:${HERO_AM_PORT:-9093}:9093"
+    networks:
+      - internal
+    logging: *default-logging
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+
+  # 看板（PR-142）：数据源与看板都是仓库内 JSON/yml 自动供给，UI 里不用手点。
+  grafana:
+    image: grafana/grafana:11.5.0
+    profiles: ["observability"]
+    environment:
+      # 口令必须换（模板里的 replace-with-*）；不填 :? 会让 compose 直接报错。
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?GRAFANA_ADMIN_PASSWORD required}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_SERVER_ROOT_URL: http://127.0.0.1:${HERO_GRAFANA_PORT:-3000}/
+    volumes:
+      - ../monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ../monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "127.0.0.1:${HERO_GRAFANA_PORT:-3000}:3000"
+    depends_on:
+      prometheus:
+        condition: service_started
+    networks:
+      - internal
+    logging: *default-logging
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+
+  # --------------------------------------------------------------------------
   # 数据层：只在 internal 网络，无宿主端口
   # --------------------------------------------------------------------------
   postgres:
@@ -294,3 +382,6 @@ volumes:
   hero-home:
   caddy_data:
   caddy_config:
+  prom_data:
+  am_data:
+  grafana_data:

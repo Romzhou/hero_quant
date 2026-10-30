@@ -1,0 +1,122 @@
+{
+  "uid": "hero-quant-overview",
+  "title": "hero-quant 单机概览",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": false,
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "timezone": "browser",
+  "templating": { "list": [] },
+  "annotations": { "list": [] },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "可用应用实例（蓝绿合计）",
+      "description": "正常运行时这里是 1（只有当前接流量的那一色在跑）。0 = 全站不可达。",
+      "datasource": { "type": "prometheus", "uid": "hero-quant-prom" },
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "targets": [{ "refId": "A", "expr": "sum(up{job=\"hero-quant-app\"})", "legendFormat": "up" }]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "请求 QPS",
+      "datasource": { "type": "prometheus", "uid": "hero-quant-prom" },
+      "gridPos": { "h": 8, "w": 10, "x": 4, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(hero_quant_requests_total[5m]))",
+          "legendFormat": "QPS"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "p95 延迟（按端点）",
+      "description": "回测/问答天然慢，判读时按端点分开看，不要只盯总量。",
+      "datasource": { "type": "prometheus", "uid": "hero-quant-prom" },
+      "gridPos": { "h": 8, "w": 10, "x": 14, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (endpoint, le) (rate(http_request_duration_seconds_bucket[5m])))",
+          "legendFormat": "{{endpoint}}"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "API 错误率 %",
+      "description": "分母做了 clamp_min：无流量时显示 0 而不是 NaN。",
+      "datasource": { "type": "prometheus", "uid": "hero-quant-prom" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "fieldConfig": { "defaults": { "unit": "percent" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(hero_quant_api_errors_total[5m])) / clamp_min(sum(rate(hero_quant_requests_total[5m])), 0.01) * 100",
+          "legendFormat": "error rate"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "数据源熔断状态",
+      "description": "0=closed 1=half_open 2=open。2 表示走降级路径，属预期可见，不是故障本身。",
+      "datasource": { "type": "prometheus", "uid": "hero-quant-prom" },
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 8 },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "targets": [{ "refId": "A", "expr": "max(circuit_state)", "legendFormat": "state" }]
+    },
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "LLM 成本（近 24h，USD）",
+      "description": "未定价模型不计数（llm/catalog.py），这里不是全部成本，只覆盖有价目表的模型。",
+      "datasource": { "type": "prometheus", "uid": "hero-quant-prom" },
+      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 8 },
+      "fieldConfig": { "defaults": { "unit": "currencyUSD" }, "overrides": [] },
+      "targets": [{ "refId": "A", "expr": "heroquant:llm_cost_usd_24h", "legendFormat": "USD" }]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "LLM provider 切换次数（10m）",
+      "datasource": { "type": "prometheus", "uid": "hero-quant-prom" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(increase(hero_quant_llm_failover_total[10m]))",
+          "legendFormat": "failover"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "stat",
+      "title": "错误预算剩余（30d）",
+      "description": "1=没动，0=已耗尽。Prometheus 保留期 <30d 时这个数不可信，先看 HERO_PROM_RETENTION。",
+      "datasource": { "type": "prometheus", "uid": "hero-quant-prom" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0, "max": 1 }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "heroquant:error_budget_remaining:ratio30d",
+          "legendFormat": "remaining"
+        }
+      ]
+    }
+  ]
+}

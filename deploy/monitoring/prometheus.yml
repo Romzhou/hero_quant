@@ -1,0 +1,72 @@
+# ============================================================================
+# Prometheus（单机，profile: observability）——PR-302/303 的观测底座。
+#
+# 启用：
+#   docker compose ... --profile blue --profile observability up -d prometheus
+#   http://127.0.0.1:9090  （仅绑定宿主回环，公网不可达）
+#
+# 边界（诚实）：这里只抓得到 **应用层** 指标。PG/Redis/磁盘/容器的细粒度指标
+# 需要 node_exporter / postgres_exporter / cadvisor（PR-301 补），文件末尾给了
+# 注释好的 job；没有那些 exporter 时对应的告警不会触发，不要以为没报就是没故障。
+# Alertmanager 也不在本批次内，规则先写 `alertmanager-independent`。
+# ============================================================================
+global:
+  scrape_interval: 15s
+  scrape_timeout: 10s
+  evaluation_interval: 30s
+  external_labels:
+    deployment: hero-quant-single
+
+rule_files:
+  # alerts.yml（告警）、slo.yml（SLI/错误预算）。新增规则文件只要落在同一目录即可。
+  - /etc/prometheus/rules/*.yml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        # profile observability 下的 alertmanager 容器；未启该 profile 时
+        # Prometheus 会一直报 "no alertmanager"，属预期，不影响规则评估。
+        - targets: ['alertmanager:9093']
+
+scrape_configs:
+  # -------------------------------------------------------------------------
+  # 应用（蓝绿两色都在维多目标里）：
+  # 注意 **故意** 抓两色目标——blue-green 下未接流量的那一色是停着的，
+  # up==0 是正常的，所以告警一律用 "全部目标都 down" 的聚合表达式，
+  # 不用单实例 up==0，否则每次发布都会误报。
+  # -------------------------------------------------------------------------
+  - job_name: hero-quant-app
+    metrics_path: /metrics
+    scheme: http
+    static_configs:
+      - targets:
+          - app-blue:8899
+          - app-green:8899
+        labels:
+          service: hero-quant
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: color
+        regex: 'app-(blue|green):8899'
+        replacement: '${1}'
+
+  - job_name: prometheus
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - 127.0.0.1:9090
+        labels:
+          service: prometheus
+
+  # -------------------------------------------------------------------------
+  # 以下 job 需 PR-301 引入对应 exporter 后才生效（保持注释，不写假目标）。
+  # -------------------------------------------------------------------------
+  # - job_name: node
+  #   static_configs:
+  #     - targets: ['host.docker.internal:9100']   # node_exporter：磁盘/内存/CPU
+  # - job_name: postgres
+  #   static_configs:
+  #     - targets: ['postgres_exporter:9187']      # PG 连接数/复制/归档
+  # - job_name: cadvisor
+  #   static_configs:
+  #     - targets: ['cadvisor:8080']               # 容器 CPU/内存/网络

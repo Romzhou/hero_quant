@@ -1,0 +1,14 @@
+# 数据源：走 compose 内部网络，Grafana 不需要出网（internal: true 已禁止出网）。
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    uid: hero-quant-prom
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      httpMethod: POST
+      timeInterval: 15s

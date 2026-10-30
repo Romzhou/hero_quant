@@ -102,6 +102,29 @@ fi
 # 发布门：生产必须开着身份验证。HERO_AUTH_MODE 缺省会收敛 enforce
 # （settings.py:331-339），模板为了"接线前也能起"预置 off，所以这里显式卡死：
 # 生产环境要上线，必须改 enforce；临时放行需显式 HERO_ALLOW_AUTH_OFF=1 并承担风险。
+# SLO 硬前提（PR-144）：错误预算规则用 30 天窗口，保留期不足时给出的数不可信。
+# 这里只告警不阻断：小盘机器确实可能扛不住 35d，但必须让人看见这个代价。
+retention="${HERO_PROM_RETENTION:-35d}"
+# 单位换算交给 python（h/d/w/m），值通过 argv 传入，不做字符串拼接。
+ret_days="$(python3 - "$retention" <<'PY'
+import re
+import sys
+
+m = re.fullmatch(r"(\d+)([hdwm]?)", sys.argv[1].strip())
+if not m:
+    print("?")
+else:
+    n, unit = int(m.group(1)), (m.group(2) or "h")
+    print(round(n * {"h": 1 / 24, "d": 1, "w": 7, "m": 30}[unit], 2))
+PY
+)" 2>/dev/null || ret_days="?"
+if [[ "$ret_days" != "?" ]] && awk -v d="$ret_days" 'BEGIN { exit !(d >= 30) }'; then
+  say "OK   Prometheus 保留期 ${retention}（>=30d，SLO 30 天窗口可用）"
+else
+  log "WARN Prometheus 保留期 ${ret_days:-?}d（${retention}） < 30d：slo.yml 的错误预算规则会失真或为空"
+  log "     要评估月度 SLO 就提到 >=35d；明确不评估就忽略这条（staging/dev 属此类）"
+fi
+
 if [[ "${HERO_ENV:-}" == "production" ]]; then
   auth_off_bypass="${HERO_ALLOW_AUTH_OFF:-0}"
   if [[ "${HERO_AUTH_MODE:-enforce}" != "enforce" && "$auth_off_bypass" != "1" ]]; then

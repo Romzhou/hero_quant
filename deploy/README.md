@@ -13,6 +13,11 @@
 | `deploy/caddy/upstream.caddy` | 蓝绿切换点模板（运行时副本在 `/var/lib/hero-quant/caddy/`） | PR-165 |
 | `deploy/systemd/hero-quant.service` | 开机自启 / compose 生命周期 | PR-162 |
 | `deploy/systemd/hero-quant-backup.{service,timer}` | 每日 03:30 备份 | PR-164 |
+| `deploy/monitoring/prometheus.yml` | Prometheus 抓取配置（profile: observability） | PR-302 |
+| `deploy/monitoring/alerts.yml` | 告警/记录规则（对应真实指标名） | PR-302 |
+| `scripts/perf/loadtest.js` | k6 压测场景（问答/SSE/回测/风控） | PR-302 |
+| `scripts/perf/smoke.sh` | 压测前置体检（端点/证书） | PR-302/303 |
+| `scripts/perf/fault-drill.sh` | 故障注入→观测→恢复→记录 | PR-303 |
 | `deploy/env/{prod,staging,dev}.env.example` | 三环境模板（同机隔离靠 project+端口+目录） | PR-165 |
 | `scripts/deploy/preflight.sh` | 前置检查 + 初始化目录 | PR-161/164 |
 | `scripts/deploy/deploy.sh` | 拉镜像 → 迁移 → 起新色 → /ready → 切流 → 停旧色 | PR-163 |
@@ -139,7 +144,28 @@ PITR 前提：基线与 WAL 覆盖目标时间；`wal` 目录属主 70:70；恢�
 - 应用 `/metrics` 只在 compose 内网可达；Caddy 仅允许私网来源访问 `/metrics`。
 - pg/redis/otel 均无宿主端口；`docker compose logs -f --tail=200 app-<color>`。
 - JSON 日志轮转：每服务 `max-size=20m × 5`；备份/发布记录在 `/var/lib/hero-quant/deploy/`。
-- Prometheus/Grafana 归 W5（`deploy/monitoring/**`），本编排只保证指标可抓。
+- 观测三件套（Prometheus / Alertmanager / Grafana）在 `profile: observability` 下，
+  全部只绑宿主回环（9090 / 9093 / 3000）。
+  规则清单、为什么这么写、本机校验方式见 [`deploy/monitoring/README.md`](monitoring/README.md)；
+  SLO 与错误预算口径见 [`docs/slo.md`](../docs/slo.md)。
+- **没接真实告警投递**：Alertmanager 默认接收端是 `unconfigured`，什么都不发（故意的，
+  配假 webhook 会让告警静默丢失）。主机/容器/PG exporter 归 PR-301，本期也没有——
+  缺它们时告警只覆盖应用层，**没告警不等于没故障**。
+
+## 6.1 容量压测与故障演练
+
+```bash
+BASE_URL=https://<domain> scripts/perf/smoke.sh          # 前置：端点/证书体检
+k6 run scripts/perf/loadtest.js                           # 压测（需 k6）
+scripts/perf/fault-drill.sh --list                        # 故障演练清单
+scripts/perf/fault-drill.sh --case redis-down --confirm   # 注入→观测→恢复→记录
+```
+
+- 台账（基线数值、演练记录）在 [`docs/perf-baseline.md`](../docs/perf-baseline.md)，
+  当前全为**待测**：没跑过的场景不许填数字，告警阈值也要回填自那张表。
+- 无 LLM key 时压测延迟不具参考性（`_FakeLLM` 接管），`loadtest.js` 会统计
+  `degraded_ratio`，报告里先报它。
+- 演练默认禁止在生产环境执行（要 `--allow-disruptive-in-prod`），脚本退出前强制恢复。
 
 ## 7. 故障排查
 
@@ -159,10 +185,13 @@ PITR 前提：基线与 WAL 覆盖目标时间；`wal` 目录属主 70:70；恢�
 
 | 项 | 命令 | 结果 |
 |---|---|---|
-| compose 解析（blue+green+auth） | `HERO_ENV_FILE=<abs> docker compose --env-file <abs> -f deploy/compose/docker-compose.prod.yml --profile '*' config` | 通过 |
-| 脚本语法 | `bash -n scripts/deploy/*.sh` | 全部通过 |
+| compose 解析（blue+green+auth+observability） | `HERO_ENV_FILE=<abs> docker compose --env-file <abs> -f deploy/compose/docker-compose.prod.yml --profile '*' config` | 通过（8 个服务） |
+| 脚本语法 | `bash -n scripts/deploy/*.sh scripts/perf/*.sh` | 全部通过 |
+| 压测脚本 | `node --check`（k6 ESM 语法） | 通过 |
+| 监控配置 | `python3 -c "yaml.safe_load(...)"` + 规则结构校验 + `json.load` 看板 | yaml ok × 6；dashboard 8 面板；rules ok（13 告警 / 9 记录规则） |
+| 告警 PromQL | `promtool check rules` | **未验证**（本机无 promtool，未拉镜像；首次接线必须补） |
 | 版本单源 | `pytest -q tests/test_bootstrap.py` | 2 passed |
-| 真实启动/TLS/迁移/备份恢复/蓝绿时延 | 需生产机与域名 | **未验证**（首次上线按第 2 节逐步走，不跳步） |
+| 真实启动/TLS/迁移/备份恢复/蓝绿时延/压测/演练 | 需生产机与域名 | **未验证**（首次上线按第 2 节逐步走，不跳步） |
 
 ## 9. 安全要点
 

@@ -1,0 +1,54 @@
+# ============================================================================
+# SLI / 错误预算记录规则（PR-144）
+#
+# 重要前提：**保留期必须够长**。下面用 30d 窗口，Prometheus 的
+# `HERO_PROM_RETENTION` 默认只有 15d，那样这些规则只会产出空序列——
+# 想真的算月度 SLO，先把保留期调成 >=35d 并确认磁盘够（TSDB 会变胖）。
+#
+# 目标值是**提案**（99% 可用性 / p95 < 5s），批复前不要拿它对外承诺，
+# 见 docs/slo.md。
+# ============================================================================
+groups:
+  - name: hero-quant-slo
+    interval: 1m
+    rules:
+      # --- 可用性 SLI：1 - 错误率（错误率口径与 HeroQuantApiErrorRateHigh 一致）---
+      - record: heroquant:sli_availability:ratio5m
+        expr: 1 - (sum(rate(hero_quant_api_errors_total[5m])) / clamp_min(sum(rate(hero_quant_requests_total[5m])), 0.01))
+
+      # --- 延迟 SLI：各端点 p95（秒）---
+      - record: heroquant:sli_latency_p95:5m
+        expr: histogram_quantile(0.95, sum by (endpoint, le) (rate(http_request_duration_seconds_bucket[5m])))
+
+      # --- 30 天窗口的请求/错误总量（错误预算的分母分子）---
+      - record: heroquant:requests:increase30d
+        expr: sum(increase(hero_quant_requests_total[30d]))
+
+      - record: heroquant:errors:increase30d
+        expr: sum(increase(hero_quant_api_errors_total[30d]))
+
+      - record: heroquant:error_rate:ratio30d
+        expr: heroquant:errors:increase30d / clamp_min(heroquant:requests:increase30d, 1)
+
+      # 错误预算消耗比例：SLO 99% ⇒ 允许 1% 错误率；>1 表示预算耗尽。
+      - record: heroquant:error_budget_consumed:ratio30d
+        expr: heroquant:error_rate:ratio30d / 0.01
+
+      # 剩余预算（1 = 全额没动，0 = 已耗尽）
+      - record: heroquant:error_budget_remaining:ratio30d
+        expr: clamp_min(1 - heroquant:error_budget_consumed:ratio30d, 0)
+
+  - name: hero-quant-slo-alerts
+    rules:
+      # 预算耗尽就冻结发布：这是 PR-313 的"错误预算触发发布冻结"的告警形态。
+      # 阈值先按"剩余为 0"触发，避免刚上线噪声太大；产品确认口径后再收紧。
+      - alert: HeroQuantErrorBudgetExhausted
+        expr: heroquant:error_budget_remaining:ratio30d <= 0
+        for: 30m
+        labels:
+          severity: critical
+          service: hero-quant
+        annotations:
+          summary: "30 天错误预算已耗尽（错误率 ≥ 1%）"
+          description: "按错误预算策略应冻结非修复类发布。窗口口径见 docs/slo.md；若 Prometheus 保留期 <30d，本规则不可信（会给出空/偏小的值）——先看保留期再决策。"
+          runbook: "docs/slo.md"

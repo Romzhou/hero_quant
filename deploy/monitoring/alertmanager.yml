@@ -1,0 +1,50 @@
+# ============================================================================
+# Alertmanager（PR-143 的"告警路由"部分）——**骨架，未完成**。
+#
+# 现状（不掩盖）：
+#   - 默认接收端是 `unconfigured`：它什么都**不发**。这样写是为了让"告警没到群里"
+#     在 UI 上一眼可见，而不是配一个假 webhook URL 之后悄悄丢告警。
+#   - 真实投递（IM/邮件/工单）需要把 webhook 地址配到 secrets 或宿主的
+#     /etc/hero-quant/ 下，再把下面注释里的 `im-webhook` 段解开、改路由的 receiver。
+#
+# 启用：
+#   docker compose ... --profile observability up -d alertmanager
+#   http://127.0.0.1:9093（只绑宿主回环）
+# ============================================================================
+global:
+  resolve_timeout: 5m
+
+route:
+  receiver: unconfigured
+  group_by: [alertname, service, severity]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  routes:
+    - matchers:
+        - severity="critical"
+      receiver: unconfigured
+      continue: false
+    - matchers:
+        - severity="warning"
+      receiver: unconfigured
+    - matchers:
+        - severity="info"
+      receiver: unconfigured
+      group_interval: 30m
+
+receivers:
+  # 占位接收端：显式"未配置"，避免静默丢告警。
+  - name: unconfigured
+
+  # 真实投递示例（解开前必须填 url，且 **不要把地址写进本仓库**）：
+  # - name: im-webhook
+  #   webhook_configs:
+  #     - url: http://<internal-webhook-relay>/hero-quant
+  #       send_resolved: true
+
+inhibit_rules:
+  # 全站 down 时不再刷"延迟高/错误率高"这类派生告警，减少噪音但保留根因告警。
+  - source_matchers: [alertname="HeroQuantAllAppInstancesDown"]
+    target_matchers: [severity="warning"]
+    equal: [service]

@@ -1,0 +1,161 @@
+# ============================================================================
+# 告警/记录规则（PR-302/303）——只对**真实存在的指标**写表达式。
+#
+# 指标来源（不改代码，照现有注册名写）：
+#   hero_quant_requests_total{endpoint}                  server.py:883
+#   http_request_duration_seconds{endpoint}              server.py:911 / metrics/__init__.py:177
+#   hero_quant_api_errors_total{endpoint,error_code}     server.py:89
+#   circuit_state (0 closed / 1 half_open / 2 open)      telemetry/circuit.py:21
+#   data_source_circuit_open_total{source}               telemetry/circuit.py:36
+#   hero_quant_risk_errors_total{op,error_code}          api/risk.py:43
+#   hero_quant_llm_{retry,timeout,tokens,cost,total}*    metrics/__init__.py:134-175
+#   hero_quant_governance_wall_time_exceeded_total       metrics/__init__.py:107
+#
+# 调阈值：改本文件的数值即可，别改字段名；所有金额阈值都要按真实预算复核。
+# 未接 Alertmanager 前，这些规则只在 Prometheus UI 的 Alerts 页可见（不静默：页面就是证据）。
+# ============================================================================
+groups:
+  - name: hero-quant-availability
+    rules:
+      # 蓝绿场景的关键：不能用单实例 up==0——未接流量的那一色本来就是停的。
+      # `count(...) > 0` 这个守卫确保"一次都没抓到"和"抓到了但全挂"区分开，
+      # 否则 Prometheus 刚启动、目标还没被发现时会误报。
+      - alert: HeroQuantAllAppInstancesDown
+        expr: (sum(up{job="hero-quant-app"}) == 0) and (count(up{job="hero-quant-app"}) > 0)
+        for: 2m
+        labels:
+          severity: critical
+          service: hero-quant
+        annotations:
+          summary: "hero-quant 全部应用实例不可达"
+          description: "job=hero-quant-app 的所有目标 2 分钟内 up=0。先 `bluegreen.sh status` 确认 Caddy 上游指向是否在跑，再看 compose 容器状态。"
+          runbook: "deploy/README.md §7（故障排查）+ docs/runbook.md §0"
+
+      - alert: HeroQuantHighLatencyP95
+        expr: histogram_quantile(0.95, sum by (endpoint, le) (rate(http_request_duration_seconds_bucket[5m]))) > 5
+        for: 10m
+        labels:
+          severity: warning
+          service: hero-quant
+        annotations:
+          summary: "端点 {{ $labels.endpoint }} p95 > 5s（10 分钟）"
+          description: "先区分是否为 LLM/回测长任务（天然慢），再看 /ready 是否降级；同步压测/回测本身p95 基线见 docs/perf-baseline.md。"
+          runbook: "docs/runbook.md §1"
+
+      - alert: HeroQuantApiErrorRateHigh
+        # 分母做 clamp_min：没有流量时不会除零告警；有错有流量才命中。
+        expr: (sum(rate(hero_quant_api_errors_total[10m])) / clamp_min(sum(rate(hero_quant_requests_total[10m])), 0.01)) > 0.05
+        for: 10m
+        labels:
+          severity: warning
+          service: hero-quant
+        annotations:
+          summary: "API 错误率 > 5%（10 分钟）"
+          description: "按端点下钻：sum by (endpoint, error_code) (rate(hero_quant_api_errors_total[10m]))。429/503 先看限流与 /ready reasons，不要先怀疑业务。"
+          runbook: "docs/runbook.md §1 / deploy/README.md §7"
+
+  - name: hero-quant-degradation
+    rules:
+      - alert: HeroQuantCircuitBreakerOpen
+        expr: max(circuit_state) >= 2
+        for: 2m
+        labels:
+          severity: warning
+          service: hero-quant
+        annotations:
+          summary: "数据源熔断器处于 OPEN"
+          description: "circuit_state=2 表示数据源熔断已打开，请求走降级路径。这是**预期可见**的降级，但持续 >30 分钟要查数据源可用性。"
+          runbook: "docs/RESILIENCE.md"
+
+      - alert: HeroQuantDataSourceCircuitOpeningOften
+        expr: sum(increase(data_source_circuit_open_total[30m])) > 3
+        for: 0m
+        labels:
+          severity: warning
+          service: hero-quant
+        annotations:
+          summary: "30 分钟内数据源熔断开启 > 3 次"
+          description: "反复开合说明上游不稳定或阈值过紧；看 docs/RESILIENCE.md 的阈值来源，别直接放宽到失效。"
+
+      - alert: HeroQuantMemoryRerankFallbackSpike
+        expr: sum(increase(rerank_fallback_total[15m])) > 10
+        for: 0m
+        labels:
+          severity: info
+          service: hero-quant
+        annotations:
+          summary: "向量回退到纯 Python 重排次数偏高"
+          description: "memory 向量失败会回退并打标；这里只是观测信号，功能不中断。频繁出现说明 pgvector 不可用。"
+
+      - alert: HeroQuantWallTimeBudgetExceeded
+        expr: sum(increase(hero_quant_governance_wall_time_exceeded_total[15m])) > 0
+        for: 0m
+        labels:
+          severity: info
+          service: hero-quant
+        annotations:
+          summary: "wall-time 预算被超过（15 分钟内 {{ $value }} 次）"
+          description: "治理层超时不算故障，但要复核 HERO_WALL_TIME_BUDGET_SECONDS 与任务拆分是否合理。"
+
+  - name: hero-quant-llm
+    rules:
+      - record: heroquant:llm_cost_usd_24h
+        expr: sum(increase(hero_quant_llm_cost_total[24h]))
+
+      - alert: HeroQuantLLMProviderFailoverSpike
+        expr: sum(increase(hero_quant_llm_failover_total[10m])) > 3
+        for: 0m
+        labels:
+          severity: warning
+          service: hero-quant
+        annotations:
+          summary: "10 分钟内 LLM provider 切换 > 3 次"
+          description: "主 provider 可能不健康；gateway 全失败会抛 AllProvidersFailed（不回退假文本），此处先于报错发现抖动。"
+
+      - alert: HeroQuantLLMTimeoutSpike
+        expr: sum(increase(hero_quant_llm_timeout_total[10m])) > 5
+        for: 0m
+        labels:
+          severity: warning
+          service: hero-quant
+        annotations:
+          summary: "10 分钟内 LLM 超时 > 5 次"
+          description: "检查 provider 状态与超时配置；流式请求尤其容易在弱网下命中。"
+
+      - alert: HeroQuantLLMLatencyP95High
+        expr: histogram_quantile(0.95, sum by (provider, model, le) (rate(hero_quant_llm_latency_seconds_bucket[10m]))) > 30
+        for: 15m
+        labels:
+          severity: warning
+          service: hero-quant
+        annotations:
+          summary: "LLM {{ $labels.provider }}/{{ $labels.model }} p95 > 30s"
+          description: "deep 模型长思考是可能的，但持续 15 分钟超标要调整模型槽位或超时预算。"
+
+      # 金额阈值是**占位**，必须按真实预算复核后再启用（默认 100 USD/天）。
+      # 成本口径：未定价模型不计数（llm/catalog.py），不把未知当 0 并入总量。
+      - alert: HeroQuantLLMDailyCostExceedsBudget
+        expr: heroquant:llm_cost_usd_24h > 100
+        for: 0m
+        labels:
+          severity: warning
+          service: hero-quant
+        annotations:
+          summary: "近 24h LLM 成本 {{ $value | printf \"%.2f\" }} USD 超出设定预算"
+          description: "阈值写死在本文件的 expr 里（默认 100），请按租户/月度预算改成真值；口径见 docs/arch/billing.md。"
+
+  - name: hero-quant-capacity
+    rules:
+      - record: heroquant:request_qps
+        expr: sum(rate(hero_quant_requests_total[5m]))
+
+      - alert: HeroQuantTrafficDropToZero
+        # 兜底：白天窗口完全没流量，可能是边缘挂了而不是业务没人用（内部工具需要这条）。
+        expr: (heroquant:request_qps == 0) and on() (hour() >= 9 and hour() < 23)
+        for: 30m
+        labels:
+          severity: info
+          service: hero-quant
+        annotations:
+          summary: "工作时段 30 分钟零请求"
+          description: "可能是 Caddy/上游断了，也可能真没人用。先看 /ready 与 Caddy 日志，别直接当正常。"
