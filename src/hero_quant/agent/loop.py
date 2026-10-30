@@ -123,6 +123,10 @@ class LoopResult:
     grounding_verified: bool = False
     trace_path: Optional[str] = None
     token_count: int = 0
+    # PR-105/115：后端 usage 累计（`{"input_tokens": n, "output_tokens": m}`）。
+    # 只透出循环内真实累计值；后端没给 usage（全 0）时保持 None，绝不用
+    # `estimate_tokens(buffer)` 冒充计量——成本/预算记账必须可追溯到后端。
+    llm_usage: Optional[Dict[str, int]] = None
 
 
 class AgentLoop:
@@ -1861,6 +1865,12 @@ class AgentLoop:
         except Exception:
             pass
 
+        # PR-105/115：把循环内累计的真实后端 usage 透出（记账/成本归集唯一来源）。
+        # 全 0 表示后端没给 usage → 保持 None，调用方据此跳过记账，绝不按字符估算凑数。
+        _llm_usage_result: Optional[Dict[str, int]] = None
+        if _llm_usage_input or _llm_usage_output:
+            _llm_usage_result = {"input_tokens": int(_llm_usage_input), "output_tokens": int(_llm_usage_output)}
+
         # Wave4: writeback on done — 结束时尽力回写入 memory
         try:
             if buffer and getattr(self, "memory_store", None) is not None:
@@ -1937,6 +1947,7 @@ class AgentLoop:
             grounding_verified=bool(grounding_verified),
             trace_path=trace_path_str,
             token_count=token_count,
+            llm_usage=_llm_usage_result,
         )
 
     def _run_graph(self, goal: str) -> LoopResult:

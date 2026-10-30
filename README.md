@@ -160,13 +160,18 @@ docker build --build-arg HERO_QUANT_VERSION="$(python -c 'import tomllib;print(t
 | `HERO_OIDC_LEEWAY_SECONDS` | `60` | 校验 `exp/nbf/iat` 的时钟偏移容忍 |
 | `HERO_OIDC_JWKS_TTL_SECONDS` | `300` | JWKS 缓存 TTL；取签失败时不静默放行 |
 | `HERO_TENANT_REQUESTS_PER_MINUTE` | `60` | 租户级 Redis 滑动窗口限流；超限 429 |
-| `HERO_TENANT_DAILY_TOKEN_BUDGET` | `2000000` | 租户日 token 预算；`<=0` 表示不限 token |
+| `HERO_TENANT_DAILY_TOKEN_BUDGET` | `2000000` | 租户日 token 预算（UTC 自然日）；`<=0` 表示不限。跑循环**前**当日已用 ≥ 预算即 429 + `Retry-After`（到 UTC 零点秒数） |
 
 全仓仅 `src/hero_quant/config/settings.py` 允许 `os.getenv`，CI 门禁 `tests/test_config.py:80` 校验。
 
 > **身份接线状态（W1，已接线）**：`api/server.py:534` 的 `_wire_auth()` 在 app 创建时挂载 `AuthContextMiddleware` + 统一 `AuthError` 映射；判据是 `auth_enabled()`（模式非 off **且** issuer/audience 齐备），因此**未配 OIDC 的环境不会被打穿**。挂载后：`/v1/query`、`/v1/query/stream`、`/v1/query/ticket` 需 analyst，`/v1/sessions*` 需 viewer；无 token 401 + `WWW-Authenticate`，错签名 401，配置故障 503（不伪装成 401 诱导重登）。`/health` `/ready` `/metrics` `/docs` 保持公开。验签失败一律 fail-closed：OIDC 配了但不全，进程直接启动失败。
 > **租户边界口径**：已认证请求的 tenant 来自 JWT claim，贯穿 checkpoint thread（`_checkpoint_thread_for_request`）与会话接口；**会话接口未绑定租户时 503，绝不回退 `default`**。kill switch（租户/模型/工具）命中或 Redis 不可用同样 503，不静默放行。
-> **配额口径（PR-105 速率部分）**：`/v1/query`、`/v1/query/ticket`、`/v1/query/stream` 已挂租户滑动窗口限流，超限 429 + `Retry-After`；**Redis 不可用是 503（`auth_config_error`）而非 429**，用户超限与服务端故障不混为一谈。日 token 预算（`HERO_TENANT_DAILY_TOKEN_BUDGET`）的记账尚未接线——需要先把 LLM gateway 接进实际调用链拿到 usage，在此之前该变量只影响策略对象、不产生扣减。
+> **配额口径（PR-105，速率 + 日 token 预算均已接线）**：`/v1/query`、`/v1/query/ticket`、`/v1/query/stream` 已挂租户滑动窗口限流，超限 429 + `Retry-After`；**Redis 不可用是 503（`auth_config_error`）而非 429**，用户超限与服务端故障不混为一谈。日 token 预算（`HERO_TENANT_DAILY_TOKEN_BUDGET`）按 UTC 自然日扣减，口径是 AgentLoop 内累计的**后端 usage**（`input_tokens+output_tokens`），无 key 的合成路径不扣减、也不产出成本字段。三种语义分得开：
+> - **429**：跑循环**前**当日已用 ≥ 预算，直接 429 + `Retry-After`（到 UTC 零点秒数），不浪费算力；
+> - **503**：记账后端（Redis）不可用 → `auth_config_error`，不伪装成 429 甩锅租户（限流依赖同口径）；
+> - **degraded**：跑完才发现超额（钱已经花了）或记账后端故障 → 仍是 200，答案照发，body 置 `degraded:true` + `degraded_reason`（`tenant_daily_token_budget_exceeded` / `quota_backend_unavailable`），SSE 侧发 `{"type":"degraded"}` 事件并在最终 `llm_cost` 事件标 `degraded`。
+>
+> **成本字段（PR-115）**：真实链路跑完会在响应体与 `trace.jsonl` 各落一份 `llm_cost`（`provider`/`model`/`input_tokens`/`output_tokens`/`total_tokens`/`cost_usd`/`priced`/`estimated`）。价格只取自 `llm/catalog.py`；**目录外模型 `cost_usd=null`**（不猜价、不用 0 冒充免费）；后端没给 usage 时**不产生该字段**（不拿字符估算冒充后端计量）。真实链路但**拿不到后端 usage** 时：不记账、不估算，但响应仍置 `degraded:true` + `degraded_reason=llm_usage_missing`（SSE 侧发 `degraded` 事件），**绝不静默放行**——否则日 token 预算会悄悄失效（假成功）。
 
 > **计费边界**：API 层没有任何 billing 路由，不存在"返回 200 的假成功面"；无 DSN 时 `BillingService` 直接抛 `BillingUnavailable`，内存模式必须显式 `HERO_BILLING_ALLOW_MEMORY=1` 且响应带 `degraded:true`。
 > **合成模式边界**：`HERO_DATA_MODE=synthetic` 不是"离线可用"的同义词——它可跑通，但每一根 bar 都是合成序列，`provenance.source=synthetic` 必须被下游如实消费。

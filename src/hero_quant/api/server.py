@@ -600,6 +600,167 @@ def _request_tenant() -> str | None:
         return None
 
 
+def _resolve_llm_provider(*candidates: object) -> str:
+    """解析本次调用**实际生效**的 provider（factory 先于客户端：本处 llm 由该 factory 创建）。
+
+    拿不到就返回 "unknown"——绝不按 HERO_API_KEY 之类线索猜成 openai，否则成本会记到
+    错误 provider 维度上（PR-115 口径：宁缺勿假）。
+    """
+    for cand in candidates:
+        if cand is None:
+            continue
+        for attr in ("provider", "active_provider"):
+            try:
+                value = getattr(cand, attr, None)
+            except (ValueError, TypeError, AttributeError, RuntimeError):
+                continue
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return "unknown"
+
+
+async def _enforce_token_budget_gate(tenant: str | None) -> None:
+    """PR-105 运行**前**日 token 预算闸：当日已用 >= 预算即 429（QuotaExceeded + Retry-After）。
+
+    中文：tenant 为空（auth 未启用）既不记账也不报错；`daily_token_budget<=0` 视为不限。
+    `usage()` 读失败按 0 处理（与 auth/quota.py 同口径，仅观测不参与放行），因此 Redis
+    故障不会在闸口被误判成"用户超限"——它在运行后的记账处显式降级为
+    `quota_backend_unavailable`，绝不伪装 429。
+    Retry-After 复用 quota.py 的 `_seconds_until_utc_midnight`（唯一实现，不另抄一份）。
+    """
+    if not tenant:
+        return
+    from hero_quant.auth.errors import QuotaExceeded
+    from hero_quant.auth.quota import _seconds_until_utc_midnight, default_quota
+
+    limiter = default_quota()
+    try:
+        budget = int(limiter.policy.daily_token_budget)
+    except (TypeError, ValueError, AttributeError) as _e:
+        logger.warning("quota.budget_policy_invalid", error_code="budget_policy_invalid", error=str(_e))
+        return
+    if budget <= 0:
+        return
+    try:
+        used = int(await limiter.usage(tenant) or 0)
+    except (TypeError, ValueError, AttributeError) as _e:
+        logger.warning("quota.budget_usage_probe_failed", error_code="budget_usage_probe_failed", error=str(_e))
+        used = 0
+    if used >= budget:
+        raise QuotaExceeded("tenant_daily_token_budget_exceeded", retry_after=_seconds_until_utc_midnight())
+
+
+async def _account_llm_cost_and_budget(
+    *,
+    endpoint: str,
+    tenant: str | None,
+    res: object,
+    llm: object,
+    model: str,
+    provider: str,
+    prompt: str,
+    latency_s: float | None,
+    trace: object,
+    out: dict | None,
+    degrade_reasons: list[str],
+    synthetic: bool = False,
+) -> dict | None:
+    """PR-105/115 运行**后**记账：成本归集（响应 + trace + 指标）与租户日预算扣减。
+
+    三种情况严格区分（fail-closed，绝不假成功）：
+    1. `synthetic=True`（`_FakeLLM` 合成路径）：不扣费、不产出 `llm_cost`、不新增 degraded reason；
+    2. 真实链路 + 有后端 usage：照常归集成本并扣减预算；
+    3. 真实链路 + **后端没给 usage**：不估算冒充（会虚增成本/预算），但**必须显式降级**
+       `llm_usage_missing` + 指标计数 + warning——否则租户日 token 预算静默失效（假成功）。
+       此分支不扣 `consume_tokens`（没有可信计量就不扣），也不产出 `llm_cost`。
+
+    其它口径：价格只来自 `llm/catalog.py`，目录外模型 `cost_usd=None`（不猜价、不算 0）；
+    预算扣减失败**不改写已完成的答案**（钱已经花了，改 429 等于把服务端问题甩给租户），
+    只追加稳定 reason 让上层置 degraded；Redis 故障同理显式降级，绝不静默吞。
+    返回 `LLMUsage.to_dict()`（无 usage / 合成路径时 None），供调用方决定是否回填响应体。
+    """
+    if synthetic:
+        return None
+    usage_dict = getattr(res, "llm_usage", None)
+    if not isinstance(usage_dict, dict) or not usage_dict:
+        # 中文：真实链路却拿不到后端计量——不能按字符估算凑（那是编数字），也不能什么都不做
+        # （预算会静默失效）。显式降级后由调用方统一置 degraded:true + reason。
+        degrade_reasons.append("llm_usage_missing")
+        _inc_api_error(endpoint, "llm_usage_missing")
+        logger.warning("llm.usage_missing", endpoint=endpoint, error_code="llm_usage_missing", chain="A")
+        return None
+    from hero_quant.auth.errors import AuthConfigError, QuotaExceeded
+    from hero_quant.auth.quota import default_quota
+    from hero_quant.llm.cost import build_usage, record_llm_usage
+
+    try:
+        usage = build_usage(
+            llm,
+            prompt,
+            getattr(res, "text", "") or "",
+            provider=provider or "unknown",
+            model=model or "",
+            latency_s=latency_s,
+            usage=usage_dict,
+        )
+    except (TypeError, ValueError, AttributeError, KeyError, RuntimeError) as _e:
+        logger.warning("llm.cost_build_failed", endpoint=endpoint, error_code="llm_cost_build_failed", error=str(_e), chain="A")
+        return None
+    payload = usage.to_dict()
+    if out is not None:
+        out["llm_cost"] = payload
+    if trace is not None:
+        try:
+            trace.append({"type": "llm_cost", **payload})
+        except (OSError, ValueError, TypeError, AttributeError, RuntimeError) as _e:
+            # 中文：轨迹落盘是观测副产物，失败只降级为 debug + error_code，绝不阻断答案。
+            logger.debug("llm.cost_trace_append_failed", endpoint=endpoint, error_code="llm_cost_trace_append_failed", error=str(_e))
+    try:
+        record_llm_usage(usage)
+    except (OSError, ValueError, TypeError, AttributeError, RuntimeError) as _e:
+        logger.debug("llm.cost_record_failed", endpoint=endpoint, error_code="llm_cost_record_failed", error=str(_e))
+    if not tenant:
+        return payload
+    try:
+        await default_quota().consume_tokens(tenant, usage.total_tokens)
+    except QuotaExceeded as _e:
+        # 中文：超额已回滚（钱却已花）——答案照发，但必须显式标记，不假装没超。
+        degrade_reasons.append("tenant_daily_token_budget_exceeded")
+        _inc_api_error(endpoint, "token_budget_exceeded")
+        logger.warning(
+            "quota.token_budget_exceeded",
+            endpoint=endpoint,
+            error_code="tenant_daily_token_budget_exceeded",
+            chain="A",
+            retry_after=getattr(_e, "retry_after", None),
+            total_tokens=usage.total_tokens,
+        )
+    except AuthConfigError as _e:
+        # 中文：Redis 挂 = 服务端故障；记账失败要可见（degraded + warning），绝不静默吞。
+        degrade_reasons.append("quota_backend_unavailable")
+        _inc_api_error(endpoint, "quota_backend_unavailable")
+        logger.warning(
+            "quota.backend_unavailable",
+            endpoint=endpoint,
+            error_code="quota_backend_unavailable",
+            chain="A",
+            detail=str(_e),
+            total_tokens=usage.total_tokens,
+        )
+    except Exception as _e:  # noqa: BLE001 — 记账兜底必须显式降级：绝不因记账异常丢掉已付费的答案
+        degrade_reasons.append("quota_accounting_failed")
+        _inc_api_error(endpoint, "quota_accounting_failed")
+        logger.warning(
+            "quota.accounting_failed",
+            endpoint=endpoint,
+            error_code="quota_accounting_failed",
+            chain="A",
+            error_type=type(_e).__name__,
+            total_tokens=usage.total_tokens,
+        )
+    return payload
+
+
 def _session_scope() -> tuple[str, str | None]:
     """会话接口的 (tenant, user)；未认证/未绑定租户时 503，绝不回退 default。"""
     from hero_quant.auth.context import current_principal, require_tenant
@@ -1781,6 +1942,9 @@ async def query(request: Request, background_tasks: BackgroundTasks, q: str = ""
             REQUEST_COUNTER.labels(endpoint="/v1/query").inc()
         except Exception as _e:
             logger.debug("metrics.counter_failed", error=str(_e))
+    # PR-105：日 token 预算闸在跑循环**之前**——此时还能以 429 + Retry-After 干净短路，
+    # 不必先把答案算出来再拒绝（auth 未启用时 tenant 为 None，直接放行且不记账）。
+    await _enforce_token_budget_gate(_request_tenant())
     # trace_dir/replay_path 白名单校验：仅允许 tempfile.gettempdir() 内
     _tmp_base = pathlib.Path(tempfile.gettempdir()).resolve()
     if trace_dir is not None:
@@ -1813,12 +1977,15 @@ async def query(request: Request, background_tasks: BackgroundTasks, q: str = ""
         llm = None
         _llm_degraded = False
         model_name = s.llm_model
+        # PR-115：provider 取实际生效值（由创建该 llm 的 factory 决定），拿不到即 "unknown"。
+        _llm_factory = None
         if key:
             try:
                 from hero_quant.llm.client import LLMClient
                 from hero_quant.llm.factory import LLMFactory
 
                 factory = LLMFactory(s)
+                _llm_factory = factory
                 try:
                     model_info = factory.model_for_stage("plan")
                     model_name = model_info.name
@@ -2004,6 +2171,22 @@ async def query(request: Request, background_tasks: BackgroundTasks, q: str = ""
         if _gw_reason:
             _degrade_reasons.append(_gw_reason)
             out.setdefault("llm_mode", "failover")
+        # PR-105/115：真实链路的成本归集 + 租户日预算扣减（_FakeLLM 合成路径不记账）。
+        # 中文：扣减失败只追加 reason、由下方统一置 degraded —— 已完成的答案照发，不改 429。
+        await _account_llm_cost_and_budget(
+            endpoint="query",
+            tenant=_request_tenant(),
+            res=res,
+            llm=llm,
+            model=model_name,
+            provider=_resolve_llm_provider(llm, _llm_factory, getattr(llm, "_chat", None)),
+            prompt=q,
+            latency_s=float(time.monotonic() - _run_start),
+            trace=trace,
+            out=out,
+            degrade_reasons=_degrade_reasons,
+            synthetic=_llm_degraded,
+        )
         if _degrade_reasons:
             out["degraded"] = True
             out["degraded_reason"] = "; ".join(_degrade_reasons)
@@ -2181,6 +2364,9 @@ async def query_stream(request: Request, background_tasks: BackgroundTasks, q: s
     # legacy 无分域票迁移期放行；metrics 分域票拒绝）。
     if not consume_ticket(x_ticket, require_scope=("query", "stream")):
         return JSONResponse(status_code=403, content={"detail": "Invalid or expired SSE ticket"})
+    # PR-105：预算闸必须在**响应头/首事件之前**——流一开始推送就只能改 body，改不了状态码。
+    # 中文：与 /v1/query 同一 helper，口径一致（auth 未启用时 tenant=None，放行且不记账）。
+    await _enforce_token_budget_gate(_request_tenant())
     # D线降级预判（链A）：无 key 即 FakeLLM 合成路径；checkpoint 非 real 即 emulated。
     # 响应头预置 degraded 标记（body 内首事件同步标记），外层预检命中缓存不阻塞流启动。
     _stream_degrade_reasons: list[str] = []
@@ -2223,6 +2409,10 @@ async def query_stream(request: Request, background_tasks: BackgroundTasks, q: s
         trace = None
         _tmp_stream_dir = None
         _gen_reasons: list[str] = list(_stream_degrade_reasons)
+        # PR-105/115：流内记账的上下文（真实链路判定 / provider / 成本 payload）。
+        _stream_synthetic = False
+        _stream_factory = None
+        _stream_cost_payload: dict | None = None
         try:
             from hero_quant.config.settings import Settings
             s = Settings()
@@ -2236,6 +2426,7 @@ async def query_stream(request: Request, background_tasks: BackgroundTasks, q: s
                     from hero_quant.llm.factory import LLMFactory
 
                     factory = LLMFactory(s)
+                    _stream_factory = factory
                     try:
                         model_info = factory.model_for_stage("plan")
                         model_name = model_info.name
@@ -2287,6 +2478,7 @@ async def query_stream(request: Request, background_tasks: BackgroundTasks, q: s
                         return self.stream_chat(goal)
 
                 llm = _FakeLLM()
+                _stream_synthetic = True
                 if _FAKE_LLM_REASON not in _gen_reasons:
                     _gen_reasons.append(_FAKE_LLM_REASON)
             # trace/_tmp_stream_dir 已在 event_generator 顶部预初始化（防 finally UnboundLocalError）
@@ -2389,6 +2581,23 @@ async def query_stream(request: Request, background_tasks: BackgroundTasks, q: s
                 _owt2("agent_loop_stream", float(time.monotonic() - _run_start2), status="success")
             except Exception as _e:
                 logger.debug("telemetry.stream_end_failed", error=str(_e))
+            # PR-105/115：流内记账与 /v1/query 同口径（同一 helper）。
+            # 中文：此时响应已开始推送，扣减失败只能追加 reason 并以 degraded 事件如实告知；
+            # 把已推送的 200 改成 429 既做不到，也不该把服务端/预算问题甩给已付费的答案。
+            _stream_cost_payload = await _account_llm_cost_and_budget(
+                endpoint="stream",
+                tenant=_request_tenant(),
+                res=res,
+                llm=llm,
+                model=model_name,
+                provider=_resolve_llm_provider(llm, _stream_factory, getattr(llm, "_chat", None)),
+                prompt=q,
+                latency_s=float(time.monotonic() - _run_start2),
+                trace=trace,
+                out=None,
+                degrade_reasons=_gen_reasons,
+                synthetic=_stream_synthetic,
+            )
             tool_records = []
             try:
                 if trace is not None and hasattr(trace, "path"):
@@ -2483,6 +2692,15 @@ async def query_stream(request: Request, background_tasks: BackgroundTasks, q: s
                     yield f"data: {_json.dumps({'type': 'shadow', 'shadow': _shadow_s}, ensure_ascii=False)}\n\n"
             except Exception as _e:
                 logger.debug("shadow.stream_emit_failed", error=str(_e))
+            # PR-115：最终 payload 带成本与降级口径（流内无法再改状态码/响应头，只能如实标记）。
+            if _stream_cost_payload is not None:
+                _cost_event = {
+                    "type": "llm_cost",
+                    "degraded": bool(_gen_reasons),
+                    "degraded_reason": "; ".join(_gen_reasons) if _gen_reasons else None,
+                    **_stream_cost_payload,
+                }
+                yield f"data: {_json.dumps(_cost_event, ensure_ascii=False)}\n\n"
             yield "data: [DONE]\n\n"
         except Exception as _e:
             # 中文：T4-1 MR3：SSE 对外脱敏——只发通用 code+message，内部细节只记日志。
