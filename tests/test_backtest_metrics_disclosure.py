@@ -27,8 +27,8 @@ def client(monkeypatch):
     import hero_quant.api.server as srv
     from fastapi.testclient import TestClient
 
-    monkeypatch.setattr(srv, "_read_backtest_bundle_cache", lambda tenant=None: None)
-    monkeypatch.setattr(srv, "_write_backtest_bundle_cache", lambda bundle, tenant=None: None)
+    monkeypatch.setattr(srv, "_read_backtest_bundle_cache", lambda tenant=None, bars=None: None)
+    monkeypatch.setattr(srv, "_write_backtest_bundle_cache", lambda bundle, tenant=None, bars=None: None)
     monkeypatch.setattr(srv, "_backtest_cache", {}, raising=False)
     return TestClient(srv.app)
 
@@ -36,7 +36,8 @@ def client(monkeypatch):
 def _metrics_body(client, monkeypatch, prices):
     import hero_quant.api.server as srv
 
-    monkeypatch.setattr(srv, "_load_backtest_prices", lambda pd_mod: prices, raising=False)
+    # PR-125：loader 新增内部窗口参数（target），monkeypatch 用 *a/**k 吃掉，不影响本文件断言。
+    monkeypatch.setattr(srv, "_load_backtest_prices", lambda pd_mod, *a, **k: prices, raising=False)
     monkeypatch.setattr(srv, "_backtest_demo_enabled", lambda: False, raising=False)
     r = client.get("/v1/backtest/metrics.json")
     assert r.status_code == 200, r.text[:300]
@@ -82,18 +83,23 @@ def test_no_market_data_discloses_zero_sample(client, monkeypatch):
 
 
 def test_demo_mode_uses_same_disclosure_rule(client, monkeypatch):
-    """HERO_BACKTEST_DEMO=1 只是换数据源，口径规则与标记同步生效。"""
+    """HERO_BACKTEST_DEMO=1 只是换数据源，口径规则与标记同步生效。
+
+    PR-125：demo 根数跟随默认窗口（20 → 60）。60 根恰好达到年化门槛，所以这里断的是
+    "同一套规则">= 60 走年化、标记仍为 synthetic/degraded；<60 仍置 null 的用例见
+    tests/test_pr125_backtest_bars.py（demo 20 根）。
+    """
     import hero_quant.api.server as srv
 
-    monkeypatch.setattr(srv, "_load_backtest_prices", lambda pd_mod: None, raising=False)
+    monkeypatch.setattr(srv, "_load_backtest_prices", lambda pd_mod, *a, **k: None, raising=False)
     monkeypatch.setattr(srv, "_backtest_demo_enabled", lambda: True, raising=False)
     r = client.get("/v1/backtest/metrics.json")
     assert r.status_code == 200, r.text[:300]
     body = r.json()
 
-    assert body["sample"]["bars"] == 20
-    assert body["sharpe"] is None
-    assert body["sharpe_basis"] is None
-    assert "insufficient_sample" in body["warnings"]
+    assert body["sample"]["bars"] == srv._BACKTEST_BARS_TARGET
+    assert isinstance(body["sharpe"], (int, float)) and body["sharpe"] is not None
+    assert body["sharpe_basis"] == "annualized_252"
+    assert "insufficient_sample" not in body["warnings"]
     assert body["synthetic"] is True
     assert body["degraded"] is True

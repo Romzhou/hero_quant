@@ -2861,8 +2861,18 @@ _BACKTEST_NO_DATA_MARKERS: dict = {
 }
 # 回测行情标的与目标交易日数（真行情不足 2 根即视为不可用）
 _BACKTEST_SYMBOL = "600519.SH"
-_BACKTEST_BARS_TARGET = 20
+# PR-125：默认窗口 20 → 60 根。60 不是拍的数：它就是下面 _BACKTEST_MIN_SHARPE_BARS（年化
+# Sharpe 的最低样本门槛），G1 也要求默认真行情能给出年化 Sharpe —— 默认窗口低于门槛等于
+# 默认永远拿不到年化口径，只能靠"放开披露规则"糊过去，而 R8-1b 的披露规则不许松。
+_BACKTEST_BARS_TARGET = 60
+# 内部窗口参数边界（只有内部/测试用，不开公开 query 参数）：
+# 下限 2 根 = 一条收益序列的最小样本（1 根连日收益都算不出，_load_backtest_prices 也按 <2 丢弃）；
+# 上限 250 根 ≈ 一年交易日，防单次回测裸拉过长历史把上游限流/内存打爆（更长的历史应走快照通道）。
+_BACKTEST_BARS_MIN = 2
+_BACKTEST_BARS_MAX = 250
 # R8-1b：年化 Sharpe 需要足够样本；低于该根数只披露样本量，不输出年化口径。
+# PR-125 不动该阈值（判定是 `bars < 60` 才置 null），"默认能年化"靠把默认窗口提到 60 根，
+# 不靠放宽披露规则。
 _BACKTEST_MIN_SHARPE_BARS = 60
 # 空 CSV（仅表头）：positions 缺失时返回它，绝不塞具体 K 线数字。
 _BACKTEST_CSV_HEADER = "date,symbol,weight,close\n"
@@ -2877,16 +2887,42 @@ def _backtest_demo_enabled() -> bool:
     return os.environ.get("HERO_BACKTEST_DEMO", "").strip().lower() in ("1", "true", "yes", "on")
 
 
-def _load_backtest_prices(pd) -> "object | None":
+def _resolve_backtest_bars(bars: int | None = None) -> int:
+    """把内部窗口参数收敛到 [_BACKTEST_BARS_MIN, _BACKTEST_BARS_MAX]；None/非法值走默认。
+
+    中文：窗口只从内部入口传进来（端点仍是零参，OpenAPI 表面不变，PR-182 以此为基线），
+    越界一律夹紧并告警，绝不把 0 根/几十年的请求直接甩给上游。
+    """
+    if bars is None:
+        return _BACKTEST_BARS_TARGET
+    try:
+        _n = int(bars)
+    except (TypeError, ValueError):
+        logger.warning("backtest.bars_invalid fallback=%d input=%r", _BACKTEST_BARS_TARGET, bars)
+        return _BACKTEST_BARS_TARGET
+    if _n < _BACKTEST_BARS_MIN or _n > _BACKTEST_BARS_MAX:
+        _clamped = max(_BACKTEST_BARS_MIN, min(_n, _BACKTEST_BARS_MAX))
+        logger.warning("backtest.bars_clamped requested=%d applied=%d", _n, _clamped)
+        return _clamped
+    return _n
+
+
+def _load_backtest_prices(pd, target: int | None = None) -> "object | None":
     """真行情优先：tools.get_market_data(allow_synthetic=False)；拿不到返回 None。
 
     中文：allow_synthetic=False 让"无 loader / 网络失败"直接抛错，由调用方按空产物降级，
     绝不静默回退合成冒充真实回测。
+
+    PR-125：target 是内部窗口参数（缺省 _BACKTEST_BARS_TARGET=60），经 _resolve_backtest_bars
+    夹到 [MIN, MAX]。回看天数按 target 反推而不是写死：一年约 244 个交易日但日历日 365 天，
+    再加 A 股长假，用 max(target*2+10, 30) 给足日历冗余，才可能真取到 ≥ target 根日线
+    （取不够就只披露实际根数，不补不造）。
     """
     from datetime import date, timedelta
 
+    _target = _resolve_backtest_bars(target)
     _end = date.today()
-    _start = _end - timedelta(days=_BACKTEST_BARS_TARGET * 2 + 10)  # 目标 ~20 个交易日
+    _start = _end - timedelta(days=max(_target * 2 + 10, 30))  # 目标 ~_target 个交易日
     try:
         from hero_quant.tools.market_data import get_market_data
 
@@ -2909,7 +2945,7 @@ def _load_backtest_prices(pd) -> "object | None":
         if "date" not in df.columns or "close" not in df.columns:
             return None
         df = df.dropna(subset=["close"])
-        prices = df.set_index(pd.to_datetime(df["date"]))[["close"]].sort_index().tail(_BACKTEST_BARS_TARGET)
+        prices = df.set_index(pd.to_datetime(df["date"]))[["close"]].sort_index().tail(_target)
         prices.index.name = "date"
     except Exception as _e:
         logger.warning("backtest.real_market_data_parse_failed error=%s", str(_e))
@@ -2919,15 +2955,19 @@ def _load_backtest_prices(pd) -> "object | None":
     return prices
 
 
-def _demo_backtest_prices(pd) -> "object":
-    """确定性合成 demo 行情（仅 HERO_BACKTEST_DEMO=1 时使用），响应标 synthetic/degraded。"""
+def _demo_backtest_prices(pd, target: int | None = None) -> "object":
+    """确定性合成 demo 行情（仅 HERO_BACKTEST_DEMO=1 时使用），响应标 synthetic/degraded。
+
+    PR-125：合成根数 = 窗口（缺省 60），与真行情同一参数口径；标记逻辑不变。
+    """
     import numpy as np
 
-    dates = pd.date_range("2026-07-20", periods=_BACKTEST_BARS_TARGET, freq="D")
+    _target = _resolve_backtest_bars(target)
+    dates = pd.date_range("2026-07-20", periods=_target, freq="D")
     base = 1680.0
     close_vals = [
         base + i * 1.8 + (3.0 if i % 5 == 0 else -1.2 if i % 7 == 0 else 0.6 * np.sin(i))
-        for i in range(_BACKTEST_BARS_TARGET)
+        for i in range(_target)
     ]
     prices = pd.DataFrame({"close": close_vals}, index=dates)
     prices.index.name = "date"
@@ -2953,6 +2993,9 @@ def _apply_metrics_disclosure(metrics: dict, sample: dict) -> tuple[dict, "str |
 
     中文：sharpe=null 但保留 key（schema 稳定），cumulative_return / volatility /
     max_drawdown 等不依赖年化的指标照旧透出；metrics.py 的 √252 公式本身正确，不改。
+
+    PR-125：门槛判定是严格 `bars < _BACKTEST_MIN_SHARPE_BARS` —— 默认窗口 60 根恰好落在
+    `>=` 侧（60 >= 60）才算年化，不改成 `<=`，也不为"默认能年化"调低门槛。
     """
     warnings: list = []
     if sample.get("bars", 0) < _BACKTEST_MIN_SHARPE_BARS:
@@ -2970,36 +3013,47 @@ def _backtest_markers(bundle: dict) -> dict:
     return dict(_BACKTEST_DEGRADE_MARKERS)
 
 
-def _backtest_bundle_cache_key(tenant: str | None = None) -> str:
-    """bundle 参数哈希 key（当前参数固定，保留 hash(params) 形态便于扩展）。
+def _backtest_bundle_cache_key(tenant: str | None = None, bars: int | None = None) -> str:
+    """bundle 参数哈希 key（参数显式入 hash，便于扩展）。
 
-    中文：G-12——tenant 可选混入 hash：当前 bundle 为全局合成 demo 数据（无租户私密成分），
-    缺省 tenant=None 时键与旧全局键完全一致（兼容）；未来参数/数据按租户分化时，调用方
-    传入 tenant 即可隔离（非空租户归一后参与 hash，避免跨租户串扰）。
+    中文：G-12——tenant 可选混入 hash：非空租户归一后参与 hash，避免跨租户串扰；
+    缺省 tenant=None 时不出现 tenant 字段。
+
+    窗口必须进 key（PR-125）：v5 之前窗口固定 20 根、v4 起响应体才带 sample/sharpe_basis/
+    warnings。若不把实际生效的 bars 写进 hash，"窗口从 20 改成 60 但 key 没变 = 拿 Redis 里
+    20 根的旧 bundle 当 60 根新结果返回"，sample.bars/sharpe 口径全错。所以：版本 v4→v5，
+    且 bars 恒定入 hash（默认 60 也要进，保证与旧 v4/20 根缓存彻底隔离）。
+    说明：线上唯一写缓存的是默认窗口（四端点零参调用，见 _get_backtest_bundle）；显式窗口走
+    无缓存冷路径，故线上 key 的 bars 即默认值，形参保留给后续按窗口分片缓存（PR-182 基线）。
     """
     try:
         _t = tenant.strip() if isinstance(tenant, str) else ""
     except (ValueError, TypeError, AttributeError):
         _t = ""
-    # v4：R8-1b 起响应体新增 sample / sharpe_basis / warnings（<60 根 sharpe 置 null），
-    # 旧缓存没有这些字段，换 key 避免把 v3 的裸 sharpe 当权威指标返回。
+    _bars = _resolve_backtest_bars(bars)
+    # v5：PR-125 窗口参数化 + 实际生效 bars 入 hash；v4 的键绑定 20 根产物，必须彻底隔离。
     if _t:
-        raw = json.dumps({"v": 4, "capital": 1.0, "weights": [0.5, 0.5], "tenant": _t}, sort_keys=True)
+        raw = json.dumps(
+            {"v": 5, "bars": _bars, "capital": 1.0, "weights": [0.5, 0.5], "tenant": _t}, sort_keys=True
+        )
     else:
-        raw = json.dumps({"v": 4, "capital": 1.0, "weights": [0.5, 0.5]}, sort_keys=True)
+        raw = json.dumps({"v": 5, "bars": _bars, "capital": 1.0, "weights": [0.5, 0.5]}, sort_keys=True)
     digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
     return f"{_BACKTEST_BUNDLE_CACHE_PREFIX}{digest}"
 
 
-def _read_backtest_bundle_cache(tenant: str | None = None) -> dict | None:
-    """优先读 Redis L2（JSON 反序列化；positions 存 CSV 文本，还原为 None 由调用方按 csv 用）。"""
+def _read_backtest_bundle_cache(tenant: str | None = None, bars: int | None = None) -> dict | None:
+    """优先读 Redis L2（JSON 反序列化；positions 存 CSV 文本，还原为 None 由调用方按 csv 用）。
+
+    PR-125：bars 透传给 key —— 窗口不进 key 就会把旧窗口产物当新窗口结果返回。
+    """
     try:
         from hero_quant.infra.redis import get_redis_sync
 
         client = get_redis_sync()
         if client is None:
             return None
-        raw = client.get(_backtest_bundle_cache_key(tenant))
+        raw = client.get(_backtest_bundle_cache_key(tenant, bars))
         if not raw:
             return None
         data = json.loads(raw)
@@ -3014,8 +3068,12 @@ def _read_backtest_bundle_cache(tenant: str | None = None) -> dict | None:
         return None
 
 
-def _write_backtest_bundle_cache(bundle: dict, tenant: str | None = None) -> None:
-    """计算后写 L2（JSON ex=600；positions 为 DataFrame 时只存 csv/tearsheet/metrics）。"""
+def _write_backtest_bundle_cache(bundle: dict, tenant: str | None = None, bars: int | None = None) -> None:
+    """计算后写 L2（JSON ex=600；positions 为 DataFrame 时只存 csv/tearsheet/metrics）。
+
+    PR-125：写入必须与读取用同一个窗口口径，否则读到的 key 与写下的 key 分叉（永远 miss
+    或串窗口）。
+    """
     try:
         from hero_quant.infra.redis import get_redis_sync
 
@@ -3031,28 +3089,33 @@ def _write_backtest_bundle_cache(bundle: dict, tenant: str | None = None) -> Non
             "sharpe_basis": bundle.get("sharpe_basis"),
             "warnings": list(bundle.get("warnings") or []),
         }
-        client.set(_backtest_bundle_cache_key(tenant), json.dumps(payload, ensure_ascii=False, default=str), ex=600)
+        client.set(
+            _backtest_bundle_cache_key(tenant, bars), json.dumps(payload, ensure_ascii=False, default=str), ex=600
+        )
     except Exception as _e:
         logger.debug(f"backtest.bundle_cache_write_failed error={_e}")
 
 
-def _compute_backtest_bundle() -> dict:
+def _compute_backtest_bundle(bars: int | None = None) -> dict:
     """重计算 bundle（调用方已持有本地互斥；内部不再加锁，避免非重入死锁）。
 
     R8-1：默认只吃真行情（get_market_data(allow_synthetic=False)）；拿不到就返回空指标 +
     降级标记（reason=backtest:no_market_data），不再造 20 日合成 K 线（旧 base=1680.0
     属伪造数字，见审计 §4.2）。合成 demo 行情仅当 HERO_BACKTEST_DEMO=1 显式开启时使用，
     并照旧标 synthetic/degraded。
+
+    PR-125：bars 只透传给行情加载器/demo 生成器（缺省 = 默认窗口 60），不改变任何降级分支
+    或披露判定 —— 窗口变大不代表"缺数据可以造"。
     """
     import pandas as pd
     from hero_quant.backtest.engine import BacktestEngine
 
-    prices = _load_backtest_prices(pd)
+    prices = _load_backtest_prices(pd, bars)
     if prices is not None:
         markers = dict(_BACKTEST_REAL_MARKERS)
         synthetic = False
     elif _backtest_demo_enabled():
-        prices = _demo_backtest_prices(pd)
+        prices = _demo_backtest_prices(pd, bars)
         markers = dict(_BACKTEST_DEGRADE_MARKERS)
         synthetic = True
     else:
@@ -3125,17 +3188,30 @@ def _static_backtest_bundle() -> dict:
     }
 
 
-def _get_backtest_bundle():
+def _get_backtest_bundle(tenant: str | None = None, bars: int | None = None):
     """获取回测产物（metrics、持仓、tearsheet、CSV）：L1 内存 → L2 Redis → 计算。
 
     并发：double-checked locking——仅 L1 首检/发布走本地锁；Redis I/O、
     分布式锁与 _compute_backtest_bundle() 重计算均在锁外，避免慢网络/重计算
-    串行化所有回测请求。失败返回静态兜底。"""
+    串行化所有回测请求。失败返回静态兜底。
+
+    PR-125：bars 是内部窗口参数（缺省 = _BACKTEST_BARS_TARGET=60）。四个端点仍零参调用，
+    不改端点签名、也不加公开 query 参数（OpenAPI 表面不变，PR-182 以此为基础）。
+    显式窗口走无缓存冷路径：L1 是进程内单槽（只存一份 bundle），20 根和 60 根共用一槽会
+    互相串味；冷路径也不写 L2，避免公开路径永远不会读的非默认 key 堆在 Redis 里。
+    """
+    _bars = _resolve_backtest_bars(bars)
+    if _bars != _BACKTEST_BARS_TARGET:
+        try:
+            return _compute_backtest_bundle(_bars)
+        except Exception as _e:
+            logger.warning("backtest.bundle_failed_fallback", error=str(_e), bars=_bars)  # 静态兜底，不伪造
+            return _static_backtest_bundle()
     global _backtest_cache
     with _backtest_cache_lock:
         if _backtest_cache:
             return _backtest_cache
-    cached = _read_backtest_bundle_cache()
+    cached = _read_backtest_bundle_cache(tenant, _bars)
     if cached is not None:
         with _backtest_cache_lock:
             if not _backtest_cache:
@@ -3164,6 +3240,7 @@ def _get_backtest_bundle():
         logger.debug(f"backtest.bundle_dlock_failed error={_e}")
     try:
         try:
+            # 走到这里 _bars 恒等于默认窗口（显式窗口已在上面的冷路径截走），故零参调用。
             bundle = _compute_backtest_bundle()
         except Exception as _e:
             logger.warning("backtest.bundle_failed_fallback", error=str(_e))  # intentional fallback to static
@@ -3171,7 +3248,7 @@ def _get_backtest_bundle():
         with _backtest_cache_lock:
             if not _backtest_cache:
                 _backtest_cache = bundle
-            _write_backtest_bundle_cache(_backtest_cache)
+            _write_backtest_bundle_cache(_backtest_cache, tenant, _bars)
             return _backtest_cache
     finally:
             if _have_dlock and _rc is not None and _dlock_token is not None:
