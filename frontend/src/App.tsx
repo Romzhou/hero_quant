@@ -7,8 +7,10 @@
 import { Suspense, lazy, useEffect, useState } from "react"
 import { NavLink, Route, Routes, Navigate } from "react-router-dom"
 import DegradedBanner from "./components/DegradedBanner"
+import RouteGuard, { useTokenInfo } from "./components/RouteGuard"
 import { NO_DIST_503_HINT, isServiceUnavailable } from "./config/degraded"
 import { APP_VERSION } from "./config/version"
+import { getToken, hasRole, highestRole, roleLabel, type Role } from "./config/auth"
 
 const Dashboard = lazy(() => import("./pages/Dashboard"))
 const Research = lazy(() => import("./pages/Research"))
@@ -17,6 +19,52 @@ const Live = lazy(() => import("./pages/Live"))
 const Risk = lazy(() => import("./pages/Risk"))
 const Monitor = lazy(() => import("./pages/Monitor"))
 const Settings = lazy(() => import("./pages/Settings"))
+
+/**
+ * 导航项与所需角色（PR-103）：角色口径对齐后端端点 —— `/v1/query*` = analyst，
+ * `/v1/backtest|sessions*` = viewer。设置页不在此表：换令牌入口必须永远可达。
+ */
+const NAV_ITEMS: { to: string; label: string; required: Role }[] = [
+  { to: "/dashboard", label: "看板", required: "viewer" },
+  { to: "/research", label: "研究", required: "viewer" },
+  { to: "/backtest", label: "回测", required: "analyst" },
+  { to: "/live", label: "实盘", required: "viewer" },
+  { to: "/monitor", label: "监控", required: "viewer" },
+  { to: "/risk", label: "风控", required: "viewer" },
+]
+
+/** 锁形提示：不隐藏链接（避免用户找不到页面），只表达「按令牌声明预期权限不足，是否拒绝由后端定」 */
+function LockHint() {
+  return (
+    <svg aria-hidden="true" viewBox="0 0 24 24" className="h-3 w-3 shrink-0" fill="none" stroke="currentColor" strokeWidth={2}>
+      <rect x="5" y="11" width="14" height="9" rx="2" />
+      <path d="M8 11V8a4 4 0 0 1 8 0v3" />
+    </svg>
+  )
+}
+
+/** 顶栏角色 chip：数据来自令牌声明，文案必须带「未验签」 */
+function RoleChip() {
+  const info = useTokenInfo()
+  const token = getToken()
+  const top = highestRole(info)
+  const text = !token ? "未提供令牌" : top ? `角色：${top}（未验签）` : "角色未声明"
+  const title = !token
+    ? "本机未配置令牌：若后端已开启鉴权，请求将被 401/403"
+    : top
+      ? `令牌声明角色：${info.roles.map(r => `${r}（${roleLabel(r)}）`).join("、")}；未验签，实际权限以服务端裁决为准`
+      : "令牌未声明任何已知角色；权限以服务端裁决为准"
+  const tone = !token
+    ? "border-white/10 bg-white/5 text-slate-400"
+    : top
+      ? "border-emerald-400/20 bg-emerald-400/10 text-emerald-200"
+      : "border-amber-500/25 bg-amber-500/10 text-amber-200"
+  return (
+    <span data-testid="role-chip" title={title} className={`rounded-full border px-2.5 py-1 text-[11px] ${tone}`}>
+      {text}
+    </span>
+  )
+}
 
 function Shell() {
   // 全局服务状态横幅：消费 D 线暴露的 `/ready` degraded/503 语义（只读消费，不改 server.py）。
@@ -67,6 +115,11 @@ function Shell() {
       ? "rounded-xl bg-white text-ink-900 px-3.5 py-2 text-sm font-semibold shadow"
       : "rounded-xl px-3.5 py-2 text-sm font-medium text-slate-300 hover:bg-white/10 hover:text-mist transition"
 
+  // 导航锁定：仅在「有令牌 + 令牌明确声明了角色」时判定；advisory 状态（无令牌/无角色）不动导航。
+  // 链接仍可点击 → 进入页面看到 RouteGuard 的 403 解释面板（不发请求），故用 aria-disabled 表达预期而非拦截点击。
+  const info = useTokenInfo()
+  const navLockable = getToken() !== null && info.roles.length > 0
+
   return (
     <div className="min-h-screen">
       {/* 顶部导航：品牌标识 + 主导航 + 状态/设置入口 */}
@@ -84,15 +137,32 @@ function Shell() {
           </div>
 
           <nav aria-label="Primary" className="flex max-w-[60vw] items-center gap-1 overflow-x-auto rounded-2xl border border-white/10 bg-white/[0.04] p-1 backdrop-blur scrollbar-none md:max-w-none">
-            <NavLink to="/dashboard" className={linkCls}>看板</NavLink>
-            <NavLink to="/research" className={linkCls}>研究</NavLink>
-            <NavLink to="/backtest" className={linkCls}>回测</NavLink>
-            <NavLink to="/live" className={linkCls}>实盘</NavLink>
-            <NavLink to="/monitor" className={linkCls}>监控</NavLink>
-            <NavLink to="/risk" className={linkCls}>风控</NavLink>
+            {NAV_ITEMS.map(item => {
+              const locked = navLockable && !hasRole(info, item.required)
+              return (
+                <NavLink
+                  key={item.to}
+                  to={item.to}
+                  data-locked={locked ? "true" : undefined}
+                  aria-disabled={locked ? "true" : undefined}
+                  title={
+                    locked
+                      ? `需要 ${item.required} 及以上；当前令牌声明：${info.roles.join(", ")}（未验签，以服务端为准）`
+                      : undefined
+                  }
+                  className={({ isActive }) => linkCls({ isActive }) + (locked ? " opacity-60" : "")}
+                >
+                  <span className="inline-flex items-center gap-1">
+                    {item.label}
+                    {locked ? <LockHint /> : null}
+                  </span>
+                </NavLink>
+              )
+            })}
           </nav>
 
           <div className="hidden items-center gap-2 md:flex shrink-0">
+            <RoleChip />
             <span className="text-xs text-slate-400">FastAPI · SSE</span>
             <span className="h-2 w-2 rounded-full bg-emerald-400 shadow-[0_0_10px_rgba(52,211,153,0.8)] animate-pulse" />
             <NavLink to="/settings" className="ml-1 rounded-xl border border-white/10 bg-white/5 px-2.5 py-1.5 text-xs text-slate-300 hover:bg-white/10 transition">设置</NavLink>
@@ -111,14 +181,16 @@ function Shell() {
         <Suspense fallback={<div className="p-8"><div className="mx-auto max-w-3xl rounded-2xl border border-white/10 bg-white/[0.03] p-6 animate-pulse"><div className="h-4 w-28 rounded bg-white/10" /><div className="mt-4 h-24 rounded-xl bg-white/5" /><div className="mt-3 h-3 w-1/2 rounded bg-white/5" /></div><p className="mt-3 text-center text-xs text-slate-500">加载中…</p></div>}>
           <Routes>
             <Route path="/" element={<Navigate to="/dashboard" replace />} />
-            <Route path="/dashboard" element={<Dashboard />} />
-            <Route path="/research" element={<Research />} />
-            {/* 回测与对话复用同一 Chat 组件，/backtest 为历史入口兼容 */}
-            <Route path="/backtest" element={<Chat />} />
-            <Route path="/chat" element={<Chat />} />
-            <Route path="/live" element={<Live />} />
-            <Route path="/monitor" element={<Monitor />} />
-            <Route path="/risk" element={<Risk />} />
+            {/* 路由守卫：前端只做 UX 提示，真正的 401/403 由后端返回（见 RouteGuard.tsx 头注释） */}
+            <Route path="/dashboard" element={<RouteGuard required="viewer" title="看板"><Dashboard /></RouteGuard>} />
+            <Route path="/research" element={<RouteGuard required="viewer" title="研究"><Research /></RouteGuard>} />
+            {/* 回测与对话复用同一 Chat 组件，/backtest 为历史入口兼容；两者都打 /v1/query*（analyst） */}
+            <Route path="/backtest" element={<RouteGuard required="analyst" title="回测"><Chat /></RouteGuard>} />
+            <Route path="/chat" element={<RouteGuard required="analyst" title="对话"><Chat /></RouteGuard>} />
+            <Route path="/live" element={<RouteGuard required="viewer" title="实盘"><Live /></RouteGuard>} />
+            <Route path="/monitor" element={<RouteGuard required="viewer" title="监控"><Monitor /></RouteGuard>} />
+            <Route path="/risk" element={<RouteGuard required="viewer" title="风控"><Risk /></RouteGuard>} />
+            {/* 设置页不设角色闸：换令牌入口必须永远可达，否则低权令牌无法自救 */}
             <Route path="/settings" element={<Settings />} />
           </Routes>
         </Suspense>

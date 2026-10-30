@@ -7,7 +7,7 @@
 import { useEffect, useRef, useState } from "react"
 import { useSettingsStore } from "../store/settings"
 import { RAW_API_PATHS } from "../config/api"
-import { authHeaders, clearToken, getToken, inspectToken, setToken } from "../config/auth"
+import { authHeaders, clearToken, getToken, inspectToken, notifyTokenChanged, roleLabel, setToken } from "../config/auth"
 
 type Check = { ok: boolean | null; latency?: number; status?: number }
 
@@ -104,12 +104,15 @@ export default function Settings() {
     setToken(value)
     setSavedToken(getToken())
     setTokenDraft("")
+    // 告知 App/RouteGuard 重读角色（同标签页 localStorage 不会自发 storage 事件）
+    notifyTokenChanged()
   }
 
   const handleClearToken = () => {
     clearToken()
     setSavedToken(null)
     setTokenDraft("")
+    notifyTokenChanged()
   }
 
   // draft 同步守卫：仅当外部持久化与 draft 实质不同时回写，避免防抖提交 normalize 时冲掉正在输入的内容
@@ -319,6 +322,14 @@ export default function Settings() {
                 <span className={tokenInfo.expired ? "text-red-300" : ""}>
                   {tokenInfo.expiresAt ? new Date(tokenInfo.expiresAt * 1000).toLocaleString() : "—"}
                   {tokenInfo.expired ? "（已过期）" : ""}
+                </span>
+              </div>
+              <div>
+                角色：
+                <span data-testid="token-roles">
+                  {tokenInfo.roles.length
+                    ? tokenInfo.roles.map(r => `${r}（${roleLabel(r)}）`).join("、")
+                    : "未声明"}
                 </span>
               </div>
               {tokenInfo.error && <div className="text-red-300">{tokenInfo.error}</div>}

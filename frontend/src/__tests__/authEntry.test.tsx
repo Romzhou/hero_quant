@@ -1,7 +1,7 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import Settings from "../pages/Settings"
 import { useSettingsStore } from "../store/settings"
-import { TOKEN_STORAGE_KEY } from "../config/auth"
+import { TOKEN_CHANGED_EVENT, TOKEN_STORAGE_KEY } from "../config/auth"
 
 const b64url = (obj: unknown) =>
   btoa(JSON.stringify(obj)).replace(/=+$/, "").replace(/\+/g, "-").replace(/\//g, "_")
@@ -49,4 +49,24 @@ test("设置页对非 JWT 令牌显示解析错误但仍允许保存（有效性
   await waitFor(() => expect(screen.getByTestId("token-status")).toHaveTextContent("已配置"))
   expect(document.body.textContent).toMatch(/三段/)
   expect(screen.getByTestId("token-tenant")).toHaveTextContent("—")
+})
+
+test("保存/清除令牌后派发 hero-quant:token-changed，并展示令牌声明的角色", async () => {
+  const handler = vi.fn()
+  window.addEventListener(TOKEN_CHANGED_EVENT, handler)
+  const token = makeJwt({ sub: "user-1", tenant_id: "tenant-a", roles: ["viewer", "analyst"] })
+
+  render(<Settings />)
+  fireEvent.change(screen.getByPlaceholderText(/粘贴 JWT/), { target: { value: token } })
+  fireEvent.click(screen.getByRole("button", { name: "保存令牌" }))
+
+  await waitFor(() => expect(screen.getByTestId("token-status")).toHaveTextContent("已配置"))
+  // 角色按等级升序展示，附中文标签，仍标注来自声明
+  expect(screen.getByTestId("token-roles")).toHaveTextContent("viewer（只读）、analyst（分析）")
+  expect(handler).toHaveBeenCalledTimes(1)
+
+  fireEvent.click(screen.getByRole("button", { name: "清除" }))
+  await waitFor(() => expect(screen.getByTestId("token-status")).toHaveTextContent("未配置"))
+  expect(handler).toHaveBeenCalledTimes(2)
+  window.removeEventListener(TOKEN_CHANGED_EVENT, handler)
 })
