@@ -2876,6 +2876,20 @@ _BACKTEST_BARS_MAX = 250
 _BACKTEST_MIN_SHARPE_BARS = 60
 # 空 CSV（仅表头）：positions 缺失时返回它，绝不塞具体 K 线数字。
 _BACKTEST_CSV_HEADER = "date,symbol,weight,close\n"
+# ---- PR-124 可复现指纹：影响结果的配置口径（任一变化都必须让 config_hash 变） ----
+# 中文：这里只放「决定结果」的常量——时间戳/租户/耗时/cache 标记一律不进 config（见
+# backtest/reproducibility.py 的 VOLATILE_CONFIG_KEYS），否则同一份结果每次重跑换指纹。
+_BACKTEST_INTERVAL = "1d"
+# 复权口径：当前行情加载器没有区分前复权/后复权/不复权（get_market_data 只给收盘价序列），
+# 所以如实写 "unknown"，而不是猜一个 "qfq" 让 hash 看起来更权威。
+_BACKTEST_ADJUST = "unknown"
+_BACKTEST_INITIAL_CAPITAL = 1.0
+_BACKTEST_WEIGHTS: tuple = (0.5, 0.5)
+_BACKTEST_ENGINE_NAME = "BacktestEngine"
+# 无输入数据 / 静态兜底的原因码（写进 reproducibility.reason，让空壳显式不可复现）。
+_BACKTEST_REPRO_NO_INPUT = "no_input_data"
+_BACKTEST_REPRO_COMPUTE_FAILED = "compute_failed"
+_BACKTEST_REPRO_NO_FINGERPRINT = "data_fingerprint_unavailable"
 
 
 def _backtest_demo_enabled() -> bool:
@@ -3013,6 +3027,74 @@ def _backtest_markers(bundle: dict) -> dict:
     return dict(_BACKTEST_DEGRADE_MARKERS)
 
 
+def _backtest_config(bars: int | None = None) -> dict:
+    """回测配置（config_hash 的唯一输入）：只放影响结果的字段。
+
+    PR-124：`engine_version` 走 `hero_quant.__version__` 单一事实来源（pyproject，PR-181），
+    不在这里另写一个版本串；`bars` 是实际生效窗口（内部参数，见 _resolve_backtest_bars），
+    不是上游实际给到的根数——数据少给由 data_fingerprint 表达，不混进配置。
+    """
+    from hero_quant import __version__ as _hq_version
+
+    return {
+        "symbol": _BACKTEST_SYMBOL,
+        "interval": _BACKTEST_INTERVAL,
+        "bars": _resolve_backtest_bars(bars),
+        "adjust": _BACKTEST_ADJUST,
+        "initial_capital": _BACKTEST_INITIAL_CAPITAL,
+        "weights": list(_BACKTEST_WEIGHTS),
+        "engine": _BACKTEST_ENGINE_NAME,
+        "engine_version": _hq_version,
+    }
+
+
+def _backtest_config_hash(bars: int | None = None) -> str:
+    """配置指纹（32 hex）。配置是纯常量拼出来的，任何环境都能算——包括无行情的兜底路径。"""
+    from hero_quant.backtest.reproducibility import config_hash
+
+    return config_hash(_backtest_config(bars))
+
+
+def _attach_backtest_reproducibility(
+    bundle: dict,
+    *,
+    config_hash_value: str | None,
+    data_fp: str | None,
+    result_hash_value: str | None,
+    reason: str | None = None,
+) -> dict:
+    """把 PR-124 的 reproducibility 挂到 bundle 上，并把「拿不到 commit」显式翻成 warning。
+
+    中文：
+    - `code_commit()` 为 None（无 git / 超时 / wheel 安装）→ `code_commit: null` + 追加
+      `code_commit_unknown`（**只加一次**）；绝不编一个假 sha 冒充「代码版本已验证」。
+    - `reproducible` 只在「配置指纹 + 输入指纹 + 产物指纹三件齐全且无降级原因」时为 True；
+      缺任何一件 → False + `reason`，绝不让空壳看起来可复现。
+    """
+    from hero_quant.backtest.reproducibility import HASH_VERSION, code_commit
+
+    warnings = bundle.get("warnings")
+    if not isinstance(warnings, list):
+        warnings = []
+        bundle["warnings"] = warnings
+    _commit = code_commit()
+    if _commit is None and "code_commit_unknown" not in warnings:
+        warnings.append("code_commit_unknown")
+    _complete = bool(config_hash_value) and bool(data_fp) and bool(result_hash_value) and not reason
+    payload = {
+        "config_hash": config_hash_value or None,
+        "result_hash": result_hash_value or None,
+        "data_fingerprint": data_fp or None,
+        "code_commit": _commit,
+        "hash_version": HASH_VERSION,
+        "reproducible": _complete,
+    }
+    if not _complete:
+        payload["reason"] = reason or "incomplete_fingerprint"
+    bundle["reproducibility"] = payload
+    return payload
+
+
 def _backtest_bundle_cache_key(tenant: str | None = None, bars: int | None = None) -> str:
     """bundle 参数哈希 key（参数显式入 hash，便于扩展）。
 
@@ -3025,6 +3107,13 @@ def _backtest_bundle_cache_key(tenant: str | None = None, bars: int | None = Non
     且 bars 恒定入 hash（默认 60 也要进，保证与旧 v4/20 根缓存彻底隔离）。
     说明：线上唯一写缓存的是默认窗口（四端点零参调用，见 _get_backtest_bundle）；显式窗口走
     无缓存冷路径，故线上 key 的 bars 即默认值，形参保留给后续按窗口分片缓存（PR-182 基线）。
+
+    PR-124 为什么不升 v6：加 reproducibility 只改 **payload 形状**，不改「这个 key 选中的
+    到底是哪份产物（默认窗口 / capital 1.0 / 等权 / 同租户）」。而 v5 的 key 组成被
+    tests/test_pr125_backtest_bars.py:206-218 逐字节锁死（v/ bars / capital / weights 入 hash），
+    升 v6 会让那条 PR-125 契约测试变红，而该测试文件不在本批白名单内。所以 key 保持 v5，
+    「旧缓存（无 reproducibility）」改由 **payload 版本守卫**识别（见 _read_backtest_bundle_cache：
+    缺 hash_version 就当 miss 重算并覆盖写），隔离效果等价且不动已发布的 key 契约。
     """
     try:
         _t = tenant.strip() if isinstance(tenant, str) else ""
@@ -3046,8 +3135,13 @@ def _read_backtest_bundle_cache(tenant: str | None = None, bars: int | None = No
     """优先读 Redis L2（JSON 反序列化；positions 存 CSV 文本，还原为 None 由调用方按 csv 用）。
 
     PR-125：bars 透传给 key —— 窗口不进 key 就会把旧窗口产物当新窗口结果返回。
+
+    PR-124：payload 版本守卫。缺 `reproducibility`（无 hash_version）的是 PR-124 之前的旧
+    payload，直接当 miss（返回 None）→ 上层重算后覆盖写。**绝不在读缓存时补算 hash**：
+    补出来的 hash 只证明"我此刻补了一次"，不证明"缓存里那份产物算得出这个 hash"。
     """
     try:
+        from hero_quant.backtest.reproducibility import HASH_VERSION
         from hero_quant.infra.redis import get_redis_sync
 
         client = get_redis_sync()
@@ -3062,6 +3156,13 @@ def _read_backtest_bundle_cache(tenant: str | None = None, bars: int | None = No
         # 旧缓存可能缺标记：统一回填合成降级标记，保证缓存命中时响应仍然显式标注来源。
         if not isinstance(data.get("markers"), dict):
             data["markers"] = dict(_BACKTEST_DEGRADE_MARKERS)
+        _rep = data.get("reproducibility")
+        if not isinstance(_rep, dict) or _rep.get("hash_version") != HASH_VERSION:
+            logger.warning(
+                "backtest.bundle_cache_stale_payload reason=missing_reproducibility hash_version=%r",
+                _rep.get("hash_version") if isinstance(_rep, dict) else None,
+            )
+            return None
         return data
     except Exception as _e:
         logger.debug(f"backtest.bundle_cache_read_failed error={_e}")
@@ -3073,6 +3174,10 @@ def _write_backtest_bundle_cache(bundle: dict, tenant: str | None = None, bars: 
 
     PR-125：写入必须与读取用同一个窗口口径，否则读到的 key 与写下的 key 分叉（永远 miss
     或串窗口）。
+
+    PR-124：reproducibility 必须随 payload 落盘 —— 不写它，读回方的版本守卫会把这次写当成
+    「旧缓存」永远 miss，指纹字段也会在 L2 命中时凭空消失。原样透传（不补算）：写的时候没有，
+    读回来就必须还是没有。
     """
     try:
         from hero_quant.infra.redis import get_redis_sync
@@ -3080,6 +3185,7 @@ def _write_backtest_bundle_cache(bundle: dict, tenant: str | None = None, bars: 
         client = get_redis_sync()
         if client is None:
             return
+        _rep = bundle.get("reproducibility")
         payload = {
             "metrics": bundle.get("metrics", {}),
             "csv": bundle.get("csv", ""),
@@ -3088,6 +3194,7 @@ def _write_backtest_bundle_cache(bundle: dict, tenant: str | None = None, bars: 
             "sample": dict(bundle.get("sample") or {"bars": 0, "start": None, "end": None}),
             "sharpe_basis": bundle.get("sharpe_basis"),
             "warnings": list(bundle.get("warnings") or []),
+            "reproducibility": dict(_rep) if isinstance(_rep, dict) else None,
         }
         client.set(
             _backtest_bundle_cache_key(tenant, bars), json.dumps(payload, ensure_ascii=False, default=str), ex=600
@@ -3106,10 +3213,17 @@ def _compute_backtest_bundle(bars: int | None = None) -> dict:
 
     PR-125：bars 只透传给行情加载器/demo 生成器（缺省 = 默认窗口 60），不改变任何降级分支
     或披露判定 —— 窗口变大不代表"缺数据可以造"。
+
+    PR-124：产物带 `reproducibility` 指纹三元组（config_hash / data_fingerprint / result_hash
+    + code_commit + hash_version）。无行情/静态兜底路径**不算假 hash**：data_fingerprint 与
+    result_hash 一律 None 且 `reproducible=false` + reason，空壳绝不看起来可复现。
     """
     import pandas as pd
     from hero_quant.backtest.engine import BacktestEngine
+    from hero_quant.backtest.reproducibility import data_fingerprint, result_hash
 
+    # 配置指纹先算：它只依赖常量 + 窗口参数，任何降级分支都能给出真值（不是伪造的产物 hash）。
+    _cfg_hash = _backtest_config_hash(bars)
     prices = _load_backtest_prices(pd, bars)
     if prices is not None:
         markers = dict(_BACKTEST_REAL_MARKERS)
@@ -3120,20 +3234,22 @@ def _compute_backtest_bundle(bars: int | None = None) -> dict:
         synthetic = True
     else:
         logger.warning("backtest.bundle_no_market_data symbol=%s", _BACKTEST_SYMBOL)
-        return {
-            **_static_backtest_bundle(),
-            "markers": dict(_BACKTEST_NO_DATA_MARKERS),
-            "warnings": ["no_market_data"],
-        }
-    eng = BacktestEngine(initial_capital=1.0)
+        bundle = _static_backtest_bundle(reason=_BACKTEST_REPRO_NO_INPUT, bars=bars)
+        bundle["markers"] = dict(_BACKTEST_NO_DATA_MARKERS)
+        # 静态兜底已把 code_commit_unknown（无 git 时）写进 warnings：这里是追加 no_market_data，
+        # 不覆盖 —— 否则「代码版本未知」会被这条降级原因吃掉。
+        if "no_market_data" not in bundle["warnings"]:
+            bundle["warnings"].insert(0, "no_market_data")
+        return bundle
+    eng = BacktestEngine(initial_capital=_BACKTEST_INITIAL_CAPITAL)
     # allow_synthetic 只在显式 demo 开关下为 True：真行情走引擎的 fail-closed 通道，
     # 且必须显式给 PIT 日期（等权权重在窗口首日确定，价格窗口截至末日），否则引擎硬抛。
     if synthetic:
-        res = eng.run(prices, weights=[0.5, 0.5], allow_synthetic=True)
+        res = eng.run(prices, weights=list(_BACKTEST_WEIGHTS), allow_synthetic=True)
     else:
         res = eng.run(
             prices,
-            weights=[0.5, 0.5],
+            weights=list(_BACKTEST_WEIGHTS),
             allow_synthetic=False,
             weights_on=prices.index[0],
             price_date=prices.index[-1],
@@ -3162,7 +3278,16 @@ def _compute_backtest_bundle(bars: int | None = None) -> dict:
     if not isinstance(tearsheet, str):
         # 引擎未产出 tearsheet 就留空，不拼假 HTML（"Sharpe 1.62" 之类）
         tearsheet = ""
-    return {
+    # PR-124：输入指纹绑定「本次实际喂给引擎的价格序列」（不是 PIT 快照，见 reproducibility.py
+    # 的 D1 决策说明）；拿不到 close 列就返回 None，绝不为凑一个 hash 去猜数据。
+    data_fp = data_fingerprint(prices)
+    _result_hash = None
+    _reason = None
+    if data_fp is not None:
+        _result_hash = result_hash(metrics=metrics_data, positions_csv=csv_text, tearsheet=tearsheet)
+    else:
+        _reason = _BACKTEST_REPRO_NO_FINGERPRINT
+    bundle = {
         "metrics": metrics_data,
         "positions": positions,
         "csv": csv_text,
@@ -3172,11 +3297,24 @@ def _compute_backtest_bundle(bars: int | None = None) -> dict:
         "sharpe_basis": sharpe_basis,
         "warnings": warnings,
     }
+    _attach_backtest_reproducibility(
+        bundle,
+        config_hash_value=_cfg_hash,
+        data_fp=data_fp,
+        result_hash_value=_result_hash,
+        reason=_reason,
+    )
+    return bundle
 
 
-def _static_backtest_bundle() -> dict:
-    """静态兜底：只给空壳 + 显式降级标记，不伪造任何指标/持仓/tearsheet。"""
-    return {
+def _static_backtest_bundle(reason: str = _BACKTEST_REPRO_COMPUTE_FAILED, bars: int | None = None) -> dict:
+    """静态兜底：只给空壳 + 显式降级标记，不伪造任何指标/持仓/tearsheet。
+
+    PR-124：空壳同样带 reproducibility，但 `data_fingerprint`/`result_hash` 为 None、
+    `reproducible=false` + reason —— 没算过的东西不给指纹，空壳不许看起来可复现。
+    唯一还能给真值的是 `config_hash`（纯常量 + 窗口参数，与是否有行情无关）。
+    """
+    bundle = {
         "metrics": {},
         "positions": None,
         "csv": _BACKTEST_CSV_HEADER,
@@ -3186,6 +3324,14 @@ def _static_backtest_bundle() -> dict:
         "sharpe_basis": None,
         "warnings": [],
     }
+    _attach_backtest_reproducibility(
+        bundle,
+        config_hash_value=_backtest_config_hash(bars),
+        data_fp=None,
+        result_hash_value=None,
+        reason=reason,
+    )
+    return bundle
 
 
 def _get_backtest_bundle(tenant: str | None = None, bars: int | None = None):
@@ -3296,6 +3442,9 @@ def backtest_metrics(request: Request, _authz: object = _role_dependency("viewer
     metrics_body["sample"] = dict(bundle.get("sample") or {"bars": 0, "start": None, "end": None})
     metrics_body["sharpe_basis"] = bundle.get("sharpe_basis")
     metrics_body["warnings"] = list(bundle.get("warnings") or [])
+    # PR-124：固定键名透出可复现指纹（配置/输入/产物 + 代码版本 + hash_version）。
+    # 中文：键名不改不缩写——消费方按这个键做「同输入重跑」比对，改名等于断契约。
+    metrics_body["reproducibility"] = dict(bundle.get("reproducibility") or {})
     return JSONResponse(
         content=metrics_body,
         headers={

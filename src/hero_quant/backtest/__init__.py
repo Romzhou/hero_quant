@@ -9,6 +9,16 @@ from .bench import DEFAULT_BENCHMARK_MAP as _DEFAULT_BENCHMARK_MAP_RAW, _resolve
 from .engine import BacktestEngine
 from .metrics import compute_metrics, sharpe_ratio, max_drawdown, annual_return, turnover
 
+# PR-124：可复现指纹（纯 stdlib）。对外导出，避免调用方各自复制一份归一化规则。
+from .reproducibility import (
+    HASH_VERSION,
+    canonical_json,
+    code_commit,
+    config_hash,
+    data_fingerprint,
+    result_hash,
+)
+
 # 保护全局可变映射：对外只暴露只读视图，调用方 mutation 不影响模块全局
 DEFAULT_BENCHMARK_MAP = MappingProxyType(dict(_DEFAULT_BENCHMARK_MAP_RAW))
 
@@ -22,4 +32,10 @@ __all__ = [
     "run_batch",
     "_resolve_benchmark",
     "DEFAULT_BENCHMARK_MAP",
+    "HASH_VERSION",
+    "canonical_json",
+    "config_hash",
+    "data_fingerprint",
+    "result_hash",
+    "code_commit",
 ]
