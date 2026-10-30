@@ -774,6 +774,61 @@ def _session_scope() -> tuple[str, str | None]:
     return tenant, (principal.subject if principal is not None else None)
 
 
+# PR-171：审计写入是旁路——给一个短上限，避免 psycopg 池耗尽时把答案/[DONE] 一起拖住。
+_AUDIT_WRITE_TIMEOUT_S = 2.0
+
+
+async def _audit_query_best_effort(
+    action: str,
+    *,
+    resource: str,
+    model: str | None = None,
+    prompt: str | None = None,
+    cost: dict | None = None,
+    degraded: list[str] | None = None,
+    iterations: int | None = None,
+    grounded: bool | None = None,
+    error_type: str | None = None,
+) -> None:
+    """PR-171 链A审计生产者入口：写一条审计，**任何失败只 warning，绝不改答案/状态码**。
+
+    中文：真正的跳过判据（无租户 / 无 trace_id）与脱敏（只落计数 + prompt hash）在
+    `hero_quant.audit.api.record_query_audit`；本函数只做「导入 + 兜底 + 限时」三件事，
+    让四个调用点保持一行，且 audit 包 import 失败也不会波及链A主流程。
+
+    限时（`_AUDIT_WRITE_TIMEOUT_S`）是必要的一层：psycopg 连接池默认最长等 30s，
+    审计若在池耗尽时干等，会把已算好的答案/`[DONE]` 一起拖住——那已经算「影响了答案」。
+    超时只放弃这次审计（记账旁路），不取消答案。
+    """
+    try:
+        from hero_quant.audit.api import record_query_audit
+
+        await asyncio.wait_for(
+            record_query_audit(
+                action,
+                resource=resource,
+                model=model,
+                prompt=prompt,
+                cost=cost,
+                degraded=degraded,
+                iterations=iterations,
+                grounded=grounded,
+                error_type=error_type,
+            ),
+            timeout=_AUDIT_WRITE_TIMEOUT_S,
+        )
+    except asyncio.TimeoutError:
+        _inc_api_error("audit", "producer_timeout")
+        logger.warning(
+            "audit.producer_timeout", error_code="producer_timeout", action=action, timeout_s=_AUDIT_WRITE_TIMEOUT_S
+        )
+    except Exception as _e:  # noqa: BLE001 — 审计是旁路：导入/线程池故障都不许冒到响应
+        _inc_api_error("audit", "producer_failed")
+        logger.warning(
+            "audit.producer_failed", error_code="producer_failed", action=action, error_type=type(_e).__name__
+        )
+
+
 async def _enforce_kill_switch(tenant_id: str | None, *, model: str | None = None, tool: str | None = None) -> None:
     """租户/模型/工具 kill switch 前置检查：命中或后端不可用一律 503（fail-closed）。"""
     from hero_quant.killswitch.switch import KillSwitch, KillSwitchActive, KillSwitchUnavailable
@@ -964,6 +1019,16 @@ try:
     app.include_router(_ws_router)
 except Exception as _e:
     logger.debug("ws.router_include_failed error=%s", str(_e))
+
+# PR-171: 审计查询路由（GET /v1/audit）。查询/写入都在 audit 包内实现，server 只负责挂载，
+# 避免本文件继续膨胀；挂载失败显式告警（路由缺失只会 404，不会假成功）。
+try:
+    from hero_quant.audit.api import router as _audit_router
+
+    app.include_router(_audit_router)
+except Exception as _e:
+    _inc_api_error("audit", "router_include_failed")
+    logger.warning("audit.router_include_failed", error_code="router_include_failed", error=str(_e))
 
 
 async def _start_ws_heartbeat():
@@ -2207,6 +2272,18 @@ async def query(request: Request, background_tasks: BackgroundTasks, q: str = ""
             # D线收窄：链A TraceWriter 关闭失败 debug + error.code。
             logger.debug("trace.close_failed", error=str(_e), error_code="trace_close_failed")
             pass
+        # PR-171：链A收尾审计（一条，best-effort）——只落计数/标志 + prompt hash，
+        # 无租户（auth 未启用）或无 trace_id 时自动跳过；写失败仅 warning，不改答案/状态码。
+        await _audit_query_best_effort(
+            "query.completed",
+            resource="/v1/query",
+            model=model_name,
+            prompt=q,
+            cost=out.get("llm_cost"),
+            degraded=_degrade_reasons,
+            iterations=getattr(res, "iterations", None),
+            grounded=getattr(res, "grounding_verified", None),
+        )
         if _degrade_reasons:
             return _with_degraded_headers(JSONResponse(status_code=200, content=out), _degrade_reasons)
         return out
@@ -2215,6 +2292,8 @@ async def query(request: Request, background_tasks: BackgroundTasks, q: str = ""
     except Exception as _e:
         # 中文：T4-1 MR3：对外脱敏——只返通用 code+message，内部细节只记日志。
         logger.error("query.failed", error=str(_e), exc_info=_e)
+        # PR-171：失败也留痕，但 detail 只放 error_code/类型名（异常原文可能夹带 prompt/答案）。
+        await _audit_query_best_effort("query.failed", resource="/v1/query", error_type=type(_e).__name__)
         return JSONResponse(status_code=500, content={"code": "internal_error", "message": "Query failed"})
 
 
@@ -2701,10 +2780,26 @@ async def query_stream(request: Request, background_tasks: BackgroundTasks, q: s
                     **_stream_cost_payload,
                 }
                 yield f"data: {_json.dumps(_cost_event, ensure_ascii=False)}\n\n"
+            # PR-171：流式收尾审计（一条，best-effort）。放在 [DONE] 之前=正文已推完，
+            # 才可能拿到真实 usage；写失败仅 warning，SSE 内容与状态码都不变。
+            await _audit_query_best_effort(
+                "stream.completed",
+                resource="/v1/query/stream",
+                model=model_name,
+                prompt=q,
+                cost=_stream_cost_payload,
+                degraded=_gen_reasons,
+                iterations=getattr(res, "iterations", None),
+                grounded=getattr(res, "grounding_verified", None),
+            )
             yield "data: [DONE]\n\n"
         except Exception as _e:
             # 中文：T4-1 MR3：SSE 对外脱敏——只发通用 code+message，内部细节只记日志。
             logger.error("query_stream.failed", error=str(_e), exc_info=_e)
+            # PR-171：流式失败也留痕；detail 只放 error_code/类型名，不带异常原文。
+            await _audit_query_best_effort(
+                "stream.failed", resource="/v1/query/stream", error_type=type(_e).__name__
+            )
             try:
                 import json as _json2
                 yield f"data: {_json2.dumps({'type': 'error', 'code': 'internal_error', 'message': 'Stream failed'}, ensure_ascii=False)}\n\n"
