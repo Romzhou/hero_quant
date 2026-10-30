@@ -2,7 +2,7 @@
 
 门控：`tests/conftest.py` 的 PG 守卫不可用则整模块 skip（本机无 DSN 时不红）。
 隔离：每个用例创建独立临时 schema（search_path），结束 DROP SCHEMA CASCADE，
-不污染共享库；RLS 断言在 superuser（BYPASSRLS）下自动 skip。
+不污染共享库；RLS 断言在 superuser（BYPASSRLS）下用 `SET ROLE` 切到受限角色真跑。
 """
 
 from __future__ import annotations
@@ -18,6 +18,8 @@ _PG_GUARD_REASON = pg_guard_reason()
 pytestmark = pytest.mark.skipif(_PG_GUARD_REASON is not None, reason=_PG_GUARD_REASON or "")
 
 psycopg = pytest.importorskip("psycopg")
+
+from psycopg import sql as psql  # noqa: E402
 
 from hero_quant.audit.store import AuditStore  # noqa: E402
 from hero_quant.db.loader import load_migrations  # noqa: E402
@@ -140,16 +142,47 @@ def test_session_tenant_isolation(conn, schema):
     assert store.list_messages("tenant-a", session["id"]) == []
 
 
-def test_rls_blocks_cross_tenant_reads(conn, schema):
-    apply_migrations(conn)
-    if _is_superuser(conn):
-        pytest.skip("RLS 断言需要非 superuser 连接（BYPASSRLS 会绕过策略）")
-
-    SessionStore(_Pool(schema)).create_session("tenant-a", "user-1")
+def _count_sessions(conn, tenant: str) -> int:
     with conn.transaction():
-        conn.execute("SELECT set_config('app.tenant', %s, true)", ("tenant-b",))
-        count = conn.execute("SELECT count(*) FROM sessions").fetchone()[0]
-    assert count == 0, "RLS 必须在 tenant-b 上下文隐藏 tenant-a 的会话"
+        conn.execute("SELECT set_config('app.tenant', %s, true)", (tenant,))
+        return int(conn.execute("SELECT count(*) FROM sessions").fetchone()[0])
+
+
+def test_rls_blocks_cross_tenant_reads(conn, schema):
+    """RLS 运行时隔离：superuser 用 SET ROLE 切受限角色真跑，不再用 skip 代替证明。"""
+    apply_migrations(conn)
+    SessionStore(_Pool(schema)).create_session("tenant-a", "user-1")
+
+    if not _is_superuser(conn):
+        assert _count_sessions(conn, "tenant-b") == 0
+        assert _count_sessions(conn, "tenant-a") == 1
+        return
+
+    role = f"w4w8_rls_{uuid.uuid4().hex[:8]}"
+    conn.execute(psql.SQL("CREATE ROLE {} NOLOGIN").format(psql.Identifier(role)))
+    try:
+        for statement in (
+            psql.SQL("GRANT USAGE ON SCHEMA {} TO {}").format(
+                psql.Identifier(schema), psql.Identifier(role)
+            ),
+            psql.SQL("GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA {} TO {}").format(
+                psql.Identifier(schema), psql.Identifier(role)
+            ),
+            psql.SQL("GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA {} TO {}").format(
+                psql.Identifier(schema), psql.Identifier(role)
+            ),
+        ):
+            conn.execute(statement)
+        conn.execute(psql.SQL("SET ROLE {}").format(psql.Identifier(role)))
+        conn.execute(f'SET search_path TO "{schema}"')
+        try:
+            assert _count_sessions(conn, "tenant-b") == 0, "RLS 必须在 tenant-b 上下文隐藏 tenant-a 的会话"
+            assert _count_sessions(conn, "tenant-a") == 1
+        finally:
+            conn.execute("RESET ROLE")
+    finally:
+        conn.execute(psql.SQL("DROP OWNED BY {}").format(psql.Identifier(role)))
+        conn.execute(psql.SQL("DROP ROLE {}").format(psql.Identifier(role)))
 
 
 def test_tool_call_idempotency_and_run_resume(conn, schema):
