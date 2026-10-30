@@ -26,6 +26,16 @@ def execute(conn: Any, sql: str, params: Any = None) -> Any:
         return cur
 
 
+def executemany(conn: Any, sql: str, seq: Any) -> Any:
+    """批量执行（同一条 SQL + 参数序列）；psycopg 连接/游标两种形态兼容。"""
+    try:
+        return conn.executemany(sql, seq)
+    except AttributeError:
+        cur = conn.cursor()
+        cur.executemany(sql, seq)
+        return cur
+
+
 def fetch_one(conn: Any, sql: str, params: Any = None) -> dict[str, Any] | None:
     cur = execute(conn, sql, params)
     if cur is None:
@@ -71,4 +81,4 @@ def jsonable(value: Any) -> Any:
     return value
 
 
-__all__ = ["execute", "fetch_all", "fetch_one", "jsonable"]
+__all__ = ["execute", "executemany", "fetch_all", "fetch_one", "jsonable"]

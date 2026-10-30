@@ -52,6 +52,8 @@ EXPECTED_TABLES: tuple[str, ...] = (
     "runs",
     "tool_calls",
     "audit_log",
+    "data_snapshots",
+    "pit_bars",
 )
 
 
