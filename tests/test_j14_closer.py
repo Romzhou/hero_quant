@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 
 import pytest
 
@@ -20,15 +21,33 @@ def test_j14_risk_probes(monkeypatch):
     assert R._get_metric("turnover") is None or isinstance(R._get_metric("turnover"), float)
     assert R._get_turnover() is None or isinstance(R._get_turnover(), float)
     assert R._get_exposure() is None or isinstance(R._get_exposure(), float)
-    assert R._get_single_limit() is None
-    assert R._get_circuit_threshold() is None
-    assert R._get_reject_rate() is None
+    # PR-214：metrics 缺键时改为从真实持仓/熔断配置/影子重放取数，不再恒为 None。
+    # 这里只锁"有值必有限"（真值语义由 tests/test_pr214_risk_attribution.py 覆盖）。
+    for _probe in (R._get_single_limit, R._get_circuit_threshold, R._get_reject_rate):
+        _v = _probe()
+        assert _v is None or (isinstance(_v, float) and math.isfinite(_v)), (_probe.__name__, _v)
     assert R._get_circuit_state() in ("UNKNOWN", "CLOSED", "OPEN", "HALF_OPEN") or isinstance(R._get_circuit_state(), str)
     assert R._get_pit_status() in ("unknown", "verified", "failed")
     assert R._get_cross_source() in ("unknown", "pass", "fail")
     resp = R.risk_summary()
     assert isinstance(resp, dict) and "turnover" in resp
     assert R.risk_summary_alias() == R.risk_summary() or isinstance(R.risk_summary_alias(), dict)
+
+
+def test_j14_risk_probes_hermetic_all_none(monkeypatch):
+    """无 bundle 时必须全部 None（PR-214 也不许凭空造数）。"""
+    import hero_quant.api.server as SV
+    from hero_quant.api import risk as R
+
+    monkeypatch.setattr(SV, "_get_backtest_bundle", lambda: {}, raising=False)
+    monkeypatch.setattr(R, "_find_circuit_breaker", lambda: None, raising=True)
+    assert R._get_exposure() is None
+    assert R._get_single_limit() is None
+    assert R._get_circuit_threshold() is None
+    assert R._get_reject_rate() is None
+    resp = R.risk_summary()
+    assert resp.get("degraded") is True
+    assert "exposure_missing" in (resp.get("reason") or "")
 
 
 def test_j14_risk_with_bundle(monkeypatch):
