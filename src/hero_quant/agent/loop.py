@@ -1476,7 +1476,22 @@ class AgentLoop:
                             pass
                     try:
                         snippet = redacted_result_str[:2000] if isinstance(redacted_result_str, str) else str(redacted_result_str)[:2000]
-                        buffer += f"\n[tool {tool_name} result] {snippet}"
+                        # 中文：工具返回是不可信数据（PR-152）——用显式边界 + 固定提示包裹后
+                        # 再回喂模型，命中注入特征时只在边界标记里附 flagged=，正文除边界标记
+                        # 防伪造外逐字保留。包装属增强项：导入或调用任一失败都回退旧格式，
+                        # 绝不让安全包装吞掉工具结果。
+                        try:
+                            from hero_quant.security.untrusted import wrap_tool_output as _wrap_untrusted
+
+                            buffer += "\n" + _wrap_untrusted(tool_name, snippet)
+                        except Exception as e:
+                            try:
+                                logging.getLogger(__name__).debug(
+                                    "tool output wrap failed error_code=tool_output_wrap_fallback: %s", e
+                                )
+                            except Exception:
+                                pass
+                            buffer += f"\n[tool {tool_name} result] {snippet}"
                     except Exception:
                         pass
 
