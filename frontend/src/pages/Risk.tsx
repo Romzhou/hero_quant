@@ -28,6 +28,7 @@ type RiskAttribution = {
   metrics_cumulative_return?: number | null
   turnover_notional?: number | null
   bars?: number
+  warnings?: string[]
   degraded?: boolean
   reason?: string | null
 }
@@ -104,6 +105,7 @@ function sanitizeAttribution(raw: unknown): RiskAttribution | null {
   if (isFiniteNumber(r.metrics_cumulative_return)) out.metrics_cumulative_return = r.metrics_cumulative_return
   if (isFiniteNumber(r.turnover_notional)) out.turnover_notional = r.turnover_notional
   if (isFiniteNumber(r.bars)) out.bars = r.bars
+  if (Array.isArray(r.warnings)) out.warnings = r.warnings.filter((x) => typeof x === "string")
   out.degraded = r.degraded === true
   out.reason = typeof r.reason === "string" ? r.reason : null
   return out
@@ -320,6 +322,11 @@ export default function Risk() {
           {attribution?.not_applicable && attribution.not_applicable.length > 0 && (
             <p className="mt-1 font-mono text-[11px] text-amber-300/80">
               不可算项：{attribution.not_applicable.join(" · ")}
+            </p>
+          )}
+          {attribution?.warnings && attribution.warnings.length > 0 && (
+            <p className="mt-1 font-mono text-[11px] text-amber-300/80">
+              归因告警：{attribution.warnings.join(" · ")}
             </p>
           )}
         </div>

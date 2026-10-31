@@ -62,6 +62,7 @@ test("真实归因/影子重放渲染真值，null 渲染 --", async () => {
       metrics_cumulative_return: 0.21,
       turnover_notional: 210,
       bars: 5,
+      warnings: ["cross_section_degenerate_single_price_series"],
       degraded: false,
     },
     [SHADOW]: { orders_total: 6, allowed: 6, rejected: 0, rejected_by_rule: {}, reject_rate: 0, notional_total: 210, bars: 6, degraded: false },
@@ -76,6 +77,8 @@ test("真实归因/影子重放渲染真值，null 渲染 --", async () => {
   expect(screen.getByText("7.00%")).toBeInTheDocument()
   expect(screen.getByText(/coverage 80%/)).toBeInTheDocument() // coverage 0.8
   expect(screen.getByText(/selection_single_symbol/)).toBeInTheDocument()
+  // 退化横截面（单一价格序列广播）必须把 warning 显式呈现，不能只给一个 0.0 让用户误读
+  expect(screen.getByText(/cross_section_degenerate_single_price_series/)).toBeInTheDocument()
   // 影子重放真值
   expect(screen.getByText("0.00%")).toBeInTheDocument() // reject_rate 0
   expect(container.textContent).not.toContain("NaN%")
