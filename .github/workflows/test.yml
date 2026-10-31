@@ -90,6 +90,8 @@ jobs:
         uses: gitleaks/gitleaks-action@v2 # pin: sha256:2a65dd62a8f8b5afedd072f3e2aa1c8a3b6c7a0e7d0a9c
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # 显式指定配置：仓库根 gitleaks.toml 只有占位符/脱敏测试假值的窄口径 allowlist
+          GITLEAKS_CONFIG: gitleaks.toml
       - name: Install Playwright (root devDeps, blocking)
         # 中文：e2e 不再是可选门。根 package.json 才有 @playwright/test，先 npm ci 再跑。
         # 显式安装自带 chromium（与 @playwright/test 版本对齐），CI 内允许联网。

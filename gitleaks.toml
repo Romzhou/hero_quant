@@ -7,7 +7,7 @@
 # 这里按「整行正则」放行这些模式；真实 key 的随机串不会命中，仍然会被拦。
 #
 # 修改规则时必须保持窄口径：不要按目录/文件整体 allowlist，否则等于关掉该目录的扫描。
-[allowlist]
+[[allowlists]]
 description = "Known placeholders and fake keys used by redaction tests"
 regexTarget = "line"
 regexes = [
