@@ -1,11 +1,12 @@
 /**
  * 应用装配（App）
  * - Shell 承载全局布局：顶部导航 + 路由内容区 + 底部声明
- * - 路由结构：/ → /dashboard；/research 研究；/backtest 与 /chat 复用 Chat（回测对话）；/live 实盘；/risk 风控；/settings 设置
+ * - 路由结构：/ → /dashboard；/research 研究；/backtest 与 /chat 复用 Chat（回测对话）；/live 实盘；/risk 风控；/settings 设置；
+ *   /compliance 合规与免责（PR-172：只读静态页，不进 RouteGuard，任何角色含无令牌均可读）
  * - 页面均懒加载，Suspense 提供加载态，首屏轻量
  */
 import { Suspense, lazy, useEffect, useState } from "react"
-import { NavLink, Route, Routes, Navigate } from "react-router-dom"
+import { Link, NavLink, Route, Routes, Navigate } from "react-router-dom"
 import DegradedBanner from "./components/DegradedBanner"
 import RouteGuard, { useTokenInfo } from "./components/RouteGuard"
 import { NO_DIST_503_HINT, isServiceUnavailable } from "./config/degraded"
@@ -19,6 +20,7 @@ const Live = lazy(() => import("./pages/Live"))
 const Risk = lazy(() => import("./pages/Risk"))
 const Monitor = lazy(() => import("./pages/Monitor"))
 const Settings = lazy(() => import("./pages/Settings"))
+const Compliance = lazy(() => import("./pages/Compliance"))
 
 /**
  * 导航项与所需角色（PR-103）：角色口径对齐后端端点 —— `/v1/query*` = analyst，
@@ -192,12 +194,24 @@ function Shell() {
             <Route path="/risk" element={<RouteGuard required="viewer" title="风控"><Risk /></RouteGuard>} />
             {/* 设置页不设角色闸：换令牌入口必须永远可达，否则低权令牌无法自救 */}
             <Route path="/settings" element={<Settings />} />
+            {/* 合规页同样不设角色闸：免责/数据来源/令牌口径必须在任何角色下可读，
+                由页脚与设置页链接进入，故不占用主导航（见 NAV_ITEMS） */}
+            <Route path="/compliance" element={<Compliance />} />
           </Routes>
         </Suspense>
       </main>
 
       <footer className="border-t border-white/5 py-4 text-center text-xs text-slate-500">
-        证据优先 · PIT 已校验 · Kepler — 不构成投资建议
+        <span>证据优先 · PIT 已校验 · Kepler — 不构成投资建议</span>
+        <span className="mx-2 text-slate-600" aria-hidden="true">·</span>
+        {/* 合规入口放页脚而非主导航：不挤占已有 6 项导航，且任何角色都可点（无 RouteGuard） */}
+        <Link
+          to="/compliance"
+          data-testid="footer-compliance-link"
+          className="underline decoration-dotted underline-offset-2 hover:text-mist transition"
+        >
+          合规与免责
+        </Link>
       </footer>
     </div>
   )

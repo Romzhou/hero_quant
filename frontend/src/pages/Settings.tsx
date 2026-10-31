@@ -339,6 +339,18 @@ export default function Settings() {
             以上信息来自令牌声明，<span className="text-slate-300">未经服务端确认</span>；令牌是否有效、租户与角色是否被接受，一律由后端裁决。
             配置后所有请求自动携带 <span className="font-mono text-slate-300">Authorization: Bearer</span>；清除后回到匿名链路。
           </p>
+          {/* PR-172 合规入口：故意用原生 <a> 而非 react-router Link —— 本页在单测里独立渲染（无 Router 上下文），
+              Link 会因 useHref 缺 context 抛错；合规页是静态文本，整页跳转不丢状态（偏好已在 localStorage） */}
+          <p className="mt-2 text-xs leading-5 text-slate-500">
+            <a
+              href="/compliance"
+              data-testid="settings-compliance-link"
+              className="text-slate-300 underline decoration-dotted underline-offset-2 hover:text-mist"
+            >
+              查看合规与免责说明
+            </a>
+            <span className="text-slate-500">：投资免责、数据来源与合成模式、令牌隐私口径。</span>
+          </p>
         </div>
 
         <div className="rounded-2xl border border-white/10 bg-ink-800/60 p-5 backdrop-blur">
