@@ -265,6 +265,8 @@ class LLMGateway:
         """由 Settings 构造降级链。
 
         - primary = `settings.llm_provider` + `settings.llm_model`（沿用既有 env 网关，不新增 env）；
+        - primary 额外带上 `settings.llm_base_url`（OpenAI 兼容网关根地址）；空则 None 走官方端点。
+          回退候选**不**带 base_url —— 别的 provider 不该被 primary 的网关地址串过去；
         - 回退候选 = 其余「显式配了 provider 专属 key」的 provider，**不**把 HERO_API_KEY
           当成通用 key 塞给别家（会把 openai key 打到 deepseek 上）；
         - 无任何可用 key 时仍返回 primary 单链，由首次调用/健康检查如实失败。
@@ -286,7 +288,14 @@ class LLMGateway:
             primary_key = primary_key or os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("CLAUDE_API_KEY")
 
         specs: list[ProviderSpec] = [
-            ProviderSpec(name=primary, model=primary_model, api_key=primary_key, timeout=timeout, priority=0)
+            ProviderSpec(
+                name=primary,
+                model=primary_model,
+                api_key=primary_key,
+                base_url=getattr(settings, "llm_base_url", None),
+                timeout=timeout,
+                priority=0,
+            )
         ]
         if include_fallbacks:
             models = dict(DEFAULT_PROVIDER_MODELS)

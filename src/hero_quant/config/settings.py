@@ -322,6 +322,33 @@ def _llm_model_slot_from_env(key: str) -> str:
     return "gpt-4o-mini"
 
 
+_LLM_BASE_URL_SCHEMES = ("http", "https")
+
+
+def _llm_base_url_from_env() -> str | None:
+    """HERO_LLM_BASE_URL：OpenAI 兼容网关根地址（如 http://localhost:3001/v1）。
+
+    - 空值 → None：不覆盖，走 SDK 官方默认端点；
+    - 合法 → 去掉尾部 `/` 后返回（`http://h/v1/` 与 `http://h/v1` 等价）；
+    - 非 http(s)（ftp: / javascript: / 无 scheme）或 netloc 内嵌 userinfo（`user:pass@host`）
+      直接抛 ValueError —— 与其余严格字段一致：构造即失败，绝不把可疑网关带进运行态。
+    错误信息不回显原始 URL（可能含旁路凭据），凭据只走 HERO_API_KEY。
+    """
+    raw = (os.getenv("HERO_LLM_BASE_URL", "") or "").strip()
+    if not raw:
+        return None
+    scheme, sep, rest = raw.partition("://")
+    scheme = scheme.strip().lower()
+    if not sep or scheme not in _LLM_BASE_URL_SCHEMES:
+        raise ValueError(f"HERO_LLM_BASE_URL must be an http(s) URL, got scheme {scheme or '<none>'!r}")
+    netloc = rest.split("/", 1)[0]
+    if "@" in netloc:
+        raise ValueError("HERO_LLM_BASE_URL must not embed userinfo (user:pass@host); put credentials in HERO_API_KEY")
+    if not netloc:
+        raise ValueError("HERO_LLM_BASE_URL is missing a host")
+    return f"{scheme}://{rest}".rstrip("/")
+
+
 # 中文：W1 身份/配额 env 统一在此解析，auth 包不得直读 os.environ（便于审计与热更新）。
 _AUTH_MODES = ("off", "enforce")
 _DEFAULT_OIDC_ALGORITHMS = ("RS256",)
@@ -386,6 +413,8 @@ class Settings:
     llm_model_deep: str = field(default_factory=lambda: _llm_model_slot_from_env("HERO_LLM_MODEL_DEEP"))
     llm_model_quick: str = field(default_factory=lambda: _llm_model_slot_from_env("HERO_LLM_MODEL_QUICK"))
     api_key: str | None = field(default_factory=lambda: os.getenv("HERO_API_KEY"), repr=False)  # type: ignore[arg-type]
+    # OpenAI 兼容网关根地址：空 = 不覆盖（官方 API）；仅 http/https，见 _llm_base_url_from_env
+    llm_base_url: str | None = field(default_factory=_llm_base_url_from_env)
     data_default_market: str = field(default_factory=lambda: (os.getenv("HERO_DATA_MARKET", "") or "").strip() or "CN")
     data_mode: str = field(default_factory=lambda: (os.getenv("HERO_DATA_MODE", "") or "").strip() or "live")
     # data_mode 默认 live（生产安全）：禁止 live 失败静默回退合成；仅当 HERO_DATA_MODE=synthetic 显式指定时允许合成

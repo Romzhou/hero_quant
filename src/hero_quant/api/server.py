@@ -304,7 +304,14 @@ def _final_answer(llm, q: str, narrative: str, tool_records: list) -> str:
                 from hero_quant.llm.factory import LLMFactory as _LF2
 
                 _s2 = _S2()
-                _chat = _LF2(_s2).create(model=_s2.llm_model, api_key=_s2.api_key, streaming=False, temperature=0.3)
+                # HERO_LLM_BASE_URL：OpenAI 兼容网关根地址，空则 None（走官方端点）
+                _chat = _LF2(_s2).create(
+                    model=_s2.llm_model,
+                    api_key=_s2.api_key,
+                    base_url=getattr(_s2, "llm_base_url", None),
+                    streaming=False,
+                    temperature=0.3,
+                )
             except Exception as _e2:
                 logger.warning("final_summary_rebuild_failed", error=str(_e2))
                 return narrative
@@ -2058,7 +2065,9 @@ async def query(request: Request, background_tasks: BackgroundTasks, q: str = ""
                     # D线收窄：链A模型选择回退默认，debug + error.code。
                     logger.debug("llm.model_for_stage_fallback", error=str(_e), error_code="model_for_stage_fallback")
                     model_name = s.llm_model
-                llm = factory.create(model=model_name, api_key=key, streaming=True, temperature=0.2)
+                llm = factory.create(
+                    model=model_name, api_key=key, base_url=getattr(s, "llm_base_url", None), streaming=True, temperature=0.2
+                )
                 # ensure LLMClient wrapper
                 if not isinstance(llm, LLMClient):
                     llm = LLMClient(llm, timeout=30)
@@ -2513,7 +2522,9 @@ async def query_stream(request: Request, background_tasks: BackgroundTasks, q: s
                         # D线收窄：链A模型选择回退默认，debug + error.code。
                         logger.debug("llm.model_for_stage_fallback", error=str(_e), error_code="model_for_stage_fallback")
                         model_name = s.llm_model
-                    llm = factory.create(model=model_name, api_key=key, streaming=True, temperature=0.2)
+                    llm = factory.create(
+                        model=model_name, api_key=key, base_url=getattr(s, "llm_base_url", None), streaming=True, temperature=0.2
+                    )
                     if not isinstance(llm, LLMClient):
                         llm = LLMClient(llm, timeout=30)
                     try:

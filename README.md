@@ -130,6 +130,7 @@ docker build --build-arg HERO_QUANT_VERSION="$(python -c 'import tomllib;print(t
 | `HERO_LLM_PROVIDER` | `openai` | `openai` / `deepseek` / `anthropic` 等 |
 | `HERO_LLM_MODEL` | `gpt-4o-mini` | 默认模型名 |
 | `HERO_LLM_MODEL_QUICK` / `HERO_LLM_MODEL_DEEP` | 空（回退 `HERO_LLM_MODEL`） | 快/深两档独立模型槽位 |
+| `HERO_LLM_BASE_URL` | 空（走官方 API） | OpenAI 兼容网关根地址（如 `http://localhost:3001/v1`）；留空走官方 API；仅 http/https，带 userinfo 或非 http(s) 直接 `ValueError` |
 | `HERO_API_KEY` | — | LLM 密钥；缺省走 `_FakeLLM` 合成路径，响应带 `degraded:true` |
 | `COHERE_API_KEY` | — | 缺省只 warning，不影响 `/ready` |
 | `HERO_READY_COHERE_FATAL` | `false` | `true` 才把缺 Cohere key 判为致命 degraded |
