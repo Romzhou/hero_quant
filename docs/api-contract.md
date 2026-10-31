@@ -30,6 +30,7 @@
 | 文件 | `tests/contracts/openapi_snapshot.json` |
 | 序列化 | `json.dumps(spec, ensure_ascii=False, sort_keys=True, indent=2)` + 末尾换行 |
 | 规模（c0b40aa 基线） | 885 行 / 24415 字节；17 个 path / 17 个 operation / 2 个响应模型 |
+| 规模（PR-214 后） | 951 行 / 26216 字节；21 个 path / 21 个 operation（新增 `/v1/risk/attribution`、`/v1/risk/shadow` 各自 + `/risk/...` alias，均为 ADDITIVE） |
 | 确定性 | 同一份代码两次生成**字节相同**（清缓存重建也相同，见 `test_openapi_generation_is_deterministic`） |
 
 为什么这三个序列化参数不能省：
