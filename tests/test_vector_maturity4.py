@@ -112,6 +112,22 @@ def test_provider_pluggable_sentence_transformers_fallback(monkeypatch):
 
 def test_vector_column_and_cosine_topk_hybrid(tmp_path, monkeypatch):
     """store 新增 vector列 + cosine topK hybrid 检索."""
+    # 中文（b9）：CI workflow 导出 HERO_PG_DSN/HERO_CHECKPOINT_DSN 后，Settings.vector_dsn 会经
+    # settings.py:68-72 的键序命中 HERO_PG_DSN → is_pgvector_configured() 变 True，
+    # 这条「未配置侧车」断言在 CI 假红。必须在 MemoryStore() 之前把判定相关的键全部 delenv
+    # （monkeypatch 结束后自动还原），既确定性覆盖「未配置」分支，也避免测试真的去连 pgvector。
+    for _k in (
+        "HERO_VECTOR_DSN",
+        "HERO_PGVECTOR_DSN",
+        "HERO_MEMORY_PG_DSN",
+        "HERO_PG_DSN",
+        "HERO_VECTOR_URL",
+        "HERO_PGVECTOR_URL",
+        "HERO_CHECKPOINT_DSN",
+        "HERO_VECTOR_STORE",
+        "HERO_VECTOR_ENABLED",
+    ):
+        monkeypatch.delenv(_k, raising=False)
     monkeypatch.setenv("HERO_EMBED_PROVIDER", "offline")
     import hero_quant.agent.embed as embed_mod
     importlib.reload(embed_mod)

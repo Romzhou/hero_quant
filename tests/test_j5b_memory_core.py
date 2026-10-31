@@ -148,6 +148,25 @@ def test_j5b_store_helpers_and_sidecar(monkeypatch, tmp_path):
     assert ST._content_bigrams("abc") == "ab bc"
     assert ST._content_bigrams("") == ""
     assert ST._escape_like("a%b_c\\d") == "a\\%b\\_c\\\\d"
+    # 中文（b9）：CI 的 workflow 现在导出 HERO_PG_DSN/HERO_CHECKPOINT_DSN，而
+    # Settings.vector_dsn 走 settings.py:68-72 的键序（HERO_VECTOR_DSN/HERO_PGVECTOR_DSN/
+    # HERO_MEMORY_PG_DSN/HERO_PG_DSN/HERO_VECTOR_URL/HERO_PGVECTOR_URL），会命中 HERO_PG_DSN
+    # 并返回真 DSN ——「未配置」的断言在 CI 假红。这里把判定相关的键全部 delenv（monkeypatch
+    # 结束时自动还原），让「未配置」分支在本地与 CI 都可确定性覆盖，且不依赖 CI 一定没有 DSN。
+    # 另注：HERO_CHECKPOINT_DSN 只在 HERO_VECTOR_STORE=pgvector/auto 或 HERO_VECTOR_ENABLED=1
+    # 时才回退生效，一并清掉以免上游用例残留。
+    for _k in (
+        "HERO_VECTOR_DSN",
+        "HERO_PGVECTOR_DSN",
+        "HERO_MEMORY_PG_DSN",
+        "HERO_PG_DSN",
+        "HERO_VECTOR_URL",
+        "HERO_PGVECTOR_URL",
+        "HERO_CHECKPOINT_DSN",
+        "HERO_VECTOR_STORE",
+        "HERO_VECTOR_ENABLED",
+    ):
+        monkeypatch.delenv(_k, raising=False)
     assert ST._pgvector_dsn() is None
     monkeypatch.setenv("HERO_VECTOR_STORE", "local")
     assert ST.is_pgvector_configured() is False
