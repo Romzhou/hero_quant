@@ -319,14 +319,23 @@ def golden_sha256(path: Path = DEFAULT_GOLDEN) -> str:
 
 
 class ToolCallRecorder:
-    """记录本轮实际执行过的工具名（在 TOOL_REGISTRY 上套一层，退出即还原）。
+    """记录本轮实际执行过的工具名 + 结果（在 TOOL_REGISTRY 上套一层，退出即还原）。
 
     只用于评测观测，不改工具语义；`functools.wraps` 保留 `__wrapped__`，
     AgentLoop 的签名探测（`inspect.signature(spec.func)`）仍看到原签名。
+
+    `results` 是二段式总结的输入：形状与 `agent/trace.py` 的 `tool_result` 记录一致
+    （`{"type": "tool_result", "tool": name, "content": ...}`），这样评测侧能把
+    与生产**同一份**工具结果回喂给 `api.server._final_answer`，不必复制逻辑，
+    也不必在生产里额外开 trace 落盘。
     """
+
+    # 单条结果落内存前截断：`_final_answer` 每条只取 1200 字符，留足余量即可。
+    RESULT_STORE_LIMIT = 8000
 
     def __init__(self) -> None:
         self.calls: list[str] = []
+        self.results: list[dict[str, Any]] = []
         self._registry: dict[str, Any] = {}
         self._saved: dict[str, Any] = {}
 
@@ -334,9 +343,29 @@ class ToolCallRecorder:
         @functools.wraps(fn)
         def wrapper(*args, **kwargs):
             self.calls.append(name)
-            return fn(*args, **kwargs)
+            result = fn(*args, **kwargs)
+            self._record_result(name, result)
+            return result
 
         return wrapper
+
+    def _record_result(self, name: str, result: Any) -> None:
+        """只记**成功返回**的工具结果（抛异常时由 loop 侧收敛成 tool_error，不伪造结果）。"""
+        try:
+            # 与生产同口径：喂给模型前先脱敏（tools/redaction 不可用时退回原文，绝不吞结果）
+            from hero_quant.tools.redaction import redact_tool_result
+
+            content = redact_tool_result(result, sink="result")
+        except Exception:  # noqa: BLE001 - 脱敏是增强项，失败必须退回原文而不是丢结果
+            try:
+                content = json.dumps(result, ensure_ascii=False, default=str)
+            except Exception:  # noqa: BLE001 - 连序列化都不行就 str()
+                content = str(result)
+        if not isinstance(content, str):
+            content = str(content)
+        self.results.append(
+            {"type": "tool_result", "tool": name, "content": content[: self.RESULT_STORE_LIMIT]}
+        )
 
     def __enter__(self) -> "ToolCallRecorder":
         from hero_quant.tools.registry import TOOL_REGISTRY
@@ -356,6 +385,7 @@ class ToolCallRecorder:
 
     def reset(self) -> None:
         self.calls.clear()
+        self.results.clear()
 
 
 def _contains(haystack: str, needle: str) -> bool:
@@ -371,17 +401,69 @@ def _no_data_declared(text: str) -> bool:
     return any(_contains(text, marker) for marker in NO_DATA_MARKERS)
 
 
+# 二段式总结状态（与生产 `/v1/query` 的 `query.final_summary` 日志同一套口径）：
+# - applied：拿到了新的结论文本（评测断言就该跑在这上面）；
+# - skipped_no_tools：没有工具结果，不发起调用（省一次无意义请求）；
+# - failed：总结抛异常 / 返回空 / 原样返回叙述（`_final_answer` 的失败回退语义），
+#   此时回退清洗后的叙述，评测继续跑——绝不因总结失败丢答案。
+FINAL_SUMMARY_APPLIED = "applied"
+FINAL_SUMMARY_SKIPPED_NO_TOOLS = "skipped_no_tools"
+FINAL_SUMMARY_FAILED = "failed"
+
+
+def final_summary_step(
+    llm: Any, query: str, narrative: str, tool_records: list[dict[str, Any]]
+) -> tuple[str, str]:
+    """评测侧二段式总结：直接调用生产同一函数 `api.server._final_answer`（不复制逻辑）。
+
+    背景：`AgentLoop` 在首个工具成功后即终止，`LoopResult.text` 只剩开场白 + 原始工具 JSON。
+    不对它做总结，评测测的就是「裸工具数据」而不是「真实答案」，`content_*` 断言会把
+    管线缺陷记成模型能力问题。
+
+    返回 `(最终文本, 状态)`；状态口径见上方常量。任何异常都收敛为 `failed` + 回退叙述。
+    """
+    text = narrative or ""
+    try:
+        from hero_quant.api.server import _clean_agent_text, _final_answer
+    except Exception as exc:  # noqa: BLE001 - 生产模块都导不进来=评测环境坏了，如实 failed
+        print(f"[eval-golden] WARN final_summary import failed: {type(exc).__name__}", file=sys.stderr)
+        return text, FINAL_SUMMARY_FAILED
+    # 与生产 `/v1/query` 响应对齐：先剥 `[tool ...]` / 不可信块。这样「回退裸叙述」
+    # 回退的是清洗后的叙述（=生产返回的 text），而不是工具 JSON。
+    text = _clean_agent_text(text)
+    if not tool_records:
+        return text, FINAL_SUMMARY_SKIPPED_NO_TOOLS
+    try:
+        raw = _final_answer(llm, query, text, tool_records)
+        # 与生产响应同口径：总结里若引用了 `[tool ...]` / 不可信块，同样要被剥掉
+        summary = _clean_agent_text(raw if isinstance(raw, str) else "")
+    except Exception as exc:  # noqa: BLE001 - 总结失败必须回退裸叙述，绝不丢答案
+        print(f"[eval-golden] WARN final_summary failed: {type(exc).__name__}", file=sys.stderr)
+        return text, FINAL_SUMMARY_FAILED
+    # `_clean_agent_text` 对纯空白原样返回，这里必须再 strip 判空；原样返回叙述
+    # 则是 `_final_answer` 的失败回退语义（它内部已 warning），同样按 failed 记账。
+    if not summary.strip() or summary.strip() == text.strip():
+        return text, FINAL_SUMMARY_FAILED
+    return summary, FINAL_SUMMARY_APPLIED
+
+
 def run_case(
     case: dict[str, Any],
     llm: Any,
     recorder: ToolCallRecorder | None = None,
     capture: dict[str, Any] | None = None,
+    *,
+    summarize: bool = False,
 ) -> dict[str, Any]:
     """跑一条用例并断言；异常收敛为失败分类，不中断整轮。
 
     `capture`（可选，real 模式用）回填 `text` / `llm_usage` / `elapsed_ms`：
     usage 归集需要完整文本与 `LoopResult.llm_usage`，而行内 `text_preview` 是截断的。
     fake 模式不传 `capture`，行结构保持原样。
+
+    `summarize`（real 模式开）：循环结束后按生产口径清洗叙述 + 调用生产同款二段式总结，
+    断言跑在「真实答案」上；结果行追加 `final_summary` / `loop_elapsed_ms` / `summary_elapsed_ms`。
+    fake 模式保持默认 False —— 行结构与 fake 产物不变（`results_golden_fake.json` 是 CI 门）。
     """
     from hero_quant.agent.loop import AgentLoop
 
@@ -393,6 +475,9 @@ def run_case(
     terminated = False
     grounding_verified = False
     elapsed_ms = 0.0
+    loop_elapsed_ms = 0.0
+    summary_elapsed_ms = 0.0
+    summary_state: str | None = None
     res = None
     t0 = time.monotonic()
     try:
@@ -408,6 +493,16 @@ def run_case(
     except Exception as exc:  # noqa: BLE001 - 评测必须把任何异常收敛为失败分类
         elapsed_ms = (time.monotonic() - t0) * 1000
         failures.append(f"loop_exception:{type(exc).__name__}:{exc}")
+    loop_elapsed_ms = elapsed_ms
+
+    if summarize:
+        tool_records = list(recorder.results) if recorder is not None else []
+        t_sum = time.monotonic()
+        text, summary_state = final_summary_step(llm, str(case["query"]), text, tool_records)
+        summary_elapsed_ms = (time.monotonic() - t_sum) * 1000
+        # 用户真实等待包含这次总结调用：p50/p95 与 latency 预算按总耗时算，
+        # 两个分项同时单列，避免「多了一次 LLM 调用却从时延里消失」。
+        elapsed_ms += summary_elapsed_ms
 
     for token in case.get("expected_contains") or []:
         if not _contains(text, token):
@@ -431,7 +526,7 @@ def run_case(
         capture["llm_usage"] = getattr(res, "llm_usage", None) if res is not None else None
         capture["text"] = text
         capture["elapsed_ms"] = elapsed_ms
-    return {
+    row = {
         "id": case.get("id"),
         "category": case.get("category"),
         "passed": not failures,
@@ -445,6 +540,13 @@ def run_case(
         "expect_grounding": case.get("expect_grounding"),
         "grounding_verified": grounding_verified,
     }
+    if summarize:
+        # 只在 real 模式补字段：fake 类目的行结构被 CI 门锁定（见
+        # tests/test_evals_harness_tools.py::test_fake_mode_row_shape_unchanged_without_capture）。
+        row["final_summary"] = summary_state or FINAL_SUMMARY_SKIPPED_NO_TOOLS
+        row["loop_elapsed_ms"] = round(loop_elapsed_ms, 3)
+        row["summary_elapsed_ms"] = round(summary_elapsed_ms, 3)
+    return row
 
 
 def _skipped_payload(reason: str, detail: str, *, golden: dict[str, Any]) -> dict[str, Any]:
@@ -571,7 +673,7 @@ def main(argv: list[str] | None = None) -> int:
     with ToolCallRecorder() as recorder:
         for case in cases:
             capture: dict[str, Any] = {}
-            row = run_case(case, client.llm, recorder, capture=capture)
+            row = run_case(case, client.llm, recorder, capture=capture, summarize=True)
             # 后端 usage 优先；后端没给（LoopResult.llm_usage=None）时 build_usage 会
             # 按字符启发式估算并置 estimated=True —— 如实透出，不用 0 冒充计量。
             usage = build_usage(
@@ -593,12 +695,19 @@ def main(argv: list[str] | None = None) -> int:
     ledger_summary = ledger.summary()
     metrics = aggregate(rows, quality=True)
     estimated_cases = sum(1 for r in rows if (r.get("usage") or {}).get("estimated"))
+    # 二段式总结覆盖度：不写出来就无法判断本轮分数是「真实答案」还是「总结没接上」。
+    final_summary_counts: dict[str, int] = {}
+    for row in rows:
+        key = str(row.get("final_summary") or FINAL_SUMMARY_SKIPPED_NO_TOOLS)
+        final_summary_counts[key] = final_summary_counts.get(key, 0) + 1
     payload = {
         "mode": "real",
         "status": "ok",
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "golden_set": golden_meta,
         "provider": provider_meta,
+        "final_summary": final_summary_counts,
+        "latency_accounting": "elapsed_ms = AgentLoop 耗时 + 二段式总结耗时（分项见逐行 loop_elapsed_ms / summary_elapsed_ms）",
         "cost_accounting": {
             "pricing_source": "hero_quant.llm.catalog.MODEL_CATALOG",
             "unit": "USD_per_1M_tokens",
@@ -617,6 +726,7 @@ def main(argv: list[str] | None = None) -> int:
     pass_rate = metrics.get("pass_rate")
     qm = metrics.get("quality_metrics") or {}
     print(f"[eval-golden] pass_rate={pass_rate} failure_classes={metrics.get('failure_classes')}")
+    print(f"[eval-golden] final_summary={final_summary_counts}")
     print(f"[eval-golden] latency_ms={metrics.get('latency_ms')}")
     print(f"[eval-golden] tool_selection={(qm.get('tool_selection') or {})}")
     print(f"[eval-golden] grounding={(qm.get('grounding') or {})}")

@@ -311,3 +311,239 @@ def test_base_url_host_strips_userinfo_path_and_query():
     assert RG.base_url_host("https://api.example.com") == "api.example.com"
     assert RG.base_url_host(None) is None
     assert RG.base_url_host("") is None
+
+
+# ---------------------------------------------------------------------------
+# 二段式总结接线（real 模式必须测「真实答案」而不是裸工具 JSON）
+# ---------------------------------------------------------------------------
+# 缺陷原型：`AgentLoop` 在首个工具成功后即终止，`LoopResult.text` 只剩开场白 +
+# `[tool ...]` 原始 JSON。评测侧若不补总结，`content_*` 断言测的就是裸工具数据，
+# 会把管线缺陷记成模型能力问题（上一轮 28 条 content_gap）。
+
+
+class _SummaryChat:
+    """未绑定工具的干净 chat：`_final_answer` 经 `llm._chat.bound` 命中它。"""
+
+    def __init__(self, text: str = "结论：600519 收盘 1680.2，回撤可控。不构成投资建议。"):
+        self.text = text
+        self.prompts: list[str] = []
+
+    def invoke(self, prompt):
+        self.prompts.append(prompt)
+        return SimpleNamespace(content=self.text)
+
+
+class _BoundChat:
+    """模拟 `RunnableBinding`：`.bound` 指向未绑工具的底层 chat（_final_answer 的关键路径）。"""
+
+    def __init__(self, inner: _SummaryChat):
+        self.bound = inner
+
+
+def _summary_llm(text: str = "结论：600519 收盘 1680.2，回撤可控。不构成投资建议。") -> tuple[LLMClient, _SummaryChat]:
+    inner = _SummaryChat(text)
+    return LLMClient(_BoundChat(inner)), inner
+
+
+_TOOL_RECORD = {"type": "tool_result", "tool": "get_market_data", "content": '{"close": 1680.2}'}
+
+
+def _summary_case() -> dict:
+    """断言 token 只出现在「总结结论」里——不接总结就一定 content_missing。"""
+    return {
+        "id": "T-SUM-01",
+        "category": "market_data",
+        "query": "600519 怎么样",
+        "expected_tools": ["get_market_data"],
+        "expected_contains": ["回撤可控"],
+        "expected_not_contains": [],
+        "max_latency_ms": 30000,
+    }
+
+
+def _patch_stub_loop(monkeypatch, recorder: "RG.ToolCallRecorder", text: str) -> dict:
+    """替换 AgentLoop：回放固定 LoopResult，并把「本轮工具结果」写进 recorder。
+
+    loop 侧真实产物是 trace 里的 `tool_result`；评测侧等价物就是 `recorder.results`，
+    这里按同一形状写入，保证 `_final_answer` 拿到的是真实工具结果而不是工具名。
+    """
+    from hero_quant.agent.loop import LoopResult
+
+    state = {"calls": 0}
+
+    class _StubLoop:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def run(self, goal):  # noqa: ARG002 - 只回放固定结果
+            state["calls"] += 1
+            recorder.results.append(dict(_TOOL_RECORD))
+            return LoopResult(terminated=True, iterations=1, text=text, reason="completed")
+
+    import hero_quant.agent.loop as loop_mod
+
+    monkeypatch.setattr(loop_mod, "AgentLoop", _StubLoop)
+    return state
+
+
+def test_final_summary_step_uses_production_function(monkeypatch):
+    """评测侧必须直接调 `api.server._final_answer`（同一函数），不另写一套总结。"""
+    calls: list[tuple] = []
+
+    def _spy(llm, q, narrative, tool_records):
+        calls.append((q, narrative, list(tool_records)))
+        return "结论：回撤可控。"
+
+    import hero_quant.api.server as srv
+
+    monkeypatch.setattr(srv, "_final_answer", _spy)
+
+    text, state = RG.final_summary_step(object(), "600519 怎么样", "裸叙述", [dict(_TOOL_RECORD)])
+
+    assert (text, state) == ("结论：回撤可控。", RG.FINAL_SUMMARY_APPLIED)
+    assert len(calls) == 1, "每条用例最多一次总结调用"
+    assert calls[0][2] == [_TOOL_RECORD], "必须把工具结果原样回喂"
+
+
+def test_final_summary_step_skips_without_tools_and_never_calls_llm():
+    """没有工具结果：不发调用，状态 skipped_no_tools，文本原样返回。"""
+    llm, chat = _summary_llm()
+
+    text, state = RG.final_summary_step(llm, "q", "裸叙述", [])
+
+    assert (text, state) == ("裸叙述", RG.FINAL_SUMMARY_SKIPPED_NO_TOOLS)
+    assert chat.prompts == [], "无工具时不得发起总结调用"
+
+
+def test_final_summary_step_marks_failed_on_exception_and_falls_back(monkeypatch):
+    """总结抛异常：状态 failed + 回退裸叙述（绝不因总结失败丢答案）。"""
+    import hero_quant.api.server as srv
+
+    def _boom(*a, **k):
+        raise RuntimeError("upstream 502")
+
+    monkeypatch.setattr(srv, "_final_answer", _boom)
+
+    text, state = RG.final_summary_step(_summary_llm()[0], "q", "裸叙述", [dict(_TOOL_RECORD)])
+
+    assert (text, state) == ("裸叙述", RG.FINAL_SUMMARY_FAILED)
+
+
+def test_final_summary_step_marks_failed_on_empty_or_echo(monkeypatch):
+    """总结返回空 / 原样返回叙述（`_final_answer` 的失败回退语义）→ failed。"""
+    import hero_quant.api.server as srv
+
+    monkeypatch.setattr(srv, "_final_answer", lambda *a, **k: "   ")
+    assert RG.final_summary_step(_summary_llm()[0], "q", "裸叙述", [dict(_TOOL_RECORD)])[1] == RG.FINAL_SUMMARY_FAILED
+
+    monkeypatch.setattr(srv, "_final_answer", lambda *a, **k: "裸叙述")
+    assert RG.final_summary_step(_summary_llm()[0], "q", "裸叙述", [dict(_TOOL_RECORD)])[1] == RG.FINAL_SUMMARY_FAILED
+
+
+def test_run_case_applies_final_summary_before_assertions(monkeypatch):
+    """real 模式：断言跑在总结后的真实答案上，行里记 final_summary=applied。"""
+    recorder = RG.ToolCallRecorder()
+    _patch_stub_loop(
+        monkeypatch,
+        recorder,
+        '开场白：正在取行情。\n[tool get_market_data result] {"close": 1680.2}',
+    )
+    llm, chat = _summary_llm()
+
+    row = RG.run_case(_summary_case(), llm, recorder, summarize=True)
+
+    assert row["final_summary"] == RG.FINAL_SUMMARY_APPLIED
+    assert row["passed"] is True, row["failures"]
+    assert row["text_preview"].startswith("结论：600519"), "行文本必须换成总结结论"
+    assert row["loop_elapsed_ms"] >= 0 and row["summary_elapsed_ms"] >= 0
+    assert row["elapsed_ms"] >= row["loop_elapsed_ms"], "总耗时含总结调用"
+    assert len(chat.prompts) == 1, "每条用例最多一次总结调用"
+    assert "600519 怎么样" in chat.prompts[0], "总结 prompt 必须带用户问题"
+    assert "1680.2" in chat.prompts[0], "总结 prompt 必须带真实工具结果"
+
+
+def test_run_case_without_summarize_keeps_raw_tool_text(monkeypatch):
+    """不传 summarize（fake 模式口径）：不调总结，断言仍跑在裸文本上，行结构不加字段。"""
+    recorder = RG.ToolCallRecorder()
+    _patch_stub_loop(
+        monkeypatch,
+        recorder,
+        '开场白：正在取行情。\n[tool get_market_data result] {"close": 1680.2}',
+    )
+    llm, chat = _summary_llm()
+
+    row = RG.run_case(_summary_case(), llm, recorder)
+
+    assert "final_summary" not in row and "summary_elapsed_ms" not in row
+    assert chat.prompts == [], "未开 summarize 时绝不允许发总结调用"
+    assert row["passed"] is False and "content_missing:回撤可控" in row["failures"]
+
+
+def test_run_case_records_skipped_no_tools(monkeypatch):
+    """real 模式但本轮没有工具结果：状态 skipped_no_tools + 不发调用。"""
+    recorder = RG.ToolCallRecorder()
+
+    from hero_quant.agent.loop import LoopResult
+
+    class _NoToolLoop:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def run(self, goal):  # noqa: ARG002 - 纯文本路径
+            return LoopResult(terminated=True, iterations=1, text="纯文本回答", reason="completed")
+
+    import hero_quant.agent.loop as loop_mod
+
+    monkeypatch.setattr(loop_mod, "AgentLoop", _NoToolLoop)
+    llm, chat = _summary_llm()
+
+    row = RG.run_case(_summary_case(), llm, recorder, summarize=True)
+
+    assert row["final_summary"] == RG.FINAL_SUMMARY_SKIPPED_NO_TOOLS
+    assert chat.prompts == []
+    assert row["summary_elapsed_ms"] < 1.0, "没发调用时总结耗时应当≈0"
+
+
+def test_tool_call_recorder_stores_tool_result_content():
+    """recorder 必须留下「工具真实结果」（形状同 trace 的 tool_result），供总结回喂。"""
+    recorder = RG.ToolCallRecorder()
+    with recorder:
+        from hero_quant.tools.registry import TOOL_REGISTRY
+
+        spec = TOOL_REGISTRY["list_markets"] if "list_markets" in TOOL_REGISTRY else None
+        if spec is None:  # 注册表未导入时先注册（离线纯本地）
+            _register_tools()
+        name = "list_markets" if "list_markets" in TOOL_REGISTRY else sorted(TOOL_REGISTRY)[0]
+        spec = TOOL_REGISTRY[name]
+        try:
+            spec.func()
+        except Exception:  # noqa: BLE001 - 工具本身可能缺数据源；这里只验记录形状
+            pass
+
+    assert recorder.calls, "recorder 必须记录调用名"
+    records = [r for r in recorder.results if r["tool"] == name]
+    assert records, "recorder 必须留下本轮工具结果"
+    assert records[0]["type"] == "tool_result"
+    assert isinstance(records[0]["content"], str)
+
+    recorder.reset()
+    assert recorder.results == [] and recorder.calls == []
+
+
+def test_final_summary_step_cleans_narrative_like_production(monkeypatch):
+    """回退叙述也必须是「清洗后」的：生产 `/v1/query` 返回的 text 就是清洗后的。"""
+    narrative = '开场白：先取一段行情。\n[tool get_market_data result] {"close": 1680.2}'
+
+    text, state = RG.final_summary_step(object(), "q", narrative, [])
+    assert state == RG.FINAL_SUMMARY_SKIPPED_NO_TOOLS
+    assert "[tool " not in text and text.startswith("开场白")
+
+    import hero_quant.api.server as srv
+
+    def _boom(*a, **k):
+        raise RuntimeError("upstream 502")
+
+    monkeypatch.setattr(srv, "_final_answer", _boom)
+    text, state = RG.final_summary_step(_summary_llm()[0], "q", narrative, [dict(_TOOL_RECORD)])
+    assert state == RG.FINAL_SUMMARY_FAILED
+    assert "[tool " not in text, f"回退叙述不得把工具 JSON 当答案: {text!r}"

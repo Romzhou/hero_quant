@@ -2265,7 +2265,57 @@ async def query(request: Request, background_tasks: BackgroundTasks, q: str = ""
             _shadow = _get_shadow_stub()
         except Exception as _e:
             logger.warning("shadow.after_run_failed", error=str(_e), exc_info=_e)
-        out = {"query": q, "text": _clean_agent_text(res.text), "reason": res.reason, "grounding_verified": res.grounding_verified, "trace_path": res.trace_path, "token_count": res.token_count}
+        # 中文：二段式总结（链A / sync `/v1/query`）——AgentLoop 在首个工具成功后即终止
+        # （loop.py:1814-1817），`res.text` 只剩开场白 + `[tool ...]` 原始 JSON。
+        # 调用点事实（勿用 `grep "_final_answer("` 判断：两处调用都是把函数对象传给
+        # asyncio.to_thread，名字后面没有 `(`，所以该 grep 只命中 server.py:296 的定义）：
+        #   - `/v1/query/stream`：本批之前就在调（`asyncio.to_thread(_final_answer, ...)`）；
+        #   - sync `/v1/query`（本段）：本批之前**零调用**，直接把清洗后的工具 JSON 当答案
+        #     返回、没有结论——评测里的 content_gap 就是这么来的。本批只补 sync，流式不动。
+        # 这里复用同一个函数（不另写一套 prompt），并把总结结果再走一遍 `_clean_agent_text`
+        # （总结若引用了工具块/不可信块同样会被剥掉）。取舍：总结失败/为空一律回退清洗后的
+        # 叙述——绝不因总结失败丢答案；`_FakeLLM`（无 key 降级）与无工具记录不调用。
+        _answer_text = _clean_agent_text(res.text)
+        _tool_records: list = []
+        if not _llm_degraded and trace is not None:
+            try:
+                # resolve_offloads=True：大结果落侧车时回灌原文，否则总结只看得到 preview。
+                _traced = await asyncio.to_thread(trace.read, True)
+                _tool_records = [
+                    _rec for _rec in (_traced or []) if isinstance(_rec, dict) and _rec.get("type") == "tool_result"
+                ]
+            except Exception as _e:
+                # 读 trace 只影响总结，正文照发；异常原文只进日志，不进响应体。
+                logger.warning("query.trace_read_failed", error=str(_e), error_code="trace_read_failed")
+                _inc_api_error("query", "trace_read_failed")
+                _tool_records = []
+        # 降级（无 key/_FakeLLM）与「这轮没跑工具」是两回事，日志里必须分开。
+        _final_summary_mode = "skipped_degraded_llm" if _llm_degraded else "skipped_no_tools"
+        if _tool_records:
+            try:
+                _summary_raw = await asyncio.to_thread(_final_answer, llm, q, _answer_text, _tool_records)
+            except Exception as _e:
+                # `_final_answer` 内部已兜底（失败回退 narrative）；此处只防 wrapper 层意外，
+                # 同样不改状态码、不把异常原文透给用户。
+                logger.warning("query.final_summary_failed", error=str(_e), error_code="final_summary_failed")
+                _summary_raw = ""
+            _summary_text = _clean_agent_text(_summary_raw)
+            # 判据：非空且确实带来新结论才算 applied；原样返回叙述即 `_final_answer` 的回退语义。
+            # 注意 `_clean_agent_text` 对纯空白会原样返回，这里必须再 strip 判空，
+            # 否则空白总结会被当成「新结论」覆盖掉真实答案。
+            if _summary_text and _summary_text.strip() and _summary_text.strip() != (_answer_text or "").strip():
+                _answer_text = _summary_text
+                _final_summary_mode = "applied"
+            else:
+                _final_summary_mode = "failed"
+                _inc_api_error("query", "final_summary_failed")
+        logger.info(
+            "query.final_summary",
+            final_summary=_final_summary_mode,
+            tool_records=len(_tool_records),
+            chain="A",
+        )
+        out = {"query": q, "text": _answer_text, "reason": res.reason, "grounding_verified": res.grounding_verified, "trace_path": res.trace_path, "token_count": res.token_count}
         if _shadow is not None:
             out["shadow"] = _shadow
         # interaction: if loop reason indicates approval needed, surface it
