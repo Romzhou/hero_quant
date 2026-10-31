@@ -57,5 +57,13 @@ export default defineConfig({
       name: 'reconciliation',
       testMatch: /reconciliation\.spec\.ts/,
     },
+    {
+      name: 'compliance',
+      testMatch: /compliance\.spec\.ts/,
+    },
+    {
+      name: 'role-guard',
+      testMatch: /role-guard\.spec\.ts/,
+    },
   ],
 });
