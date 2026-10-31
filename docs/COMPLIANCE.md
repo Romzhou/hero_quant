@@ -25,12 +25,20 @@
 - **系统与运营风险**：单机部署、网络抖动、LLM 重试/预算断路（`agent/policies.py`）、PG 不可达时 checkpoint 回退 `memory` 或 emulated 桩、Redis 缺失时限流 fail-closed 等，均可能导致延迟、功能不可用或结果不一致；建议结合监控 `/metrics` 与日志 `X-Request-ID` 巡检。
 - **合规风险**：量化策略发布、投顾与资管业务在多地需持牌；用户需自行履行适当性、信息披露与风控义务。
 
-## 4. 适用范围与责任边界
+## 4. 隐私与令牌（Privacy & Token）
+
+- **令牌存储**：登录令牌（Bearer JWT）只保存在**本机浏览器** `localStorage`（键 `hero-quant.token`），不上传任何第三方、不写入服务端日志；设置页「清除令牌」即恢复匿名状态。
+- **前端解析不构成授权**：前端只解码 JWT payload 展示租户/角色，**不验签、不裁决权限**；401/403 一律由后端裁决（`src/hero_quant/auth/`）。前端路由守卫仅是 UX 提示，不是安全边界。
+- **数据边界**：问答 prompt/工具结果会发送到配置的 LLM 提供方（`HERO_LLM_PROVIDER` / `HERO_LLM_BASE_URL`）；部署方需确认该提供方的数据处理条款。日志只记录 `trace_id`/计数/成本，敏感字段按 `security/redaction.py` 脱敏。
+- **删除与保留**：当前版本**没有**对外提供“删除我的数据/导出/令牌撤销”接口；会话与审计数据的保留策略见 PR-241（未完成），在此之前由部署方手工执行库级清理。
+
+## 5. 适用范围与责任边界
 
 - 本系统面向投研辅助与自动化报告，不替代持牌投顾与风控流程；生产环境建议叠加人工复核、权限分级与审计（`governance/ledger` Hash 链 + `dedup` 幂等）。
 - 如将输出用于对外服务、客户报告或交易执行，部署方应补充法律审查、隐私与数据跨境合规评估。
 
-## 5. 参考与更新
+## 6. 参考与更新
 
 - 相关实现：`src/hero_quant/data/registry.py`（16 源注册表）、`src/hero_quant/backtest/validation.py`（PIT）、`src/hero_quant/governance/ledger.py`（审计链）。
 - 本文件随版本迭代更新，重大变更将在 `CHANGELOG` 与 `README` 中公告。
+- 产品内入口：前端 `/compliance` 页（与本文同步；版本见页面底部）。
