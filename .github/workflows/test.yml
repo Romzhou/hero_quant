@@ -32,6 +32,11 @@ jobs:
       PGPASSWORD: postgres
     steps:
       - uses: actions/checkout@v6
+        with:
+          # gitleaks-action 用 push 事件的 before/after 组 `git log <base>^..<head>` 范围扫描；
+          # 默认 fetch-depth=1 的浅克隆解析不到 base（报 "ambiguous argument ... unknown revision"），
+          # 于是 secret scan 会在"没有发现任何泄漏"的情况下以 exit 1 假红。必须取完整历史。
+          fetch-depth: 0
       - uses: actions/setup-python@v7
         with:
           python-version: '3.11'
