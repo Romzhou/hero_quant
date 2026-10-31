@@ -1,0 +1,21 @@
+# gitleaks 配置：只放行「明确的占位符 / 测试假密钥」，不放行整个文件或目录。
+#
+# 背景（2026-10-31）：CI 的 secret scan 在 master 上第一次真正跑到（此前 pytest
+# 先失败，gitleaks 步骤从未执行）。12 条命中全部是：
+#   - deploy/env/*.env.example 的 `replace-with-32-alnum` 占位符；
+#   - 测试里用于验证脱敏的 `sk-1234567890abcdef` / `sk-live-0123456789abcdef` 假值。
+# 这里按「整行正则」放行这些模式；真实 key 的随机串不会命中，仍然会被拦。
+#
+# 修改规则时必须保持窄口径：不要按目录/文件整体 allowlist，否则等于关掉该目录的扫描。
+[allowlist]
+description = "Known placeholders and fake keys used by redaction tests"
+regexTarget = "line"
+regexes = [
+  '''replace-with-[a-z0-9-]+''',
+  # 测试专用假值（逐个列全，避免用宽泛的 sk-* 规则误放真实 key）
+  '''sk-1234567890abcdef''',
+  '''sk-secret-1234567890''',
+  '''sk-live-1234567890''',
+  '''sk-live-0123456789abcdef''',
+  '''ak-live-0123456789abcdef''',
+]
