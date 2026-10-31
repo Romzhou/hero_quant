@@ -117,6 +117,51 @@ def _synthetic_prices_for_backtest(index, ticker: str):
     return df
 
 
+# ---------------------------------------------------------------- 时间参数守卫
+# 中文：start/end/as_of/weights_on 都是 LLM 传来的不可信字符串，历史上直接下传引擎。
+# 一旦模型把价格列名当日期（BT-01：weights_on="close"），就会在
+# validation.py 里炸出 "invalid timestamp: Unknown datetime string format, unable to
+# parse: close"——既不点名参数也没有稳定错误码，调用方无法自纠。故在工具边界先解析：
+# 非法值 fail-closed 返回稳定错误码，合法值才继续往下走。
+ERR_INVALID_TIMESTAMP_ARGUMENT = "invalid_timestamp_argument"
+
+# 中文：模型最常把价格列名误当时间参数，错误文案点名这类混淆（仅用于提示，不是白名单）。
+_PRICE_COLUMN_LIKE = frozenset(
+    {"close", "open", "high", "low", "adj_close", "adjclose", "volume", "vol", "amount", "turnover", "date", "time"}
+)
+
+
+def _invalid_time_arg_msg(name: str, value: Any, detail: str) -> str:
+    """构造非法时间参数的可读错误串（含稳定错误码 + 参数名 + 可自纠提示）。"""
+    hint = "expected a date string like '2024-01-01'"
+    if isinstance(value, str) and value.strip().lower() in _PRICE_COLUMN_LIKE:
+        hint += f"; {value.strip()!r} looks like a column name, not a date"
+    return f"{ERR_INVALID_TIMESTAMP_ARGUMENT}: {name}={value!r} is not a valid date ({hint}): {detail}"
+
+
+def _parse_time_arg(name: str, value: Any) -> tuple[Any, str | None]:
+    """把时间参数收敛为 pd.Timestamp，返回 (ts|None, 错误串|None)；绝不抛异常。
+
+    - None / 纯空白串 → 视为未提供（模型常把可选参数填空串，按缺省处理但留痕）；
+    - 无法解析或解析成 NaT → 返回错误串（NaT 会让 PIT 比较静默失效，必须拒绝）。
+    """
+    if value is None:
+        return None, None
+    if isinstance(value, str) and not value.strip():
+        # 中文：空串按“未提供”处理，但要留痕，不能静默——否则无法区分漏参与真给了空值。
+        logger.warning("run_backtest blank %s argument treated as absent", name)
+        return None, None
+    import pandas as pd
+
+    try:
+        ts = value if isinstance(value, pd.Timestamp) else pd.Timestamp(value)
+    except (ValueError, TypeError, OverflowError) as e:
+        return None, _invalid_time_arg_msg(name, value, str(e))
+    if ts is pd.NaT or pd.isna(ts):
+        return None, _invalid_time_arg_msg(name, value, "parsed to NaT")
+    return ts, None
+
+
 @tool(
     name="run_backtest",
     description="Run PIT-correct backtest for a symbol/weights over date range (engine-backed, costs, engine param).",
@@ -144,6 +189,7 @@ def _synthetic_prices_for_backtest(index, ticker: str):
             "metrics": {"type": "object"},
             "ok": {"type": "boolean"},
             "error": {"type": "string"},
+            "error_code": {"type": "string"},
             "engine": {"type": "string"},
             "provenance": {"type": "object"},
             "non_pit": {"type": "boolean"},
@@ -175,6 +221,9 @@ def run_backtest(
     - 推断出的基准日不是调用方声明的 PIT 时点，返回体必须 non_pit=True 且
       pit_basis="inferred_as_of"；显式 as_of 记 "explicit_as_of"。
     - weights_on 缺省交给引擎（= price_date）；显式传入时引擎校验 weights_on<=price_date。
+    - start/end/as_of/weights_on 在入口先按日期解析（fail-closed）：列名等非法值直接返回
+      {ok:False, error_code:"invalid_timestamp_argument"}，不再下传到引擎炸出无参数的
+      "invalid timestamp: ... unable to parse: close"。
 
     中文：此前 is_synthetic 自动 opt-in allow_synthetic 旁路 PIT，且 provenance
     丢 unit 字段。修复后：无真实行情默认 fail-closed 返回 {ok:False}（不再静默
@@ -223,6 +272,32 @@ def run_backtest(
         _up = str(symbol or "").upper()
         _unit = "board_lots" if (_up.endswith(".SH") or _up.endswith(".SZ")) else "shares"
         return {"source": "market", "unit": _unit, "adjust": "unknown"}
+
+    # ---- 时间参数守卫（fail-closed，先于任何行情拉取）----
+    # 中文：列名/乱串当日期必须在工具边界被点名拒绝，不能一路下传到引擎的
+    # pd.Timestamp() 里变成 "invalid timestamp: ... unable to parse: close"。
+    _time_ts: dict[str, Any] = {}
+    for _arg_name, _arg_val in (
+        ("start", start),
+        ("end", end),
+        ("as_of", as_of),
+        ("weights_on", weights_on),
+    ):
+        _ts, _err = _parse_time_arg(_arg_name, _arg_val)
+        if _err:
+            logger.warning("run_backtest rejected %s=%r: %s", _arg_name, _arg_val, _err)
+            return {
+                "equity": [],
+                "metrics": {},
+                "ok": False,
+                "error": _err,
+                "error_code": ERR_INVALID_TIMESTAMP_ARGUMENT,
+                "engine": engine or "default",
+                "provenance": _prov_envelope("market", None),
+            }
+        _time_ts[_arg_name] = _ts
+    as_of_ts = _time_ts["as_of"]
+    weights_on_ts = _time_ts["weights_on"]
 
     # 逗号多标的必查（即使 weights 长度为 1，也属 tickers-vs-weights 错位）。
     # 提前到行情拉取之前：参数错位是调用方错误，不应被“拉取失败”信封掩盖。
@@ -369,22 +444,13 @@ def run_backtest(
         prices = prices.drop(columns=["open"], errors="ignore")
 
     # ---- PIT 基准日：显式 as_of 优先，缺省推断为最后一根 K 线 ----
-    inferred_as_of = as_of is None
-    if as_of is None:
+    # 中文：as_of 已在入口守卫里解析成 Timestamp（非法值早退），此处直接用解析结果，
+    # 不再二次 pd.Timestamp(str)——那正是把 "close" 之类列名送进解析器的地方。
+    inferred_as_of = as_of_ts is None
+    if as_of_ts is None:
         price_date = prices.index[-1]
     else:
-        try:
-            price_date = pd.Timestamp(as_of)
-        except (ValueError, TypeError) as e:
-            logger.warning("run_backtest invalid as_of %r: %s", as_of, e)
-            return {
-                "equity": [],
-                "metrics": {},
-                "ok": False,
-                "error": f"invalid as_of {as_of!r}: {e}",
-                "engine": engine or "default",
-                "provenance": _prov_envelope("synthetic" if is_synthetic else "market", live_prov),
-            }
+        price_date = as_of_ts
         if price_date > prices.index[-1]:
             logger.warning("run_backtest as_of %s is after last bar %s", as_of, prices.index[-1])
             return {
@@ -407,8 +473,9 @@ def run_backtest(
         _eng_kw = {"allow_synthetic": True} if (is_synthetic and allow_synthetic) else {}
         # 真实行情必须显式给 price_date，否则 engine.py 的 PIT fail-closed 恒抛
         _eng_kw["price_date"] = price_date
-        if weights_on is not None:
-            _eng_kw["weights_on"] = weights_on
+        if weights_on_ts is not None:
+            # 中文：传已解析的 Timestamp，不再把 LLM 原文直接下传引擎
+            _eng_kw["weights_on"] = weights_on_ts
         res = eng.run(prices, weights=weights, costs=float(costs) if costs is not None else 0.0005, engine=engine or "default", **_eng_kw)
     except (ValueError, RuntimeError) as e:
         logger.warning("run_backtest engine failed: %s", e, exc_info=True)

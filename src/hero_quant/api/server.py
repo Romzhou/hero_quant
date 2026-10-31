@@ -240,11 +240,39 @@ def _clean_agent_text(text: str) -> str:
     """移除 AgentLoop buffer 中内联的 [tool xxx result] 原始 JSON 行与错误横幅，仅保留模型叙述。
 
     工具结果已由 SSE type=tool 事件单独展示，正文不该再重复大段 JSON。
+
+    PR-152 之后工具结果在 buffer 里被 `<<UNTRUSTED_TOOL_DATA ...>>` / `<<END_UNTRUSTED_TOOL_DATA>>`
+    包裹（`security/untrusted.py:wrap_tool_output`）。这些边界行、固定提示行与中间的原文
+    都属「不可信数据」，绝不能进用户可见答案——故在行过滤之前先整块剥离：
+    闭标记缺失时从开标记剥到文本末尾（不留半段原文）；只认这两个精确 tag（大小写敏感），
+    普通正文里的 `<<`（如 `a << b`、JSON 比较符）不受影响。
+
+    空结果分两种（避免「清洗后回退原文」把工具块整段漏出去）：
+    - 原文出现过不可信块 → 剥完为空就返回 ""（宁可空答也不泄露工具内部数据），debug 留痕；
+    - 原文没有不可信块 → 维持既有 `cleaned or text` 回退（`[ERROR: ...]` 等仍原样返回）。
     """
     if not text:
         return text
+
+    def _strip_untrusted_blocks(raw: str) -> tuple[str, bool]:
+        """删除整块不可信数据（开→闭标记含中间内容）；未闭合则剥到末尾。
+
+        返回 (清洗后文本, 是否真的剥掉过块)；只用一次正则扫描，供上层区分空结果语义。
+        """
+        if "<<UNTRUSTED_TOOL_DATA" not in raw:
+            # 快路径：绝大多数回答没有块，避免对大文本白跑一次 DOTALL 扫描
+            return raw, False
+        out = re.sub(
+            r"<<UNTRUSTED_TOOL_DATA\b.*?(?:<<END_UNTRUSTED_TOOL_DATA>>|\Z)",
+            "",
+            raw,
+            flags=re.DOTALL,
+        )
+        return out, out != raw
+
+    _body, _stripped_block = _strip_untrusted_blocks(text)
     lines: list[str] = []
-    for ln in text.splitlines():
+    for ln in _body.splitlines():
         s = ln.strip()
         if s.startswith("[tool ") and s.endswith("}"):
             continue
@@ -252,6 +280,16 @@ def _clean_agent_text(text: str) -> str:
             continue
         lines.append(ln)
     cleaned = "\n".join(lines).strip()
+    if _stripped_block:
+        # 中文：剥过不可信块就绝不回退原文——否则「只有工具块没有叙述」时会把整段工具
+        # 内部数据（含注入载荷）原样回给用户。空答 + debug 留痕是正确取舍。
+        if not cleaned:
+            logger.debug(
+                "agent_text_clean.untrusted_only",
+                error_code="agent_text_untrusted_only",
+                original_chars=len(text),
+            )
+        return cleaned
     return cleaned or text
 
 

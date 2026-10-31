@@ -35,6 +35,28 @@ class ValidationError(Exception):
     """输入违反 PIT/价格/币种任一正确性约束时抛出。"""
 
 
+def _pit_timestamp(name: str, value: object) -> pd.Timestamp:
+    """解析单个 PIT 时间参数，失败即 fail-closed 抛 ValidationError。
+
+    - 错误串同时给「参数名 + 稳定错误码 invalid_timestamp_argument + 原始值」，
+      便于调用方定位（旧串只有 pandas 原文，无法判断是 weights_on 还是 price_date）；
+    - NaT 一律拒绝：NaT 的比较恒为 False，会让 PIT 校验静默失效。
+    """
+    try:
+        ts = pd.Timestamp(value)  # type: ignore[arg-type]
+    except (ValueError, TypeError, AttributeError, OverflowError) as e:
+        raise ValidationError(
+            f"invalid timestamp: {name}={value!r} is not a datetime "
+            f"(error_code=invalid_timestamp_argument): {e}"
+        ) from e
+    if ts is pd.NaT or pd.isna(ts):
+        raise ValidationError(
+            f"invalid timestamp: {name}={value!r} parsed to NaT "
+            "(error_code=invalid_timestamp_argument)"
+        )
+    return ts
+
+
 def validate(
     prices: pd.DataFrame,
     weights_on: str | pd.Timestamp | None = None,
@@ -109,11 +131,11 @@ def validate(
         # aware side carries a NON-UTC offset — is fail-closed rejected, since
         # assuming UTC for the naive side could invert the verdict by hours.
         # Same-instant pairs (incl. UTC-aware vs naive) compare exactly.
-        try:
-            _w_ts_raw = pd.Timestamp(weights_on)
-            _p_ts_raw = pd.Timestamp(price_date)
-        except (ValueError, TypeError, AttributeError) as e:
-            raise ValidationError(f"invalid timestamp: {e}") from e
+        # 中文：两个 PIT 时间参数分别解析——旧实现把两者塞进同一个 try，报错只说
+        # "invalid timestamp: <pandas 原文>"，既不知是哪个参数、也没有稳定错误码，
+        # 调用方（含 LLM 工具层把列名 "close" 当日期）无法定位与自纠。
+        _w_ts_raw = _pit_timestamp("weights_on", weights_on)
+        _p_ts_raw = _pit_timestamp("price_date", price_date)
         _w_aware = _w_ts_raw.tz is not None
         _p_aware = _p_ts_raw.tz is not None
         if _w_aware != _p_aware:
