@@ -349,6 +349,40 @@ def _llm_base_url_from_env() -> str | None:
     return f"{scheme}://{rest}".rstrip("/")
 
 
+# ---- PR-151 密钥托管（B10-B）：env gate 唯一入口，secrets 包不得直读 os.getenv ----
+# tests/test_config.py::test_no_raw_getenv_outside_config 锁定「src 下除 config 外无 os.getenv」，
+# 故 secrets 包经下面两个函数取 env，散落的 os.getenv 不扩散到 src/hero_quant/secrets/。
+_SECRETS_BACKENDS = ("env",)
+# 已登记但本构建未实现：settings 层放行（配置合法），运行时由 get_secrets_provider 显式抛
+# UnsupportedSecretsBackendError，绝不静默回落 env（明文 .env 不等于"已托管"）。
+_SECRETS_RESERVED_BACKENDS = ("vault", "kms")
+_DEFAULT_SECRETS_BACKEND = "env"
+
+
+def secrets_backend_from_env() -> str:
+    """HERO_SECRETS_BACKEND：密钥托管后端；默认 env；未知值直接 ValueError（fail-closed）。
+
+    vault/kms 在本构建中登记但未实现：这里**不**抛（配置层面合法），由
+    hero_quant.secrets.manager.get_secrets_provider 抛 UnsupportedSecretsBackendError，
+    避免"配了 vault 却静默拿到 .env 明文值"的谎报。
+    """
+    raw = (os.getenv("HERO_SECRETS_BACKEND", "") or "").strip().lower()
+    if not raw:
+        return _DEFAULT_SECRETS_BACKEND
+    if raw in _SECRETS_BACKENDS or raw in _SECRETS_RESERVED_BACKENDS:
+        return raw
+    raise ValueError(f"HERO_SECRETS_BACKEND must be one of {sorted(_SECRETS_BACKENDS + _SECRETS_RESERVED_BACKENDS)}, got {raw!r}")
+
+
+def secret_env_value(env_var: str) -> str | None:
+    """secrets 包读取 env 的唯一入口：空串视同未配置（返回 None，不造值）。
+
+    不做 strip —— 密钥首尾空白是有意的字节，裁剪会静默改值。
+    """
+    raw = os.getenv(env_var, "")
+    return raw or None
+
+
 # 中文：W1 身份/配额 env 统一在此解析，auth 包不得直读 os.environ（便于审计与热更新）。
 _AUTH_MODES = ("off", "enforce")
 _DEFAULT_OIDC_ALGORITHMS = ("RS256",)
@@ -465,6 +499,9 @@ class Settings:
     # PII 加密/脱敏：统一在此 gate 解析，避免 api.middleware.pii 直接读环境变量（test_config 架构门禁校验）
     pii_encryption_key: str = field(default_factory=lambda: (os.getenv("PII_ENCRYPTION_KEY", "") or "").strip(), repr=False)
     pii_allow_legacy_noenc: bool = field(default_factory=lambda: (os.getenv("PII_ALLOW_LEGACY_NOENC", "") or "").strip() == "1")
+    # PR-151 密钥托管后端：env（默认，明文 .env）/ vault / kms（登记未实现，运行时显式报错）。
+    # 注意：本字段**不是**密钥读取通道，取密钥走 hero_quant.secrets.get_secrets_provider()。
+    secrets_backend: str = field(default_factory=secrets_backend_from_env)
     # /ready 与 billing 的两个降级开关：统一经本网关解析，禁止调用方直读 os.environ。
     # 默认均为 false：fail-open 于可用性（缺 COHERE key 只 warning、/ready 不因此变红）、
     # fail-closed 于谎报（billing 未配 DSN 仍显式不可用，绝不静默降级成假成功）。
