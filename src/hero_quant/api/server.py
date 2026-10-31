@@ -1581,6 +1581,59 @@ def _get_billing_service():
             return None
 
 
+def _execute_select_once(conn) -> None:
+    """在已取得的连接上真跑一次 `SELECT 1`。
+
+    中文（b9 fail-closed 收口）：旧实现把 `_conn.execute` 的**任何**异常都 `except Exception`
+    吞掉，再用 cursor 重试一次——首个失败原因就此丢失（/ready 只说 degraded，日志看不出为什么），
+    且「吞掉错误再试第二种写法」让失败语义变得不可判定。现在只保留一种回落：驱动不认
+    `execute(..., timeout=)` 关键字（TypeError，psycopg3 就是这种）时退回 cursor 形态；
+    其它异常一律上抛，由 `_checkpoint_pg_select` 统一 fail-closed。
+    """
+    try:
+        conn.execute("SELECT 1", timeout=1)  # type: ignore[call-arg]
+        return
+    except TypeError:
+        pass  # 仅「参数形态不匹配」才回落，不吞真实错误
+    with conn.cursor() as cur:  # type: ignore[union-attr]
+        cur.execute("SELECT 1")
+
+
+def _checkpoint_pg_select(pool) -> tuple[bool, str]:
+    """对 checkpoint 池做一次真实 SELECT 1 探活，返回 `(ok, error_code)`。
+
+    中文：**任何异常都是 fail-closed**（ok=False），并把 `error_code` 交给调用方落
+    `structlog`（`ready.checkpoint_select_failed`），供 `/ready` 降级口径追因；
+    不支持 connection/getconn 的池直接判失败（deny-by-default），不再靠「pool 非 None」放行。
+    """
+    try:
+        if hasattr(pool, "connection"):
+            try:
+                conn_cm = pool.connection(timeout=1)  # type: ignore[call-arg]
+            except TypeError:
+                # 自定义/旧池的 connection() 不接 timeout=：退回无参形态（仍然真跑 SELECT）
+                conn_cm = pool.connection()
+            with conn_cm as conn:
+                _execute_select_once(conn)
+            return True, ""
+        if hasattr(pool, "getconn"):
+            try:
+                conn = pool.getconn(timeout=1)  # type: ignore[call-arg]
+            except TypeError:
+                conn = pool.getconn()
+            try:
+                _execute_select_once(conn)
+            finally:
+                try:
+                    pool.putconn(conn)  # type: ignore[attr-defined]
+                except Exception as _e:
+                    logger.warning("ready.checkpoint_putconn_failed", error_code="checkpoint_putconn_failed", exc_info=_e)
+            return True, ""
+    except Exception as _e:  # noqa: BLE001 — 探活失败必须 fail-closed，绝不静默放行
+        return False, f"checkpoint_select_failed:{type(_e).__name__}"
+    return False, "checkpoint_pool_unsupported"
+
+
 def _check_checkpoint_pg() -> tuple[bool, str]:
     """实探 checkpoint PG：仅当 _is_real_pg_pool 且 SELECT 1 成功才算 pg_ok，否则 fail-closed 为 memory。"""
     try:
@@ -1595,8 +1648,9 @@ def _check_checkpoint_pg() -> tuple[bool, str]:
         saver = _get_checkpoint_saver()
         if saver is None:
             return False, "memory"
-        # 唯一判据：_is_real_pg_pool
+        # 唯一判据：_is_real_pg_pool（deny-by-default：两个能力探测都不认的对象不得放行）
         is_real = getattr(saver, "_is_real_pg_pool", None)
+        is_pg_mode = getattr(saver, "_is_pg_mode", None)
         if callable(is_real):
             try:
                 if not bool(is_real()):
@@ -1604,53 +1658,34 @@ def _check_checkpoint_pg() -> tuple[bool, str]:
             except Exception as _e:
                 logger.warning("ready.checkpoint_not_real", dsn=_redact_dsn_api(dsn), exc_info=_e)
                 return False, "memory"
-        elif hasattr(saver, "_is_pg_mode"):
+        elif callable(is_pg_mode):
             try:
-                if not bool(saver._is_pg_mode()):
+                if not bool(is_pg_mode()):
                     return False, "memory"
             except Exception as _e:
                 logger.warning("ready.checkpoint_not_pg_mode", dsn=_redact_dsn_api(dsn), exc_info=_e)
                 return False, "memory"
+        else:
+            # 中文：既无 _is_real_pg_pool 也无 _is_pg_mode 的对象无法自证「真池」，
+            # 旧实现只凭 pool 非空就继续探活（等于给桩对象开后门）→ 现直接 fail-closed。
+            logger.warning(
+                "ready.checkpoint_capability_missing",
+                dsn=_redact_dsn_api(dsn),
+                dsn_host=_dsn_host(dsn),
+                error_code="checkpoint_capability_missing",
+            )
+            return False, "memory"
         # 无池直接 fail-closed
         pool = getattr(saver, "pool", None)
         if pool is None:
             return False, "memory"
-        # 实探 SELECT 1（带 2s 超时，避免阻塞 /ready）
+        # 实探 SELECT 1（1s 超时，避免阻塞 /ready）；失败原因落 error_code 而非被吞
         try:
-            import concurrent.futures as _cf
-            def _do_checkpoint_select():
-                if hasattr(pool, "connection"):
-                    try:
-                        with pool.connection(timeout=1) as _conn:  # type: ignore[call-arg]
-                            try:
-                                _conn.execute("SELECT 1", timeout=1)  # type: ignore[call-arg]
-                            except TypeError:
-                                with _conn.cursor() as _cur:  # type: ignore
-                                    _cur.execute("SELECT 1")
-                            except Exception:
-                                with _conn.cursor() as _cur:  # type: ignore
-                                    _cur.execute("SELECT 1")
-                    except TypeError:
-                        with pool.connection() as _conn2:  # type: ignore
-                            with _conn2.cursor() as _cur2:  # type: ignore
-                                _cur2.execute("SELECT 1")
-                elif hasattr(pool, "getconn"):
-                    _conn = pool.getconn(timeout=1)  # type: ignore[call-arg]
-                    try:
-                        with _conn.cursor() as _cur:
-                            _cur.execute("SELECT 1")
-                    finally:
-                        try:
-                            pool.putconn(_conn)  # type: ignore
-                        except Exception as _e:
-                            logger.warning("ready.checkpoint_putconn_failed", dsn=_redact_dsn_api(dsn), exc_info=_e)
-                else:
-                    raise RuntimeError("pool has no connection/getconn")
             # 中文：超时必传，避免无超时阻塞探测（D线：复用全局 _READY_POOL，禁止每次新建池）
-            fut = _READY_POOL.submit(_do_checkpoint_select)
+            fut = _READY_POOL.submit(_checkpoint_pg_select, pool)
             try:
-                fut.result(timeout=1)
-            except _cf.TimeoutError:
+                select_ok, select_code = fut.result(timeout=1)
+            except _cf_ready.TimeoutError:
                 try:
                     fut.cancel()
                 except (ValueError, TypeError, AttributeError, RuntimeError):
@@ -1667,6 +1702,15 @@ def _check_checkpoint_pg() -> tuple[bool, str]:
                 logger.warning("ready.checkpoint_select_timeout", dsn=_redact_dsn_api(dsn), exc_info=_e)
             else:
                 logger.warning("ready.checkpoint_select_failed", dsn=_redact_dsn_api(dsn), exc_info=_e)
+            return False, "memory"
+        if not select_ok:
+            # 中文：SELECT/连接失败必须显式 fail-closed 到 memory，并把原因透出（不再当成功）。
+            logger.warning(
+                "ready.checkpoint_select_failed",
+                dsn=_redact_dsn_api(dsn),
+                dsn_host=_dsn_host(dsn),
+                error_code=select_code or "checkpoint_select_failed",
+            )
             return False, "memory"
         return True, "pg"
     except Exception as _e:

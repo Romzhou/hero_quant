@@ -25,6 +25,11 @@ jobs:
           --health-retries 10
     env:
       HERO_CHECKPOINT_DSN: postgresql://postgres:postgres@localhost:5432/hero_quant
+      # 中文：PG 相关 env 一次配齐（b9）。HERO_PG_DSN 与 checkpoint 同源，避免 conftest 守卫
+      # 与用例落到不同键；PGPASSWORD 是 libpq 兜底口令——DSN 万一缺 userinfo 也不会退化成
+      # "fe_sendauth: no password supplied" 的整模块 ERROR（只跳过，不假绿）。
+      HERO_PG_DSN: postgresql://postgres:postgres@localhost:5432/hero_quant
+      PGPASSWORD: postgres
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v7

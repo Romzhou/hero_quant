@@ -278,11 +278,12 @@ def test_lane_f_container_per_instance_lock():
     assert hasattr(c, "_lock") or hasattr(c, "lock")
 
 
-def test_lane_f_container_checkpointer_warns(caplog):
+def test_lane_f_container_checkpointer_warns(caplog, monkeypatch):
     from hero_quant.agent.container import AgentContainer
     c = AgentContainer()
-    import os
-    os.environ.pop("HERO_CHECKPOINT_DSN", None)
+    # 中文（b9）：必须走 monkeypatch —— 裸 os.environ.pop 不会还原，会把 HERO_CHECKPOINT_DSN
+    # 从进程 env 里永久抹掉，后面的 PG 集成族（如 tests/test_w4w8_pg.py）就掉到无口令默认 DSN。
+    monkeypatch.delenv("HERO_CHECKPOINT_DSN", raising=False)
     with caplog.at_level(logging.WARNING):
         c.init_checkpointer(dsn="memory://default")
     # missing DSN fallback to memory must be visible at warning+

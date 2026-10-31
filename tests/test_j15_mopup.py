@@ -227,11 +227,18 @@ def test_j15_middleware_approval_questions():
 
 def test_j15_loaders_exact(monkeypatch):
     import sys
+    import unittest.mock as mock
+
     # akshare health 缺席分支 + settings 失败分支
     from hero_quant.data.loaders import akshare_loader as AK
 
-    assert AK.AKShareLoader().health()["akshare_available"] is False
-    import unittest.mock as mock
+    # 中文：health() 的判据就是 `import akshare` 成不成功，所以两个分支都必须由 sys.modules
+    # 决定，不能依赖「本机/CI 装没装 akshare」——CI 装 .[dev,ashare,us]，akshare 真实存在，
+    # 旧写法（裸断言 False）在 CI 必红。sys.modules[name]=None → `import name` 抛 ImportError。
+    with mock.patch.dict("sys.modules", {"akshare": None}):
+        with pytest.raises(ImportError):  # 先证明 patch 生效，避免分支断言恒真
+            import akshare  # noqa: F401
+        assert AK.AKShareLoader().health()["akshare_available"] is False
     with mock.patch.dict("sys.modules", {"akshare": mock.MagicMock()}):
         assert AK.AKShareLoader().health()["akshare_available"] is True
     from hero_quant.data.loaders import ccxt_loader as CC

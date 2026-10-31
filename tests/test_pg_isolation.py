@@ -71,69 +71,152 @@ def test_publish_no_fake_success_without_pool():
     assert res is not True  # 旧实现返回 None 亦视为不伪成功，但显式 False 更佳；此处保证不为 True
 
 
-def test_ready_pg_probe_requires_real_pool_and_select_success():
-    """ /ready pg_ok 仅真池探活 SELECT 1 成功才 True；SELECT 失败或无池则 False（fail-closed）。"""
-    from fastapi.testclient import TestClient
+_PG_DSN = "postgresql://postgres:postgres@localhost:5432/hero_quant"
+
+
+class _FailingCursor:
+    def execute(self, sql, params=None):
+        raise RuntimeError("SELECT 1 failed")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+class _FailingConn:
+    """连接能取到、但连接/查询必失败（模拟 PG 掉线、只读副本、口令失效）。"""
+
+    def execute(self, sql, params=None, **kw):
+        raise RuntimeError("SELECT 1 failed")
+
+    def cursor(self):
+        return _FailingCursor()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+class _FailingPool:
+    """有池（_is_real_pg_pool 为真）但 SELECT 必失败。"""
+
+    def connection(self, *a, **kw):
+        return _FailingConn()
+
+    def getconn(self, *a, **kw):
+        return _FailingConn()
+
+    def putconn(self, conn):
+        return None
+
+
+class _OkConn:
+    def execute(self, sql, params=None, **kw):
+        return None
+
+    def cursor(self):
+        return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+class _OkPool:
+    """同形态的健康池：SELECT 1 成功（仅用于验证健康路径未被改坏）。"""
+
+    def connection(self, *a, **kw):
+        return _OkConn()
+
+    def getconn(self, *a, **kw):
+        return _OkConn()
+
+    def putconn(self, conn):
+        return None
+
+
+def _saver_with(pool):
+    from hero_quant.checkpoint.postgres import AsyncPostgresSaver
+
+    return AsyncPostgresSaver(dsn=_PG_DSN, pool=pool)
+
+
+def test_ready_pg_probe_requires_real_pool_and_select_success(monkeypatch):
+    """有池但 SELECT 失败 → (False, "memory")；同形态健康池 → (True, "pg")（fail-closed，不假绿）。"""
     import hero_quant.api.server as srv
 
-    # 场景1：mock 无池或探活失败 -> pg False
-    original = srv._check_checkpoint_pg
-    original_billing = srv._check_billing_pg
+    # 中文：探针读 env 的 HERO_CHECKPOINT_DSN —— CI 有真 PG、本地被 conftest 中和，环境不同。
+    # 这里把「DSN 判定」与「saver 获取」两个入口都钉成确定值，保证两种环境同结论。
+    monkeypatch.setattr(srv, "_checkpoint_dsn_explicit", lambda: _PG_DSN)
+    # 中文：旧写法只 patch hero_quant.checkpoint.postgres.get_saver。一旦 _checkpoint_saver_cache
+    # 已被前面的 /ready 用例灌入真 saver（CI 有真 PG），该 patch 完全不起作用 → 探针拿到真池、
+    # SELECT 1 成功、返回 (True,"pg")，用例在 CI 假红。必须直接钉住 server 侧的取 saver 入口。
+    monkeypatch.setattr(srv, "_get_checkpoint_saver", lambda: _saver_with(_FailingPool()))
+    ok, mode = srv._check_checkpoint_pg()
+    assert ok is False, f"SELECT 失败必须 fail-closed，got ok={ok} mode={mode}"
+    assert mode == "memory"
+
+    # 健康路径不变：同形态健康池必须仍是 (True, "pg")
+    monkeypatch.setattr(srv, "_get_checkpoint_saver", lambda: _saver_with(_OkPool()))
+    assert srv._check_checkpoint_pg() == (True, "pg")
+
+
+def test_checkpoint_probe_denies_saver_without_capability(monkeypatch):
+    """saver 既无 _is_real_pg_pool 也无 _is_pg_mode → deny-by-default，不得凭 pool 非空放行。"""
+    import hero_quant.api.server as srv
+
+    class _OpaqueSaver:
+        pool = _OkPool()
+
+    monkeypatch.setattr(srv, "_checkpoint_dsn_explicit", lambda: _PG_DSN)
+    monkeypatch.setattr(srv, "_get_checkpoint_saver", lambda: _OpaqueSaver())
+    assert srv._check_checkpoint_pg() == (False, "memory")
+
+
+def test_ready_checkpoint_failure_does_not_poison_other_probes(monkeypatch):
+    """checkpoint 探针异常只降级自己：503 + checkpoint:memory，但 billing 仍报 pg、字段齐全。"""
+    from fastapi.testclient import TestClient
+
+    import hero_quant.api.server as srv
+
+    srv._READY_CACHE.clear()
+    monkeypatch.setattr(srv, "_checkpoint_dsn_explicit", lambda: _PG_DSN)
+    monkeypatch.setattr(srv, "_get_checkpoint_saver", lambda: _saver_with(_FailingPool()))
+    monkeypatch.setattr(srv, "_check_billing_pg", lambda: (True, "pg"))
     try:
-        # 构造一个 fake pool 在 SELECT 上抛异常
-        class FakeCursor:
-            def execute(self, sql, params=None):
-                raise RuntimeError("SELECT 1 failed")
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *a):
-                return False
-
-        class FakeConn:
-            def cursor(self):
-                return FakeCursor()
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *a):
-                return False
-
-        class FakePool:
-            def connection(self):
-                return FakeConn()
-
-            def getconn(self):
-                return FakeConn()
-
-        # 注入 fake saver：有池但 SELECT 失败 -> 应返回 False
-        def fake_get_saver(dsn=None, ttl_seconds=None, **kw):
-            from hero_quant.checkpoint.postgres import AsyncPostgresSaver
-            s = AsyncPostgresSaver(dsn=dsn or "postgresql://postgres:postgres@localhost:5432/hero_quant", pool=FakePool())
-            return s
-
-        import unittest.mock as mock
-
-        with mock.patch("hero_quant.checkpoint.postgres.get_saver", side_effect=fake_get_saver):
-            # 同时 patch server 模块内的 get_saver 引用
-            with mock.patch.object(srv, "_check_checkpoint_pg", wraps=srv._check_checkpoint_pg):
-                # 直接测 _check_checkpoint_pg：有池但 SELECT 异常应返回 (False, "memory")
-                # 由于实现带 suppress，当前会错误返回 True，需要修复后返回 False
-                ok, mode = srv._check_checkpoint_pg()
-                # 修复后应为 False；未修复时为 True -> 此断言会失败，驱动修复
-                assert ok is False, f"expected pg probe False when SELECT fails, got {ok} mode={mode}"
-                assert mode == "memory"
+        r = TestClient(srv.app).get("/ready")
     finally:
-        pass
+        srv._READY_CACHE.clear()
+    body = r.json()
+    assert r.status_code == 503, f"checkpoint 探活失败必须 503，got {r.status_code}"
+    assert body["status"] == "degraded" and body["degraded"] is True
+    assert body["pg"] is False and body["checkpoint"] == "memory"
+    assert body["billing"] == "pg", "checkpoint 探针异常不得污染 billing 探针结果"
+    assert "checkpoint" in body["reasons"]
+    assert "billing" not in body["reasons"]
+    assert isinstance(body["redis"], bool)
 
-    # 场景2：无池 -> 直接 False（已在真实环境验证）
-    c = TestClient(srv.app)
-    # 使用 env 无 PG DSN 时 /ready 亦应 pg False；此处不强制 200/503，仅校验 pg 字段为 bool
-    r = c.get("/ready")
+
+def test_ready_pg_field_is_bool_in_any_env():
+    """无 PG DSN 的环境里 /ready 的 pg 字段仍必须是 bool（不因缺配抛错/缺字段）。"""
+    from fastapi.testclient import TestClient
+
+    import hero_quant.api.server as srv
+
+    srv._READY_CACHE.clear()
+    try:
+        r = TestClient(srv.app).get("/ready")
+    finally:
+        srv._READY_CACHE.clear()
     j = r.json()
     assert isinstance(j.get("pg"), bool)
+    assert isinstance(j.get("checkpoint"), str) and j["checkpoint"] in ("pg", "memory")
 
 
 def test_cohere_probe_not_always_true(monkeypatch):
