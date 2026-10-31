@@ -3335,6 +3335,7 @@ def _write_backtest_bundle_cache(bundle: dict, tenant: str | None = None, bars: 
             "tearsheet": bundle.get("tearsheet", ""),
             "markers": dict(bundle.get("markers") or _BACKTEST_DEGRADE_MARKERS),
             "sample": dict(bundle.get("sample") or {"bars": 0, "start": None, "end": None}),
+            "prices": bundle.get("prices"),
             "sharpe_basis": bundle.get("sharpe_basis"),
             "warnings": list(bundle.get("warnings") or []),
             "reproducibility": dict(_rep) if isinstance(_rep, dict) else None,
@@ -3344,6 +3345,28 @@ def _write_backtest_bundle_cache(bundle: dict, tenant: str | None = None, bars: 
         )
     except Exception as _e:
         logger.debug(f"backtest.bundle_cache_write_failed error={_e}")
+
+
+def _backtest_prices_payload(prices: "object | None") -> list | None:
+    """把收盘价序列压成 `[{"date": iso, "close": float}]`（PR-214）。
+
+    bundle 带 prices 才能做归因（收益来自真实行情），且必须能 JSON 落 L2 缓存 ——
+    DataFrame 直接进 json.dumps 会被 default=str 变成字符串，故在此处一次性序列化。
+    无行情返回 None（不补、不合成）。
+    """
+    if prices is None:
+        return None
+    try:
+        out: list = []
+        for ts, close in prices["close"].items():
+            f = float(close)
+            if not math.isfinite(f):
+                continue
+            out.append({"date": ts.date().isoformat(), "close": f})
+        return out or None
+    except (KeyError, TypeError, ValueError, AttributeError) as _e:
+        logger.warning("backtest.prices_payload_failed error=%s", _e)
+        return None
 
 
 def _compute_backtest_bundle(bars: int | None = None) -> dict:
@@ -3433,6 +3456,7 @@ def _compute_backtest_bundle(bars: int | None = None) -> dict:
     bundle = {
         "metrics": metrics_data,
         "positions": positions,
+        "prices": _backtest_prices_payload(prices),
         "csv": csv_text,
         "tearsheet": tearsheet,
         "markers": markers,
@@ -3460,6 +3484,7 @@ def _static_backtest_bundle(reason: str = _BACKTEST_REPRO_COMPUTE_FAILED, bars: 
     bundle = {
         "metrics": {},
         "positions": None,
+        "prices": None,
         "csv": _BACKTEST_CSV_HEADER,
         "tearsheet": "",
         "markers": dict(_BACKTEST_DEGRADE_MARKERS),

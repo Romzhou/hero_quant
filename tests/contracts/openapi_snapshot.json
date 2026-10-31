@@ -163,6 +163,38 @@
         "summary": "Ready"
       }
     },
+    "/risk/attribution": {
+      "get": {
+        "operationId": "risk_attribution_alias_risk_attribution_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Risk Attribution Alias"
+      }
+    },
+    "/risk/shadow": {
+      "get": {
+        "operationId": "risk_shadow_alias_risk_shadow_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Risk Shadow Alias"
+      }
+    },
     "/risk/summary": {
       "get": {
         "operationId": "risk_summary_alias_risk_summary_get",
@@ -679,6 +711,40 @@
           }
         },
         "summary": "Query Ticket"
+      }
+    },
+    "/v1/risk/attribution": {
+      "get": {
+        "description": "真实回测归因：5 类全部由 positions/prices/metrics 算出，不可算为 null。",
+        "operationId": "risk_attribution_v1_risk_attribution_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Risk Attribution"
+      }
+    },
+    "/v1/risk/shadow": {
+      "get": {
+        "description": "真实 fills 重放：逐笔过 RiskEngine 真实规则，输出真实拒单分布。",
+        "operationId": "risk_shadow_v1_risk_shadow_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Risk Shadow"
       }
     },
     "/v1/risk/summary": {

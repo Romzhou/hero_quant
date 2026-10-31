@@ -105,23 +105,84 @@ def _get_turnover() -> float | None:
         return None
 
 
-def _get_exposure() -> float | None:
-    return _get_metric("exposure")
+def _bundle() -> dict:
+    """取回测产物（延迟导入，便于测试 monkeypatch server._get_backtest_bundle）。"""
+    try:
+        from hero_quant.api.server import _get_backtest_bundle
+
+        b = _get_backtest_bundle()
+        return b if isinstance(b, dict) else {}
+    except (ImportError, AttributeError, ValueError, TypeError, OSError, RuntimeError) as e:
+        logger.warning("risk.bundle_unavailable %s", e)
+        return {}
 
 
-def _get_single_limit() -> float | None:
-    return _get_metric("single_limit")
+def _finite(value) -> float | None:
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    return f if math.isfinite(f) else None
 
 
-def _get_circuit_threshold() -> float | None:
-    return _get_metric("circuit_threshold")
+def _positions_frame():
+    """真实持仓 DataFrame（算不出就 None，不伪造敞口/权重）。"""
+    try:
+        from hero_quant.risk.attribution import load_positions
+
+        return load_positions(_bundle())
+    except (ImportError, AttributeError, ValueError, TypeError, OSError, RuntimeError) as e:
+        logger.warning("risk.positions_unavailable %s", e)
+        return None
 
 
-def _get_reject_rate() -> float | None:
-    return _get_metric("reject_rate")
+def _exposure_from_positions() -> float | None:
+    """敞口真值：E_t 均值 / 首日毛敞口（无权益序列时不臆造分母）。"""
+    pos = _positions_frame()
+    if pos is None or len(pos.index) == 0:
+        return None
+    try:
+        gross = pos.abs().sum(axis=1)
+        e_bar = _finite(gross.mean())
+        e_0 = _finite(gross.iloc[0])
+        if e_bar is None or e_0 is None or e_0 <= 0:
+            return None
+        return _finite(e_bar / e_0)
+    except (ValueError, TypeError, AttributeError, IndexError) as e:
+        logger.warning("risk.exposure_from_positions_failed %s", e)
+        return None
 
 
-def _get_circuit_state() -> str:
+def _single_limit_from_positions() -> float | None:
+    """单票上限真值：max_t max_i |h_{t,i}| / E_t（权重时序最大值）。"""
+    pos = _positions_frame()
+    if pos is None or len(pos.index) == 0:
+        return None
+    try:
+        gross = pos.abs().sum(axis=1)
+        weight = pos.abs().div(gross.where(gross > 0), axis=0)
+        return _finite(weight.max(axis=1).max())
+    except (ValueError, TypeError, AttributeError, IndexError) as e:
+        logger.warning("risk.single_limit_from_positions_failed %s", e)
+        return None
+
+
+def _reject_rate_from_shadow() -> float | None:
+    """拒单率真值：真实 fills 重放过影子风控规则后的拒绝比例。"""
+    try:
+        from hero_quant.risk.attribution import build_shadow_replay
+
+        replay = build_shadow_replay(_bundle())
+        if not isinstance(replay, dict) or replay.get("degraded"):
+            return None
+        return _finite(replay.get("reject_rate"))
+    except (ImportError, AttributeError, ValueError, TypeError, OSError, RuntimeError) as e:
+        logger.warning("risk.shadow_replay_failed %s", e)
+        return None
+
+
+def _find_circuit_breaker():
+    """探测真实的熔断单例（拿不到返回 None，由调用方降级）。"""
     try:
         import hero_quant.telemetry.circuit as circ_mod
 
@@ -147,6 +208,53 @@ def _get_circuit_state() -> str:
                     cb = _rc
             except (ImportError, AttributeError, RuntimeError) as e:
                 logger.warning("circuit router singleton probe failed %s", e)
+        return cb
+    except (ImportError, AttributeError, ValueError, TypeError, OSError, RuntimeError) as e:
+        logger.warning("circuit breaker singleton not found, degraded %s", e)
+        return None
+
+
+def _get_exposure() -> float | None:
+    """metrics 透传优先，缺失时从真实 positions 算（不再返回写死敞口值）。"""
+    v = _get_metric("exposure")
+    if v is not None:
+        return v
+    return _exposure_from_positions()
+
+
+def _get_single_limit() -> float | None:
+    """metrics 透传优先，缺失时取真实持仓的单标的最大权重。"""
+    v = _get_metric("single_limit")
+    if v is not None:
+        return v
+    return _single_limit_from_positions()
+
+
+def _get_circuit_threshold() -> float | None:
+    """metrics 透传优先，缺失时取真实熔断配置 failure_threshold。"""
+    v = _get_metric("circuit_threshold")
+    if v is not None:
+        return v
+    cb = _find_circuit_breaker()
+    if cb is None:
+        return None
+    return _finite(getattr(cb, "failure_threshold", None))
+
+
+def _get_reject_rate() -> float | None:
+    """metrics 透传优先，缺失时取影子重放的真实拒单率。"""
+    v = _get_metric("reject_rate")
+    if v is not None:
+        return v
+    return _reject_rate_from_shadow()
+
+
+
+
+def _get_circuit_state() -> str:
+    try:
+        # PR-214：单例探测抽成 _find_circuit_breaker()，供 circuit_threshold 复用同一真源。
+        cb = _find_circuit_breaker()
         if cb is not None:
             state = getattr(cb, "state", None)
             if callable(state):
@@ -362,3 +470,83 @@ def risk_summary():
 @router.get("/risk/summary")
 def risk_summary_alias():
     return risk_summary()
+
+
+try:
+    from hero_quant.risk.attribution import ATTRIBUTION_KEYS as _ATTR_KEYS
+except Exception:  # pragma: no cover — 归因模块不可用时端点仍须返回显式降级体
+    _ATTR_KEYS = ("timing", "selection", "cost", "risk_control", "residual")
+
+
+def _attribution_degraded(reason: str) -> dict:
+    """归因端点失败/不可用时的显式降级体（components 全 null，不用 epsilon 占位）。"""
+    return {
+        "components": {k: None for k in _ATTR_KEYS},
+        "not_applicable": [],
+        "coverage": 0.0,
+        "net_return": None,
+        "metrics_cumulative_return": None,
+        "turnover_notional": None,
+        "bars": 0,
+        "warnings": [],
+        "degraded": True,
+        "reason": reason,
+        "reproducibility": None,
+    }
+
+
+def _shadow_degraded(reason: str) -> dict:
+    """影子重放降级体：拒绝率等数值一律 null（0.0 会冒充"零拒单"）。"""
+    return {
+        "orders_total": None,
+        "allowed": None,
+        "rejected": None,
+        "rejected_by_rule": {},
+        "reject_rate": None,
+        "notional_total": None,
+        "turnover_notional": None,
+        "turnover_mean_exposure": None,
+        "bars": 0,
+        "warnings": [],
+        "degraded": True,
+        "reason": reason,
+        "reproducibility": None,
+    }
+
+
+@router.get("/v1/risk/attribution")
+def risk_attribution():
+    """真实回测归因：5 类全部由 positions/prices/metrics 算出，不可算为 null。"""
+    try:
+        from hero_quant.risk.attribution import compute_attribution
+
+        return compute_attribution(_bundle())
+    except (ImportError, AttributeError, ValueError, TypeError, OSError, RuntimeError) as e:
+        _risk_observe("attribution_failed", "attribution_unavailable")
+        logger.warning("risk.attribution_unavailable %s", e)
+        return _attribution_degraded("attribution_unavailable")
+
+
+@router.get("/risk/attribution")
+def risk_attribution_alias():
+    return risk_attribution()
+
+
+@router.get("/v1/risk/shadow")
+def risk_shadow():
+    """真实 fills 重放：逐笔过 RiskEngine 真实规则，输出真实拒单分布。"""
+    try:
+        from hero_quant.risk.attribution import build_shadow_replay
+
+        return build_shadow_replay(_bundle())
+    except (ImportError, AttributeError, ValueError, TypeError, OSError, RuntimeError) as e:
+        _risk_observe("shadow_failed", "shadow_replay_unavailable")
+        logger.warning("risk.shadow_replay_unavailable %s", e)
+        return _shadow_degraded("shadow_replay_unavailable")
+
+
+@router.get("/risk/shadow")
+def risk_shadow_alias():
+    return risk_shadow()
+
+
