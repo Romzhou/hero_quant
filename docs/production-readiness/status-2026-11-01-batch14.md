@@ -97,3 +97,21 @@ master `b1f3ce7` 已 push，后端/前端/e2e 门禁全绿；批次 14 的 7 条
 3. **队列上线准备**：systemd unit + `hero_queue_worker` 角色脚本（写进 `docs/SECURITY-SECRETS.md` §7 已列）、把 `reap_expired` 挂成定时任务。
 4. **PR-122-b 扩量**：先做磁盘评估（100M/标的/3 年的实测基线已有了），再决定全市场还是沪深300。
 5. **等生产机**：到位后立刻做 PR-161~165 的 TLS / 备份恢复 / 蓝绿演练，那是 Phase 1 最后一块。
+### 5.1 批次15 收口结果（2026-11-01 晚）
+
+| 原「做一半」项 | 状态 | 证据 |
+|---|---|---|
+| 定价阀门（原 #1） | **已收口** | `HERO_PRICING_BACKEND`（catalog 默认 / null 关闭 / 非法 ValueError）+ 两个记账点 `allow_estimate=False`；6 例接线测试 |
+| 现实性未接响应（原 #2） | **已收口** | 回测产物带 `realism`/`realism_assumptions`，真行情 60 根实测 118 笔、cost_bps 7.39、无降级；缓存同步透传 |
+| 队列角色未建（原 #4 部分） | **已收口** | 迁移 `0008`：`hero_queue_worker` + `hero_admin_readonly`，`CREATE POLICY ... TO role`，**删除** GUC 旁路（有反证测试）；DSN 拆 `HERO_QUEUE_WORKER_DSN`/`HERO_ADMIN_READONLY_DSN` |
+| 队列部署单元（原 #4 部分） | **已收口** | `deploy/systemd/hero-quant-runs-worker.service` + `runs-reap.service/.timer`（30s）；CLI 增 `--reap` |
+| 管理后台跨租户（原 #7） | **已收口** | 只读角色 + TO role 只读策略，不再依赖 SUPERUSER/BYPASSRLS |
+
+**剩余自主可收口项（3 条，达标）**：PR-241 会话级生产者（`session.run`）、PR-122-b PIT 扩量（等体积结论）、PR-112 真评测按「次数+耗时」跑一轮。
+**外部依赖项（不计入）**：生产机验收、真 Vault/KMS、数据源采购、告警投递（Alertmanager）。
+
+**CI 核实**：`test.yml`/`ci.yml` 均有 postgres service，CI 全量 `3650 passed / 9 skipped`（90 skip 只在本机无 DSN 时出现）→ RG 族在 CI 真跑，**无 P0 门禁漏洞**，批次15 第 5 项无需改动。
+
+**体积结论（禁止外推）**：PIT 726 个 parquet 文件**每个恰好 2658 B、每个只有 1 行**；单文件 footer 1836 B（约 69%）。
+即 1.93MB ≈ 726 × (1836 元数据 + 822 数据)，是**文件级开销主导**，不能用来外推 122-b 的磁盘需求；
+122-b 必须换分区粒度（按 symbol×年/月，而不是每交易日一文件）再评估。
