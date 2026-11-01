@@ -34,10 +34,12 @@ dependencies = [
     # W1 OIDC：RS256 验签必需；缺失时 auth 层 fail-closed（AuthConfigError -> 503）。
     "cryptography>=41.0,<51",
     # PR-122 PIT 数据层：Parquet 落盘（pyarrow）+ as-of 查询（duckdb）。
-    # 上界按「本机已验证最高版本 + 1」：本机实测 duckdb 2.0.0 / pyarrow 26.0.0。
-    # duckdb 2.x 为跨大版本，放开 <3 之前必须先跑 tests/test_pr122_pit_*.py 的 as-of 反证用例。
-    "duckdb>=1.0,<3",
-    "pyarrow>=15.0,<27",
+    # 区间规则见 AGENTS.md §10：下界=本机实测值（没测过的版本不写下界）；
+    # 存储/格式类库上界收 minor、ABI 绑定类库上界收 major。
+    # duckdb 版本号非严格 semver 且自带存储格式 → 收到 <2.1；pyarrow 是 ABI 绑定库 → <27。
+    # 放宽上界前必须先跑 tests/test_pr122_pit_store.py 的 as-of 反证用例。
+    "duckdb>=2.0,<2.1",
+    "pyarrow>=26,<27",
 ]
 
 [project.optional-dependencies]

@@ -9,6 +9,8 @@
 # CI 的 pip install -e ".[dev]" 按 pyproject 边界自动降级，安装结果不变），并新增
 # duckdb==2.0.0 / pyarrow==26.0.0（PR-122 PIT）。不采用裸重编译：那会连带升级
 # langchain/openai/numpy/anyio 等十余项，超出本批范围。
+# 同日追加（AGENTS §10 依赖区间规则）：duckdb 上界由 <3 收到 <2.1（非严格 semver + 自带
+# 存储格式），pyarrow 维持 <27；下界统一收到实测值 >=2.0 / >=26。pin 未变（仍 2.0.0 / 26.0.0）。
 annotated-doc==0.0.5 \
     --hash=sha256:117bac03a25ede5df5440e855b32d556049ca169ead221505badf432fed4b101 \
     --hash=sha256:c7e58ce09192557605d8bbd92836d7e1d520ac9580096042c0bfd197efacf1bb
