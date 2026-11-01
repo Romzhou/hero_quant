@@ -2,6 +2,7 @@
 
 职责：
 - `GET /v1/audit`：只读查询当前租户的审计事件（按 run_id 查全链路 / 按时间或用户检索）；
+- `GET /v1/audit/verify`：重算链式哈希校验完整性（PR-241，只读、不修复、不回填）；
 - `record_query_audit()`：`/v1/query` 与 `/v1/query/stream` 收尾时写**一条**审计事件。
 
 架构位置：audit 包自身的 FastAPI 接缝；server.py 只 `include_router` + 调生产者，
@@ -14,20 +15,22 @@
   但无主体时不在此处 401 —— 统一交给 `_audit_scope()` 出 503，与 `/v1/sessions` 同口径；
 - 存储异常分级映射：不可用 503 / 入参非法 400 / 其余 500 只回通用 code，细节进 structlog；
 - 生产者只落计数与 hash：prompt 原文/答案正文永不进审计，`prompt_hash` 用 sha256 前 32 hex；
-  写失败只 warning（`try_append` 自带告警），**绝不改变答案与状态码**；租户为空即跳过。
+- 生产者写入走 `AuditChain`（PR-241 入链，ts 由应用显式生成）；写失败只 warning，
+  **绝不改变答案与状态码**；租户为空/无 trace_id 即跳过。
 """
 
 from __future__ import annotations
 
 import asyncio
 import hashlib
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 import structlog
 import structlog.contextvars
 from fastapi import APIRouter, Depends, HTTPException, Query
 
+from hero_quant.audit.chain import AuditChain
 from hero_quant.audit.store import (
     AuditError,
     AuditStoreUnavailable,
@@ -211,6 +214,76 @@ async def query_audit(
 
 
 # ---------------------------------------------------------------------------
+# GET /v1/audit/verify（PR-241 链式哈希校验）
+# ---------------------------------------------------------------------------
+@router.get("/v1/audit/verify")
+async def verify_audit_chain(
+    limit: int | None = Query(
+        None,
+        description=f"可选：只校验最早的 N 条（1..{MAX_LIMIT}）；缺省全量重算，耗时随行数线性增长",
+    ),
+    _admin: None = Depends(require_audit_admin),
+) -> dict[str, Any]:
+    """校验当前租户审计链的完整性（只读）。篡改是**返回值**，不是异常。
+
+    响应字段（与 AuditChain.verify 一致）：
+    ok / entries / head_hash / broken_at / reason / degraded / reason_code
+    + chain_start_entry_id / chain_start_at / uncovered_count。
+
+    中文口径：迁移前历史行的 prev_hash/entry_hash 为 NULL，**不回填、不伪造**；
+    链自 chain_start_entry_id（ts=chain_start_at）起算，此前 uncovered_count 条未覆盖。
+    文档/前端禁止把它写成「审计已启用」这类全量断言。
+    """
+    tenant = _audit_scope()
+    try:
+        store = get_audit_store()
+        chain = AuditChain(store)
+        if limit is None:
+            report = await asyncio.to_thread(chain.verify, tenant)
+        else:
+            report = await asyncio.to_thread(chain.verify, tenant, limit=_clamp_limit(limit))
+    except AuditStoreUnavailable as exc:
+        logger.warning(
+            "audit.verify_unavailable",
+            error_code="audit_store_unavailable",
+            trace_id=_trace_id(),
+            reason=exc.reason,
+            error_type=type(exc).__name__,
+        )
+        raise HTTPException(status_code=503, detail={"reason": "audit_store_unavailable"}) from exc
+    except AuditValidationError as exc:
+        logger.warning(
+            "audit.verify_invalid",
+            error_code="audit_invalid",
+            trace_id=_trace_id(),
+            reason=exc.reason,
+        )
+        raise HTTPException(
+            status_code=400, detail={"reason": "audit_invalid", "detail": exc.reason}
+        ) from exc
+    except AuditError as exc:
+        logger.error(
+            "audit.verify_failed",
+            error_code="audit_error",
+            trace_id=_trace_id(),
+            reason=exc.reason,
+            error_type=type(exc).__name__,
+            exc_info=True,
+        )
+        raise HTTPException(status_code=500, detail={"reason": "audit_error"}) from exc
+    except Exception as exc:  # noqa: BLE001 — 驱动层异常（psycopg/池）也必须脱敏成通用 500
+        logger.error(
+            "audit.verify_failed",
+            error_code="audit_error",
+            trace_id=_trace_id(),
+            error_type=type(exc).__name__,
+            exc_info=True,
+        )
+        raise HTTPException(status_code=500, detail={"reason": "audit_error"}) from exc
+    return report
+
+
+# ---------------------------------------------------------------------------
 # 链A最小生产者（best-effort）
 # ---------------------------------------------------------------------------
 def _prompt_digest(prompt: str | None) -> str | None:
@@ -270,7 +343,12 @@ def _append(
     prompt_hash: str | None,
     detail: dict[str, Any],
 ) -> bool:
-    """线程内执行：取 store + `try_append`，任何异常在此收敛成 False + warning。"""
+    """线程内执行：取 store + 入链追加，任何异常在此收敛成 False + warning。
+
+    中文：query.* 也走 AuditChain（PR-241），否则这些行 entry_hash 为 NULL、天天推高
+    verify 的 uncovered_count。ts 必须由这里显式给出并参与 hash —— 交给 DB 的 now()
+    生成，校验端重算就对不上。失败语义与旧的 try_append 一致：只降级、不阻断响应。
+    """
     try:
         store = get_audit_store()
     except AuditError as exc:
@@ -290,17 +368,16 @@ def _append(
         )
         return False
     try:
-        return bool(
-            store.try_append(
-                tenant,
-                action,
-                user_id=user_id,
-                resource=resource,
-                run_id=run_id,
-                model=model,
-                prompt_hash=prompt_hash,
-                detail=detail,
-            )
+        AuditChain(store).append(
+            tenant,
+            action,
+            user_id=user_id,
+            resource=resource,
+            run_id=run_id,
+            model=model,
+            prompt_hash=prompt_hash,
+            detail=detail,
+            ts=datetime.now(timezone.utc),
         )
     except Exception as exc:  # noqa: BLE001 — 审计是旁路：未预期异常绝不允许冒到响应
         logger.warning(
@@ -310,6 +387,7 @@ def _append(
             error_type=type(exc).__name__,
         )
         return False
+    return True
 
 
 async def record_query_audit(

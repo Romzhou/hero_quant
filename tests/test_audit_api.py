@@ -134,6 +134,31 @@ def _isolate_contextvars():
     _cvars.clear_contextvars()
 
 
+class _FakeChainRecorder:
+    """PR-241 后生产者走 AuditChain（入链）：折回 _FakeAuditStore.try_append，断言口径不变。
+
+    中文：本文件只关心「写了几条、字段是什么、失败会不会外抛」。链的 hash/串接由
+    tests/test_pr241_audit_chain.py 与 tests/test_pr241_audit_pg.py 负责；这里把
+    AuditChain.append 桥到原来的 try_append 记录器，链条失败注入（try_append 抛错）
+    因此仍会照原样冒到 _append 的 except 分支。
+    """
+
+    def __init__(self, store) -> None:
+        self._store = store
+
+    def append(self, tenant, action, **fields):
+        fields.pop("ts", None)  # 链层显式注入的时间戳，替身不关心
+        if not self._store.try_append(tenant, action, **fields):
+            # append_ok=False 表示「存储报失败」：链层没有这种返回值，用异常等价表达。
+            raise AuditError("fake_store_reported_failure")
+        return {"id": 1, "entry_hash": "e" * 64}
+
+
+@pytest.fixture(autouse=True)
+def _chain_recorder(monkeypatch):
+    monkeypatch.setattr(audit_api, "AuditChain", _FakeChainRecorder)
+
+
 @pytest.fixture
 def admin_client():
     return _client(Role.ADMIN.value)
