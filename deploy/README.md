@@ -269,3 +269,17 @@ Alertmanager 的根路由和三个 severity 子路由都指向 `unconfigured`，
 - app 容器：非 root、`read_only`、`cap_drop ALL`、`no-new-privileges`、tmpfs。
 - 密钥只在 env 文件与 GitHub secrets；`backup.sh` 产物 700，`deploys.jsonl` 600。
 - `/metrics` 公网 403；Caddy 去 `Server` 头 + HSTS/`nosniff`/`DENY`。
+## 队列 worker 与租约回收（批次15）
+
+| 单元 | 作用 | 启停 |
+|---|---|---|
+| `hero-quant-runs-worker.service` | PG 队列消费者（`python -m hero_quant.runs --handler pkg.mod:func`） | `systemctl enable --now hero-quant-runs-worker` |
+| `hero-quant-runs-reap.service` + `.timer` | 每 30s 回收过期租约（`--reap`），超 max_tries 置 dead | `systemctl enable --now hero-quant-runs-reap.timer` |
+
+前置：
+1. `/etc/hero-quant/hero-quant.env` 里必须有 `HERO_RUNS_HANDLER=pkg.module:function`（不给就 exit 2，不会空转领任务）；
+2. 队列 DSN 用 `HERO_QUEUE_WORKER_DSN`（角色 `hero_queue_worker`，见 `docs/SECURITY-SECRETS.md` §7）；
+3. 管理后台只读用 `HERO_ADMIN_READONLY_DSN`（角色 `hero_admin_readonly`）。
+
+停 worker：`systemctl stop hero-quant-runs-worker` —— SIGTERM 是协作式停止，当前任务跑完才退出；
+卡住超过 `TimeoutStopSec=120` 会被强杀，未完成的租约由 reaper 在到期后打回 queued。

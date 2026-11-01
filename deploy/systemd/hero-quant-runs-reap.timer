@@ -1,0 +1,13 @@
+[Unit]
+Description=Run hero-quant lease reaper every 30s
+Documentation=file:/opt/hero-quant/deploy/README.md
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=30s
+# 同一时刻只跑一个回收（oneshot 幂等，但避免叠跑浪费连接）
+AccuracySec=1s
+Unit=hero-quant-runs-reap.service
+
+[Install]
+WantedBy=timers.target

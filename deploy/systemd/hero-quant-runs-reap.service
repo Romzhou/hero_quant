@@ -1,0 +1,13 @@
+[Unit]
+Description=hero-quant runs lease reaper (requeue expired leases, mark dead over max_tries)
+Documentation=file:/opt/hero-quant/deploy/README.md
+After=hero-quant.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/hero-quant
+EnvironmentFile=/etc/hero-quant/hero-quant.env
+Environment=HERO_ENV_FILE=/etc/hero-quant/hero-quant.env
+# worker 专用角色：回收同样需要跨租户 UPDATE
+ExecStart=/opt/hero-quant/.venv/bin/python -m hero_quant.runs --reap
+TimeoutStartSec=120

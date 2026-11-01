@@ -1,0 +1,26 @@
+[Unit]
+Description=hero-quant runs worker (PG queue consumer, PR-201~203)
+Documentation=file:/opt/hero-quant/deploy/README.md
+After=hero-quant.service network-online.target
+Wants=network-online.target
+# 连续重启 5 次仍失败就停下等人工（避免把坏配置刷成重启风暴）
+StartLimitBurst=5
+StartLimitIntervalSec=300
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/hero-quant
+# DSN/口令只放这里（chmod 600），绝不写进 unit
+EnvironmentFile=/etc/hero-quant/hero-quant.env
+Environment=HERO_ENV_FILE=/etc/hero-quant/hero-quant.env
+# 必填：任务处理器（pkg.module:function）。没配就 exit 2，不会空转领任务
+Environment=HERO_RUNS_HANDLER=
+ExecStart=/opt/hero-quant/.venv/bin/python -m hero_quant.runs --handler ${HERO_RUNS_HANDLER} --poll 1 --lease 300 --heartbeat 30
+# SIGTERM = 协作式停止：当前任务做完再退，不打断进行中的 LLM 调用
+KillSignal=SIGTERM
+TimeoutStopSec=120
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
