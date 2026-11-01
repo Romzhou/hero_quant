@@ -13,6 +13,9 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 from urllib.parse import quote as _urlquote
+from urllib.parse import unquote as _urlunquote
+from urllib.parse import urlsplit as _urlsplit
+from urllib.parse import urlunsplit as _urlunsplit
 
 logger = logging.getLogger(__name__)
 
@@ -166,14 +169,14 @@ def _checkpoint_dsn_from_env() -> str:
     if raw and raw.strip():
         s = raw.strip()
         if s.lower().startswith(_PG_PREFIXES):
-            return s
+            return _apply_pg_password(s)
         warnings.warn(f"HERO_CHECKPOINT_DSN does not look like PG DSN: {_redact_dsn(s)!r}", UserWarning, stacklevel=2)
         logger.warning("HERO_CHECKPOINT_DSN invalid PG DSN: %r", _redact_dsn(s))
         # fall through to alias / fail-closed rather than returning garbage
     # also respect legacy HERO_PG_DSN alias (requires prefix consistently)
     alt = os.getenv("HERO_PG_DSN", "")
     if alt and alt.strip() and alt.strip().lower().startswith(_PG_PREFIXES):
-        return alt.strip()
+        return _apply_pg_password(alt.strip())
     elif alt and alt.strip():
         warnings.warn(f"HERO_PG_DSN does not look like PG DSN: {_redact_dsn(alt)!r}", UserWarning, stacklevel=2)
         logger.warning("HERO_PG_DSN invalid PG DSN: %r", _redact_dsn(alt))
@@ -183,7 +186,66 @@ def _checkpoint_dsn_from_env() -> str:
     # 库名统一为 heroquant：与 docker-compose.yml 的 HERO_CHECKPOINT_DSN、
     # POSTGRES_DB 及 scripts/init/001_schema.sql 的建库目标一致（曾用 hero_quant
     # 会连到另一个库，导致建表脚本与运行时各说各话）。
-    return f"postgresql://{_pg_host_from_env()}:5432/heroquant"
+    return _apply_pg_password(f"postgresql://{_pg_host_from_env()}:5432/heroquant")
+
+
+def _pg_password_from_provider() -> str | None:
+    """PG 口令经 secrets provider 取（env 后端即 HERO_PG_PASSWORD）。
+
+    PR-151 接线：`vault`/`kms` 未实现时返回 None —— **不回落** os.environ，
+    DSN 保持无口令，连接失败按既有语义暴露（/ready 如实 503），不偷偷用明文。
+    延迟导入 secrets：settings 是 env 网关，secrets 包又依赖 settings，避免循环导入。
+    """
+    try:
+        from hero_quant.secrets.resolve import resolve_secret
+    except ImportError as e:  # pragma: no cover - 只在残缺安装下触发
+        logger.warning("settings.pg_password_unavailable error_code=secrets_unavailable detail=%s", e)
+        return None
+    value, reason = resolve_secret("pg_password")
+    if reason:
+        logger.warning("settings.pg_password_unavailable error_code=%s", reason)
+    return value
+
+
+def _apply_pg_password(dsn: str | None) -> str | None:
+    """给「有用户名但没口令」的 PG DSN 注入 provider 提供的口令（PR-151）。
+
+    规则（保守，全部显式）：
+    - 非 PG scheme 不动；
+    - DSN 已带口令 → 显式优先，不动；
+    - 无 userinfo（连用户名都没有）→ 不动（只有口令没有用户拼不出合法 DSN）；
+    - provider 取不到口令（未配置 / vault 不可用）→ 不动；
+    - 口令按 RFC 3986 百分号编码后写入，特殊字符不会破坏 DSN。
+    日志只记 host，永不记口令或完整 DSN。
+    """
+    if not dsn or not isinstance(dsn, str):
+        return dsn
+    try:
+        parts = _urlsplit(dsn)
+    except ValueError:
+        return dsn
+    if parts.scheme.lower() not in ("postgres", "postgresql"):
+        return dsn
+    if "@" not in parts.netloc:
+        return dsn
+    if parts.password:
+        return dsn
+    password = _pg_password_from_provider()
+    if not password:
+        return dsn
+    try:
+        port = parts.port
+    except ValueError:
+        logger.warning("settings.pg_password_injected_skipped error_code=invalid_port")
+        return dsn
+    user = _urlunquote(parts.username or "")
+    host = parts.hostname or ""
+    host_part = f"[{host}]" if ":" in host else host
+    netloc = f"{_urlquote(user, safe='')}:{_urlquote(password, safe='')}@{host_part}"
+    if port:
+        netloc += f":{port}"
+    logger.info("settings.pg_password_injected host=%s", host)
+    return _urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
 
 
 def _checkpoint_ttl_from_env() -> int:
@@ -212,7 +274,7 @@ def _billing_dsn_from_env() -> str | None:
     raw = (os.getenv("HERO_BILLING_DSN", "") or "").strip()
     if raw:
         if raw.lower().startswith(_PG_PREFIXES):
-            return raw
+            return _apply_pg_password(raw)
         warnings.warn(f"HERO_BILLING_DSN does not look like PG DSN: {_redact_dsn(raw)!r}", UserWarning, stacklevel=2)
         logger.warning("HERO_BILLING_DSN invalid PG DSN: %r", _redact_dsn(raw))
     # 共享 DB 必须显式 opt-in，否则 fail-closed（默认 None → 内存/独立回退）
@@ -229,7 +291,7 @@ def _billing_dsn_from_env() -> str | None:
                 stacklevel=2,
             )
             logger.warning("HERO_BILLING_DSN not set, falling back to %s – shared DB", k)
-            return raw.strip()
+            return _apply_pg_password(raw.strip())
     return None
 
 

@@ -103,14 +103,21 @@ grep -c 'sk-' var/secrets_state.json   # 期望 0 —— 状态文件里不该�
    取决于调用方接线——业务侧目前只读主槽（`resolve_secret` 走 `slot="current"`），
    `*_NEXT` 仍需人工切换。
 7. **仍未接线的读取点**（别当成已完成）：
-   - PG / Redis 口令仍由 DSN 组装（`settings.py` 的 env 网关），`pg_password`/`redis_password`
-     两个逻辑名暂无业务调用方；
+   - `redis_password`：Redis 口令仍在 `settings._redis_dsn_from_env` 里从 `HERO_REDIS_PASSWORD`
+     直接拼 DSN，未走 provider；
    - `security/credentials.py` 是另一套「凭据引用」解析（`${VAR}` / 文件凭据），未接 provider。
+
+8. **PG 口令注入口径**（容易误读）：
+   - 只在 DSN **有用户名**（`userinfo` 存在）且**没有口令**时注入；`HERO_PG_USER` 不是密钥，
+     本模块不处理，用户段必须由 DSN 或 compose 渲染提供；
+   - 已带口令的 DSN 一律以显式值为准（不覆盖、不改写）；
+   - `HERO_SECRETS_BACKEND=vault|kms` 时不注入，DSN 保持无口令，连接失败由 `/ready` 如实反映。
 
 ### 5.1 已接线的读取点（本批）
 
 | 位置 | 说明 |
 |---|---|
+| `config/settings.py::_apply_pg_password` | PG DSN「有用户名、没口令」时注入 provider 的 `pg_password`（百分号编码，保留 query）；显式口令优先；无 userinfo 或取不到口令则按原样返回（fail-closed，不回落 env） |
 | `api/middleware/pii.py::_get_key` | PII 加密口令经 provider；取不到即 `pii_encrypt/pii_decrypt` 抛 `RuntimeError`（拒绝明文），探针 `pii_key_status()` 返回 `configured/reason/crypto_available`（不含值） |
 | `llm/factory.py::LLMFactory.create` | 显式入参 > provider(`HERO_API_KEY`) > `Settings.api_key` > provider(`OPENAI_API_KEY`) > `Settings.openai_api_key` > provider 专属（deepseek/anthropic）；strict 缺 key 抛 `ValueError` 且带 reason |
 | `llm/gateway.py::LLMGateway.from_settings` / `_env_key` | primary 与回退链的 key 都经 provider；不再 `os.environ.get` |

@@ -140,7 +140,7 @@ docker build --build-arg HERO_QUANT_VERSION="$(python -c 'import tomllib;print(t
 | `HERO_DATA_MARKET` | `CN` | 默认市场 |
 | `HERO_BENCHMARK_TICKER` | 空 | 显式基准；空则按 `benchmark_map` 后缀映射（`.NS`→`^NSEI` 等） |
 | `HERO_PG_HOST` | `100.114.54.26` | 宿主与容器统一用本机 tailscale IP（决策 D-1）；换机器/IP 变了要改。显式 `HERO_*_DSN` 优先 |
-| `HERO_PG_USER` / `HERO_PG_PASSWORD` | 空 | 供 compose 的 DSN 变量插值；llm-pg 超级用户名**不是** `postgres`，取容器内 `$POSTGRES_USER`；口令只写 `.env` |
+| `HERO_PG_USER` / `HERO_PG_PASSWORD` | 空 | 供 compose 的 DSN 变量插值；llm-pg 超级用户名**不是** `postgres`，取容器内 `$POSTGRES_USER`；口令只写 `.env`。运行时若 DSN **有用户名但没口令**，`settings._apply_pg_password` 会把该口令（经 secrets provider）注入 DSN；显式带口令的 DSN 优先，`HERO_SECRETS_BACKEND=vault` 时不注入 |
 | `HERO_PG_DSN` | 空 | checkpoint DSN 的 legacy 别名（显式 `HERO_CHECKPOINT_DSN` 优先） |
 | `HERO_CHECKPOINT_DSN` | `postgresql://100.114.54.26:5432/heroquant`（无口令） | 显式优先；compose 内渲染为 `postgresql://<user>:<password>@100.114.54.26:5432/heroquant`。**`.env` 不填 `HERO_PG_PASSWORD` 时口令段为空**，`/ready` 如实 503 |
 | `HERO_CHECKPOINT_TTL_SECONDS` | `604800`（7 天） | checkpoint `expires_at` TTL |
