@@ -95,6 +95,8 @@ def _all_tables() -> set[str]:
         "audit_log",
         "data_snapshots",
         "pit_bars",
+        "run_steps",
+        "audit_chain_head",
     }
 
 

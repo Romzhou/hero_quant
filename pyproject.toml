@@ -33,6 +33,11 @@ dependencies = [
     "setuptools>=83.0.0",
     # W1 OIDC：RS256 验签必需；缺失时 auth 层 fail-closed（AuthConfigError -> 503）。
     "cryptography>=41.0,<51",
+    # PR-122 PIT 数据层：Parquet 落盘（pyarrow）+ as-of 查询（duckdb）。
+    # 上界按「本机已验证最高版本 + 1」：本机实测 duckdb 2.0.0 / pyarrow 26.0.0。
+    # duckdb 2.x 为跨大版本，放开 <3 之前必须先跑 tests/test_pr122_pit_*.py 的 as-of 反证用例。
+    "duckdb>=1.0,<3",
+    "pyarrow>=15.0,<27",
 ]
 
 [project.optional-dependencies]

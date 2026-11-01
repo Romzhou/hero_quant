@@ -54,6 +54,10 @@ EXPECTED_TABLES: tuple[str, ...] = (
     "audit_log",
     "data_snapshots",
     "pit_bars",
+    # 批次14：长任务队列断点表（db/migrations/0005_runs_queue.sql）
+    "run_steps",
+    # 批次14：审计链头（db/migrations/0006_audit_chain.sql）
+    "audit_chain_head",
 )
 
 
