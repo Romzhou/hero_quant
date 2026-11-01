@@ -92,7 +92,8 @@ test("malformed payload → 不崩，无效字段渲染 --", async () => {
     [SHADOW]: { orders_total: "x", reject_rate: null, rejected_by_rule: "bad" },
   })
   const { container } = render(<Risk />)
-  await waitFor(() => expect(screen.getByText("总敞口")).toBeInTheDocument())
+  // 必须等"加载完成后的渲染"：表头在 loading 阶段就已存在，只等它会在慢机器上抢跑（CI 已踩）
+  await waitFor(() => expect(screen.getAllByText("--").length).toBeGreaterThan(0))
   expect(container.textContent).not.toContain("NaN%")
   expect(screen.getAllByText("--").length).toBeGreaterThan(0)
   expect(container.textContent).not.toContain("62%")
