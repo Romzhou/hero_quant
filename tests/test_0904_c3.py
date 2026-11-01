@@ -91,7 +91,10 @@ def test_threadpool_timeout_nonblocking():
     TOOL_REGISTRY.pop(tool_name, None)
 
     def slow_func(symbol: str = "600519.SH"):
-        time.sleep(0.6)  # 超过 timeoutMs
+        # 睡眠必须与断言门拉开距离：原 0.6s + 0.45s 门只有 0.15s 余量，
+        # CI 慢机实测 0.54s 直接假红（run 41308347243）。坏实现（shutdown wait=True）
+        # 会至少阻塞到 1.5s，1.0s 门仍能可靠区分。
+        time.sleep(1.5)  # 超过 timeoutMs
         return "slow done"
 
     spec = ToolSpec(
@@ -114,8 +117,8 @@ def test_threadpool_timeout_nonblocking():
         start = time.monotonic()
         result = loop.run("test timeout")
         elapsed = time.monotonic() - start
-        # 修复后不应阻塞等待线程完成，elapsed 应远小于 0.6s（容忍 0.45s）
-        assert elapsed < 0.45, f"执行阻塞 {elapsed:.3f}s，说明 shutdown(wait=True) 未修复"
+        # 修复后不应阻塞等待线程完成：正常 ~0.1s，坏实现 >=1.5s，门取 1.0s
+        assert elapsed < 1.0, f"执行阻塞 {elapsed:.3f}s，说明 shutdown(wait=True) 未修复"
         # 应转为 tool_error timeout
         assert "timeout" in result.text.lower() or "tool_error" in result.text.lower()
     finally:
