@@ -1075,6 +1075,27 @@ except Exception as _e:
     _inc_api_error("audit", "router_include_failed")
     logger.warning("audit.router_include_failed", error_code="router_include_failed", error=str(_e))
 
+# PR-201~203 / PR-215（批次14）：长任务队列 + 管理后台。模块内路径是相对的，这里双前缀挂载
+# （/v1/... 与无前缀），与本文件既有 risk/audit 惯例一致；挂载失败显式告警，不静默 404。
+try:
+    from hero_quant.runs.api import router as _runs_router
+
+    app.include_router(_runs_router, prefix="/v1/runs")
+    app.include_router(_runs_router, prefix="/runs")
+except Exception as _e:
+    _inc_api_error("runs", "router_include_failed")
+    logger.warning("runs.router_include_failed", error_code="router_include_failed", error=str(_e))
+
+try:
+    from hero_quant.admin.api import router as _admin_router
+
+    app.include_router(_admin_router, prefix="/v1/admin")
+    app.include_router(_admin_router, prefix="/admin")
+except Exception as _e:
+    _inc_api_error("admin", "router_include_failed")
+    logger.warning("admin.router_include_failed", error_code="router_include_failed", error=str(_e))
+
+
 
 async def _start_ws_heartbeat():
     """WS 心跳监控（best-effort，懒加载 ws，避免 import 失败时函数缺失）。"""
@@ -3502,6 +3523,57 @@ def _static_backtest_bundle(reason: str = _BACKTEST_REPRO_COMPUTE_FAILED, bars: 
     return bundle
 
 
+def _audit_trace_id() -> str | None:
+    """当前请求 trace_id（审计 run_id）；拿不到返回 None，绝不现编 uuid。"""
+    try:
+        import structlog
+
+        value = structlog.contextvars.get_contextvars().get("trace_id")
+        return value.strip() if isinstance(value, str) and value.strip() else None
+    except Exception:  # pragma: no cover - 最小环境无 structlog
+        return None
+
+
+def _audit_current_tenant() -> str | None:
+    try:
+        from hero_quant.auth.context import current_tenant_id
+
+        return current_tenant_id()
+    except Exception:  # pragma: no cover - 无 auth 上下文（离线/测试）
+        return None
+
+
+def _audit_backtest_bundle(bundle: dict | None) -> None:
+    """回测跑完写一条 backtest.run 审计（PR-241 接线，批次14）。
+
+    只在**真的重算**时调用（缓存命中不记，避免把读缓存算成一次回测）；
+    无租户上下文（离线/测试）直接跳过——审计必须有 tenant，绝不现编。
+    失败只 warning，绝不改变回测响应。
+    """
+    tenant = _audit_current_tenant()
+    if not tenant:
+        return
+    try:
+        from hero_quant.audit.producers import record_backtest_audit
+
+        rep = (bundle or {}).get("reproducibility") or {}
+        ok = bool(rep.get("reproducible"))
+        record_backtest_audit(
+            tenant,
+            run_id=_audit_trace_id(),
+            strategy="default",
+            ok=ok,
+            error_code=None if ok else (rep.get("reason") or "not_reproducible"),
+            detail={
+                "result_hash": rep.get("result_hash"),
+                "data_fingerprint": rep.get("data_fingerprint"),
+                "bars": ((bundle or {}).get("sample") or {}).get("bars"),
+            },
+        )
+    except Exception as _e:  # noqa: BLE001 - 审计旁路失败不得影响回测
+        logger.warning("audit.backtest_producer_failed error_code=audit_producer_failed error_type=%s", type(_e).__name__)
+
+
 def _get_backtest_bundle(tenant: str | None = None, bars: int | None = None):
     """获取回测产物（metrics、持仓、tearsheet、CSV）：L1 内存 → L2 Redis → 计算。
 
@@ -3517,7 +3589,9 @@ def _get_backtest_bundle(tenant: str | None = None, bars: int | None = None):
     _bars = _resolve_backtest_bars(bars)
     if _bars != _BACKTEST_BARS_TARGET:
         try:
-            return _compute_backtest_bundle(_bars)
+            _cold_bundle = _compute_backtest_bundle(_bars)
+            _audit_backtest_bundle(_cold_bundle)
+            return _cold_bundle
         except Exception as _e:
             logger.warning("backtest.bundle_failed_fallback", error=str(_e), bars=_bars)  # 静态兜底，不伪造
             return _static_backtest_bundle()
@@ -3556,6 +3630,7 @@ def _get_backtest_bundle(tenant: str | None = None, bars: int | None = None):
         try:
             # 走到这里 _bars 恒等于默认窗口（显式窗口已在上面的冷路径截走），故零参调用。
             bundle = _compute_backtest_bundle()
+            _audit_backtest_bundle(bundle)
         except Exception as _e:
             logger.warning("backtest.bundle_failed_fallback", error=str(_e))  # intentional fallback to static
             bundle = _static_backtest_bundle()

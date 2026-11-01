@@ -295,6 +295,40 @@ def _billing_dsn_from_env() -> str | None:
     return None
 
 
+def _redis_password_from_provider(legacy: str | None) -> tuple[str, str | None]:
+    """Redis 口令经 secrets provider 取（env 后端下才回退 legacy=HERO_REDIS_PASSWORD）。
+
+    PR-151 收尾（批次14）：vault/kms 未实现时返回 ("", reason)，**不回落** env——
+    DSN 保持无口令，连接失败按既有语义暴露（/ready 如实 503），不偷偷用明文。
+    延迟导入 secrets：settings 是 env 网关，secrets 包又依赖 settings，避免循环导入。
+    """
+    try:
+        from hero_quant.secrets.resolve import resolve_secret
+    except ImportError as e:  # pragma: no cover - 只在残缺安装下触发
+        logger.warning("settings.redis_password_unavailable error_code=secrets_unavailable detail=%s", e)
+        return (legacy or ""), None
+    value, reason = resolve_secret("redis_password", legacy)
+    if reason:
+        logger.warning("settings.redis_password_unavailable error_code=%s", reason)
+    return (value or ""), reason
+
+
+def _apply_redis_password(dsn: str | None) -> str | None:
+    """给「有 userinfo 但没口令」的 Redis DSN 注入 provider 口令（PR-151 收尾）。
+
+    规则与 secrets.redis.apply_redis_password 完全一致，这里只是延迟导入的薄壳：
+    settings 模块导入时不拉 secrets 包，避免 settings<->secrets 循环。
+    """
+    if not dsn:
+        return dsn
+    try:
+        from hero_quant.secrets.redis import apply_redis_password
+    except ImportError as e:  # pragma: no cover - 只在残缺安装下触发
+        logger.warning("settings.redis_password_inject_skipped error_code=secrets_unavailable detail=%s", e)
+        return dsn
+    return apply_redis_password(dsn)
+
+
 def _redis_dsn_from_env() -> str | None:
     """Redis DSN 解析，遵循单一 env gate 约束。
 
@@ -305,7 +339,8 @@ def _redis_dsn_from_env() -> str | None:
     if raw and raw.strip():
         s = raw.strip()
         if s.lower().startswith(("redis://", "rediss://", "unix://")):
-            return s
+            # PR-151 收尾：无口令时按 provider 注入（vault/kms 不可用则原样返回）
+            return _apply_redis_password(s)
         warnings.warn(f"HERO_REDIS_DSN does not look like redis DSN: {_redact_dsn(s)!r}", UserWarning, stacklevel=2)
         logger.warning("HERO_REDIS_DSN invalid redis DSN: %r", _redact_dsn(s))
         # fall through：非法 DSN 不直接返回，继续走 HERO_REDIS_HOST 拼装/REDIS_URL 兼容，
@@ -326,7 +361,9 @@ def _redis_dsn_from_env() -> str | None:
             warnings.warn(f"Invalid HERO_REDIS_PORT={port} out of range 1-65535, using 6379", UserWarning, stacklevel=2)
             logger.warning("Invalid HERO_REDIS_PORT %r out of range 1-65535, using 6379", port)
             port = 6379
-        pw = (os.getenv("HERO_REDIS_PASSWORD", "") or "").strip()
+        # PR-151 收尾：provider 优先，env 后端下才回退 HERO_REDIS_PASSWORD（同源 env）；
+        # vault/kms 不通时不回落（pw 为空 → DSN 无口令，连接失败按既有语义暴露）。
+        pw, _pw_reason = _redis_password_from_provider((os.getenv("HERO_REDIS_PASSWORD", "") or "").strip())
         try:
             db_raw = (os.getenv("HERO_REDIS_DB", "0") or "0").strip()
             db = int(db_raw) if db_raw else 0
@@ -347,7 +384,7 @@ def _redis_dsn_from_env() -> str | None:
     # REDIS_URL 兼容
     alt = (os.getenv("REDIS_URL", "") or "").strip()
     if alt and alt.lower().startswith(("redis://", "rediss://")):
-        return alt
+        return _apply_redis_password(alt)
     return None
 
 
@@ -500,6 +537,25 @@ def _bounded_int_from_env(key: str, default: int, *, low: int, high: int) -> int
     return value
 
 
+_DEFAULT_PIT_ROOT = "/root/hero-data/pit"
+
+
+def _pit_root_from_env() -> str:
+    """HERO_PIT_ROOT：PIT Parquet 存储根目录（仓库外，绝对路径）。
+
+    - 空值 → 默认 /root/hero-data/pit（批次14 决策：数据落在仓库外，避免撑爆仓库所在分区）；
+    - 必须是绝对路径且不含波浪号：expanduser 在 systemd / 容器里语义不同，一律拒绝；
+    - 存在性/可写性**不在这里校验**：Settings 被大量进程与测试构造，缺目录不该让配置层崩。
+      真正使用处（PitParquetStore）必须 fail-fast 抛错，绝不静默 mkdir。
+    """
+    raw = (os.getenv("HERO_PIT_ROOT", "") or "").strip()
+    if not raw:
+        return _DEFAULT_PIT_ROOT
+    if "~" in raw or not raw.startswith("/"):
+        raise ValueError("HERO_PIT_ROOT must be an absolute path without '~'")
+    return raw.rstrip("/") or "/"
+
+
 @dataclass
 class Settings:
     """全局配置聚合，字段按分组：LLM / 数据与基准 / wall-time 治理 / 向量与嵌入 / checkpoint。"""
@@ -513,6 +569,8 @@ class Settings:
     llm_base_url: str | None = field(default_factory=_llm_base_url_from_env)
     data_default_market: str = field(default_factory=lambda: (os.getenv("HERO_DATA_MARKET", "") or "").strip() or "CN")
     data_mode: str = field(default_factory=lambda: (os.getenv("HERO_DATA_MODE", "") or "").strip() or "live")
+    # PIT Parquet 根目录（仓库外绝对路径；见 _pit_root_from_env）
+    pit_root: str = field(default_factory=_pit_root_from_env)
     # data_mode 默认 live（生产安全）：禁止 live 失败静默回退合成；仅当 HERO_DATA_MODE=synthetic 显式指定时允许合成
     # 基准指数映射：用于多市场回测时选择对照指数，默认覆盖常见后缀
     benchmark_ticker: str | None = field(default_factory=lambda: os.getenv("HERO_BENCHMARK_TICKER") or None)  # type: ignore[arg-type]

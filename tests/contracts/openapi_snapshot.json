@@ -1,6 +1,51 @@
 {
   "components": {
     "schemas": {
+      "EnqueueRunRequest": {
+        "properties": {
+          "kind": {
+            "default": "agent",
+            "description": "agent / backtest / research",
+            "title": "Kind",
+            "type": "string"
+          },
+          "max_tries": {
+            "default": 3,
+            "title": "Max Tries",
+            "type": "integer"
+          },
+          "payload": {
+            "additionalProperties": true,
+            "title": "Payload",
+            "type": "object"
+          },
+          "run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "可选：客户端提供用于幂等，重复即 400",
+            "title": "Run Id"
+          },
+          "session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Session Id"
+          }
+        },
+        "title": "EnqueueRunRequest",
+        "type": "object"
+      },
       "HTTPValidationError": {
         "properties": {
           "detail": {
@@ -12,6 +57,35 @@
           }
         },
         "title": "HTTPValidationError",
+        "type": "object"
+      },
+      "ToggleRequest": {
+        "description": "killswitch 启停入参；action 非法由端点显式判 400（不用 422 代替）。",
+        "properties": {
+          "action": {
+            "title": "Action",
+            "type": "string"
+          },
+          "reason": {
+            "title": "Reason",
+            "type": "string"
+          },
+          "scope": {
+            "title": "Scope",
+            "type": "string"
+          },
+          "target": {
+            "title": "Target",
+            "type": "string"
+          }
+        },
+        "required": [
+          "scope",
+          "target",
+          "action",
+          "reason"
+        ],
+        "title": "ToggleRequest",
         "type": "object"
       },
       "ValidationError": {
@@ -62,6 +136,291 @@
   },
   "openapi": "3.1.0",
   "paths": {
+    "/admin/audit/summary": {
+      "get": {
+        "description": "审计条数 + 最近 N 条（无 detail）+ 链校验摘要（字段与 AuditChain.verify 一致）。",
+        "operationId": "audit_summary_admin_audit_summary_get",
+        "parameters": [
+          {
+            "description": "最近 N 条，默认 20，上限 100",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 20,
+              "description": "最近 N 条，默认 20，上限 100",
+              "title": "Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Audit Summary Admin Audit Summary Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Audit Summary"
+      }
+    },
+    "/admin/overview": {
+      "get": {
+        "description": "平台（或当前租户）总览。\n\n中文：优先平台视图；DB 角色没有跨租户权限时退回当前租户，并通过\n`scope:\"tenant\"` + `cross_tenant_not_permitted` 显式告知范围被收窄——\n绝不把 RLS 过滤后的空集当成「平台没有数据」。",
+        "operationId": "overview_admin_overview_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Overview Admin Overview Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Overview"
+      }
+    },
+    "/admin/quotas": {
+      "get": {
+        "description": "当前租户配额：速率策略 + 当日 token 用量。\n\n中文：`TenantQuotaLimiter.usage()` 读失败会按 0 返回（其注释口径是「仅观测」），\n所以先用 `ping()` 探活，探活失败一律 null + reason，绝不把不可用写成 0。\n速率滑动窗口计数没有公开读接口 → `rate_window_used` 恒为 null 并带原因。",
+        "operationId": "quotas_admin_quotas_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Quotas Admin Quotas Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Quotas"
+      }
+    },
+    "/admin/runs": {
+      "get": {
+        "description": "只读 run 看板：直接走 RunQueue.list（租户内，不 HTTP 自调）。",
+        "operationId": "list_runs_admin_runs_get",
+        "parameters": [
+          {
+            "description": "queued/running/succeeded/failed/cancelled/cancelling/dead",
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "queued/running/succeeded/failed/cancelled/cancelling/dead",
+              "title": "Status"
+            }
+          },
+          {
+            "description": "默认 50，上限 100",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "description": "默认 50，上限 100",
+              "title": "Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Runs Admin Runs Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Runs"
+      }
+    },
+    "/admin/tenants": {
+      "get": {
+        "description": "跨租户清单（runs 数 + 最后活动时间）；无权限/无 PG 时显式降级。",
+        "operationId": "tenants_admin_tenants_get",
+        "parameters": [
+          {
+            "description": "默认 50，上限 100",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "description": "默认 50，上限 100",
+              "title": "Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Tenants Admin Tenants Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Tenants"
+      }
+    },
+    "/admin/toggles": {
+      "get": {
+        "description": "列出当前活动开关（运维总览）。",
+        "operationId": "list_toggles_admin_toggles_get",
+        "parameters": [
+          {
+            "description": "tenant/model/tool；缺省列出全部",
+            "in": "query",
+            "name": "scope",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "tenant/model/tool；缺省列出全部",
+              "title": "Scope"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Toggles Admin Toggles Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Toggles"
+      },
+      "post": {
+        "description": "开启/关闭 killswitch，并写一条 admin.toggle 审计。",
+        "operationId": "set_toggle_admin_toggles_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ToggleRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Set Toggle Admin Toggles Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Set Toggle"
+      }
+    },
     "/live": {
       "get": {
         "description": "存活探针：返回 ok 并递增请求计数。",
@@ -211,6 +570,515 @@
         "summary": "Risk Summary Alias"
       }
     },
+    "/runs": {
+      "get": {
+        "description": "当前租户的 run 列表（created_at 倒序）。",
+        "operationId": "list_runs_runs_get",
+        "parameters": [
+          {
+            "description": "可选，取值 cancelled/cancelling/dead/failed/queued/running/succeeded",
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "可选，取值 cancelled/cancelling/dead/failed/queued/running/succeeded",
+              "title": "Status"
+            }
+          },
+          {
+            "description": "默认 50，硬上限 200（超出被夹住）",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "description": "默认 50，硬上限 200（超出被夹住）",
+              "title": "Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Runs Runs Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Runs"
+      },
+      "post": {
+        "description": "入队一个长任务；返回 queued 状态的 run 行。",
+        "operationId": "enqueue_run_runs_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EnqueueRunRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Enqueue Run Runs Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Enqueue Run"
+      }
+    },
+    "/runs/{run_id}": {
+      "get": {
+        "description": "run 详情 + step 断点 + 进度；跨租户表现成 404。",
+        "operationId": "get_run_runs__run_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "title": "Run Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Run Runs  Run Id  Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Run"
+      }
+    },
+    "/runs/{run_id}/cancel": {
+      "post": {
+        "description": "queued → cancelled；running → cancelling（worker 在 step 边界收成 cancelled）。",
+        "operationId": "cancel_run_runs__run_id__cancel_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "title": "Run Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Cancel Run Runs  Run Id  Cancel Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Cancel Run"
+      }
+    },
+    "/runs/{run_id}/events": {
+      "get": {
+        "description": "SSE 进度流；首个事件反映当前状态，终态后关闭。",
+        "operationId": "stream_run_events_runs__run_id__events_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "title": "Run Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Stream Run Events"
+      }
+    },
+    "/v1/admin/audit/summary": {
+      "get": {
+        "description": "审计条数 + 最近 N 条（无 detail）+ 链校验摘要（字段与 AuditChain.verify 一致）。",
+        "operationId": "audit_summary_v1_admin_audit_summary_get",
+        "parameters": [
+          {
+            "description": "最近 N 条，默认 20，上限 100",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 20,
+              "description": "最近 N 条，默认 20，上限 100",
+              "title": "Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Audit Summary V1 Admin Audit Summary Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Audit Summary"
+      }
+    },
+    "/v1/admin/overview": {
+      "get": {
+        "description": "平台（或当前租户）总览。\n\n中文：优先平台视图；DB 角色没有跨租户权限时退回当前租户，并通过\n`scope:\"tenant\"` + `cross_tenant_not_permitted` 显式告知范围被收窄——\n绝不把 RLS 过滤后的空集当成「平台没有数据」。",
+        "operationId": "overview_v1_admin_overview_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Overview V1 Admin Overview Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Overview"
+      }
+    },
+    "/v1/admin/quotas": {
+      "get": {
+        "description": "当前租户配额：速率策略 + 当日 token 用量。\n\n中文：`TenantQuotaLimiter.usage()` 读失败会按 0 返回（其注释口径是「仅观测」），\n所以先用 `ping()` 探活，探活失败一律 null + reason，绝不把不可用写成 0。\n速率滑动窗口计数没有公开读接口 → `rate_window_used` 恒为 null 并带原因。",
+        "operationId": "quotas_v1_admin_quotas_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Quotas V1 Admin Quotas Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Quotas"
+      }
+    },
+    "/v1/admin/runs": {
+      "get": {
+        "description": "只读 run 看板：直接走 RunQueue.list（租户内，不 HTTP 自调）。",
+        "operationId": "list_runs_v1_admin_runs_get",
+        "parameters": [
+          {
+            "description": "queued/running/succeeded/failed/cancelled/cancelling/dead",
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "queued/running/succeeded/failed/cancelled/cancelling/dead",
+              "title": "Status"
+            }
+          },
+          {
+            "description": "默认 50，上限 100",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "description": "默认 50，上限 100",
+              "title": "Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Runs V1 Admin Runs Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Runs"
+      }
+    },
+    "/v1/admin/tenants": {
+      "get": {
+        "description": "跨租户清单（runs 数 + 最后活动时间）；无权限/无 PG 时显式降级。",
+        "operationId": "tenants_v1_admin_tenants_get",
+        "parameters": [
+          {
+            "description": "默认 50，上限 100",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "description": "默认 50，上限 100",
+              "title": "Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Tenants V1 Admin Tenants Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Tenants"
+      }
+    },
+    "/v1/admin/toggles": {
+      "get": {
+        "description": "列出当前活动开关（运维总览）。",
+        "operationId": "list_toggles_v1_admin_toggles_get",
+        "parameters": [
+          {
+            "description": "tenant/model/tool；缺省列出全部",
+            "in": "query",
+            "name": "scope",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "tenant/model/tool；缺省列出全部",
+              "title": "Scope"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Toggles V1 Admin Toggles Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Toggles"
+      },
+      "post": {
+        "description": "开启/关闭 killswitch，并写一条 admin.toggle 审计。",
+        "operationId": "set_toggle_v1_admin_toggles_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ToggleRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Set Toggle V1 Admin Toggles Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Set Toggle"
+      }
+    },
     "/v1/audit": {
       "get": {
         "description": "查询当前租户的审计事件（只读）。\n\n排序口径由 store 决定：给 `run_id` 走 `trace()`（时间正序，便于串联一条链路）；\n不给则走 `query()`（时间倒序，便于\"最近发生了什么\"）。响应恒回\n`{\"items\", \"count\", \"limit\", \"offset\"}`，item 原样透出 store 行（ts 由 FastAPI 序列化）。",
@@ -356,6 +1224,57 @@
           }
         },
         "summary": "Query Audit"
+      }
+    },
+    "/v1/audit/verify": {
+      "get": {
+        "description": "校验当前租户审计链的完整性（只读）。篡改是**返回值**，不是异常。\n\n响应字段（与 AuditChain.verify 一致）：\nok / entries / head_hash / broken_at / reason / degraded / reason_code\n+ chain_start_entry_id / chain_start_at / uncovered_count。\n\n中文口径：迁移前历史行的 prev_hash/entry_hash 为 NULL，**不回填、不伪造**；\n链自 chain_start_entry_id（ts=chain_start_at）起算，此前 uncovered_count 条未覆盖。\n文档/前端禁止把它写成「审计已启用」这类全量断言。",
+        "operationId": "verify_audit_chain_v1_audit_verify_get",
+        "parameters": [
+          {
+            "description": "可选：只校验最早的 N 条（1..500）；缺省全量重算，耗时随行数线性增长",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "可选：只校验最早的 N 条（1..500）；缺省全量重算，耗时随行数线性增长",
+              "title": "Limit"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Verify Audit Chain V1 Audit Verify Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Verify Audit Chain"
       }
     },
     "/v1/backtest/drawdowns.json": {
@@ -761,6 +1680,230 @@
           }
         },
         "summary": "Risk Summary"
+      }
+    },
+    "/v1/runs": {
+      "get": {
+        "description": "当前租户的 run 列表（created_at 倒序）。",
+        "operationId": "list_runs_v1_runs_get",
+        "parameters": [
+          {
+            "description": "可选，取值 cancelled/cancelling/dead/failed/queued/running/succeeded",
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "可选，取值 cancelled/cancelling/dead/failed/queued/running/succeeded",
+              "title": "Status"
+            }
+          },
+          {
+            "description": "默认 50，硬上限 200（超出被夹住）",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "description": "默认 50，硬上限 200（超出被夹住）",
+              "title": "Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Runs V1 Runs Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Runs"
+      },
+      "post": {
+        "description": "入队一个长任务；返回 queued 状态的 run 行。",
+        "operationId": "enqueue_run_v1_runs_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EnqueueRunRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Enqueue Run V1 Runs Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Enqueue Run"
+      }
+    },
+    "/v1/runs/{run_id}": {
+      "get": {
+        "description": "run 详情 + step 断点 + 进度；跨租户表现成 404。",
+        "operationId": "get_run_v1_runs__run_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "title": "Run Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Run V1 Runs  Run Id  Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Run"
+      }
+    },
+    "/v1/runs/{run_id}/cancel": {
+      "post": {
+        "description": "queued → cancelled；running → cancelling（worker 在 step 边界收成 cancelled）。",
+        "operationId": "cancel_run_v1_runs__run_id__cancel_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "title": "Run Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Cancel Run V1 Runs  Run Id  Cancel Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Cancel Run"
+      }
+    },
+    "/v1/runs/{run_id}/events": {
+      "get": {
+        "description": "SSE 进度流；首个事件反映当前状态，终态后关闭。",
+        "operationId": "stream_run_events_v1_runs__run_id__events_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "title": "Run Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Stream Run Events"
       }
     },
     "/v1/sessions": {

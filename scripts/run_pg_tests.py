@@ -29,6 +29,10 @@ _PG_TESTS = (
     "tests/test_data_snapshot_pg.py",
     "tests/test_checkpoint_pg.py",
     "tests/test_j8_loop_ckpt_gov.py",
+    # 批次14：审计链 / 长任务队列（真 PG）
+    "tests/test_pr241_audit_pg.py",
+    "tests/test_pr201_queue_pg.py",
+    "tests/test_pr215_admin_pg.py",
 )
 _PG_PREFIXES = ("postgresql://", "postgres://", "postgresql+psycopg://")
 _DSN_KEYS = ("HERO_CHECKPOINT_DSN", "HERO_PG_DSN")

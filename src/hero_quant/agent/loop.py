@@ -1457,6 +1457,31 @@ class AgentLoop:
 
                 def _handle_result(tool_name: str, result: Any, err: Optional[Exception]):
                     nonlocal tool_success_this_iter, _tool_success_global, buffer
+                    # PR-241 接线（批次14）：工具级审计 best-effort。无租户上下文（离线/测试）直接跳过，
+                    # 失败只 warning —— 审计绝不改变工具结果，也绝不现编 run_id。
+                    try:
+                        from hero_quant.audit.producers import record_tool_call_audit
+                        from hero_quant.auth.context import current_principal, current_tenant_id
+
+                        _audit_tenant = current_tenant_id()
+                        if _audit_tenant:
+                            try:
+                                import structlog as _slog_ctx
+
+                                _trace = _slog_ctx.contextvars.get_contextvars().get("trace_id")
+                                _audit_run = _trace.strip() if isinstance(_trace, str) and _trace.strip() else None
+                            except Exception:
+                                _audit_run = None
+                            record_tool_call_audit(
+                                _audit_tenant,
+                                tool=tool_name,
+                                run_id=_audit_run,
+                                user_id=getattr(current_principal(), "subject", None),
+                                ok=err is None,
+                                error_code=None if err is None else "tool_error",
+                            )
+                    except Exception:
+                        pass
                     # err 为 None 即成功，统一收敛错误分支
                     if err is None:
                         tool_success_this_iter = True
