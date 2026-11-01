@@ -747,6 +747,8 @@ async def _account_llm_cost_and_budget(
             model=model or "",
             latency_s=latency_s,
             usage=usage_dict,
+            # 批次15：拿不到 usage 就记 absent + 字符数/耗时，不伪造 estimated token
+            allow_estimate=False,
         )
     except (TypeError, ValueError, AttributeError, KeyError, RuntimeError) as _e:
         logger.warning("llm.cost_build_failed", endpoint=endpoint, error_code="llm_cost_build_failed", error=str(_e), chain="A")
@@ -3125,6 +3127,14 @@ def _load_backtest_prices(pd, target: int | None = None) -> "object | None":
         df = df.dropna(subset=["close"])
         prices = df.set_index(pd.to_datetime(df["date"]))[["close"]].sort_index().tail(_target)
         prices.index.name = "date"
+        # 现实性报告要成交量判停牌；引擎只吃 close，故另挂 attrs，不污染价格列（否则会被当成第二个资产）
+        if "volume" in df.columns:
+            try:
+                _vol = df.set_index(pd.to_datetime(df["date"]))["volume"].sort_index().tail(_target)
+                _vol.index.name = "date"
+                prices.attrs["volume"] = _vol
+            except (KeyError, TypeError, ValueError):
+                pass
     except Exception as _e:
         logger.warning("backtest.real_market_data_parse_failed error=%s", str(_e))
         return None
@@ -3360,6 +3370,9 @@ def _write_backtest_bundle_cache(bundle: dict, tenant: str | None = None, bars: 
             "sharpe_basis": bundle.get("sharpe_basis"),
             "warnings": list(bundle.get("warnings") or []),
             "reproducibility": dict(_rep) if isinstance(_rep, dict) else None,
+            # 批次15：现实性随缓存透传（小 dict；不写会让 L2 命中时字段凭空消失）
+            "realism": bundle.get("realism"),
+            "realism_assumptions": bundle.get("realism_assumptions"),
         }
         client.set(
             _backtest_bundle_cache_key(tenant, bars), json.dumps(payload, ensure_ascii=False, default=str), ex=600
@@ -3388,6 +3401,96 @@ def _backtest_prices_payload(prices: "object | None") -> list | None:
     except (KeyError, TypeError, ValueError, AttributeError) as _e:
         logger.warning("backtest.prices_payload_failed error=%s", _e)
         return None
+
+
+def _backtest_realism(positions, prices, engine_costs) -> tuple[dict, dict]:
+    """回测现实性报告（PR-234 接线，批次15）。
+
+    口径（写进响应，避免与引擎自身 costs 混淆）：
+    - fills 由引擎持仓市值差分反推：qty = Δ市值 / 当日收盘，side 由正负决定（首行取期初建仓）；
+    - bars 取价格序列，成交量若在 attrs 里（_load_backtest_prices 挂的）一并带上，否则停牌判定降级；
+    - 成本用 TradingCosts 默认假设（佣金/滑点/印花税），涨跌停按 A 股主板 ±10%；
+    - 这些是**假设**，与 engine.run(costs=...) 的计费口径是两回事，故单独放 realism_assumptions。
+
+    失败/缺数据一律交给 realism_report 的 degraded 分支，绝不在这里补 0。
+    """
+    assumptions = {
+        "fill_derivation": "positions.diff() / close",
+        "notional_unit": "engine position units（不是 CNY；成本率 cost_bps 才是可比口径）",
+        "first_bar_fills_excluded": True,
+        "price_limit_pct": 0.10,
+        "engine_costs": engine_costs,
+        "source": "backtest.realism defaults",
+    }
+    if positions is None:
+        # 没有持仓就没有 fills：显式说明，不用"0 笔成交"冒充正常
+        return {"degraded": True, "reason": "positions_missing"}, assumptions
+    try:
+        from hero_quant.backtest.realism import TradingConstraints, TradingCosts, realism_report
+
+        costs = TradingCosts()
+        assumptions.update(
+            commission_bps=costs.commission_bps,
+            slippage_bps=costs.slippage_bps,
+            stamp_duty_bps=costs.stamp_duty_bps,
+        )
+        fills: list[dict] = []
+        bars: list[dict] = []
+        closes = None
+        if prices is not None and hasattr(prices, "columns") and "close" in prices.columns:
+            closes = prices["close"]
+        if closes is not None:
+            volumes = None
+            try:
+                volumes = (prices.attrs or {}).get("volume")
+            except (AttributeError, TypeError):
+                volumes = None
+            for ts, close in closes.items():
+                if close is None or float(close) <= 0:
+                    continue
+                bar = {"trade_date": ts.date() if hasattr(ts, "date") else ts, "close": float(close)}
+                if volumes is not None and ts in getattr(volumes, "index", []):
+                    bar["volume"] = float(volumes.loc[ts])
+                bars.append(bar)
+            if positions is not None and hasattr(positions, "diff") and closes is not None:
+                delta = positions.diff()
+                # 首根 bar 的「建仓」没有前收盘可比，涨跌停/滑点模型无从套用：整行跳过，
+                # 而不是编一个 prev_close=当日收盘 的假值（会把首日成交算成永不触板）。
+                _first_ts = closes.index[0] if len(closes.index) else None
+                for ts, row in delta.iterrows():
+                    if _first_ts is not None and ts == _first_ts:
+                        continue
+                    if ts not in closes.index:
+                        continue
+                    price = float(closes.loc[ts])
+                    if price <= 0:
+                        continue
+                    for col, raw in row.items():
+                        try:
+                            value = float(raw)
+                        except (TypeError, ValueError):
+                            continue
+                        if value != value or abs(value) < 1e-9:  # NaN / 无变动
+                            continue
+                        fills.append(
+                            {
+                                "symbol": str(col),
+                                "trade_date": ts.date() if hasattr(ts, "date") else ts,
+                                "qty": value / price,
+                                "price": price,
+                                "side": "buy" if value > 0 else "sell",
+                            }
+                        )
+        report = realism_report(
+            fills=fills,
+            bars=bars,
+            costs=costs,
+            constraints=TradingConstraints(price_limit_pct=0.10),
+        )
+        return report, assumptions
+    except Exception as exc:  # noqa: BLE001 - 现实性是旁路报告，失败不得影响回测产物
+        logger.warning("backtest.realism_failed error_code=realism_failed error_type=%s", type(exc).__name__)
+        return {"degraded": True, "reason": "realism_failed"}, assumptions
 
 
 def _compute_backtest_bundle(bars: int | None = None) -> dict:
@@ -3474,6 +3577,8 @@ def _compute_backtest_bundle(bars: int | None = None) -> dict:
         _result_hash = result_hash(metrics=metrics_data, positions_csv=csv_text, tearsheet=tearsheet)
     else:
         _reason = _BACKTEST_REPRO_NO_FINGERPRINT
+    # PR-234 接线（批次15）：现实性报告随产物返回；假设单独给，避免与引擎 costs 口径混淆
+    realism, realism_assumptions = _backtest_realism(positions, prices, res.get("costs"))
     bundle = {
         "metrics": metrics_data,
         "positions": positions,
@@ -3484,6 +3589,8 @@ def _compute_backtest_bundle(bars: int | None = None) -> dict:
         "sample": sample,
         "sharpe_basis": sharpe_basis,
         "warnings": warnings,
+        "realism": realism,
+        "realism_assumptions": realism_assumptions,
     }
     _attach_backtest_reproducibility(
         bundle,
@@ -3512,6 +3619,9 @@ def _static_backtest_bundle(reason: str = _BACKTEST_REPRO_COMPUTE_FAILED, bars: 
         "sample": {"bars": 0, "start": None, "end": None},
         "sharpe_basis": None,
         "warnings": [],
+        # 没算过就没有现实性报告：显式降级，不给空数字
+        "realism": {"degraded": True, "reason": "static_bundle"},
+        "realism_assumptions": None,
     }
     _attach_backtest_reproducibility(
         bundle,
