@@ -2,6 +2,7 @@
 
 对外最小面：
     from hero_quant.secrets import get_secrets_provider, begin_rotation, complete_rotation, rotation_status
+    from hero_quant.secrets import apply_redis_password, rotation_audit_hook
 
 本批**没有**真 Vault/KMS 后端：`vault` / `kms` 命中即抛
 `UnsupportedSecretsBackendError`，不静默回落 env。生产 `.env` 仍是明文，
@@ -10,6 +11,7 @@
 
 from __future__ import annotations
 
+from .audit_bridge import rotation_audit_hook
 from .base import SLOT_CURRENT, SLOT_NEXT, SecretValue, SecretsProvider, fingerprint
 from .env_provider import NEXT_SUFFIX, SECRET_ENV_VARS, EnvSecretsProvider
 from .manager import (
@@ -19,6 +21,7 @@ from .manager import (
     UnsupportedSecretsBackendError,
     get_secrets_provider,
 )
+from .redis import apply_redis_password
 from .resolve import (LLM_KEY_NAME, OPENAI_KEY_NAME, PROVIDER_KEY_NAMES, resolve_llm_api_key, resolve_secret, secret_value)
 from .rotation import (
     DEFAULT_STATE_PATH,
@@ -52,10 +55,12 @@ __all__ = [
     "SecretValue",
     "SecretsProvider",
     "UnsupportedSecretsBackendError",
+    "apply_redis_password",
     "begin_rotation",
     "complete_rotation",
     "fingerprint",
     "get_secrets_provider",
+    "rotation_audit_hook",
     "rotation_status",
     "LLM_KEY_NAME",
     "OPENAI_KEY_NAME",

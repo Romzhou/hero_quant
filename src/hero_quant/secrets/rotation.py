@@ -19,6 +19,7 @@ import logging
 import os
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from .base import SLOT_CURRENT, SLOT_NEXT, SecretValue, SecretsProvider
 from .manager import get_secrets_provider
@@ -161,11 +162,29 @@ def rotation_status(name: str, *, state_path: Path | str = DEFAULT_STATE_PATH) -
     return _status(RotationStore(state_path), name)
 
 
+def _notify_audit(hook: Any, payload: dict[str, object]) -> None:
+    """把轮换事件交给审计钩子（批次14 接线）。
+
+    钩子失败绝不影响轮换本身：轮换状态已落盘，审计是旁路；只记 error_type，不记异常文本
+    （异常消息里可能带密钥片段）。audit_bridge.rotation_audit_hook 内部也会吞异常，这里是第二道保险。
+    """
+    if hook is None:
+        return
+    try:
+        hook(dict(payload))
+    except Exception as exc:  # noqa: BLE001 - 审计旁路失败不得改变轮换结果
+        logger.warning(
+            "secrets.rotation_audit_failed error_code=rotation_audit_failed error_type=%s",
+            type(exc).__name__,
+        )
+
+
 def begin_rotation(
     name: str,
     *,
     provider: SecretsProvider | None = None,
     state_path: Path | str = DEFAULT_STATE_PATH,
+    audit_hook: Any = None,
 ) -> dict[str, object]:
     """开启双读窗口：要求 `next` 槽已配新值，且与当前值指纹不同。不改版本。"""
     prov = provider or get_secrets_provider()
@@ -192,7 +211,9 @@ def begin_rotation(
     )
     store.put(rec)
     _log_event("begin", name=name, state=STATE_ROTATING, **_safe_fields(pending))
-    return _status(store, name)
+    status = _status(store, name)
+    _notify_audit(audit_hook, status)
+    return status
 
 
 def complete_rotation(
@@ -200,6 +221,7 @@ def complete_rotation(
     *,
     provider: SecretsProvider | None = None,
     state_path: Path | str = DEFAULT_STATE_PATH,
+    audit_hook: Any = None,
 ) -> dict[str, object]:
     """完成轮换：主槽必须真的已是窗口期新值（指纹比对），才版本 +1。"""
     prov = provider or get_secrets_provider()
@@ -229,7 +251,9 @@ def complete_rotation(
     )
     store.put(rec)
     _log_event("complete", name=name, state=STATE_STABLE, **_safe_fields(current))
-    return _status(store, name)
+    status = _status(store, name)
+    _notify_audit(audit_hook, status)
+    return status
 
 
 def _safe_fields(secret: SecretValue) -> dict[str, object]:
