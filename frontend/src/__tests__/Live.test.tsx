@@ -71,8 +71,8 @@ test("清空 clears offset/cost refs", async () => {
   await waitFor(() => {
     expect(screen.getByText(/offset: 0/)).toBeInTheDocument()
   })
-  // also cost should reset to 0
-  expect(document.body.textContent).toContain("0.000")
+  // PR-112：清空后成本回到「未定价」，不显示 $0.00 / 0.000 冒充真实读数
+  expect(document.body.textContent).toContain("未定价")
 })
 
 test("unstable React key fixed - duplicate offsets render distinct rows", async () => {

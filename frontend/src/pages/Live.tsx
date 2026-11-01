@@ -30,12 +30,13 @@ export default function Live() {
   const [events, setEvents] = useState<LiveEvent[]>([])
   const [offset, setOffset] = useState(0)
   const [paused, setPaused] = useState(false)
-  const [cost, setCost] = useState(0)
+  // cost 为 null 表示尚未收到任何有限数值（未定价 ≠ 0）；绝不能默认 0 冒充真实成本
+  const [cost, setCost] = useState<number | null>(null)
   // isDemo：默认演示态；只有真实事件（non_synthetic:true 或 trace.jsonl 带 ts 的记录）才摘标记，
   // 后端在无 trace 时推送的合成心跳必须保留「演示数据」标记（config/trace.ts）
   const [isDemo, setIsDemo] = useState(true)
   const costLimit = COST_LIMIT_USD
-  const ratio = Math.min(cost / costLimit, 1)
+  const ratio = cost === null ? 0 : Math.min(cost / costLimit, 1)
   const breakerState = getBreakerState(ratio)
   const listRef = useRef<HTMLDivElement>(null)
   const esRef = useRef<EventSource | null>(null)
@@ -176,11 +177,11 @@ export default function Live() {
   const handleClear = () => {
     setEvents([])
     setOffset(0)
-    setCost(0)
+    setCost(null)
     // 清空后回到「无真实证据」的演示态
     setIsDemo(true)
     offsetRef.current = 0
-    costRef.current = 0
+    costRef.current = null
   }
 
   return (
@@ -202,7 +203,10 @@ export default function Live() {
       <div className="mt-6 rounded-2xl border border-white/10 bg-ink-800/60 p-4 backdrop-blur">
         <div className="flex items-center justify-between">
           <h2 className="text-sm font-semibold text-mist">OTel cost 熔断条</h2>
-          <span className="font-mono text-xs text-slate-400">daily {cost.toFixed(3)} / {costLimit.toFixed(1)} USD · {breakerState}{isDemo ? " · 等待真实事件" : ""}</span>
+          <span className="font-mono text-xs text-slate-400">
+            daily {cost === null ? "未定价" : `${cost.toFixed(3)} / ${costLimit.toFixed(1)} USD · ${breakerState}`}
+            {isDemo ? " · 等待真实事件" : ""}
+          </span>
         </div>
         <div className="mt-3 h-3 w-full overflow-hidden rounded-full bg-ink-900 border border-white/5">
           <div className={"h-full rounded-full transition-all duration-700 " + (ratio >= BREAKER_OPEN_RATIO ? "bg-gradient-to-r from-red-500 to-red-600" : ratio >= BREAKER_HALF_OPEN_RATIO ? "bg-gradient-to-r from-amber-400 to-orange-500" : "bg-gradient-to-r from-emerald-400 to-teal-500")} style={{ width: `${Math.min(ratio * 100, 100)}%` }} />

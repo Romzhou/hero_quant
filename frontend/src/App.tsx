@@ -1,7 +1,8 @@
 /**
  * 应用装配（App）
  * - Shell 承载全局布局：顶部导航 + 路由内容区 + 底部声明
- * - 路由结构：/ → /dashboard；/research 研究；/backtest 与 /chat 复用 Chat（回测对话）；/live 实盘；/risk 风控；/settings 设置；
+ * - 路由结构：/ → /dashboard；/research 研究；/backtest 与 /chat 复用 Chat（回测对话）；/live 实盘；/risk 风控；
+ *   /admin 管理后台（PR-215，仅 admin）；/settings 设置；
  *   /compliance 合规与免责（PR-172：只读静态页，不进 RouteGuard，任何角色含无令牌均可读）
  * - 页面均懒加载，Suspense 提供加载态，首屏轻量
  */
@@ -19,6 +20,7 @@ const Chat = lazy(() => import("./pages/Chat"))
 const Live = lazy(() => import("./pages/Live"))
 const Risk = lazy(() => import("./pages/Risk"))
 const Monitor = lazy(() => import("./pages/Monitor"))
+const Admin = lazy(() => import("./pages/admin/Admin"))
 const Settings = lazy(() => import("./pages/Settings"))
 const Compliance = lazy(() => import("./pages/Compliance"))
 
@@ -33,6 +35,7 @@ const NAV_ITEMS: { to: string; label: string; required: Role }[] = [
   { to: "/live", label: "实盘", required: "viewer" },
   { to: "/monitor", label: "监控", required: "viewer" },
   { to: "/risk", label: "风控", required: "viewer" },
+  { to: "/admin", label: "管理", required: "admin" },
 ]
 
 /** 锁形提示：不隐藏链接（避免用户找不到页面），只表达「按令牌声明预期权限不足，是否拒绝由后端定」 */
@@ -192,6 +195,8 @@ function Shell() {
             <Route path="/live" element={<RouteGuard required="viewer" title="实盘"><Live /></RouteGuard>} />
             <Route path="/monitor" element={<RouteGuard required="viewer" title="监控"><Monitor /></RouteGuard>} />
             <Route path="/risk" element={<RouteGuard required="viewer" title="风控"><Risk /></RouteGuard>} />
+            {/* 管理后台：仅 admin；后端 /v1/admin/* 也会再判一次 403（前端只做 UX 提示） */}
+            <Route path="/admin" element={<RouteGuard required="admin" title="管理后台"><Admin /></RouteGuard>} />
             {/* 设置页不设角色闸：换令牌入口必须永远可达，否则低权令牌无法自救 */}
             <Route path="/settings" element={<Settings />} />
             {/* 合规页同样不设角色闸：免责/数据来源/令牌口径必须在任何角色下可读，
