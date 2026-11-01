@@ -281,6 +281,7 @@ def run_group(group, use_grounding, runs, model, api_key, base_url,
         unverified = bool(price_claims) and (hit is None or hit < 1.0)
         items.append({"idx": i, "group": group, "question": item["q"], "answer": answer[:6000],
                       "reason": reason, "iterations": iters, "wall_s": round(wall, 2),
+                      "llm_calls": llm.calls,
                       "expected_numbers": expected, "real_number_hit_rate": hit,
                       "unverified_numbers_in_answer": unverified,
                       "price_claims_found": len(price_claims)})
@@ -291,9 +292,12 @@ def run_group(group, use_grounding, runs, model, api_key, base_url,
     for it in items:
         reasons[it["reason"]] = reasons.get(it["reason"], 0) + 1
     hits = [it["real_number_hit_rate"] for it in items if it["real_number_hit_rate"] is not None]
+    # 判定口径：终止原因 / 真实数字命中 / 调用次数 / 耗时；成本不参与判定。
     return {"group": group, "tools": True, "grounding": use_grounding, "runs": len(items),
             "reason_distribution": reasons,
             "real_number_hit_mean": round(statistics.fmean(hits), 3) if hits else None,
+            "llm_calls_total": sum(int(it.get("llm_calls") or 0) for it in items),
+            "duration_s_total": round(sum(float(it.get("wall_s") or 0.0) for it in items), 2),
             "usage_total": usage, "items": items}
 
 
@@ -331,6 +335,8 @@ def summarize(items):
     for it in items:
         reasons[it["reason"]] = reasons.get(it["reason"], 0) + 1
     return {"n": len(items), "reasons": reasons,
+            "llm_calls_total": sum(int(it.get("llm_calls") or 0) for it in items),
+            "duration_s_total": round(sum(float(it.get("wall_s") or 0.0) for it in items), 2),
             "accuracy_mean": round(statistics.fmean(acc), 2) if acc else None,
             "accuracy_pass_4plus": round(sum(1 for v in acc if v >= 4) / max(1, len(acc)), 3) if acc else None,
             "hallucination_flagged": hall,
@@ -389,7 +395,9 @@ def main():
     out = ROOT / (args.out or f"eval_tool_{args.group}.json")
     out.write_text(json.dumps(res, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"\n[{res['group']}] reasons={res['reason_distribution']} "
-          f"real_number_hit_mean={res['real_number_hit_mean']} usage={res['usage_total']}")
+          f"real_number_hit_mean={res['real_number_hit_mean']} "
+          f"calls={res['llm_calls_total']} duration_s={res['duration_s_total']} "
+          f"usage={res['usage_total']}")
     print(f"# -> {out}")
 
 

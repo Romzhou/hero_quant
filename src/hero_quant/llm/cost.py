@@ -6,7 +6,11 @@
 口径（与仓库既有「降级必须显式」契约一致）：
 - 价格只取自 `llm/catalog.py::MODEL_CATALOG`（USD / 1M tokens），本模块不另建价目表；
 - 目录外模型 `cost_usd=None`（不猜价），计入 `unpriced_models`，绝不返回 0 冒充免费；
-- 后端没给 usage 时按字符启发式估算并置 `estimated=True`，不把估算值伪装成后端计量。
+- 后端没给 usage 时按字符启发式估算并置 `estimated=True`，不把估算值伪装成后端计量；
+- 免费源根本拿不到 usage 时走 `LLMUsage.from_free_source`：`usage_source="absent"`，
+  token 保持 0，只记字符数/调用次数/耗时，**禁止**伪造 estimated token；
+- `cost_usd` 字段保留给既有调用方；新的 `cost` 属性给出 `{"value", "status"}`，
+  `status` 只有 `priced`/`unpriced` 两种，与 `cost_usd` 恒一致。
 """
 
 from __future__ import annotations
@@ -30,6 +34,12 @@ except Exception:  # pragma: no cover - 最小环境无 structlog
 
 PRICE_UNIT = 1_000_000
 """价目表单位：catalog 的价格是 USD / 1M tokens。"""
+
+USAGE_SOURCES = ("provider", "estimated", "absent")
+"""usage_source 取值：后端计量 / 字符启发式估算 / 免费源无计量。"""
+
+ESTIMATED_METHOD_CHAR_HEURISTIC = "char_heuristic_cjk_4char"
+"""字符启发式估算方法名（CJK 1 字 ≈ 1 token，其余 4 字符 ≈ 1 token）。"""
 
 
 def _pick_int(raw: Any, *names: str) -> int | None:
@@ -100,7 +110,11 @@ def estimate_tokens(text: str | None) -> int:
 
 @dataclass(frozen=True)
 class LLMUsage:
-    """一次 LLM 调用的用量与成本快照。"""
+    """一次 LLM 调用的用量与成本快照。
+
+    保留 input_tokens/output_tokens/cost_usd/estimated/latency_s 的原有顺序与语义，
+    既有调用方（LLMFactory、gateway、evals、server）不需要改构造方式。
+    """
 
     provider: str
     model: str
@@ -109,10 +123,70 @@ class LLMUsage:
     cost_usd: float | None = None
     estimated: bool = False
     latency_s: float | None = None
+    usage_source: str = ""
+    estimated_method: str | None = None
+    input_chars: int = 0
+    output_chars: int = 0
+    calls: int = 1
+    duration_s: float | None = None
+
+    def __post_init__(self) -> None:
+        # 兼容旧构造：只给 estimated 不给 usage_source 时按 estimated 推导。
+        source = str(self.usage_source or "").strip().lower()
+        if not source:
+            source = "estimated" if self.estimated else "provider"
+        if source not in USAGE_SOURCES:
+            raise ValueError(f"invalid usage_source {self.usage_source!r}; expected one of {USAGE_SOURCES}")
+        object.__setattr__(self, "usage_source", source)
+        # estimated 与 usage_source 互斥且恒一致：只看 usage_source 就够，避免两处口径打架。
+        object.__setattr__(self, "estimated", source == "estimated")
+        if source != "estimated":
+            object.__setattr__(self, "estimated_method", None)
+        if self.duration_s is None and self.latency_s is not None:
+            object.__setattr__(self, "duration_s", self.latency_s)
+        if int(self.calls) < 0:
+            raise ValueError(f"calls must be >= 0, got {self.calls!r}")
+
+    @classmethod
+    def from_free_source(
+        cls,
+        provider: str,
+        model: str,
+        *,
+        input_chars: int = 0,
+        output_chars: int = 0,
+        calls: int = 1,
+        duration_s: float | None = None,
+    ) -> "LLMUsage":
+        """免费源（无 usage 接口）记录：只留字符数/次数/耗时，token 记 0 且不估算。
+
+        没有 token 就没有可计价基数，cost 恒为 unpriced；禁止用 0 元或估算 token 冒充。
+        """
+        return cls(
+            provider=str(provider),
+            model=str(model),
+            input_tokens=0,
+            output_tokens=0,
+            cost_usd=None,
+            estimated=False,
+            latency_s=duration_s,
+            usage_source="absent",
+            input_chars=max(0, int(input_chars)),
+            output_chars=max(0, int(output_chars)),
+            calls=max(0, int(calls)),
+            duration_s=duration_s,
+        )
 
     @property
     def total_tokens(self) -> int:
         return int(self.input_tokens) + int(self.output_tokens)
+
+    @property
+    def cost(self) -> dict[str, Any]:
+        """定价状态：value 与 cost_usd 恒等，status 只有 priced/unpriced。"""
+        if self.cost_usd is None:
+            return {"value": None, "status": "unpriced"}
+        return {"value": float(self.cost_usd), "status": "priced"}
 
     @property
     def priced(self) -> bool:
@@ -126,8 +200,15 @@ class LLMUsage:
             "output_tokens": int(self.output_tokens),
             "total_tokens": self.total_tokens,
             "cost_usd": self.cost_usd,
+            "cost": self.cost,
             "priced": self.priced,
             "estimated": bool(self.estimated),
+            "usage_source": self.usage_source,
+            "estimated_method": self.estimated_method,
+            "input_chars": int(self.input_chars),
+            "output_chars": int(self.output_chars),
+            "calls": int(self.calls),
+            "duration_s": self.duration_s,
             "latency_s": self.latency_s,
         }
 
@@ -142,10 +223,15 @@ def build_usage(
     latency_s: float | None = None,
     usage: Any = None,
     output_chars: int | None = None,
+    allow_estimate: bool = True,
 ) -> LLMUsage:
     """构造 `LLMUsage`：优先后端 usage，缺失时按字符估算。
 
     `output_chars` 用于流式场景——此时没有完整文本，只累计了字符数。
+
+    估算路径只服务既有调用方（后端静默但确实跑了模型）；免费源调用方传
+    `allow_estimate=False`：拿不到 usage 就转 `usage_source="absent"`，只记字符数/
+    次数/耗时，绝不伪造 token。
     """
     raw = usage
     if raw is None and llm is not None:
@@ -154,6 +240,15 @@ def build_usage(
             if raw is not None:
                 break
     normalized = normalize_usage(raw)
+    if normalized is None and not allow_estimate:
+        return LLMUsage.from_free_source(
+            provider,
+            model,
+            input_chars=len(str(prompt or "")),
+            output_chars=int(output_chars) if output_chars is not None else len(str(text or "")),
+            calls=1,
+            duration_s=latency_s,
+        )
     estimated = False
     if normalized is None:
         estimated = True
@@ -173,6 +268,7 @@ def build_usage(
         ) * float(info.output_price_per_million_tokens)
         cost = round(cost, 8)
 
+    chars_out = int(output_chars) if output_chars is not None else len(str(text or ""))
     return LLMUsage(
         provider=str(provider),
         model=str(model),
@@ -181,6 +277,12 @@ def build_usage(
         cost_usd=cost,
         estimated=estimated,
         latency_s=latency_s,
+        usage_source="estimated" if estimated else "provider",
+        estimated_method=ESTIMATED_METHOD_CHAR_HEURISTIC if estimated else None,
+        input_chars=len(str(prompt or "")),
+        output_chars=max(0, chars_out),
+        calls=1,
+        duration_s=latency_s,
     )
 
 
@@ -210,8 +312,13 @@ def record_llm_usage(usage: LLMUsage) -> None:
                 input_tokens=usage.input_tokens,
                 output_tokens=usage.output_tokens,
                 cost_usd=usage.cost_usd,
+                cost_status=usage.cost["status"],
                 priced=usage.priced,
                 estimated=usage.estimated,
+                usage_source=usage.usage_source,
+                input_chars=usage.input_chars,
+                output_chars=usage.output_chars,
+                calls=usage.calls,
                 latency_ms=round(usage.latency_s * 1000, 3) if usage.latency_s is not None else None,
             )
     except Exception:  # pragma: no cover - 日志 best-effort
@@ -252,11 +359,17 @@ class UsageLedger:
                     "output_tokens": 0,
                     "cost_usd": 0.0,
                     "priced": True,
+                    "input_chars": 0,
+                    "output_chars": 0,
+                    "duration_s": 0.0,
                 },
             )
             bucket["calls"] += 1
             bucket["input_tokens"] += usage.input_tokens
             bucket["output_tokens"] += usage.output_tokens
+            bucket["input_chars"] += int(usage.input_chars)
+            bucket["output_chars"] += int(usage.output_chars)
+            bucket["duration_s"] += float(usage.duration_s or 0.0)
             prov = by_provider.setdefault(
                 usage.provider, {"calls": 0, "input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0}
             )
@@ -274,15 +387,25 @@ class UsageLedger:
 
         for bucket in by_model.values():
             bucket["cost_usd"] = round(bucket["cost_usd"], 8)
+            bucket["duration_s"] = round(bucket["duration_s"], 6)
         for prov in by_provider.values():
             prov["cost_usd"] = round(prov["cost_usd"], 8)
 
         calls = len(self.items)
+        usage_sources: dict[str, int] = {}
+        for usage in self.items:
+            usage_sources[usage.usage_source] = usage_sources.get(usage.usage_source, 0) + 1
+        durations = [float(u.duration_s) for u in self.items if u.duration_s is not None]
         return {
             "calls": calls,
+            "llm_calls": sum(int(u.calls) for u in self.items),
             "input_tokens": sum(u.input_tokens for u in self.items),
             "output_tokens": sum(u.output_tokens for u in self.items),
             "total_tokens": sum(u.total_tokens for u in self.items),
+            "input_chars": sum(int(u.input_chars) for u in self.items),
+            "output_chars": sum(int(u.output_chars) for u in self.items),
+            "duration_s": round(sum(durations), 6) if durations else None,
+            "usage_sources": usage_sources,
             "total_cost_usd": round(total_cost, 8) if priced_calls else None,
             "priced_calls": priced_calls,
             "unpriced_calls": calls - priced_calls,
@@ -298,8 +421,10 @@ class UsageLedger:
 
 
 __all__ = [
+    "ESTIMATED_METHOD_CHAR_HEURISTIC",
     "LLMUsage",
     "PRICE_UNIT",
+    "USAGE_SOURCES",
     "UsageLedger",
     "build_usage",
     "estimate_tokens",

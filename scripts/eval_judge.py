@@ -25,7 +25,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from eval_agent import REAL_QUESTIONS, ZenChat, cost_usd  # noqa: E402
+from eval_agent import REAL_QUESTIONS, ZenChat, cost_block, usage_source  # noqa: E402
 from hero_quant.agent.loop import AgentLoop  # noqa: E402
 
 JUDGE_SYSTEM = """你是严格的投资研究问答评测判官。对给定「问题」和「回答」按三个维度打分（1-5 整数）：
@@ -66,7 +66,7 @@ def generate_answers(model, api_key, base_url, api_style, runs):
         for k in usage:
             usage[k] += llm.usage[k]
         items.append({"idx": i, "question": goal, "answer": answer,
-                      "reason": reason, "wall_s": round(wall, 3)})
+                      "reason": reason, "wall_s": round(wall, 3), "llm_calls": llm.calls})
         print(f"  [{i+1}/{runs}] {reason} {wall:.1f}s {len(answer)} chars")
     return items, usage
 
@@ -141,8 +141,11 @@ def aggregate(items, usage, gen_seconds, model):
         "hallucination_flagged": halluc,
         "compliance_violations": violations,
         "gen_wall_s_total": round(gen_seconds, 1),
+        "llm_calls_total": sum(int(it.get("llm_calls") or 0) for it in items),
         "usage_total": usage,
-        "cost_usd_total": round(cost_usd(usage), 6),
+        "usage_source": usage_source(usage),
+        # 回归判定只看判官分数与调用次数/耗时；成本只报告，目录外模型记 unpriced（禁止 0 元）
+        "cost": cost_block(model, usage),
         "caveat": "判官与被测为同一模型（自评偏差），通过率仅供相对比较；逐题明细已落盘供人工复核。",
     }
 

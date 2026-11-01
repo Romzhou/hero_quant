@@ -3,11 +3,19 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date
 from types import MappingProxyType
 from typing import Mapping
 
 
 DEFAULT_MODEL = "gpt-4o-mini"
+
+# 目录价没有版本链：effective_from 取「该模型首次公开可用日」，作为「不可能更早生效」
+# 的保守下界，保证早于该日的时点查询一律不猜价。价格本身可能随后续调价变化，
+# 因此 pricing 侧只标 source=llm.catalog，不承诺可回溯到历史真实账单。
+# 新增条目必须显式填 effective_from；默认值 date.max 表示「生效日未知」，
+# 时点查询恒视为未生效（fail-closed），禁止用今天的价冒充历史价。
+_DEFAULT_EFFECTIVE_FROM = date.max
 
 # 中文：已移除对常量集合的 no-op import-time guard（原检查恒为 False，仅 pass）；
 # 真实 fail-fast 由下方 MODEL_CATALOG 校验保证。
@@ -22,6 +30,7 @@ class ModelInfo:
     output_price_per_million_tokens: float
     capabilities: tuple[str, ...]
     context_window: int | None = None
+    effective_from: date = _DEFAULT_EFFECTIVE_FROM
 
     @property
     def input_price(self) -> float:
@@ -42,6 +51,7 @@ MODEL_CATALOG: Mapping[str, ModelInfo] = MappingProxyType(
             output_price_per_million_tokens=0.60,
             capabilities=("chat", "tool_calling", "structured_output"),
             context_window=128_000,
+            effective_from=date(2024, 7, 18),  # 公开可用日（价格生效下界）
         ),
         "gpt-4o": ModelInfo(
             name="gpt-4o",
@@ -49,6 +59,7 @@ MODEL_CATALOG: Mapping[str, ModelInfo] = MappingProxyType(
             output_price_per_million_tokens=10.00,
             capabilities=("chat", "tool_calling", "structured_output"),
             context_window=128_000,
+            effective_from=date(2024, 5, 13),  # 公开可用日（价格生效下界）
         ),
         "gpt-4.1-mini": ModelInfo(
             name="gpt-4.1-mini",
@@ -56,6 +67,7 @@ MODEL_CATALOG: Mapping[str, ModelInfo] = MappingProxyType(
             output_price_per_million_tokens=1.60,
             capabilities=("chat", "tool_calling", "structured_output"),
             context_window=1_000_000,
+            effective_from=date(2025, 4, 14),  # 公开可用日（价格生效下界）
         ),
         "gpt-4.1": ModelInfo(
             name="gpt-4.1",
@@ -63,6 +75,7 @@ MODEL_CATALOG: Mapping[str, ModelInfo] = MappingProxyType(
             output_price_per_million_tokens=8.00,
             capabilities=("chat", "tool_calling", "structured_output"),
             context_window=1_000_000,
+            effective_from=date(2025, 4, 14),  # 公开可用日（价格生效下界）
         ),
         "deepseek-chat": ModelInfo(
             name="deepseek-chat",
@@ -70,6 +83,7 @@ MODEL_CATALOG: Mapping[str, ModelInfo] = MappingProxyType(
             output_price_per_million_tokens=1.10,
             capabilities=("chat", "tool_calling", "structured_output"),
             context_window=128_000,
+            effective_from=date(2024, 5, 6),  # 公开可用日（价格生效下界）
         ),
         "deepseek-reasoner": ModelInfo(
             name="deepseek-reasoner",
@@ -77,6 +91,7 @@ MODEL_CATALOG: Mapping[str, ModelInfo] = MappingProxyType(
             output_price_per_million_tokens=2.19,
             capabilities=("chat", "tool_calling", "reasoning"),
             context_window=128_000,
+            effective_from=date(2025, 1, 20),  # 公开可用日（价格生效下界）
         ),
     }
 )

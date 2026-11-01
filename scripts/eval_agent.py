@@ -1,6 +1,10 @@
 """Agent 自动评测管线 — 场景矩阵 + 指标聚合。
 
-产出 eval_report.json：成功率/终止原因分布/轮次/耗时 P50·P95/token/成本/重试率/幻觉拦截率。
+产出 eval_report.json：成功率/终止原因分布/轮次/耗时 P50·P95/调用次数/重试率/幻觉拦截率。
+回归门只按「调用次数 / 耗时」判定（GATE_* 常量，经验值，未在真实网关验证）：
+免费源拿不到 usage 时 token 恒为 0，按 token/成本判定会假通过；成本只做报告，
+目录外模型记 unpriced（禁止 0 元）。
+
 mock 模式：脚本化 FakeLLM 注入故障场景，全程确定性可复现，不消耗真实 LLM 配额。
 
 用法（项目根目录）: python scripts/eval_agent.py [--runs 20] [--out eval_report.json]
@@ -21,20 +25,24 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from hero_quant.agent.loop import AgentLoop, LoopResult  # noqa: E402
-from hero_quant.agent.policies import BudgetBreaker, RetryPolicy  # noqa: E402
+from hero_quant.agent.policies import RetryPolicy  # noqa: E402
 from hero_quant.agent.grounding import GroundingLedger  # noqa: E402
+from hero_quant.llm.cost import price_for  # noqa: E402
 
-# 与 BudgetBreaker 默认定价一致（per 1M tokens），可通过 HERO_LLM_PRICE_IN/OUT 覆盖
-PRICE_IN, PRICE_OUT = 0.15, 0.60
+# 回归门（经验值，未在真实网关验证）：只看调用次数与单题壁钟，不看 token/成本。
+# 取 8 次：max_iterations=5 再加一次重试余量；取 120s：给慢网关留余量。
+GATE_MAX_CALLS_PER_RUN = 8
+GATE_MAX_WALL_S_PER_RUN = 120.0
 
 
 class FakeLLM:
     """脚本化 LLM：按剧本 yield chunks；前 fail_times 次调用抛瞬时故障；自记 token 用量。"""
 
-    def __init__(self, chunks, fail_forever=False, fail_times=0):
+    def __init__(self, chunks, fail_forever=False, fail_times=0, delay_s=0.0):
         self.chunks = list(chunks)
         self.fail_forever = fail_forever
         self.fail_times = fail_times
+        self.delay_s = delay_s
         self.calls = 0
         self.failed_calls = 0
         self.usage = {"input_tokens": 0, "output_tokens": 0}
@@ -44,6 +52,8 @@ class FakeLLM:
         if self.fail_forever or self.calls <= self.fail_times:
             self.failed_calls += 1
             raise ConnectionError(f"simulated llm failure (call #{self.calls})")
+        if self.delay_s:
+            time.sleep(self.delay_s)
         for chunk in self.chunks:
             um = chunk.get("usage_metadata") if isinstance(chunk, dict) else None
             if isinstance(um, dict):
@@ -52,8 +62,36 @@ class FakeLLM:
             yield chunk
 
 
-def cost_usd(usage: dict) -> float:
-    return usage["input_tokens"] / 1e6 * PRICE_IN + usage["output_tokens"] / 1e6 * PRICE_OUT
+def gate_result(calls: int, wall_s: float) -> dict:
+    """回归门判定：调用次数 + 壁钟（不参与判定的 token/成本一律不算）。"""
+    return {
+        "passed": int(calls) <= GATE_MAX_CALLS_PER_RUN and float(wall_s) <= GATE_MAX_WALL_S_PER_RUN,
+        "basis": "calls_wall",
+        "calls": int(calls),
+        "max_calls": GATE_MAX_CALLS_PER_RUN,
+        "wall_s": round(float(wall_s), 3),
+        "max_wall_s": GATE_MAX_WALL_S_PER_RUN,
+    }
+
+
+def usage_source(usage: dict) -> str:
+    """usage 全 0 = 后端没回计量 → absent；绝不按字符估算 token 冒充 provider。"""
+    total = int(usage.get("input_tokens") or 0) + int(usage.get("output_tokens") or 0)
+    return "provider" if total > 0 else "absent"
+
+
+def cost_block(model: str, usage: dict) -> dict:
+    """成本只报告不判定：无 usage 记 usage_unavailable，目录外模型记 unpriced，禁止 0 元。"""
+    if usage_source(usage) == "absent":
+        return {"value": None, "status": "unpriced", "reason": "usage_unavailable", "model": model}
+    info = price_for(model)
+    if info is None:
+        return {"value": None, "status": "unpriced", "reason": "pricing_source_unavailable", "model": model}
+    value = (
+        int(usage["input_tokens"]) / 1e6 * info.input_price_per_million_tokens
+        + int(usage["output_tokens"]) / 1e6 * info.output_price_per_million_tokens
+    )
+    return {"value": round(value, 8), "status": "priced", "source": "llm.catalog", "model": model}
 
 
 class ZenChat:
@@ -162,7 +200,7 @@ def run_real(model: str, runs: int, api_key: str, base_url: str, api_style: str 
     session_id = str(uuid.uuid4())  # 一次评测 = 一个稳定会话（Go 端点要求）
     prompts = (REAL_QUESTIONS * (runs // len(REAL_QUESTIONS) + 1))[:runs]
     results, usage_totals = [], {"input_tokens": 0, "output_tokens": 0}
-    retries = 0
+    retries, calls_total = 0, 0
     for i, goal in enumerate(prompts):
         llm = ZenChat(model=model, api_key=api_key, base_url=base_url,
                       api_style=api_style, session_id=session_id)
@@ -176,8 +214,10 @@ def run_real(model: str, runs: int, api_key: str, base_url: str, api_style: str 
             reason, iters = f"exception:{type(exc).__name__}", 0
             wall = time.perf_counter() - t0
         results.append({"reason": reason, "iterations": iters, "wall_s": round(wall, 3),
+                        "llm_calls": llm.calls, "gate": gate_result(llm.calls, wall),
                         "goal": goal[:40], "answer": getattr(r, "text", "")[:4000]})
         retries += llm.failed_calls
+        calls_total += llm.calls
         for k in usage_totals:
             usage_totals[k] += llm.usage[k]
     reasons: dict[str, int] = {}
@@ -194,14 +234,18 @@ def run_real(model: str, runs: int, api_key: str, base_url: str, api_style: str 
         "success_rate": round(reasons.get("completed", 0) / runs, 4),
         "wall_s": {"p50": round(p(0.5), 3), "p95": round(p(0.95), 3), "mean": round(statistics.fmean(walls), 3)},
         "llm_retry_failures": retries,
+        "llm_calls_total": calls_total,
+        "gate_pass_rate": round(sum(1 for r in results if r["gate"]["passed"]) / runs, 4),
+        "gate_basis": "calls_wall",
         "usage_total": usage_totals,
-        "cost_usd_total": round(cost_usd(usage_totals), 6),
-        "cost_usd_per_run": round(cost_usd(usage_totals) / runs, 6),
+        "usage_source": usage_source(usage_totals),
+        "cost": cost_block(model, usage_totals),
     }
 
 
 def run_scenario(name, runs, make_loop, goal="eval task"):
-    results, retries, usage_totals = [], 0, {"input_tokens": 0, "output_tokens": 0}
+    results, retries, calls_total = [], 0, 0
+    usage_totals = {"input_tokens": 0, "output_tokens": 0}
     for _ in range(runs):
         loop, llm = make_loop()
         t0 = time.perf_counter()
@@ -210,9 +254,11 @@ def run_scenario(name, runs, make_loop, goal="eval task"):
         results.append({
             "reason": r.reason, "terminated": bool(r.terminated), "iterations": r.iterations,
             "wall_s": round(wall, 4), "token_count": r.token_count,
+            "llm_calls": llm.calls, "gate": gate_result(llm.calls, wall),
             "grounding_verified": bool(r.grounding_verified),
         })
         retries += llm.failed_calls  # 实际抛错并触发重试策略的调用次数
+        calls_total += llm.calls
         for k in usage_totals:
             usage_totals[k] += llm.usage[k]
     reasons = {}
@@ -228,9 +274,11 @@ def run_scenario(name, runs, make_loop, goal="eval task"):
         "wall_s": {"mean": round(statistics.fmean(walls), 4), "p50": round(p(0.5), 4), "p95": round(p(0.95), 4)},
         "iterations": {"mean": round(statistics.fmean(iters), 2), "max": max(iters)},
         "retries_total": retries,
+        "llm_calls_total": calls_total,
+        "gate_pass_rate": round(sum(1 for r in results if r["gate"]["passed"]) / runs, 4),
+        "gate_basis": "calls_wall",
         "usage_total": usage_totals,
-        "cost_usd_total": round(cost_usd(usage_totals), 6),
-        "cost_usd_per_run": round(cost_usd(usage_totals) / runs, 6),
+        "usage_source": usage_source(usage_totals),
     }
 
 
@@ -282,7 +330,6 @@ def _resolve_key() -> str | None:
 def main():
     import os
 
-    global PRICE_IN, PRICE_OUT
     ap = argparse.ArgumentParser()
     ap.add_argument("--runs", type=int, default=20)
     ap.add_argument("--out", default="eval_report.json")
@@ -293,13 +340,6 @@ def main():
     ap.add_argument("--api", default="auto", choices=["auto", "chat", "responses"],
                     help="API 协议：Go 订阅端点模型用 responses，标准端点用 chat")
     args = ap.parse_args()
-
-    # 定价与环境变量对齐 BudgetBreaker 口径（HERO_LLM_PRICE_IN/OUT 覆盖默认值）
-    try:
-        PRICE_IN = float(os.environ.get("HERO_LLM_PRICE_IN", "") or PRICE_IN)
-        PRICE_OUT = float(os.environ.get("HERO_LLM_PRICE_OUT", "") or PRICE_OUT)
-    except ValueError:
-        pass
 
     if args.list_models or args.real:
         key = _resolve_key()
@@ -319,7 +359,13 @@ def main():
             "meta": {
                 "mode": f"real（真实 LLM e2e，model={args.model}）",
                 "generated_at": datetime.now(timezone.utc).isoformat(),
-                "pricing_per_1m": {"input": PRICE_IN, "output": PRICE_OUT},
+                "gate": {
+                    "basis": "calls_wall",
+                    "max_calls_per_run": GATE_MAX_CALLS_PER_RUN,
+                    "max_wall_s_per_run": GATE_MAX_WALL_S_PER_RUN,
+                    "note": "阈值是经验值，未在真实网关验证",
+                },
+                "cost_policy": "只报告不判定；目录外模型记 unpriced，禁止 0 元",
                 "runs_per_scenario": args.runs,
             },
             "scenarios": [res],
@@ -330,8 +376,9 @@ def main():
         print(f"# eval report -> {out}")
         print(f"\n[{s['scenario']}] model={s['model']} success={s['success_rate']:.0%} "
               f"wall p50/p95={s['wall_s']['p50']}s/{s['wall_s']['p95']}s "
-              f"tokens(in/out)={s['usage_total']['input_tokens']}/{s['usage_total']['output_tokens']} "
-              f"cost/run=${s['cost_usd_per_run']}")
+              f"calls/run={s['llm_calls_total'] / max(1, s['runs']):.1f} "
+              f"gate_pass={s['gate_pass_rate']:.0%} "
+              f"cost={s['cost']['status']}({s['cost']['value']}) usage={s['usage_source']}")
         print(f"  reasons: {s['reason_distribution']}")
         return
 
@@ -339,10 +386,6 @@ def main():
 
     normal_chunks = [{"type": "text", "text": "分析完成：600519 收盘 10.0 元，趋势稳定。",
                       "usage_metadata": {"input_tokens": 120, "output_tokens": 80}}]
-    huge_chunks = [{"type": "text", "text": "x" * 200_000,
-                    "usage_metadata": {"input_tokens": 50_000, "output_tokens": 50_000}}]
-    heavy_chunks = [{"type": "text", "text": "ok",
-                     "usage_metadata": {"input_tokens": 20_000, "output_tokens": 20_000}}]
     empty_chunks = [{"type": "text", "text": ""}]
     bad_tool_chunks = [{"type": "tool_call", "name": "__no_such_tool__", "arguments": {}}]
 
@@ -368,14 +411,16 @@ def main():
         llm = FakeLLM(bad_tool_chunks)
         return AgentLoop(llm=llm, max_iterations=5), llm
 
-    def mk_token_limit():
-        llm = FakeLLM(huge_chunks)
-        return AgentLoop(llm=llm, max_iterations=5, token_limit=2000), llm
+    def mk_wall_budget():
+        # 耗时判定：每次调用睡 10ms，壁钟预算 1ms → 第二轮即 wall_time_budget_exceeded。
+        # 这里的 0.001s 是构造熔断用的固定测试值，不是 GATE_MAX_WALL_S_PER_RUN 经验值。
+        llm = FakeLLM(empty_chunks, delay_s=0.01)
+        return AgentLoop(llm=llm, max_iterations=5, wall_time_budget=0.001), llm
 
-    def mk_budget():
-        llm = FakeLLM(heavy_chunks)
-        return AgentLoop(llm=llm, max_iterations=5,
-                         budget_breaker=BudgetBreaker(daily_limit=0.001)), llm
+    def mk_call_cap():
+        # 调用次数判定：空回环，max_iterations=2 直接把 LLM 调用次数限制住。
+        llm = FakeLLM(empty_chunks)
+        return AgentLoop(llm=llm, max_iterations=2), llm
 
     scenarios = [
         run_scenario("S1_normal_completion", n, mk_normal),
@@ -383,8 +428,8 @@ def main():
         run_scenario("S3_llm_persistent_failure", max(5, n // 2), mk_fail),
         run_scenario("S4a_empty_loop_max_iterations", max(5, n // 2), mk_empty),
         run_scenario("S4b_unknown_tool", max(5, n // 2), mk_bad_tool),
-        run_scenario("S5_token_limit", max(5, n // 2), mk_token_limit),
-        run_scenario("S6_budget_circuit_break", max(5, n // 2), mk_budget),
+        run_scenario("S5_wall_time_budget", max(5, n // 2), mk_wall_budget),
+        run_scenario("S6_call_cap_max_iterations", max(5, n // 2), mk_call_cap),
     ]
 
     report = {
@@ -392,7 +437,12 @@ def main():
             "mode": "mock（脚本化 LLM + 故障注入，确定性可复现，未调用真实 LLM）",
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "python": platform.python_version(),
-            "pricing_per_1m": {"input": PRICE_IN, "output": PRICE_OUT},
+            "gate": {
+                "basis": "calls_wall",
+                "max_calls_per_run": GATE_MAX_CALLS_PER_RUN,
+                "max_wall_s_per_run": GATE_MAX_WALL_S_PER_RUN,
+                "note": "阈值是经验值，未在真实网关验证",
+            },
             "runs_per_scenario": n,
         },
         "scenarios": scenarios,
@@ -406,7 +456,8 @@ def main():
         print(f"\n[{s['scenario']}] success={s['success_rate']:.0%} "
               f"wall p50/p95={s['wall_s']['p50']}s/{s['wall_s']['p95']}s "
               f"iters={s['iterations']['mean']} retries={s['retries_total']} "
-              f"cost/run=${s['cost_usd_per_run']}")
+              f"calls/run={s['llm_calls_total'] / max(1, s['runs']):.1f} "
+              f"gate_pass={s['gate_pass_rate']:.0%}")
         print(f"  reasons: {s['reason_distribution']}")
     g = report["grounding"]
     print(f"\n[grounding] 幻觉拦截率={g['hallucination_block_rate']:.0%} "
