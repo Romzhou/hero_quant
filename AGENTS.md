@@ -45,3 +45,16 @@
 - PR 必须列出“能碰/不能碰”文件清单，遵守第 5 节五线划分：`server.py` 仅 D 线、`settings.py` 仅 A 线、`tests/.github` 仅 B 线、`docs/AGENTS` 仅 C 线、`frontend/e2e` 仅 E 线、`migrations/` 全线冻结。
 - 改行为必改文档：`README` 启动/env、`docs/` 行号、`.env.example` 三处联动；`docs/plans` 被 ignore 的需显式说明去向。
 - 分段提交：每段完成就 `git commit`（勿 `push`，由总管统一处理）；多线并行时 `git add` 必须带显式路径，禁止 `git add -A` 卷入他人文件；C 线提交信息前缀 `C:`（例 `C: docs/issues P0-P3 line mapping`）。
+## 10. 依赖版本区间（新增依赖/调区间必须照此写）
+
+| 场景 | 下界 | 上界 | 例 |
+|---|---|---|---|
+| 通用 | **本机实测版本**（没实测过的版本不许写下界） | 实测 major + 1 | `foo>=1.4.2,<2` |
+| 存储/格式类库（自带文件格式，或版本号非严格 semver） | 实测版本 | 收一级 minor（major.minor+1） | `duckdb>=2.0,<2.1` |
+| ABI 绑定类库（wheel 与解释器/上游 ABI 绑定） | 实测版本 | 实测 major + 1 | `pyarrow>=26,<27` |
+| 拿不准归类 | 实测版本 | 取最窄（通常是 minor+1） | — |
+
+- 下界一律写**实测过的版本**：写「理论上能用」的旧版本等于给未验证的运行时开门。
+- 改区间必须同步 `uv pip compile --generate-hashes` 重生成 `requirements-lock.txt`，并跑 `pip-audit`；
+  lock 里的版本要与 pyproject 区间自洽（历史教训：rich/pandas 曾长期与 pyproject 边界矛盾，靠 pip 自动降级掩盖）。
+- 一次 PR 只动与本次需求相关的那几条，提交信息写明理由与被验证版本。
