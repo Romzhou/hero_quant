@@ -4,6 +4,11 @@
 拒绝明文落盘与明文透传（fail-closed）。历史遗留 !NOENC! 明文默认拒绝，
 仅显式 PII_ALLOW_LEGACY_NOENC=1 迁移开关放行并告警。
 参考 skills/fastapi-agent-module-skill/references/pii.py。
+
+密钥来源（PR-151 接线）：走 `hero_quant.secrets.resolve.resolve_secret("pii_encryption_key", ...)`，
+即 `HERO_SECRETS_BACKEND` 决定的后端；env 后端下才回退 `Settings.pii_encryption_key`。
+`vault`/`kms` 未实现时取不到 key —— 行为与"未配置 key"一致：**拒绝加密/解密**（RuntimeError），
+绝不静默降级成明文。
 """
 
 from __future__ import annotations
@@ -13,6 +18,7 @@ import warnings
 from typing import Optional
 
 from hero_quant.config.settings import Settings
+from hero_quant.secrets.resolve import resolve_secret
 
 logger = logging.getLogger(__name__)
 
@@ -29,24 +35,34 @@ _PII_KEY: Optional[bytes] = None
 # 缺 key 告警只打一次，避免热路径刷屏。
 _WARNED_NO_KEY = False
 _WARNED_NO_CRYPTO = False
+# 最近一次取 key 失败的原因（探针用；不含值）：None = 未取过或取到了
+_LAST_REASON: Optional[str] = None
 
 
 def _get_key() -> Optional[bytes]:
-    """懒加载 PII_ENCRYPTION_KEY，无密钥/无效密钥返回 None。"""
-    global _PII_KEY, _WARNED_NO_KEY, _WARNED_NO_CRYPTO
+    """懒加载 PII 加密口令（经 secrets provider），无密钥/无效密钥返回 None。"""
+    global _PII_KEY, _WARNED_NO_KEY, _WARNED_NO_CRYPTO, _LAST_REASON
     if _PII_KEY is not None:
         return _PII_KEY
     if not CRYPTO_AVAILABLE:
+        _LAST_REASON = "crypto_unavailable"
         # 缺依赖告警只打一次
         if not _WARNED_NO_CRYPTO:
             logger.warning("cryptography 未安装，PII 加密不可用")
             _WARNED_NO_CRYPTO = True
         return None
-    key_str = Settings().pii_encryption_key
+    settings = Settings()
+    # PR-151：provider 优先；env 后端下才回退 Settings 同源字段；vault/kms 不可用时不回落。
+    key_str, key_reason = resolve_secret("pii_encryption_key", settings.pii_encryption_key)
     if not key_str:
+        _LAST_REASON = key_reason or "pii_key_missing"
         # 缺 key 告警只打一次，避免热路径刷屏
         if not _WARNED_NO_KEY:
-            logger.warning("PII_ENCRYPTION_KEY 未设置，PII 加密拒绝明文落盘")
+            logger.warning(
+                "PII 加密口令不可用，拒绝明文落盘 error_code=%s backend_reason=%s",
+                "pii_key_missing",
+                key_reason or "not_configured",
+            )
             _WARNED_NO_KEY = True
         return None
     try:
@@ -54,10 +70,22 @@ def _get_key() -> Optional[bytes]:
         candidate = key_str.strip().encode()
         Fernet(candidate)  # 校验有效性
         _PII_KEY = candidate
+        _LAST_REASON = None
         return _PII_KEY
     except (ValueError, TypeError) as e:
-        logger.error("PII_ENCRYPTION_KEY 无效: %s", e)
+        _LAST_REASON = "pii_key_invalid"
+        logger.error("PII 加密口令无效 error_code=pii_key_invalid: %s", e)
         return None
+
+
+def pii_key_status() -> dict:
+    """PII 密钥可用性探针（不含任何密钥值）：运维/探针/单测用。"""
+    key = _get_key()
+    return {
+        "configured": key is not None,
+        "reason": None if key is not None else (_LAST_REASON or "pii_key_missing"),
+        "crypto_available": CRYPTO_AVAILABLE,
+    }
 
 
 def pii_encrypt(plaintext: str) -> str:
@@ -164,4 +192,5 @@ __all__ = [
     "is_pii_field",
     "safe_log_args",
     "CRYPTO_AVAILABLE",
+    "pii_key_status",
 ]

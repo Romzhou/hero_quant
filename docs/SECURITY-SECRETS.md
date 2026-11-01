@@ -102,9 +102,7 @@ grep -c 'sk-' var/secrets_state.json   # 期望 0 —— 状态文件里不该�
 6. **双读窗口只是"能并存"，不是"自动双读"**。窗口期内新旧值谁生效、业务是否真的同时接受两者，
    取决于调用方接线——业务侧目前只读主槽（`resolve_secret` 走 `slot="current"`），
    `*_NEXT` 仍需人工切换。
-7. **仍未接线的读取点**（这两条本批故意不动，别当成已完成）：
-   - `api/middleware/pii.py` 仍直接读 `Settings().pii_encryption_key`（PII 加密口令走同一条 env 路径，
-     但改它要连带定义"取不到 key 时是否拒绝加密/明文放行"的语义，属另一个 PR）；
+7. **仍未接线的读取点**（别当成已完成）：
    - PG / Redis 口令仍由 DSN 组装（`settings.py` 的 env 网关），`pg_password`/`redis_password`
      两个逻辑名暂无业务调用方；
    - `security/credentials.py` 是另一套「凭据引用」解析（`${VAR}` / 文件凭据），未接 provider。
@@ -113,13 +111,14 @@ grep -c 'sk-' var/secrets_state.json   # 期望 0 —— 状态文件里不该�
 
 | 位置 | 说明 |
 |---|---|
+| `api/middleware/pii.py::_get_key` | PII 加密口令经 provider；取不到即 `pii_encrypt/pii_decrypt` 抛 `RuntimeError`（拒绝明文），探针 `pii_key_status()` 返回 `configured/reason/crypto_available`（不含值） |
 | `llm/factory.py::LLMFactory.create` | 显式入参 > provider(`HERO_API_KEY`) > `Settings.api_key` > provider(`OPENAI_API_KEY`) > `Settings.openai_api_key` > provider 专属（deepseek/anthropic）；strict 缺 key 抛 `ValueError` 且带 reason |
 | `llm/gateway.py::LLMGateway.from_settings` / `_env_key` | primary 与回退链的 key 都经 provider；不再 `os.environ.get` |
 | `agent/embed.py::_try_openai` | `openai_api_key` 经 provider（env 后端下回退 Settings 同源字段） |
 | `memory/rerank.py::CohereReranker` | `cohere_api_key` 同上 |
 
 行为差异只有一条：`HERO_SECRETS_BACKEND=vault|kms` 时上面每一处都拿不到 key（即使 `.env` 里有），
-表现为既有降级路径（`_FakeLLM` / 空 key 跳过）**而不是**偷偷用明文——这是刻意的 fail-closed。
+表现为既有降级路径（`_FakeLLM` / 空 key 跳过 / PII 加解密抛错）**而不是**偷偷用明文——这是刻意的 fail-closed。
 
 ## 6. 铁律
 
