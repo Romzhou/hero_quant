@@ -6,6 +6,7 @@ import os
 from typing import Mapping
 
 from hero_quant.config.settings import Settings
+from hero_quant.secrets.resolve import resolve_llm_api_key
 
 from .catalog import DEFAULT_MODEL, ModelInfo, UnknownModelError, resolve_model
 
@@ -125,19 +126,18 @@ class LLMFactory:
                 except (ValueError, UnknownModelError) as e:
                     _logging.getLogger(__name__).warning("model_for_stage failed, fallback to settings.llm_model: %s", e)
                     model = getattr(self.settings, "llm_model", DEFAULT_MODEL) or DEFAULT_MODEL
-        # resolve api key — fail-visible in strict mode, per-provider env fallback
-        key = api_key or getattr(self.settings, "api_key", None) or getattr(self.settings, "openai_api_key", None)
-        if not key:
-            if provider == "anthropic":
-                key = os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("CLAUDE_API_KEY")
-            elif provider == "deepseek":
-                key = os.environ.get("DEEPSEEK_API_KEY")
-            if not key:
-                key = os.environ.get("OPENAI_API_KEY") or os.environ.get("HERO_API_KEY")
+        # resolve api key — 统一走 secrets provider（PR-151 接线）：
+        # provider 优先，env 后端下才回退 Settings 同源字段；vault/kms 不可用时不回落。
+        key, key_reason = resolve_llm_api_key(self.settings, provider=provider, explicit=api_key)
         if not key:
             if self.strict:
-                raise ValueError("LLM api_key missing; configure api_key / OPENAI_API_KEY / provider-specific key")
-            _logging.getLogger(__name__).warning("LLM api_key missing, using dummy key for offline fallback")
+                raise ValueError(
+                    "LLM api_key missing; configure api_key / OPENAI_API_KEY / provider-specific key"
+                    + (f" ({key_reason})" if key_reason else "")
+                )
+            _logging.getLogger(__name__).warning(
+                "LLM api_key missing, using dummy key for offline fallback reason=%s", key_reason or "not_configured"
+            )
             key = "test"
         # provider-specific chat creation
         chat = None

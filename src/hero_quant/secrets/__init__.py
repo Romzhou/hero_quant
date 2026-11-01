@@ -19,6 +19,7 @@ from .manager import (
     UnsupportedSecretsBackendError,
     get_secrets_provider,
 )
+from .resolve import (LLM_KEY_NAME, OPENAI_KEY_NAME, PROVIDER_KEY_NAMES, resolve_llm_api_key, resolve_secret, secret_value)
 from .rotation import (
     DEFAULT_STATE_PATH,
     STATE_KEYS,
@@ -56,4 +57,10 @@ __all__ = [
     "fingerprint",
     "get_secrets_provider",
     "rotation_status",
+    "LLM_KEY_NAME",
+    "OPENAI_KEY_NAME",
+    "PROVIDER_KEY_NAMES",
+    "resolve_llm_api_key",
+    "resolve_secret",
+    "secret_value",
 ]

@@ -17,6 +17,8 @@ import re
 import threading
 from typing import Dict, List
 
+from hero_quant.secrets.resolve import resolve_secret
+
 logger = logging.getLogger(__name__)
 
 # 默认维度：稠密召回常用 32/64，此处统一 32
@@ -242,7 +244,8 @@ def _try_openai(text: str, dim: int) -> List[float] | None:
         from hero_quant.config.settings import Settings
 
         _s = Settings()
-        api_key = _s.openai_api_key or ""
+        # PR-151：经 secrets provider 取（env 后端下才回退 Settings 同源字段）
+        api_key = resolve_secret("openai_api_key", _s.openai_api_key)[0] or ""
         model = _s.openai_embed_model
     except (ImportError, ValueError, TypeError, AttributeError, OSError) as exc:
         logger.warning("openai settings failed: %s", exc, exc_info=True)

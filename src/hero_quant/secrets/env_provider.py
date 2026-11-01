@@ -21,6 +21,10 @@ SECRET_ENV_VARS: Mapping[str, str] = {
     "llm_api_key": "HERO_API_KEY",
     "cohere_api_key": "COHERE_API_KEY",
     "openai_api_key": "OPENAI_API_KEY",
+    # PR-151 接线：多 provider 的专属 key 也登记进来，业务侧不再各自 os.environ.get
+    "deepseek_api_key": "DEEPSEEK_API_KEY",
+    "anthropic_api_key": "ANTHROPIC_API_KEY",
+    "claude_api_key": "CLAUDE_API_KEY",
     "pii_encryption_key": "PII_ENCRYPTION_KEY",
     "pg_password": "HERO_PG_PASSWORD",
     "redis_password": "HERO_REDIS_PASSWORD",

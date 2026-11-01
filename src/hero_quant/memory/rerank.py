@@ -7,6 +7,8 @@ import logging
 import threading
 from typing import List, Tuple
 
+from hero_quant.secrets.resolve import resolve_secret
+
 logger = logging.getLogger("hero_quant.memory.rerank")
 
 # prometheus counter or simple fallback
@@ -99,7 +101,8 @@ class CohereReranker:
             try:
                 from hero_quant.config.settings import Settings as _Settings
 
-                self.api_key = (_Settings().cohere_api_key or "").strip()
+                # PR-151：经 secrets provider 取（env 后端下才回退 Settings 同源字段）
+                self.api_key = (resolve_secret("cohere_api_key", _Settings().cohere_api_key)[0] or "").strip()
             except Exception:
                 self.api_key = ""  # intentional: 配置缺失即无 key（离线回退排序）；key 永不进日志
         # timeout 校验(0/负/非数→ValueError)

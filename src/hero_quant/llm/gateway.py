@@ -15,13 +15,13 @@
 from __future__ import annotations
 
 import logging
-import os
 import re
 import time
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
 from typing import Any
 
+from hero_quant.secrets.resolve import resolve_llm_api_key, secret_value
 from hero_quant.telemetry.circuit import CircuitBreaker
 
 from .cost import LLMUsage, build_usage, record_llm_usage
@@ -44,10 +44,12 @@ DEFAULT_PROVIDER_MODELS: dict[str, str] = {
 }
 """回退 provider 的默认模型（primary 用 settings.llm_model，不用这张表）。"""
 
-_PROVIDER_ENV_KEYS: dict[str, tuple[str, ...]] = {
-    "openai": ("OPENAI_API_KEY", "HERO_API_KEY"),
-    "deepseek": ("DEEPSEEK_API_KEY",),
-    "anthropic": ("ANTHROPIC_API_KEY", "CLAUDE_API_KEY"),
+# 逻辑密钥名（PR-151 接线）：实际环境变量由 secrets.env_provider.SECRET_ENV_VARS 登记，
+# 这里不再直接 os.environ.get，避免"同一把 key 两套读法"。
+_PROVIDER_SECRET_NAMES: dict[str, tuple[str, ...]] = {
+    "openai": ("llm_api_key", "openai_api_key"),
+    "deepseek": ("deepseek_api_key",),
+    "anthropic": ("anthropic_api_key", "claude_api_key"),
 }
 
 _SECRET_RE = re.compile(r"(sk-[A-Za-z0-9_\-]{6,}|Bearer\s+[A-Za-z0-9._\-]{6,}|api[_-]?key\s*[=:]\s*\S+)", re.IGNORECASE)
@@ -279,13 +281,8 @@ class LLMGateway:
 
         primary = _normalize_provider(getattr(settings, "llm_provider", None))
         primary_model = getattr(settings, "llm_model", None) or DEFAULT_PROVIDER_MODELS.get(primary)
-        primary_key = getattr(settings, "api_key", None) or getattr(settings, "openai_api_key", None)
-        if primary == "openai":
-            primary_key = primary_key or os.environ.get("OPENAI_API_KEY") or os.environ.get("HERO_API_KEY")
-        elif primary == "deepseek":
-            primary_key = primary_key or os.environ.get("DEEPSEEK_API_KEY")
-        else:
-            primary_key = primary_key or os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("CLAUDE_API_KEY")
+        # PR-151：key 一律经 secrets provider（vault/kms 不可用时不回落 env）
+        primary_key, _primary_key_reason = resolve_llm_api_key(settings, provider=primary)
 
         specs: list[ProviderSpec] = [
             ProviderSpec(
@@ -610,9 +607,9 @@ class GatewayResponse:
 
 
 def _env_key(provider: str) -> str | None:
-    """读 provider 专属 key（空串视为未配置）；只读环境，不落日志。"""
-    for key in _PROVIDER_ENV_KEYS.get(provider, ()):
-        val = (os.environ.get(key) or "").strip()
+    """读 provider 专属 key（经 secrets provider；空值视为未配置）；不落日志、不落值。"""
+    for name in _PROVIDER_SECRET_NAMES.get(provider, ()):
+        val, _reason = secret_value(name)
         if val:
             return val
     return None

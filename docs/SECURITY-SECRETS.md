@@ -12,6 +12,7 @@
 | `secrets/env_provider.py` | `EnvSecretsProvider`：逻辑名 → env 变量映射集中登记；`rotation: manual`、`persistence: env_file` |
 | `secrets/manager.py` | `get_secrets_provider()`：`env` 可用；`vault`/`kms` 抛 `UnsupportedSecretsBackendError`；未知值 `ValueError` |
 | `secrets/rotation.py` | 轮换记账：`begin_rotation` / `complete_rotation` / `rotation_status`，只记版本/时间/指纹 |
+| `secrets/resolve.py` | **业务侧唯一取密钥入口**：`resolve_llm_api_key()` / `resolve_secret()` / `secret_value()`；非 env 后端返回 `(None, reason)`，不回落 env |
 
 逻辑名 → 环境变量（唯一登记处，新增密钥先改 `SECRET_ENV_VARS` 再改本文）：
 
@@ -20,6 +21,9 @@
 | `llm_api_key` | `HERO_API_KEY` | `HERO_API_KEY_NEXT` |
 | `cohere_api_key` | `COHERE_API_KEY` | `COHERE_API_KEY_NEXT` |
 | `openai_api_key` | `OPENAI_API_KEY` | `OPENAI_API_KEY_NEXT` |
+| `deepseek_api_key` | `DEEPSEEK_API_KEY` | `DEEPSEEK_API_KEY_NEXT` |
+| `anthropic_api_key` | `ANTHROPIC_API_KEY` | `ANTHROPIC_API_KEY_NEXT` |
+| `claude_api_key` | `CLAUDE_API_KEY` | `CLAUDE_API_KEY_NEXT` |
 | `pii_encryption_key` | `PII_ENCRYPTION_KEY` | `PII_ENCRYPTION_KEY_NEXT` |
 | `pg_password` | `HERO_PG_PASSWORD` | `HERO_PG_PASSWORD_NEXT` |
 | `redis_password` | `HERO_REDIS_PASSWORD` | `HERO_REDIS_PASSWORD_NEXT` |
@@ -96,7 +100,26 @@ grep -c 'sk-' var/secrets_state.json   # 期望 0 —— 状态文件里不该�
    代价说明：接审计要动 audit 的 schema 与写入路径（跨线），且审计存储本身可能含 PII 通道，
    需要一并定脱敏口径与失败语义（写审计失败算不算轮换失败）；本批不做，留后续批次。
 6. **双读窗口只是"能并存"，不是"自动双读"**。窗口期内新旧值谁生效、业务是否真的同时接受两者，
-   取决于调用方接线——本批**没有**改 `server.py` / LLM 调用链，业务侧仍只读主槽。
+   取决于调用方接线——业务侧目前只读主槽（`resolve_secret` 走 `slot="current"`），
+   `*_NEXT` 仍需人工切换。
+7. **仍未接线的读取点**（这两条本批故意不动，别当成已完成）：
+   - `api/middleware/pii.py` 仍直接读 `Settings().pii_encryption_key`（PII 加密口令走同一条 env 路径，
+     但改它要连带定义"取不到 key 时是否拒绝加密/明文放行"的语义，属另一个 PR）；
+   - PG / Redis 口令仍由 DSN 组装（`settings.py` 的 env 网关），`pg_password`/`redis_password`
+     两个逻辑名暂无业务调用方；
+   - `security/credentials.py` 是另一套「凭据引用」解析（`${VAR}` / 文件凭据），未接 provider。
+
+### 5.1 已接线的读取点（本批）
+
+| 位置 | 说明 |
+|---|---|
+| `llm/factory.py::LLMFactory.create` | 显式入参 > provider(`HERO_API_KEY`) > `Settings.api_key` > provider(`OPENAI_API_KEY`) > `Settings.openai_api_key` > provider 专属（deepseek/anthropic）；strict 缺 key 抛 `ValueError` 且带 reason |
+| `llm/gateway.py::LLMGateway.from_settings` / `_env_key` | primary 与回退链的 key 都经 provider；不再 `os.environ.get` |
+| `agent/embed.py::_try_openai` | `openai_api_key` 经 provider（env 后端下回退 Settings 同源字段） |
+| `memory/rerank.py::CohereReranker` | `cohere_api_key` 同上 |
+
+行为差异只有一条：`HERO_SECRETS_BACKEND=vault|kms` 时上面每一处都拿不到 key（即使 `.env` 里有），
+表现为既有降级路径（`_FakeLLM` / 空 key 跳过）**而不是**偷偷用明文——这是刻意的 fail-closed。
 
 ## 6. 铁律
 
