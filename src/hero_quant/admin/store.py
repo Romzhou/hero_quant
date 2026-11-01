@@ -121,9 +121,17 @@ class AdminStore:
 
     @classmethod
     def from_settings(cls) -> "AdminStore":
-        """按 Settings.checkpoint_dsn 建/复用共享池；不可用即 fail-closed。"""
+        """按 HERO_ADMIN_READONLY_DSN（批次15）建/复用共享池；缺省回落 checkpoint_dsn。
+
+        只读角色（hero_admin_readonly）在库侧只有 SELECT + TO role 的 SELECT 策略，
+        即使本进程被攻破也写不了 runs / run_steps。不可用即 fail-closed。
+        """
         try:
-            return cls(get_pool())
+            from hero_quant.config.settings import Settings
+
+            dsn = getattr(Settings(), "admin_readonly_dsn", None) or None
+            # 无专用 DSN 时走 get_pool() 的原有零参路径（保持既有测试替身与默认行为）
+            return cls(get_pool(dsn) if dsn else get_pool())
         except DatabaseUnavailable as exc:
             logger.warning(
                 "admin.store_unavailable error_code=pg_unavailable reason=%s", exc.reason

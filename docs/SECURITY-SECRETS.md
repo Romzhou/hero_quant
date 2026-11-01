@@ -137,16 +137,12 @@ grep -c 'sk-' var/secrets_state.json   # 期望 0 —— 状态文件里不该�
 - 轮换状态文件的 `persistence` 字段必须如实：写不进去就是 `memory`，不假装已落盘。
 ## 7. 部署前置（批次14 新增，未完成前不要宣称"多租户隔离已闭环"）
 
-1. **队列 worker 独立数据库角色**：生产建 `hero_queue_worker`，本仓库不建角色。
-   建好后把 `db/migrations/0005_runs_queue.sql` 的两条 permissive policy 收窄：
-
-   ```sql
-   ALTER POLICY runs_queue_worker ON runs TO hero_queue_worker;
-   ALTER POLICY run_steps_queue_worker ON run_steps TO hero_queue_worker;
-   ```
-
-   **不要**给该角色 `BYPASSRLS`：worker 只在领取事务内 `SET LOCAL app.queue_worker='on'`，
-   领到后立刻 `SET LOCAL app.tenant_id=<租户>` 并清空该 GUC，执行期回归普通租户 RLS。
+1. **队列/管理后台的数据库角色**（批次15 起由 `db/migrations/0008_queue_roles.sql` 建立）：
+   `hero_queue_worker`（runs/run_steps 读写）与 `hero_admin_readonly`（只读），两者建为 `NOLOGIN`，
+   部署方用 `ALTER ROLE ... LOGIN PASSWORD` 自己设口令（仓库不落口令）。
+   跨租户能力来自 `CREATE POLICY ... TO hero_queue_worker` / `TO hero_admin_readonly`，
+   **不使用 BYPASSRLS**，也不依赖任何会话级 GUC（批次14 的 `app.queue_worker` 旁路已删除，有测试反证）。
+   DSN 走 `HERO_QUEUE_WORKER_DSN` / `HERO_ADMIN_READONLY_DSN`（留空回落 checkpoint DSN）。
 2. **API 侧连接永不带 worker GUC**：`runs.guards.assert_no_queue_worker` 检测到残留直接抛
    `QueueWorkerOnApiConnection`；若线上出现该异常，说明连接池被 worker/API 混用，属配置事故。
 3. **PIT 数据目录**（`HERO_PIT_ROOT`，默认 `/root/hero-data/pit`）必须由部署方预先创建且可写：

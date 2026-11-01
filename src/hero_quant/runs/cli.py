@@ -47,7 +47,8 @@ def build_parser() -> argparse.ArgumentParser:
         prog="python -m hero_quant.runs",
         description="长任务队列 worker（PR-201~203）。必须显式指定 handler；不指定直接退出。",
     )
-    parser.add_argument("--handler", help="pkg.module:function —— 任务处理器（必填）")
+    parser.add_argument("--handler", help="pkg.module:function —— 任务处理器（除 --reap 外必填）")
+    parser.add_argument("--reap", action="store_true", help="只跑一次过期租约回收（看门狗），不起 worker")
     parser.add_argument("--once", action="store_true", help="只跑一轮（有活返回 0，没活也返回 0）")
     parser.add_argument("--poll", type=float, default=1.0, help="空闲轮询间隔秒（默认 1.0）")
     parser.add_argument("--lease", type=int, default=300, help="租约秒（默认 300）")
@@ -58,6 +59,11 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(list(argv) if argv is not None else None)
+    if args.reap:
+        queue = RunQueue.from_worker_dsn()
+        result = queue.reap_expired()
+        print(f"reap: {result}")
+        return 0
     if not args.handler:
         print(
             "missing --handler: refusing to start a worker without a job handler "
@@ -71,7 +77,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"cannot load handler: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 2
 
-    queue = RunQueue.from_dsn()
+    queue = RunQueue.from_worker_dsn()
     worker = RunWorker(
         queue,
         handler,

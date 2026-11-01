@@ -169,10 +169,10 @@ def test_claim_sets_local_worker_guc_then_reverts_to_tenant():
 
     assert run is not None and run["attempt"] == 1
     assert conn.statements("FOR UPDATE SKIP LOCKED"), "领取必须是单语句 SKIP LOCKED"
-    assert conn.statements("set_config('app.queue_worker', 'on', true)")
-    # 领取成功后同一事务内立刻切租户，并把 worker GUC 清空
+    # 批次15：跨租户靠数据库角色策略，领取事务不再开 worker GUC（旧旁路已删除）
+    assert not conn.statements("set_config('app.queue_worker'"), "不得再依赖 worker GUC 开关"
+    # 领取成功后同一事务内立刻切租户
     assert conn.statements("set_config('app.tenant_id'")
-    assert conn.statements("set_config('app.queue_worker', '', true)")
     # 绝不允许会话级 SET（会在连接回池后残留）
     assert not conn.statements("SET app"), "禁止会话级 SET"
     assert queue.claim_registry_size() == 1

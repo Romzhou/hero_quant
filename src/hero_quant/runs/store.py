@@ -8,7 +8,9 @@
   单事务、无长事务；handler 在事务外跑（LLM 调用绝不包在事务里）。
 - **fencing**：`finish` / `fail` / `heartbeat` 一律带 `AND attempt = %s`；影响 0 行即
   丢弃写、打 `runs.write_fenced`、返回 False。僵尸 worker 因此写不进结果。
-- **RLS/GUC**：跨租户领取只在领取事务内 `SET LOCAL app.queue_worker='on'`（禁止会话级
+- **RLS**：跨租户领取靠数据库角色 hero_queue_worker + TO role 策略（批次15 起；旧的
+  会话级 GUC 旁路已删除）；领取事务内 `SET LOCAL app.tenant_id`，执行期回归普通租户 RLS。
+  历史说明（批次14 的做法，已废弃）：跨租户领取只在领取事务内 `SET LOCAL app.queue_worker='on'`（禁止会话级
   SET）；领到后同一事务内立刻 `SET LOCAL app.tenant_id` + 把 worker GUC 清空，执行期与
   写结果回归普通租户 RLS。连接回池不残留 GUC（SET LOCAL 随事务结束失效）。
 - **租户解析**：finish/fail/heartbeat 的契约签名不带 tenant_id，RunQueue 在 claim 时把
@@ -282,10 +284,14 @@ class _PoolBacked:
 
     @contextmanager
     def _worker_tx(self) -> Iterator[Any]:
-        """领取/看门狗专用事务：事务级 worker GUC，提交即失效（绝不会话级 SET）。"""
+        """领取/看门狗专用事务。
+
+        批次15 起跨租户靠**数据库角色**（hero_queue_worker + TO role 策略），不再用
+        会话级 GUC 开关——任何能连库的会话都能 set_config，等于可自助提权。这里不再
+        设置任何 GUC；领取后的租户上下文由 claim() 在同一事务内 SET LOCAL 到该行租户。
+        """
         with self._connection() as conn:
             with conn.transaction():
-                execute(conn, "SELECT set_config('app.queue_worker', 'on', true)")
                 yield conn
 
 
@@ -296,6 +302,13 @@ class RunQueue(_PoolBacked):
         super().__init__(pool)
         self._claims: dict[str, tuple[str, int]] = {}
         self._claims_lock = threading.Lock()
+
+    @classmethod
+    def from_worker_dsn(cls) -> "RunQueue":
+        """worker 进程专用：优先 HERO_QUEUE_WORKER_DSN（角色 hero_queue_worker），否则回落 checkpoint DSN。"""
+        from hero_quant.config.settings import Settings
+
+        return cls.from_dsn(getattr(Settings(), "queue_worker_dsn", None) or None)
 
     @classmethod
     def from_dsn(cls, dsn: str | None = None) -> "RunQueue":
@@ -402,12 +415,10 @@ class RunQueue(_PoolBacked):
         with self._worker_tx() as conn:
             row = fetch_one(conn, _CLAIM_SQL, (lease,))
             if row is not None:
-                # 同一事务内立刻切到该行租户，并清掉 worker GUC：此后（含本事务剩余部分）
-                # 一切读写都走普通租户 RLS，跨租户可见性只活到这一句。
+                # 同一事务内立刻切到该行租户：此后（含本事务剩余部分）一切读写都走普通租户 RLS
                 execute(conn, "SELECT set_config('app.tenant_id', %s, true)", (row["tenant_id"],))
                 execute(conn, "SELECT set_config('app.tenant', %s, true)", (row["tenant_id"],))
                 execute(conn, "SELECT set_config('app.current_tenant', %s, true)", (row["tenant_id"],))
-                execute(conn, "SELECT set_config('app.queue_worker', '', true)")
         if row is None:
             return None
         self._remember_claim(str(row["id"]), str(row["tenant_id"]), int(row["attempt"]))

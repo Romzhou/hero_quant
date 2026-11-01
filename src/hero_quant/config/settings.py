@@ -578,6 +578,21 @@ def _pricing_backend_from_env() -> str:
     raise ValueError(f"HERO_PRICING_BACKEND must be one of {_PRICING_BACKENDS}, got {raw!r}")
 
 
+def _role_dsn_from_env(key: str) -> str | None:
+    """按角色拆分的 DSN（批次15）：HERO_QUEUE_WORKER_DSN / HERO_ADMIN_READONLY_DSN。
+
+    - 空值 → None（回落到 checkpoint DSN，保持单库单角色可用）；
+    - 非 PostgreSQL scheme → ValueError（写错协议不许静默当没配）；
+    - 口令仍走 provider 注入（与 _apply_pg_password 同规则，vault/kms 不通则不注入）。
+    """
+    raw = (os.getenv(key, "") or "").strip()
+    if not raw:
+        return None
+    if not raw.lower().startswith(_PG_PREFIXES):
+        raise ValueError(f"{key} must be a postgresql:// DSN")
+    return _apply_pg_password(raw)
+
+
 @dataclass
 class Settings:
     """全局配置聚合，字段按分组：LLM / 数据与基准 / wall-time 治理 / 向量与嵌入 / checkpoint。"""
@@ -595,6 +610,10 @@ class Settings:
     pit_root: str = field(default_factory=_pit_root_from_env)
     # 定价源：catalog（默认，仓内价目）| null（明确关闭，全部 unpriced）
     pricing_backend: str = field(default_factory=_pricing_backend_from_env)
+    # 按角色拆分的 DSN（批次15）：worker 用 hero_queue_worker、管理后台只读用 hero_admin_readonly；
+    # 留空则回落 checkpoint_dsn（单角色部署仍可用，但跨租户能力取决于该角色的 RLS 策略）
+    queue_worker_dsn: str | None = field(default_factory=lambda: _role_dsn_from_env("HERO_QUEUE_WORKER_DSN"))
+    admin_readonly_dsn: str | None = field(default_factory=lambda: _role_dsn_from_env("HERO_ADMIN_READONLY_DSN"))
     # data_mode 默认 live（生产安全）：禁止 live 失败静默回退合成；仅当 HERO_DATA_MODE=synthetic 显式指定时允许合成
     # 基准指数映射：用于多市场回测时选择对照指数，默认覆盖常见后缀
     benchmark_ticker: str | None = field(default_factory=lambda: os.getenv("HERO_BENCHMARK_TICKER") or None)  # type: ignore[arg-type]

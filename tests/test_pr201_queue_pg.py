@@ -484,49 +484,50 @@ def test_cancel_takes_effect_at_next_step_boundary(queue):
 # ---------------------------------------------------------------------------
 # RLS/GUC 三条附加验收
 # ---------------------------------------------------------------------------
-def test_claim_uses_set_local_and_leaves_no_worker_guc(schema, rls):
-    pool, _role, _name = rls
-    name, _role2 = schema
-    admin_queue = RunQueue(_Pool(_dsn(), name))
-    admin_queue.enqueue(_TENANT_A, "agent", {})
-    admin_queue.enqueue(_TENANT_B, "agent", {})
-
-    queue = RunQueue(pool)
-    claimed = queue.claim(lease_seconds=60)
-    assert claimed is not None and claimed["tenant_id"] in {_TENANT_A, _TENANT_B}
-
-    # ① 同一连接、事务外：SET LOCAL 已随提交失效，绝不能残留 'on'
-    leaked = pool.scalar("SELECT current_setting('app.queue_worker', true)")
-    assert (leaked or "").strip() == "", "SET LOCAL 提交后不应残留 worker GUC，实际 %r" % (leaked,)
-
-    # 跨租户可见性同时收回：没有租户上下文时 0 行（不是 2 行）
-    assert pool.scalar("SELECT count(*) FROM runs") == 0
-
-
-def test_worker_guc_visible_only_inside_claim_transaction(schema):
+def test_worker_policy_is_role_scoped(schema):
+    """跨租户改由 hero_queue_worker 角色承担（TO role 策略），不再依赖会话 GUC。"""
+    name, role = schema
+    RunQueue(_Pool(_dsn(), name)).enqueue(_TENANT_A, "agent", {})
+    RunQueue(_Pool(_dsn(), name)).enqueue(_TENANT_B, "agent", {})
+    conn = psycopg.connect(_dsn(), autocommit=False)
+    try:
+        conn.execute('SET search_path TO "%s"' % name)
+        # 临时 schema 由 app 角色创建，worker 角色默认没有 USAGE：补授权（生产里表在 public，
+        # PUBLIC 自带 USAGE，不存在这一步）
+        conn.execute('GRANT USAGE ON SCHEMA "%s" TO hero_queue_worker' % name)
+        conn.commit()
+        conn.execute('SET search_path TO "%s"' % name)
+        try:
+            conn.execute("SET LOCAL ROLE hero_queue_worker")
+        except psycopg.errors.InsufficientPrivilege:
+            pytest.skip("当前 DSN 角色不是 hero_queue_worker 的成员，无法 SET ROLE")
+        visible = conn.execute("SELECT count(*) FROM runs").fetchone()[0]
+        assert visible == 2, "hero_queue_worker 应跨租户看到全部 runs，实际 %s 行" % visible
+    finally:
+        conn.close()
+    if role:
+        conn2 = psycopg.connect(_dsn(), autocommit=False)
+        try:
+            conn2.execute('SET search_path TO "%s"' % name)
+            conn2.execute('SET ROLE "%s"' % role)
+            assert conn2.execute("SELECT count(*) FROM runs").fetchone()[0] == 0, "普通角色无租户上下文应看不到"
+        finally:
+            conn2.close()
+def test_guc_bypass_removed(schema):
+    """批次14 的 set_config(app.queue_worker,on) 必须已经无效（旧旁路已撤）。"""
     name, role = schema
     if role is None:
         pytest.skip("无可用非 superuser 登录角色（BYPASSRLS 无法证明 RLS），RLS 用例跳过")
-    pool = _SinglePool(_dsn(), name, role=role)
+    RunQueue(_Pool(_dsn(), name)).enqueue(_TENANT_A, "agent", {})
+    conn = psycopg.connect(_dsn(), autocommit=False)
     try:
-        admin_queue = RunQueue(_Pool(_dsn(), name))
-        admin_queue.enqueue(_TENANT_A, "agent", {})
-        admin_queue.enqueue(_TENANT_B, "agent", {})
-
-        with pool.connection() as conn:
-            assert (conn.execute("SELECT current_setting('app.queue_worker', true)").fetchone()[0] or "") == ""
-            conn.execute("SELECT set_config('app.queue_worker', 'on', true)")
-            visible = conn.execute("SELECT count(*) FROM runs").fetchone()[0]
-        assert visible == 2, "领取事务内 worker GUC 应看到全部租户，实际 %s 行" % visible
-
-        cleared = pool.scalar(
-            "SELECT COALESCE(current_setting('app.queue_worker', true), '') = ''"
-        )
-        assert cleared is True
-        assert pool.scalar("SELECT count(*) FROM runs") == 0
+        conn.execute('SET search_path TO "%s"' % name)
+        conn.execute('SET ROLE "%s"' % role)
+        conn.execute("SELECT set_config('app.queue_worker', 'on', true)")
+        assert conn.execute("SELECT count(*) FROM runs").fetchone()[0] == 0, "GUC 旁路应已撤掉"
+        conn.rollback()
     finally:
-        pool.close()
-
+        conn.close()
 
 def test_api_guard_rejects_leaked_worker_guc(schema):
     name, role = schema
