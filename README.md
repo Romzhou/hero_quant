@@ -136,6 +136,7 @@ docker build --build-arg HERO_QUANT_VERSION="$(python -c 'import tomllib;print(t
 | `HERO_READY_COHERE_FATAL` | `false` | `true` 才把缺 Cohere key 判为致命 degraded |
 | `HERO_SECRETS_BACKEND` | `env` | 密钥托管后端：`env`=进程环境/`.env` 明文（唯一可用，人工轮换）；`vault`/`kms` 已登记未实现，命中即抛 `UnsupportedSecretsBackendError`；其它未知值 `ValueError`——均 fail-closed，不静默回落 env。取密钥走 `hero_quant.secrets.get_secrets_provider()`，轮换 runbook 见 `docs/SECURITY-SECRETS.md` |
 | `HERO_ENV` | 空 | 本地验收设 `development`，无真 Redis 时才允许 fakeredis 回退；否则限流 fail-closed 直接 429 |
+| `HERO_PRICING_BACKEND` | `catalog` | 定价源：`catalog`=仓内 `llm/catalog.py` 价目（目录外模型仍 `unpriced`）；`null`=明确关闭，全部记 `unpriced` 且绝不写 0 元；其余值 `ValueError` |
 | `HERO_PIT_ROOT` | `/root/hero-data/pit` | PIT Parquet 数据根目录（**仓库外**绝对路径）。拒绝 `~` 与非绝对路径（`ValueError`）；存在性/可写性在使用处 fail-fast 校验，不静默创建 |
 | `HERO_DATA_MODE` | `live` | `live` 调真实行情；`synthetic` **可用**，但 `provenance.source=synthetic`、A股 `unit=board_lots`，跨源 1% 比对被显式跳过并 warning（非"离线可用"） |
 | `HERO_DATA_MARKET` | `CN` | 默认市场 |

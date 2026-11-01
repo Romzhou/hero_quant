@@ -213,6 +213,32 @@ class LLMUsage:
         }
 
 
+def _price_card(model: str, pricing: Any = None) -> Any:
+    """按定价源取价卡（PR-112 接线，批次15）：provider 优先，缺省读 HERO_PRICING_BACKEND。
+
+    - backend=null：恒 None → unpriced（不写 0 元）；
+    - backend=catalog：走 llm/catalog 的价目（未知模型仍 None）；
+    - 配置非法/导入失败：**不抛**——定价不是正确性路径，降级成 unpriced 并打 warning，
+      绝不因为算不出钱把答案打挂。
+    """
+    if pricing is not None:
+        try:
+            return pricing.price(model)
+        except (ValueError, TypeError, AttributeError, RuntimeError) as exc:
+            logger.warning("llm.pricing_lookup_failed error_code=pricing_lookup_failed error_type=%s", type(exc).__name__)
+            return None
+    try:
+        from hero_quant.config.settings import Settings
+        from hero_quant.pricing.base import get_pricing_provider
+
+        # getattr 兜底：测试里 Settings 常被替身（如 _FakeSettings），缺字段不等于关阀
+        backend = getattr(Settings(), "pricing_backend", "catalog")
+        return get_pricing_provider(backend).price(model)
+    except (ImportError, ValueError, TypeError, AttributeError, RuntimeError) as exc:
+        logger.warning("llm.pricing_unavailable error_code=pricing_unavailable error_type=%s", type(exc).__name__)
+        return None
+
+
 def build_usage(
     llm: Any,
     prompt: str,
@@ -224,6 +250,7 @@ def build_usage(
     usage: Any = None,
     output_chars: int | None = None,
     allow_estimate: bool = True,
+    pricing: Any = None,
 ) -> LLMUsage:
     """构造 `LLMUsage`：优先后端 usage，缺失时按字符估算。
 
@@ -260,12 +287,12 @@ def build_usage(
     else:
         input_tokens, output_tokens = normalized
 
-    info = price_for(model)
+    card = _price_card(model, pricing)
     cost: float | None = None
-    if info is not None:
-        cost = (input_tokens / PRICE_UNIT) * float(info.input_price_per_million_tokens) + (
+    if card is not None:
+        cost = (input_tokens / PRICE_UNIT) * float(card.input_usd_per_mtok) + (
             output_tokens / PRICE_UNIT
-        ) * float(info.output_price_per_million_tokens)
+        ) * float(card.output_usd_per_mtok)
         cost = round(cost, 8)
 
     chars_out = int(output_chars) if output_chars is not None else len(str(text or ""))

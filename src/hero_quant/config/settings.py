@@ -556,6 +556,28 @@ def _pit_root_from_env() -> str:
     return raw.rstrip("/") or "/"
 
 
+_PRICING_BACKENDS = ("null", "catalog")
+
+
+def _pricing_backend_from_env() -> str:
+    """HERO_PRICING_BACKEND：定价源选择（PR-112 接线，批次15）。
+
+    - 默认 `catalog`：用仓内 llm/catalog.py 的价目（有价就 priced，目录外仍 unpriced）；
+    - `null`/none/off：明确关闭定价，所有调用记 unpriced（不写 0 元）；
+    - 其它值直接 ValueError：配置写错必须显式失败，不能静默当成 null 让上游以为拿到了价。
+
+    与 HERO_SECRETS_BACKEND 同款 fail-closed 风格；三处联动见 .env.example 与 README env 表。
+    """
+    raw = (os.getenv("HERO_PRICING_BACKEND", "") or "").strip().lower()
+    if not raw:
+        return "catalog"
+    if raw in ("null", "none", "off"):
+        return "null"
+    if raw == "catalog":
+        return "catalog"
+    raise ValueError(f"HERO_PRICING_BACKEND must be one of {_PRICING_BACKENDS}, got {raw!r}")
+
+
 @dataclass
 class Settings:
     """全局配置聚合，字段按分组：LLM / 数据与基准 / wall-time 治理 / 向量与嵌入 / checkpoint。"""
@@ -571,6 +593,8 @@ class Settings:
     data_mode: str = field(default_factory=lambda: (os.getenv("HERO_DATA_MODE", "") or "").strip() or "live")
     # PIT Parquet 根目录（仓库外绝对路径；见 _pit_root_from_env）
     pit_root: str = field(default_factory=_pit_root_from_env)
+    # 定价源：catalog（默认，仓内价目）| null（明确关闭，全部 unpriced）
+    pricing_backend: str = field(default_factory=_pricing_backend_from_env)
     # data_mode 默认 live（生产安全）：禁止 live 失败静默回退合成；仅当 HERO_DATA_MODE=synthetic 显式指定时允许合成
     # 基准指数映射：用于多市场回测时选择对照指数，默认覆盖常见后缀
     benchmark_ticker: str | None = field(default_factory=lambda: os.getenv("HERO_BENCHMARK_TICKER") or None)  # type: ignore[arg-type]

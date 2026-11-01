@@ -426,6 +426,8 @@ class LLMGateway:
             model=st.spec.model or DEFAULT_PROVIDER_MODELS.get(st.spec.name, "unknown"),
             latency_s=latency,
             output_chars=output_chars,
+            # 批次15：免费源/后端不回 usage 时记 absent + 字符数，绝不伪造 estimated token
+            allow_estimate=False,
         )
         self.last_usage = usage
         record_llm_usage(usage)
