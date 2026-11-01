@@ -95,16 +95,15 @@ grep -c 'sk-' var/secrets_state.json   # 期望 0 —— 状态文件里不该�
 3. **无自动轮换**。env 后端 `rotation: "manual"`：轮换是上面第 3 节的人工 runbook；
    没有定时触发、没有到期告警、没有"密钥年龄"度量。
 4. **无删除/吊销能力**。代码只记账，不调供应商 API；旧 key 的吊销在 runbook 第 6 步由人执行。
-5. **未接审计链**。轮换事件目前只走 `logging` / 可选 `structlog`（字段只有 name/state/version/fingerprint），
-   **没有**写入 `hero_quant/audit` 的既有审计存储。
-   代价说明：接审计要动 audit 的 schema 与写入路径（跨线），且审计存储本身可能含 PII 通道，
-   需要一并定脱敏口径与失败语义（写审计失败算不算轮换失败）；本批不做，留后续批次。
+5. **轮换事件已可入审计链（批次14 接线，非自动）**。`begin_rotation` / `complete_rotation` 接受
+   `audit_hook` 参数，配 `secrets.audit_bridge.rotation_audit_hook(chain)` 后写 action
+   `secrets.rotation.begin` / `secrets.rotation.complete`；detail 只有 name/version/fingerprint/state，
+   不含任何值。**边界**：钩子是可选参数，调用方不传就没有审计；hook 失败只 warning、不改变轮换结果
+   （即「审计写失败」不算轮换失败，这是刻意取舍）。
 6. **双读窗口只是"能并存"，不是"自动双读"**。窗口期内新旧值谁生效、业务是否真的同时接受两者，
    取决于调用方接线——业务侧目前只读主槽（`resolve_secret` 走 `slot="current"`），
    `*_NEXT` 仍需人工切换。
 7. **仍未接线的读取点**（别当成已完成）：
-   - `redis_password`：Redis 口令仍在 `settings._redis_dsn_from_env` 里从 `HERO_REDIS_PASSWORD`
-     直接拼 DSN，未走 provider；
    - `security/credentials.py` 是另一套「凭据引用」解析（`${VAR}` / 文件凭据），未接 provider。
 
 8. **PG 口令注入口径**（容易误读）：
@@ -123,6 +122,9 @@ grep -c 'sk-' var/secrets_state.json   # 期望 0 —— 状态文件里不该�
 | `llm/gateway.py::LLMGateway.from_settings` / `_env_key` | primary 与回退链的 key 都经 provider；不再 `os.environ.get` |
 | `agent/embed.py::_try_openai` | `openai_api_key` 经 provider（env 后端下回退 Settings 同源字段） |
 | `memory/rerank.py::CohereReranker` | `cohere_api_key` 同上 |
+| `config/settings.py::_redis_password_from_provider` | Redis 口令经 provider；env 后端下才回退 `HERO_REDIS_PASSWORD`，vault/kms 时 DSN 保持无口令（不回落 env） |
+| `secrets/redis.py::apply_redis_password` | `redis://`/`rediss://` 有 userinfo 无口令时注入（百分号编码，保留 query）；显式口令优先 |
+| `secrets/rotation.py` + `secrets/audit_bridge.py` | 轮换 begin/complete 可经 `audit_hook` 写审计链（只带 name/version/fingerprint/state） |
 
 行为差异只有一条：`HERO_SECRETS_BACKEND=vault|kms` 时上面每一处都拿不到 key（即使 `.env` 里有），
 表现为既有降级路径（`_FakeLLM` / 空 key 跳过 / PII 加解密抛错）**而不是**偷偷用明文——这是刻意的 fail-closed。
@@ -133,3 +135,19 @@ grep -c 'sk-' var/secrets_state.json   # 期望 0 —— 状态文件里不该�
 - 拿不到就说拿不到：provider 缺失返回 `None`，不抛、不造值、不用占位符冒充。
 - 降级/不可用必须显式：`vault`/`kms` 抛明确异常，不静默回落 env。
 - 轮换状态文件的 `persistence` 字段必须如实：写不进去就是 `memory`，不假装已落盘。
+## 7. 部署前置（批次14 新增，未完成前不要宣称"多租户隔离已闭环"）
+
+1. **队列 worker 独立数据库角色**：生产建 `hero_queue_worker`，本仓库不建角色。
+   建好后把 `db/migrations/0005_runs_queue.sql` 的两条 permissive policy 收窄：
+
+   ```sql
+   ALTER POLICY runs_queue_worker ON runs TO hero_queue_worker;
+   ALTER POLICY run_steps_queue_worker ON run_steps TO hero_queue_worker;
+   ```
+
+   **不要**给该角色 `BYPASSRLS`：worker 只在领取事务内 `SET LOCAL app.queue_worker='on'`，
+   领到后立刻 `SET LOCAL app.tenant_id=<租户>` 并清空该 GUC，执行期回归普通租户 RLS。
+2. **API 侧连接永不带 worker GUC**：`runs.guards.assert_no_queue_worker` 检测到残留直接抛
+   `QueueWorkerOnApiConnection`；若线上出现该异常，说明连接池被 worker/API 混用，属配置事故。
+3. **PIT 数据目录**（`HERO_PIT_ROOT`，默认 `/root/hero-data/pit`）必须由部署方预先创建且可写：
+   不存在/不可写时 `PitParquetStore` 直接抛 `pit_root_missing` / `pit_root_not_writable`，**不会**替你 mkdir。
