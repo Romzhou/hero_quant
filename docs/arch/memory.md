@@ -10,27 +10,28 @@
 
 | 文件 | 行 | 内容 |
 |---|---|---|
-| `src/hero_quant/memory/store.py:1-4` | 模块 docstring | “文件 + SQLite FTS5 双存储与向量混合检索；文件为真实来源；30 秒滑动窗口去重；向量本地优先、pgvector 失败静默回退” |
-| `src/hero_quant/memory/store.py:48` | trigram 切分 | 相邻二字 token，供无 trigram 时 FTS5 回退 |
-| `src/hero_quant/memory/store.py:61-88` | DSN 收口 | pgvector DSN 前缀白名单（`:61`）；`_pgvector_dsn(:65)` 经 Settings 解析，非法 → `None`；`is_pgvector_configured(:79)` 鉴权收口 Settings |
-| `src/hero_quant/memory/store.py:104-113` | 向量字面量 | `to_pgvector_literal`（委托 `hero_quant.agent.embed`，`:111`），兼顾 vector 类型与 TEXT 回退 |
-| `src/hero_quant/memory/store.py:123-130` | `class PgVectorSidecar` | “配置时一等公民，未就绪则静默回退到本地”（docstring `:123`）；`dsn` 经 `_pgvector_dsn()`（`:130`） |
-| `src/hero_quant/memory/store.py:211,228,245,257,268,300-301,341-342,363-364,444-445,1025-1026,1056-1057` | 静默回退点 | 均为 `logger.debug("silent handled: offline-safe: memory sidecar/pgvector optional, fallback to local", exc_info=...)` + `pass # intentional offline-safe`（抽查 13 处，与 recon “向量失败必须回退”一致） |
-| `src/hero_quant/memory/store.py:387` | `def search` | 向量检索入口（`query_vec/top_k/namespace`） |
-| `src/hero_quant/memory/store.py:475-476` | `class MemoryStore:` | 主存储：文件落地 + FTS5 索引 + 30 秒去重 + 向量混合检索 |
-| `src/hero_quant/memory/store.py:502-519` | sidecar 装配 | 已配置 → `PgVectorSidecar(dim=get_vector_dim())`（`:508`）；否则 `_pgvector=None/_enabled=False` 回退本地（`:515-519`） |
-| `src/hero_quant/memory/store.py:643-655` | 后端自述 | `vector_backend` → `pgvector/local`（`:643-646`）；`is_pgvector_enabled(:653)` 三条件与门 |
-| `src/hero_quant/memory/store.py:739,777` | SQLite 初始化 | 建表 + 补向量列 + 创建 FTS5 虚表（`:777`） |
-| `src/hero_quant/memory/store.py:1044-1057` | `_pgvector_upsert` | 未启用/无 vec 直接返（`:1046`）；失败 `debug + pass`（`:1056-1057`） |
-| `src/hero_quant/memory/__init__.py:4` | 架构位置 | “上游为 Agent 工具与上下文，下游落盘到文件目录 + SQLite FTS5 + 可选 pgvector” |
-| `src/hero_quant/memory/__init__.py:16` | 导出 | `MemoryStore, PgVectorSidecar, get_vector_dim, is_pgvector_configured` |
-| `src/hero_quant/memory/lifecycle.py:125,129,133,183,188,204,335,523` | 裸 `pass` 群 | P3-3 抽查命中（与 `docs/issues.md` P3-3 一致，`wall_time` 相关） |
-| `src/hero_quant/memory/hierarchy.py:249,262,340` | 裸 `pass` 群 | P3-3 抽查命中 |
-| `src/hero_quant/memory/store.py:115,229,246,258` | `pass` 群 | P3-3 抽查命中（总量级与“20 处”一致） |
+| `src/hero_quant/memory/store.py` | 模块 docstring | “文件 + SQLite FTS5 双存储与向量混合检索；文件为真实来源；30 秒滑动窗口去重；向量本地优先、pgvector 失败静默回退” |
+| `src/hero_quant/memory/store.py` | trigram 切分 | 相邻二字 token，供无 trigram 时 FTS5 回退 |
+| `src/hero_quant/memory/store.py` | DSN 收口 | pgvector DSN 前缀白名单（`:61`）；`_pgvector_dsn(:65)` 经 Settings 解析，非法 → `None`；`is_pgvector_configured(:79)` 鉴权收口 Settings |
+| `src/hero_quant/memory/store.py` | 向量字面量 | `to_pgvector_literal`（委托 `hero_quant.agent.embed`，`:111`），兼顾 vector 类型与 TEXT 回退 |
+| `src/hero_quant/memory/store.py` | `class PgVectorSidecar` | “配置时一等公民，未就绪则静默回退到本地”（docstring `:123`）；`dsn` 经 `_pgvector_dsn()`（`:130`） |
+| `src/hero_quant/memory/store.py` | 静默回退点 | 均为 `logger.debug("silent handled: offline-safe: memory sidecar/pgvector optional, fallback to local", exc_info=...)` + `pass # intentional offline-safe`（抽查 13 处，与 recon “向量失败必须回退”一致） |
+| `src/hero_quant/memory/store.py` | `def search` | 向量检索入口（`query_vec/top_k/namespace`） |
+| `src/hero_quant/memory/store.py` | `class MemoryStore:` | 主存储：文件落地 + FTS5 索引 + 30 秒去重 + 向量混合检索 |
+| `src/hero_quant/memory/store.py` | sidecar 装配 | 已配置 → `PgVectorSidecar(dim=get_vector_dim())`（`:508`）；否则 `_pgvector=None/_enabled=False` 回退本地（`:515-519`） |
+| `src/hero_quant/memory/store.py` | 后端自述 | `vector_backend` → `pgvector/local`（`:643-646`）；`is_pgvector_enabled(:653)` 三条件与门 |
+| `src/hero_quant/memory/store.py` | SQLite 初始化 | 建表 + 补向量列 + 创建 FTS5 虚表（`:777`） |
+| `src/hero_quant/memory/store.py` | `_pgvector_upsert` | 未启用/无 vec 直接返（`:1046`）；失败 `debug + pass`（`:1056-1057`） |
+| `src/hero_quant/memory/__init__.py` | 架构位置 | “上游为 Agent 工具与上下文，下游落盘到文件目录 + SQLite FTS5 + 可选 pgvector” |
+| `src/hero_quant/memory/__init__.py` | 导出 | `MemoryStore, PgVectorSidecar, get_vector_dim, is_pgvector_configured` |
+| `src/hero_quant/memory/lifecycle.py` | 裸 `pass` 群 | P3-3 抽查命中（与 `docs/issues.md` P3-3 一致，`wall_time` 相关） |
+| `src/hero_quant/memory/hierarchy.py` | 裸 `pass` 群 | P3-3 抽查命中 |
+| `src/hero_quant/memory/store.py` | `pass` 群 | P3-3 抽查命中（总量级与“20 处”一致） |
 
 ## 3. 上游 / 下游
 
-- 上游：Agent 工具与上下文（`AgentLoop.__init__` 注入 `memory_store`，见 `loop.py:119-134`；`__init__.py:4`）。
+- 上游：Agent 工具与上下文（`AgentLoop.__init__` 注入 `memory_store`，见 `loop.py`；`__init__.py`）。
+- 批次17 接线：`api/server.py` 两处 `loop_kwargs` 注入 `hero_quant.memory.store.MemoryStore`（文件 + FTS5 持久化，根为 `HERO_DATA_DIR`）；`app.state.session_buffer` 是 `hero_quant.agent.memory.store.SessionBuffer`（进程内 LRU，不落盘，由阶段0 改名）；lifespan 关闭时 `await memory_store.aclose()` 释放 pgvector 异步池与 SQLite 句柄。
 - 下游：文件目录（真实来源）→ SQLite `memory.db` FTS5 索引（`:739-777`）→ 可选 pgvector sidecar（`:502-519`）。
 
 ## 4. 检索优先级与一致性
@@ -42,10 +43,10 @@
 
 | 场景 | 语义 | 依据 |
 |---|---|---|
-| pgvector 未配置 | 回退本地混合检索；`is_pgvector_enabled()=False`，`vector_backend()=local` | `store.py:506-519,643-655` |
-| pgvector 运行时失败 | **静默回退**（`debug + pass # intentional offline-safe`）：离线安全，不断检索。注意与 billing/checkpoint 的 fail-closed 相反——记忆向量是“可选增强”，降级不抛错是设计意图 | `store.py:211` 等 13 处 |
-| FTS5 无 trigram | 二字 token 回退（`:48`），检索召回下降但可用 | `store.py:48` |
-| DSN 非法 | `_pgvector_dsn()=None` → 视为未配置，走本地 | `store.py:65-88` |
+| pgvector 未配置 | 回退本地混合检索；`is_pgvector_enabled()=False`，`vector_backend()=local` | `store.py` |
+| pgvector 运行时失败 | **静默回退**（`debug + pass # intentional offline-safe`）：离线安全，不断检索。注意与 billing/checkpoint 的 fail-closed 相反——记忆向量是“可选增强”，降级不抛错是设计意图 | `store.py` 等 13 处 |
+| FTS5 无 trigram | 二字 token 回退（`:48`），检索召回下降但可用 | `store.py` |
+| DSN 非法 | `_pgvector_dsn()=None` → 视为未配置，走本地 | `store.py` |
 
 ## 6. 已知问题挂钩
 

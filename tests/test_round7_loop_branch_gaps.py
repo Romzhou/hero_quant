@@ -1301,12 +1301,16 @@ def test_tool_price_claim_failing_grounding_terminates_as_grounding_failed(monke
 
     def _fn(**kwargs):
         calls.append(kwargs)
-        return "AAPL close 7"
+        # 批次18 P1-9：工具回显是数据、不是模型的价格断言，数字改由模型文本给出。
+        return "AAPL close data"
 
     _register(monkeypatch, "wt_price_tool", _fn)
     ledger = GroundingLedger()
     ledger.ingest("AAPL", [{"close": 100.0}], provenance=_PROV)
-    llm = _ScriptedLLM([[{"type": "tool_call", "name": "wt_price_tool", "arguments": {}}]])
+    llm = _ScriptedLLM([[
+        {"type": "text", "text": "AAPL close 7"},
+        {"type": "tool_call", "name": "wt_price_tool", "arguments": {}},
+    ]])
 
     res = AgentLoop(llm=llm, max_iterations=2, grounding=ledger, trace=False).run("q")
     assert res.reason == "grounding_failed"

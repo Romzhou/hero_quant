@@ -1,12 +1,12 @@
-"""PR3-H: MemoryStore LRU + MemoryBuffer 截断 + AgentContainer 幂等回归."""
+"""PR3-H: SessionBuffer LRU + MemoryBuffer 截断 + AgentContainer 幂等回归."""
 
 from hero_quant.agent.memory.buffer import MemoryBuffer
-from hero_quant.agent.memory.store import MAX_SESSIONS, MemoryStore
+from hero_quant.agent.memory.store import MAX_SESSIONS, SessionBuffer
 from hero_quant.agent.container import AgentContainer, AgentState
 
 
 def test_memory_store_evicts_oldest_over_limit():
-    store = MemoryStore()
+    store = SessionBuffer()
     assert MAX_SESSIONS == 1000
     for sid in range(1001):
         store.get_buffer(sid)
@@ -16,7 +16,7 @@ def test_memory_store_evicts_oldest_over_limit():
 
 
 def test_memory_store_lru_touch_keeps_hot_session():
-    store = MemoryStore()
+    store = SessionBuffer()
     for sid in range(1000):
         store.get_buffer(sid)
     # touch session 0 -> becomes most-recently-used
@@ -59,7 +59,7 @@ def test_loop_duck_holds_buffer_store():
         def stream_chat(self, goal):
             return [{"type": "text", "text": "ok"}]
 
-    store = MemoryStore()
+    store = SessionBuffer()
     loop = AgentLoop(llm=FakeLLM(), memory_store=store)
     # duck-type: loop holds the new buffer-style store without AttributeError
     assert loop.memory_store is store

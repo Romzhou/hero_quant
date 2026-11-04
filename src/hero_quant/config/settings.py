@@ -654,6 +654,9 @@ class Settings:
     sbert_model: str = field(default_factory=lambda: (os.getenv("HERO_SBERT_MODEL", "") or "").strip() or "all-MiniLM-L6-v2")
     openai_embed_model: str = field(default_factory=lambda: (os.getenv("HERO_OPENAI_EMBED_MODEL", "") or "").strip() or "text-embedding-3-small")
     openai_api_key: str | None = field(default_factory=lambda: os.getenv("OPENAI_API_KEY") or None, repr=False)  # type: ignore[arg-type]
+    # 运行时数据根目录：持久记忆（memory/）与工具幂等账本（dedup.db）都落在这里。
+    # 只做路径约定，不读 .env 真值；空 → 仓库相对 data/（.gitignore 已排除）。
+    data_dir: str = field(default_factory=lambda: (os.getenv("HERO_DATA_DIR", "") or "").strip() or "data")
     checkpoint_dsn: str | None = field(default_factory=_checkpoint_dsn_from_env, repr=False)
     checkpoint_ttl_seconds: int = field(default_factory=_checkpoint_ttl_from_env)
     billing_dsn: str | None = field(default_factory=_billing_dsn_from_env, repr=False)

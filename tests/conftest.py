@@ -374,9 +374,15 @@ def pytest_runtest_logreport(report) -> None:
 
 def pytest_sessionfinish(session, exitstatus) -> None:
     if _PG_SKIPPED_NODEIDS:
+        # 错误的入口必须显式提示（批次16 A 补充）：本地跑全量只有一个正确命令。
+        bar = "=" * 78
         print(
-            f"\n[PG GUARD] {len(_PG_SKIPPED_NODEIDS)} 个 PG 集成用例因无可用 PostgreSQL 被 skip；"
-            "显式导出 HERO_CHECKPOINT_DSN（或 HERO_PG_HOST）可让其真跑。"
+            f"\n{bar}\n"
+            f"[PG GUARD] {len(_PG_SKIPPED_NODEIDS)} 个 PG 集成用例因无可用 PostgreSQL 被整族 skip。\n"
+            "  本地跑全量请用唯一入口：scripts/test_local.sh（自动注入 DSN）\n"
+            "  Windows：scripts/test_local.ps1\n"
+            "  直接用 pytest 会丢掉这族用例，本地绿不代表 CI 绿。\n"
+            f"{bar}\n"
         )
     # 还原 conftest 加载时被中和的 dotenv DSN 键（避免污染同一进程内的后续调用）
     for key, value in _DSN_ENV_NEUTRALIZED.items():

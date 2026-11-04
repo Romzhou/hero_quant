@@ -144,7 +144,7 @@ class AuditChain:
   `chain_start_at`（该行 `ts`，无则 `None`）、`uncovered_count`（`entry_hash IS NULL` 的历史行数）。
   语义：历史行不回填、不伪造哈希，链从 `chain_start_entry_id` 起算。
 - 端点 `GET /v1/audit/verify`（加在既有 `audit/api.py` 的 router 上，主控无需再注册，
-  `server.py:1073` 已 include），需 admin 权限（复用 `require_audit_admin`）；返回上面四个字段 +
+  `server.py` 已 include），需 admin 权限（复用 `require_audit_admin`）；返回上面四个字段 +
   `ok/entries/head_hash/reason`。
 - **措辞硬约束**：文档与前端**禁止**写「审计已启用」这类全量断言；必须写成
   「自 `<chain_start_at>` 起算，此前 `<uncovered_count>` 条未覆盖」。前端由 W7 落实。

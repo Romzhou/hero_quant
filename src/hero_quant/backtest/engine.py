@@ -624,6 +624,9 @@ class BacktestEngine:
                     "(non-PIT result, must not be used for live thresholds)"
                 )
             non_pit = True
+            # 阶段4：旁路只跳过 PIT 时序比对，validate() 仍完整执行（价格/索引/币种），
+            # 防止「skip_pit=True 等于不校验」。
+            validate(prices, weights_on=weights_on, price_date=price_date, skip_pit=True)
             logger.info("PIT guard bypassed via skip_pit/enforce_pit flag (non-PIT, ack confirmed)")
         else:
             non_pit = False

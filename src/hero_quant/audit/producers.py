@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any, Mapping
 
 import structlog
@@ -179,3 +180,41 @@ __all__ = [
     "record_session_audit",
     "record_tool_call_audit",
 ]
+
+def session_run_hook() -> Callable[[dict[str, Any]], None]:
+    """会话/运行生命周期 → 审计链（action=session.run，PR-241 批次16）。
+
+    事件由 SessionStore 在 create_session / start_run / finish_run 时发出，形如：
+    {"phase": "created"|"started"|"finished", "tenant_id", "session_id", "run_id", "status"}。
+
+    口径：
+    - 成功/失败的判定：phase=finished 时 ok = (status == "succeeded")，否则 ok=True
+      （创建与启动本身没有失败语义，异常路径根本走不到这里）；
+    - detail 只放 phase/status，绝不放消息正文、prompt、结果；
+    - 失败只 warning（审计是旁路），绝不把会话操作打挂。
+    """
+    def _hook(event: dict[str, Any]) -> None:
+        tenant = str(event.get("tenant_id") or "").strip() or None
+        phase = str(event.get("phase") or "").strip() or "unknown"
+        status = event.get("status")
+        ok = True if phase != "finished" else str(status or "") == "succeeded"
+        detail = {"phase": phase}
+        if status is not None:
+            detail["status"] = str(status)
+        try:
+            record_session_audit(
+                tenant,
+                run_id=event.get("run_id"),
+                session_id=event.get("session_id"),
+                ok=ok,
+                error_code=None if ok else (str(status) if status else "session_run_failed"),
+                detail=detail,
+            )
+        except Exception as exc:  # noqa: BLE001 - 钩子是旁路：任何异常都不得冒到会话写入
+            logger.warning(
+                "audit.session_hook_failed",
+                error_code="audit_hook_failed",
+                error_type=type(exc).__name__,
+            )
+
+    return _hook

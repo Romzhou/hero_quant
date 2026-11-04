@@ -50,9 +50,9 @@ def test_lane_f_buffer_system_bounded():
 # ================= agent store (2) =================
 
 def test_lane_f_agent_store_overwrite_clears_old():
-    from hero_quant.agent.memory.store import MemoryStore
+    from hero_quant.agent.memory.store import SessionBuffer
     from hero_quant.agent.memory.buffer import MemoryBuffer
-    ms = MemoryStore(max_sessions=5)
+    ms = SessionBuffer(max_sessions=5)
     old = MemoryBuffer()
     old.add_user_message("old")
     ms.save_buffer(1, old)

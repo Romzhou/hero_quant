@@ -38,11 +38,11 @@
 | `heroquant:error_budget_consumed:ratio30d` | 预算消耗比例（SLO 99% ⇒ 1% 为满额） |
 | `heroquant:error_budget_remaining:ratio30d` | 剩余预算，1=没动，0=耗尽 |
 
-**硬前提**：这些规则用 30 天窗口。生产 compose（`deploy/compose/docker-compose.prod.yml:190`）
+**硬前提**：这些规则用 30 天窗口。生产 compose（`deploy/compose/docker-compose.prod.yml`）
 与 `deploy/env/prod.env.example:36` 的 `HERO_PROM_RETENTION` 默认是 **35d**；但
 `staging.env.example` / `dev.env.example` 是 **3d / 1d**——按它们起 Prometheus 时规则产出的是
 **偏小甚至空的值**，看起来像"SLO 很好"，实际是数据窗口不够。要真算月度 SLO：
-`HERO_PROM_RETENTION=35d`（并确认备份盘/数据盘容量）。`preflight.sh`（`scripts/deploy/preflight.sh:107-125`）
+`HERO_PROM_RETENTION=35d`（并确认备份盘/数据盘容量）。`preflight.sh`（`scripts/deploy/preflight.sh`）
 在 <30d 时打 WARN，但**不阻断**。
 
 ### 口径偏差（2026-10-31 复核 src 后补，读数字前必看）

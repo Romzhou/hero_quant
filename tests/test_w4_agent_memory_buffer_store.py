@@ -6,7 +6,7 @@
   messages setter 的 dict/非法条目/超容量校验、from_dict 的形态与容量校验、to_dict/clear
 - src/hero_quant/agent/memory/store.py: get_buffer 的创建与 LRU 命中、满容量淘汰、
   save_buffer 的替换清理与满容量淘汰、clear/delete/has/size、
-  get_memory_store 的 app.state 注入与兜底、inject_memory_store
+  get_session_buffer 的 app.state 注入与兜底、inject_session_buffer
 
 断言均为具体数值/类型/异常类型/消息字段，不使用弱断言。
 """
@@ -18,10 +18,10 @@ import pytest
 from hero_quant.agent.memory.buffer import DEFAULT_SYSTEM_LIMIT, MemoryBuffer, Message
 from hero_quant.agent.memory.store import (
     MAX_SESSIONS,
-    MemoryStore,
-    get_memory_store,
-    inject_memory_store,
-    memory_store,
+    SessionBuffer,
+    get_session_buffer,
+    inject_session_buffer,
+    session_buffer,
 )
 
 
@@ -216,7 +216,7 @@ def test_from_dict_rejects_too_many_system_messages():
 
 def test_store_get_buffer_creates_once():
     """同 session 复用同一 buffer（LRU 命中）。"""
-    s = MemoryStore()
+    s = SessionBuffer()
     b1 = s.get_buffer(1)
     b2 = s.get_buffer(1)
     assert b1 is b2
@@ -226,7 +226,7 @@ def test_store_get_buffer_creates_once():
 
 def test_store_evicts_oldest_when_full():
     """超出 max_sessions 时淘汰最久未用会话。"""
-    s = MemoryStore(max_sessions=2)
+    s = SessionBuffer(max_sessions=2)
     s.get_buffer(1)
     s.get_buffer(2)
     s.get_buffer(3)
@@ -237,7 +237,7 @@ def test_store_evicts_oldest_when_full():
 
 def test_store_save_buffer_replaces_and_clears_old():
     """保存同 session 的新 buffer 时旧 buffer 被清空释放。"""
-    s = MemoryStore()
+    s = SessionBuffer()
     old = s.get_buffer(1)
     old.add_user_message("x")
     new = MemoryBuffer(max_turns=5)
@@ -248,7 +248,7 @@ def test_store_save_buffer_replaces_and_clears_old():
 
 def test_store_save_buffer_evicts_when_full():
     """保存新 session 且已满时先淘汰最旧会话。"""
-    s = MemoryStore(max_sessions=1)
+    s = SessionBuffer(max_sessions=1)
     s.get_buffer(1)
     s.save_buffer(2, MemoryBuffer(max_turns=5))
     assert s.has_buffer(1) is False
@@ -257,7 +257,7 @@ def test_store_save_buffer_evicts_when_full():
 
 def test_store_clear_and_delete_buffer():
     """clear_buffer 清内容、delete_buffer 移除条目。"""
-    s = MemoryStore()
+    s = SessionBuffer()
     b = s.get_buffer(1)
     b.add_user_message("x")
     s.clear_buffer(1)
@@ -269,7 +269,7 @@ def test_store_clear_and_delete_buffer():
 
 def test_store_delete_and_clear_unknown_session_are_noop():
     """对未知 session 的清理/删除是安全 no-op。"""
-    s = MemoryStore()
+    s = SessionBuffer()
     s.clear_buffer(999)
     s.delete_buffer(999)
     assert s.size == 0
@@ -280,12 +280,12 @@ def test_store_max_sessions_constant():
     assert MAX_SESSIONS == 1000
 
 
-def test_get_memory_store_prefers_app_state():
-    """app.state.memory_store 存在时优先使用注入实例。"""
+def test_get_session_buffer_prefers_app_state():
+    """app.state.session_buffer 存在时优先使用注入实例。"""
 
     class _State:
         def __init__(self):
-            self.memory_store = MemoryStore()
+            self.session_buffer = SessionBuffer()
 
     class _App:
         def __init__(self):
@@ -296,13 +296,13 @@ def test_get_memory_store_prefers_app_state():
             self.app = app
 
     app = _App()
-    got = get_memory_store(_Request(app))
-    assert got is app.state.memory_store
-    assert got is not memory_store
+    got = get_session_buffer(_Request(app))
+    assert got is app.state.session_buffer
+    assert got is not session_buffer
 
 
-def test_get_memory_store_falls_back_to_global():
-    """app.state 缺 memory_store 时回落模块级兜底实例。"""
+def test_get_session_buffer_falls_back_to_global():
+    """app.state 缺 session_buffer 时回落模块级兜底实例。"""
 
     class _State:
         pass
@@ -315,12 +315,12 @@ def test_get_memory_store_falls_back_to_global():
         def __init__(self, app):
             self.app = app
 
-    got = get_memory_store(_Request(_App()))
-    assert got is memory_store
+    got = get_session_buffer(_Request(_App()))
+    assert got is session_buffer
 
 
-def test_inject_memory_store_binds_to_app():
-    """inject_memory_store 把实例挂到 app.state。"""
+def test_inject_session_buffer_binds_to_app():
+    """inject_session_buffer 把实例挂到 app.state。"""
 
     class _State:
         pass
@@ -330,7 +330,7 @@ def test_inject_memory_store_binds_to_app():
             self.state = _State()
 
     app = _App()
-    store = MemoryStore()
-    got = inject_memory_store(app, store)
+    store = SessionBuffer()
+    got = inject_session_buffer(app, store)
     assert got is store
-    assert app.state.memory_store is store
+    assert app.state.session_buffer is store

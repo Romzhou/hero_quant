@@ -14,7 +14,7 @@
 
 **架构形态：**
 - 后端 `FastAPI` 单进程 + 静态托管 Vite 构建产物（同源 8899 对外）。
-- 内核 `AgentLoop`（`src/hero_quant/agent/loop.py:102` `AgentLoop.run`）+ LangGraph 可选分支（`src/hero_quant/agent/graph/`）。
+- 内核 `AgentLoop`（`src/hero_quant/agent/loop.py` `AgentLoop.run`）+ LangGraph 可选分支（`src/hero_quant/agent/graph/`）。
 - 数据层 `tencent/yahoo` 双源 + 16 源注册表 + 全链路 `provenance`（`src/hero_quant/data/`、`src/hero_quant/tools/registry/`）。
 - 回测 `PIT` + 自研 `quantlib`（`src/hero_quant/quantlib/`、`src/hero_quant/backtest/`、`src/hero_quant/tools/market_data/`、`src/hero_quant/tools/backtest/`）。
 - 记忆 `SQLite-FTS` + 治理 `hash` 链（`src/hero_quant/memory/`、`src/hero_quant/governance/`）。
@@ -29,7 +29,7 @@
 - 关键后端依赖：`fastapi 0.141.1 / uvicorn / pydantic2 / pandas / numpy / scipy / httpx / langchain / structlog / redis / slowapi / psycopg`；extras 分组 `ashare / us / crypto / vector / dev`，见 `pyproject.toml`。
 
 **入口与启动：**
-- 后端唯一入口 `src/hero_quant/api/server.py:322 app=FastAPI`（模块级 `app` 对象）。
+- 后端唯一入口 `src/hero_quant/api/server.py app=FastAPI`（模块级 `app` 对象）。
 - 标准启动 `uvicorn hero_quant.api.server:app --port 8899`（`Dockerfile:103 CMD`）。
 - 前端入口 `frontend/src/main.tsx -> App.tsx`，开发 `npm run dev --port 5173`。
 - 单机交付 `docker compose up --build` 后 8899 同源服务（含静态前端回退）。
@@ -38,7 +38,7 @@
 **服务与 Env：**
 - 本地编排：`postgres:16` + `redis:7 volatile-lru` + `temporal1.26` 占位 + `otel-collector`，见 `docker-compose.yml`、`deploy/`（仅 otel）、`deploy/*.yaml`。
 - 外部行情：`qt.gtimg.cn / yahoo + tushare / akshare / yfinance / ccxt`；LLM：`openai / deepseek / anthropic`，见 `src/hero_quant/llm/factory.py`、`src/hero_quant/llm/client.py`、`src/hero_quant/data/`。
-- 唯一 env 网关 `src/hero_quant/config/settings.py`，键范围 `settings.py:146-347`，核心键：`HERO_LLM_PROVIDER / HERO_LLM_MODEL / HERO_LLM_API_KEY`、`HERO_DATA_MODE / HERO_DATA_MARKET`、`HERO_CHECKPOINT_DSN（默认 postgresql://localhost:5432/hero_quant）`、`HERO_BILLING_DSN（默认 None，fail-closed）`、`HERO_REDIS_DSN`、`HERO_VECTOR_*`、`HERO_WALL_TIME_BUDGET`、`PII_ENCRYPTION_KEY`、`HERO_OTEL_MODE`、`FRONTEND_DIST`。详见 `.env.example` + `settings.py:146-347`。
+- 唯一 env 网关 `src/hero_quant/config/settings.py`，键范围 `settings.py`，核心键：`HERO_LLM_PROVIDER / HERO_LLM_MODEL / HERO_LLM_API_KEY`、`HERO_DATA_MODE / HERO_DATA_MARKET`、`HERO_CHECKPOINT_DSN（默认 postgresql://localhost:5432/hero_quant）`、`HERO_BILLING_DSN（默认 None，fail-closed）`、`HERO_REDIS_DSN`、`HERO_VECTOR_*`、`HERO_WALL_TIME_BUDGET`、`PII_ENCRYPTION_KEY`、`HERO_OTEL_MODE`、`FRONTEND_DIST`。详见 `.env.example` + `settings.py`。
 
 ---
 
@@ -76,22 +76,22 @@
 - `src` 下一级（按链路重要度）：`api(server/ws/security/risk) / agent(loop/trace/context/grounding/graph) / tools(registry/market_data/backtest) / llm(factory/client) / checkpoint / postgres / memory/store / billing / data / infra(redis/session) / config/settings / mcp / telemetry / governance / sandbox / backtest`。
 
 **链A — 问答（核心链路）：**
-- `POST /v1/query/ticket`（`server.py:1235` 签票）-> `GET /v1/query:998` / `stream:1296`（`event_generator:1338`）。
+- `POST /v1/query/ticket`（`server.py` 签票）-> `GET /v1/query:998` / `stream:1296`（`event_generator:1338`）。
 -  gating：`_check_rate_limit -> consume_ticket -> Settings()`。
 - 推理装配：`LLMFactory.create + model_for_stage -> bind_tools(get_definitions)`（`src/hero_quant/llm/factory.py`、`src/hero_quant/tools/registry/`）。
 - 上下文与治理：`TraceWriter + GroundingLedger + ContextManager + BudgetBreaker + _get_checkpoint_saver`。
-- 执行：`AgentLoop.run`（`src/hero_quant/agent/loop.py:102`）。
+- 执行：`AgentLoop.run`（`src/hero_quant/agent/loop.py`）。
 - 落盘与广播：`trace.jsonl` + ledger 内存 + checkpoint + WS 广播（`src/hero_quant/agent/trace/`、`src/hero_quant/api/ws.py`）。
-- 依据：`src/hero_quant/api/server.py:998,1235,1296,1338` + `src/hero_quant/agent/loop.py:102`。
+- 依据：`src/hero_quant/api/server.py` + `src/hero_quant/agent/loop.py`。
 
 **链B — 回测 / 轨迹：**
-- `GET /v1/backtest/metrics.json` 等（`server.py:1789 / 1805 / 1822 / 1925`）-> `_get_backtest_bundle:1721`：L1 内存 -> L2 Redis -> 重算 -> `_static` 回退。
+- `GET /v1/backtest/metrics.json` 等（`server.py / 1805 / 1822 / 1925`）-> `_get_backtest_bundle:1721`：L1 内存 -> L2 Redis -> 重算 -> `_static` 回退。
 - `GET /v1/trace/events:1948` 读 `TRACE_PATH` 等按 `offset` 切片。
-- 依据：`src/hero_quant/api/server.py:1721,1789,1805,1822,1925,1948`。
+- 依据：`src/hero_quant/api/server.py`。
 
 **存储（无 ORM，手写驱动）：**
 - `psycopg_pool + redis.asyncio / fakeredis`（无 SQLAlchemy/Django ORM，依据：`grep ORM/sqlalchemy` 无命中 + `src/hero_quant/postgres/` 手写池）。
-- checkpoint：PG 表 `checkpoints`（`migrations/001_checkpoint.sql:5`），DSN 默认 `localhost`；无 PG 走 `memory:///` + `_PG_GLOBAL_STORE` 内存回退。
+- checkpoint：PG 表 `checkpoints`（`migrations/001_checkpoint.sql`），DSN 默认 `localhost`；无 PG 走 `memory:///` + `_PG_GLOBAL_STORE` 内存回退。
 - billing：`factors / purchases` + RLS（`migrations/002_billing_rls.sql`），DSN `fail-closed`（`HERO_BILLING_DSN` 默认 None 则拒绝启动计费路径）。
 - memory：`MemoryStore(base_path) -> memory.db FTS5 + 文件 + hierarchy`，向量 `pgvector` 失败回退（`src/hero_quant/memory/store.py`）。
 - Redis 键前缀：`hero:ticket / hero:ratelimit / hero:cache / hero:stream`（依据：`src/hero_quant/infra/redis.py` + `server.py` 键字面量）。
@@ -104,28 +104,28 @@
 
 1. **明文真密钥 + env_file 自动加载风险** — 依据：`.env:3-4` 存明文真密钥（`HERO_LLM_API_KEY` / `HERO_API_KEY` 疑似真值），且 `compose env_file` / `Settings` 会默认加载。风险：密钥进镜像层/git 历史/日志。处置：立即轮换 + 改用占位符 + `.env` 永不入库（检查 `.gitignore` 是否覆盖）。
 2. **README 错误启动示例** — 依据：`README.md:66` `python -m hero_quant.api.server`；反证 `src/hero_quant/api/` 无 `__main__.py` 且 `server.py` 无 `__main__` 守卫。处置：改为 `uvicorn hero_quant.api.server:app --port 8899`（与 `Dockerfile:103 CMD` 对齐）。
-3. **前端零构建本地假活** — 依据：`frontend/dist/` 零文件 + `.gitignore` 忽略 `dist`，而 `server.py:2062-2174` 静态托管 + `_static` 回退在无构建时返回假页面/空 bundle，健康检查仍绿。处置：无 `dist` 时 `/` 明确 503 + 提示 `npm run build`，或 Docker 多阶段必构建。
-4. **缺配直接 raise RuntimeError（可用性断点）** — 依据：`src/hero_quant/checkpoint/postgres.py:246-248` 缺配直接 `raise RuntimeError`，上层无降级开关说明。处置：与 billing 一样明确 `fail-closed/fail-open` 策略并在 `/ready` 如实暴露（参考 4.3-4）。
+3. **前端零构建本地假活** — 依据：`frontend/dist/` 零文件 + `.gitignore` 忽略 `dist`，而 `server.py` 静态托管 + `_static` 回退在无构建时返回假页面/空 bundle，健康检查仍绿。处置：无 `dist` 时 `/` 明确 503 + 提示 `npm run build`，或 Docker 多阶段必构建。
+4. **缺配直接 raise RuntimeError（可用性断点）** — 依据：`src/hero_quant/checkpoint/postgres.py` 缺配直接 `raise RuntimeError`，上层无降级开关说明。处置：与 billing 一样明确 `fail-closed/fail-open` 策略并在 `/ready` 如实暴露（参考 4.3-4）。
 
 ### 4.2 严重（P1，本迭代必修）
 
-1. **_FakeLLM 合成演示数无感知** — 依据：`src/hero_quant/api/server.py:1091-1401` `_FakeLLM` 在无 LLM key 时合成看似真实的投研结论/数字，前端无 `demo/degraded` 标识。风险：用户把演示数当实盘依据。处置：响应头 + body 强制 `degraded:true + reason`，前端横幅。
-2. **PG 不可达跳 DDL 走 emulated 假持久化** — 依据：`src/hero_quant/api/server.py:229-235` PG 不可达时跳过 DDL 走内存 `emulated`，但日志/探针仍报 ready。风险：重启丢单/丢检查点。处置：`emulated` 必须打标并在 `/ready` + `/v1/*` 响应中显式声明。
-3. **宽 except 吞错（三处）** — 依据：`src/hero_quant/api/server.py:381`、`server.py:606`、`src/hero_quant/api/risk.py:164,236` 的裸 `except Exception` 直接降级/放行。处置：收窄异常类型 + `structlog` 结构化记录 + 指标计数。
-4. **双写死 localhost 与 compose 矛盾 + 旧口令默认** — 依据：`src/hero_quant/config/settings.py:172` + `src/hero_quant/api/server.py:214` 双写死 `localhost`，与 `docker-compose.yml` 的 `postgres` 主机名矛盾，容器内必连失败；`README.md:142` 旧口令默认与 compose 不一致。处置：DSN 默认改走 env 模板（compose 内用 `postgres`，本地用 `localhost`），README 口令与 compose 对齐。
+1. **_FakeLLM 合成演示数无感知** — 依据：`src/hero_quant/api/server.py` `_FakeLLM` 在无 LLM key 时合成看似真实的投研结论/数字，前端无 `demo/degraded` 标识。风险：用户把演示数当实盘依据。处置：响应头 + body 强制 `degraded:true + reason`，前端横幅。
+2. **PG 不可达跳 DDL 走 emulated 假持久化** — 依据：`src/hero_quant/api/server.py` PG 不可达时跳过 DDL 走内存 `emulated`，但日志/探针仍报 ready。风险：重启丢单/丢检查点。处置：`emulated` 必须打标并在 `/ready` + `/v1/*` 响应中显式声明。
+3. **宽 except 吞错（三处）** — 依据：`src/hero_quant/api/server.py`、`server.py`、`src/hero_quant/api/risk.py` 的裸 `except Exception` 直接降级/放行。处置：收窄异常类型 + `structlog` 结构化记录 + 指标计数。
+4. **双写死 localhost 与 compose 矛盾 + 旧口令默认** — 依据：`src/hero_quant/config/settings.py` + `src/hero_quant/api/server.py` 双写死 `localhost`，与 `docker-compose.yml` 的 `postgres` 主机名矛盾，容器内必连失败；`README.md:142` 旧口令默认与 compose 不一致。处置：DSN 默认改走 env 模板（compose 内用 `postgres`，本地用 `localhost`），README 口令与 compose 对齐。
 
 ### 4.3 一般（P2，择期修）
 
 1. **`server.py` 30+ 处 `except pass / debug` 静默** — 依据：`grep -n "except.*pass\|logger.debug" src/hero_quant/api/server.py` 30+ 命中。处置：按链A/链B分级提为 `warning/error` + 脱敏字段。
 2. **checkpoint postgres silent handled 无结构化字段** — 依据：`src/hero_quant/checkpoint/postgres.py` 的 `except` 分支仅字符串 log，无 `exc_info/error.code/dsn_host` 字段。处置：统一 `structlog`  schema。
 3. **阈值与“277 passed”口径打架** — 依据：`pyproject.toml fail_under=50` vs `README` 30 vs 历史 “277 passed” 截图。处置：统一 50，README 更新，CI 以 `test.yml` 为准，归档 `ci.yml` 旧值 46。
-4. **`/ready:729-891` 每次建 ThreadPoolExecutor 双探易误报** — 依据：`src/hero_quant/api/server.py:729-891` 每次 readiness 新建 `ThreadPoolExecutor` 同步探 PG+Redis，在 `mem2g/cpu1.5` 小机上易超时误标 unready。处置：复用全局池 + 缓存探针结果 + 区分 `liveness/readiness`。
+4. **`/ready:729-891` 每次建 ThreadPoolExecutor 双探易误报** — 依据：`src/hero_quant/api/server.py` 每次 readiness 新建 `ThreadPoolExecutor` 同步探 PG+Redis，在 `mem2g/cpu1.5` 小机上易超时误标 unready。处置：复用全局池 + 缓存探针结果 + 区分 `liveness/readiness`。
 
 ### 4.4 卫生（P3，顺手修）
 
 - 无 `AGENTS.md / CLAUDE.md / CONTRIBUTING.md`（依据：根目录 `glob AGENTS* CLAUDE* CONTRIBUTING*` 无命中）。
 - `ruff` 仅 `E,F,W` 无 `mypy`（依据：`pyproject.toml [tool.ruff]` + 无 `[tool.mypy]`）。
-- `src/hero_quant/data/akshare_loader.py:108 TODO` + `wall_time` 裸 `pass` + `memory/` 20 处 `pass` 无单测锁定（依据：`grep -n "TODO\|pass" src/hero_quant/memory/ src/hero_quant/data/akshare_loader.py`）。
+- `src/hero_quant/data/akshare_loader.py TODO` + `wall_time` 裸 `pass` + `memory/` 20 处 `pass` 无单测锁定（依据：`grep -n "TODO\|pass" src/hero_quant/memory/ src/hero_quant/data/akshare_loader.py`）。
 - `docs/plans/` 被 `.gitignore` 大面积忽略，计划文档不在库内（依据：`.gitignore` 中 `docs/plans` 条目）。
 
 ### 4.5 AGENTS 缺失现状
@@ -172,12 +172,12 @@
 - `migrations/` 为冻结区：无专线指令不得新增/修改 DDL。
 
 ## 2. Env Gate（唯一入口 + 绝不碰真密钥）
-- 唯一 env 网关是 `src/hero_quant/config/settings.py:146-347`；新增 env 必须同步 `.env.example` + `settings.py` + `README` env 表，三处缺一不可。
+- 唯一 env 网关是 `src/hero_quant/config/settings.py`；新增 env 必须同步 `.env.example` + `settings.py` + `README` env 表，三处缺一不可。
 - 严禁读取/回显/提交 `.env` 真值；`.env:3-4` 类真密钥只轮换不传播。`HERO_BILLING_DSN` 为空即 fail-closed，不得静默旁路。
 - `localhost` 与 `postgres` 主机名不得硬编码混用：本地默认 `localhost`，compose 内必须 `postgres`，经 `settings.py` 统一切换。
 
 ## 3. 启动验证（先跑起来，再改代码）
-- 后端唯一启动：`uvicorn hero_quant.api.server:app --port 8899`（`src/hero_quant/api/server.py:322`）。`python -m hero_quant.api.server` 已废弃，禁止写入文档。
+- 后端唯一启动：`uvicorn hero_quant.api.server:app --port 8899`（`src/hero_quant/api/server.py`）。`python -m hero_quant.api.server` 已废弃，禁止写入文档。
 - 前端：`frontend/` 下 `npm run dev --port 5173`；交付以 `npm run build` 产物为准，无 `dist` 时后端必须显式 503，不得假活。
 - 单机验收：`docker compose up --build` 后 8899 同源可访问 + `/ready` 绿。
 
@@ -187,13 +187,13 @@
 - 安装：`uv` + `requirements-lock.txt --require-hashes`；`pip install -e .[dev,ashare,us]` 仅 CI 用，本地不得放宽哈希。
 
 ## 5. 架构（链路归属，不跨层直调）
-- 链A问答：`server.py:998,1235,1296,1338 -> LLMFactory -> AgentLoop.run(loop.py:102) -> trace.jsonl + WS`；链B回测：`server.py:1721,1789,1805,1822,1925,1948` L1->L2->重算->_static。
+- 链A问答：`server.py -> LLMFactory -> AgentLoop.run(loop.py) -> trace.jsonl + WS`；链B回测：`server.py` L1->L2->重算->_static。
 - 数据访问走 `tools/registry + data/`，无 ORM（手写 `psycopg_pool + redis.asyncio`）；记忆走 `MemoryStore -> memory.db FTS5`，向量失败必须回退并打标。
 - 新增工具/数据源必须注册表登记 + provenance 全链路透传，不得私开直调。
 
 ## 6. Fail-Closed（降级必须显式，不许假成功）
-- `_FakeLLM(server.py:1091-1401)` 与 `emulated(server.py:229-235)` 必须在响应中置 `degraded:true + reason`，前端必须横幅提示。
-- `checkpoint/postgres.py:246-248` 缺配 `raise` 与 `billing RLS` 拒绝必须透到 `/ready`，禁止 `except pass` 吞错；宽异常必须收窄 + `structlog` + 指标计数。
+- `_FakeLLM(server.py)` 与 `emulated(server.py)` 必须在响应中置 `degraded:true + reason`，前端必须横幅提示。
+- `checkpoint/postgres.py` 缺配 `raise` 与 `billing RLS` 拒绝必须透到 `/ready`，禁止 `except pass` 吞错；宽异常必须收窄 + `structlog` + 指标计数。
 
 ## 7. 风格（日志脱敏 + 行号依据）
 - 日志统一 `structlog`，含 `trace_id / ticket_id / dsn_host(脱敏) / error.code`；PII/API key 永不进日志。
@@ -201,8 +201,8 @@
 - 提问/报告必须带 `文件路径+行号+依据`，无依据的结论视为无效。
 
 ## 8. 测试与覆盖率口径
-- `tests/` 为 pytest 唯一目录（`testpaths=["tests"]`），`fakeredis` 隔离外部；`fail_under=50` 为硬门，旧 `ci.yml:46` 与 README 旧值以 `test.yml + pyproject` 为准。
-- `memory/` 的 20 处 `pass` 与 `akshare_loader.py:108 TODO` 需单测锁定一处、清理一处，不得新增裸 `pass`。
+- `tests/` 为 pytest 唯一目录（`testpaths=["tests"]`），`fakeredis` 隔离外部；`fail_under=50` 为硬门，旧 `ci.yml` 与 README 旧值以 `test.yml + pyproject` 为准。
+- `memory/` 的 20 处 `pass` 与 `akshare_loader.py TODO` 需单测锁定一处、清理一处，不得新增裸 `pass`。
 
 ## 9. PR（文档同步 + 并行不撞车）
 - PR 必须列出“能碰/不能碰”文件清单，遵守第 5 节五线划分：`server.py` 仅 D 线、`settings.py` 仅 A 线、`tests/.github` 仅 B 线、`docs/AGENTS` 仅 C 线、`frontend/e2e` 仅 E 线、`migrations/` 全线冻结。

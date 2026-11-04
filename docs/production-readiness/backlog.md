@@ -19,6 +19,61 @@
 
 ---
 
+## 未接线/未生效清单（合并审查，2026-11-02）
+
+两份审查合并去重后的事实清单。**只列能给出代码证据的条目**；原始审查里 P0-1 / P0-2 / P1-* 的文字本会话未取得，不在此编造，下一会话按原文补。
+
+| ID | 问题 | 级别 | 证据（文件 + 函数，无行号） | 后果 |
+|---|---|---|---|---|
+| P0-3 / B3 | 两个同名 `MemoryStore`，装配接错 | P0 | `agent/memory/store.py::MemoryStore`（进程内 LRU 会话缓冲，参数 `max_sessions`）与 `memory/store.py::MemoryStore`（文件 + SQLite FTS5 持久化，参数 `base_path`/`namespace`）同名；`api/server.py` 启动注入调的是 `agent/memory/store.py::inject_memory_store` | 持久记忆从不落盘、不可检索；接错不报错、测试全绿 |
+| P0-4 / B4 | `DedupStore` 未接线 | P0 | `governance/dedup.py::DedupStore` 在 `agent/loop.py`、`tools/registry.py` 中零引用（grep 无命中） | 队列重试会重复执行工具副作用（写文件/下单/发通知） |
+| P0-5 / B1 | 会话写端点不存在 | P0 | `api/server.py` 只有 `GET /v1/sessions`、`GET /v1/sessions/{id}`、`POST /v1/sessions/{id}/resume`；`create_session` / `start_run` / `finish_run` 无任何生产调用方 | 会话无法创建；批次16 接的 `session.run` 审计永不触发 |
+| P2-1 / B2 | 数据源白名单 16 个，运行时只注册 2 个 | P2 | `data/sources.py::VALID_SOURCES`（16 个）vs `tools/market_data.py` 仅 `register(TencentLoader())` 与 `register(YahooLoader())` | **批次18 已修（文档口径）**：`registry.py` docstring / `data/arch/data.md` / `COMPLIANCE.md` / `sources.py` 注释统一写明「白名单只是契约枚举，运行时仅两源、按注册顺序回退，无 16 源择优」；`tests/test_batch18_source_whitelist_doc.py` 锁定事实。恢复多源仍另开线。Yahoo 在本机全端点 403 |
+| P2-2 / 同名类 | 全仓 3 组同名类（按类名严格统计） | P2 | ① `DataValidationError` ×4：`data/loaders/tencent.py`、`yahoo.py`、`akshare_loader.py`、`ccxt_loader.py`；② `ApprovalService`：`security/approval.py` 与 `interaction/approval.py`（后者继承前者别名）；③ `RunNotFound`：`runs/store.py`(RunsError) 与 `session/store.py`(SessionError)，两者都活跃使用、风险最高 | **批次18 已修**：① 四个 loader 共用 `data/loaders/errors.py::DataValidationError`；② `interaction/approval.py` 改名 `InteractionApprovalService`（兼容别名保留）；③ `session/store.py` 改名 `SessionRunNotFound`（兼容别名保留）。`tests/test_batch18_no_duplicate_class_names.py` 按类名严格扫描锁零重复（阶段0 给定的 awk 整行比对会漏掉基类不同的 ②③）。 |
+| P1-10 / 记忆检索 L2 缓存跨实例串数据 | Redis L2 检索缓存按 `hero:cache:memory:search:{ns}:{query}:{backend}` 全局键控，不含 store/base_path | `memory/store.py::MemoryStore.search` / `_invalidate_redis_search_cache`；批次17 阶段2 的跨进程用例初版因共用 token 被上一用例的 L2 缓存命中而假绿，改用唯一 marker 后反证 | **批次18 已修**：新增 `MemoryStore._store_tag/_l2_prefix/_l2_key`，L2 键与失效前缀都含解析后数据根身份；`tests/test_batch18_memory_l2_isolation.py` 用 fakeredis 反证两个 store 不互相命中、失效不误删。 |
+| P1-9 / 接地回显自证 | 工具结果回显进 buffer 后「任一价格命中证据即整段放行」 | P1 | `agent/loop.py::AgentLoop.run` 的接地校验逐数字 try `assert_price`，而 `_handle_result` 把工具结果回显进 buffer；批次17 阶段1 用 pad 把 bars 数值挤出回显窗口复现 | **批次18 已修**：`AgentLoop.run` 记录每次工具回显片段，step 7 从 buffer 剥离后再抽 claims，回显数字不再替模型断言自证；`tests/test_batch18_grounding_echo.py` 锁「回显真价格 + 幻觉价 → verified False」。批次17 修的是 ingest 缺失（已 REAL）。 |
+
+> 批次18（单 agent 串行，无 git 写）：P2-2 同名类 3 组统一、P1-10 L2 缓存按 store 隔离、P1-9 接地回显剥离、P2-1 数据源文档口径，均先写测试跑红再修；新增 4 个 `tests/test_batch18_*.py`。P1-11/P1-12 仓库无定义未编造；P0-5 会话写端点按批次17 结论保持「未接」不做。
+> 批次17 阶段5 独立审查：接线项 1-4 结论 REAL；`SessionStore` 进入 /v1/query 链路仍 FAKE（预期「未接」，如实标）；另发现 `ApprovalService` / `RunNotFound` 两组同名类，已并入本表 P2-2。
+> 批次17 阶段1：P0-1 / P0-2 / P0-4 已接线（真实调用点见 `AgentLoop._handle_result`、`AgentLoop.run._exec_spec`、`MarketDataRegistry.get_bars`）；P0-3 阶段2处理。
+> 批次17 决策：接地校验粒度（P1-9）按主控建议排期批次18；阶段3 装配用真实模块级 `app` + `TestClient`（仓库没有 `create_app()`），不引入工厂重构。
+> 去重规则（已执行）：B4 = P0-4；B1 = P0-5；B3 = P0-3（采用 P0-3 表述，含同名类陷阱）；B2 = P2 第一条。
+> 批次17 阶段0：`agent/memory/store.py::MemoryStore` 已改名 `SessionBuffer`，同名类只剩持久化侧；装配接线在阶段2处理。
+> 归属：B1/B3/B4 同时符合下方「L1 但未接线」口径。
+
+## 完成度口径（L1–L4，2026-11-02 起）
+
+| 级别 | 定义 | 是否计入完成 |
+|---|---|---|
+| L1 | 代码就绪（模块 + 单测存在） | 否 |
+| L2 | 接线可达（路由 / 工具注册 / CLI / 中间件 / CI 作业能触达） | **是** |
+| L3 | 路径覆盖（有端到端或真栈集成用例覆盖主路径） | 是 |
+| L4 | 生产验证（目标环境跑过并留证） | 是 |
+
+**重算结果（取代此前"42/67"）**：**L2 = 29 / 67**（L3、L4 本表不主张，无端到端或生产证据时不下调也不上调）。
+Phase 1：26/36（原 35）；Phase 2：7/17（原 7，其中队列、审计、Risk、管理后台、现实性、定价均 L2）。
+
+## L1 但未接线（逐条证据）
+
+> 审查项 B1（会话端点）、B3（同名 MemoryStore）、B4（DedupStore）同样属于本级，见上方「未接线/未生效清单」，此处不重复列。
+
+| ID | 任务 | 未接线证据 |
+|---|---|---|
+| PR-112 | 真模型 E2E | 只有 `scripts/eval_*.py`，手动跑；无应用/CI 触达 |
+| PR-121 | 数据快照清单 | `SnapshotStore` / `capture_snapshot` 在 `src/` 内除自身与 `pit_store` 外无调用方 |
+| PR-123 | 数据质量门 | `assert_quality` 只被未接线的 `SnapshotStore` 使用 |
+| PR-132 | 工具调用幂等 | `governance/dedup.py` 的 `DedupStore` 在 `agent/loop.py`、`tools/registry.py` 中零引用（批次17 P0 修） |
+| PR-142 | Grafana 看板 | `deploy/monitoring/grafana/` 有产物，未验证 provisioning |
+| PR-143 | 告警规则 | `alertmanager.yml` 在 observability profile 下，未配置真实投递 |
+| PR-144 | SLO/错误预算 | `slo.yml` 与文档，未接评估/告警 |
+| PR-161 | 生产 compose | `docker-compose.yml` 存在，未在目标机跑过 |
+| PR-162 | 反代/TLS/systemd | unit/caddy 配置存在，未实机验证 |
+| PR-163 | CI/CD 单机发布 | 发布脚本未在任何环境执行 |
+| PR-164 | 备份/PITR | `hero-quant-backup.service/.timer` 存在，未跑过恢复演练 |
+| PR-165 | 环境隔离与蓝绿 | 蓝绿脚本存在，未演练 |
+
+**待复核（1 项）**：PR-181 版本单源 —— 未找到 CI 校验或统一入口脚本，暂记 L1，下一批复核。
+
 ## Phase 1（G1 上线底座）
 
 | ID | 优先级 | 工作流 | 任务 | 交付物 | 验收摘要 | 依赖 | 规模 | 负责 |

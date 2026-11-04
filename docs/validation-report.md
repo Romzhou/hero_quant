@@ -1,9 +1,9 @@
 # quantlib / 回测正确性交叉验证报告（Q线）
 
-- 范围：`src/hero_quant/quantlib/indicators.py:1-243`（sma/ema/rsi/bollinger/macd/max_drawdown）、
-  `src/hero_quant/quantlib/options.py:1-275`（bs_price/bs_greeks/implied_volatility）、
+- 范围：`src/hero_quant/quantlib/indicators.py`（sma/ema/rsi/bollinger/macd/max_drawdown）、
+  `src/hero_quant/quantlib/options.py`（bs_price/bs_greeks/implied_volatility）、
   `src/hero_quant/quantlib/polars_base.py`、`src/hero_quant/quantlib/rust.py`（桥接）、
-  `src/hero_quant/backtest/metrics.py:1-302`（sharpe/max_drawdown/annual_return/turnover/compute_metrics）、
+  `src/hero_quant/backtest/metrics.py`（sharpe/max_drawdown/annual_return/turnover/compute_metrics）、
   `src/hero_quant/backtest/engine.py`（BacktestEngine.run）。
 - 方法：pandas-ta / TA-Lib 在本机均未安装（`ModuleNotFoundError`），按任务要求改用**手算 golden +
   pandas 独立实现**做三方对照。fixture 写死小数组 + 期望值，回归锁见
@@ -32,15 +32,15 @@
 | 15 | Greeks delta | 0.63683065 | 手算N(d1) | bit一致 | 等价 |
 | 16 | 引擎buy-hold [100,110,121] w=[1] costs=0 | equity [1.0,1.1,1.1] | naive close比 [1.0,1.1,1.21] | 末bar差一拍 | 等价（设计：次日执行语义，见注3） |
 
-注1（RSI seeding）：`indicators.py:122-123` 用 `ewm(alpha=1/n, min_periods=1)` 从bar0起平滑；
+注1（RSI seeding）：`indicators.py` 用 `ewm(alpha=1/n, min_periods=1)` 从bar0起平滑；
 经典Wilder/TA-Lib以前n个gain/loss的SMA做种。16点短序列尾差约2.0（72.51 vs 70.50），
 200点序列尾部50点maxabs 9e-05 → 差异随时间洗出，非bug，属参数对齐说明项。
 
-注2（BOLL std口径）：`indicators.py:174` 用 `rolling.std(ddof=1)`（样本std，与pandas-ta一致）；
+注2（BOLL std口径）：`indicators.py` 用 `rolling.std(ddof=1)`（样本std，与pandas-ta一致）；
 TA-Lib BBANDS用总体std（ddof=0），两者恒差 `√((n-1)/n)` 因子（如n=20差约2.56%带宽）。
 quantlib选择与pandas一致，可解释，非bug。
 
-注3（引擎末bar）：`engine.py:206-317` `_align` 次日可执行价语义下，bar0决策→bar1(110)成交、
+注3（引擎末bar）：`engine.py` `_align` 次日可执行价语义下，bar0决策→bar1(110)成交、
 末bar按自身收盘盯市，equity [1.0,1.1,1.1] 自洽（买入110→盯市121即+10%）。
 naive close复利 [1.0,1.1,1.21] 隐含bar0收盘即成交，违反PIT。属设计，非bug。
 
@@ -48,14 +48,14 @@ naive close复利 [1.0,1.1,1.21] 隐含bar0收盘即成交，违反PIT。属设�
 
 - U1 polars加速路径（`polars_base.sma_polars`）：本机无polars包，`ImportError`回落分支；
   代码检查 `rolling_mean(min_samples=n)` 与pandas min_periods=n对齐，未实测。待有vector环境补测。
-- U2 ATR：任务书提及但quantlib无ATR实现（`__init__.py:4` 仅导出6项），属功能缺失非正确性bug，
+- U2 ATR：任务书提及但quantlib无ATR实现（`__init__.py` 仅导出6项），属功能缺失非正确性bug，
   不修（超出“最小修”授权，且无对照基准）。
 
 ## 验收（M线汇总 2026-10-20；Q线原文保留见 git 历史）
 
 - 对照项数：16（Q全过）+ 新增28用例（R 6 + U1 11 + U2 11）
 - 差异数：Q 4说明项（注1/注2/注3 + RSI短序列seeding差，均判定等价/设计）+ U1 窗口/别名契约说明1项 + ATR NaN/Inf诚实置空说明（均非bug，见U1/U2补记）
-- 修复数：R 1（`metrics.py:156-160` min_count=1，0.375 bug→0.5口径）；U2 功能新增1（Wilder ATR，与TA-Lib一致）；U1 0（src零改动，只读复核）
+- 修复数：R 1（`metrics.py` min_count=1，0.375 bug→0.5口径）；U2 功能新增1（Wilder ATR，与TA-Lib一致）；U1 0（src零改动，只读复核）
 - 回归锁：`tests/validation/test_quantlib_golden.py` 12 passed + `test_turnover_parity.py` 6 + `test_polars_parity.py` 11（9 passed, 2 skipped：需真实polars的sma数值对照）+ `test_atr_golden.py` 11 passed
 - 口径结论：`0.5` 正确（单边日均换手 `sum(|Δ|)/2/(n_valid-1)`，首日剔除），`0.375` 为DF路径稀释bug；详见 `docs/quant-semantics.md §1-2`
 - 报告路径：`docs/validation-report.md`（本文件）
@@ -64,7 +64,7 @@ naive close复利 [1.0,1.1,1.21] 隐含bar0收盘即成交，违反PIT。属设�
 
 - 结论：`0.5` 为约定（`sum(|Δ|)/2/(n_valid-1)`，首日剔除），`0.375` 为 DF 路径
   `sum(axis=1)` 稀释 bug（首行 NaN→0 计入分母）。详见 `docs/quant-semantics.md §1-2`。
-- 修复：`src/hero_quant/backtest/metrics.py:156-160` DF 路径加 `min_count=1`
+- 修复：`src/hero_quant/backtest/metrics.py` DF 路径加 `min_count=1`
   使首行保持 NaN 并被 `dropna` 剔除。单列 `[1,2,3,2]`：`0.375→0.5`；
   双列 `a=[1,2,3,2],b=[10,10,12,12]`：`0.625→0.8333…`；
   `[-inf,1,2,3]` DF：`0.333…→0.5`（与 Series 一致）。
@@ -101,8 +101,8 @@ naive close复利 [1.0,1.1,1.21] 隐含bar0收盘即成交，违反PIT。属设�
 
 ## U2补记（2026-10-20，Wilder ATR 新增）
 
-- 范围：`src/hero_quant/quantlib/indicators.py:221-308`（`_extract_ohlc` + `atr`）、
-  `src/hero_quant/quantlib/__init__.py:2,4`（导出atr）。commit `3e97fda`。
+- 范围：`src/hero_quant/quantlib/indicators.py`（`_extract_ohlc` + `atr`）、
+  `src/hero_quant/quantlib/__init__.py`（导出atr）。commit `3e97fda`。
 - 口径：TR=max(H-L, |H-prevC|, |L-prevC|)，TR[0]=H-L；ATR[n-1]=mean(TR[0:n])，
   之后 ATR[i]=(ATR[i-1]*(n-1)+TR[i])/n 递推 —— 与 Wilder/TA-Lib 一致。
   前 n-1 个为 NaN（诚实置空，不填0）；有效TR不足n个全NaN；NaN的TR对应ATR为NaN
@@ -119,7 +119,7 @@ naive close复利 [1.0,1.1,1.21] 隐含bar0收盘即成交，违反PIT。属设�
 | U2-6 | 中间NaN不污染状态（seed沿用ATR[2]递推）/ Inf→NaN种子顺延 | 手算 | 通过×2 |
 | U2-7 | 别名n/window/span等价 + 包导出atr | 契约 | 通过 |
 
-- tool层：`src/hero_quant/tools/quantlib_tool.py:47` `SUPPORTED_INDICATORS` 未含atr，
+- tool层：`src/hero_quant/tools/quantlib_tool.py` `SUPPORTED_INDICATORS` 未含atr，
   属后续wiring（本线不扩tool面，quantlib包级可用即可）。
 - 回归：`tests/validation/test_atr_golden.py` 11 passed。
 
@@ -165,10 +165,10 @@ naive close复利 [1.0,1.1,1.21] 隐含bar0收盘即成交，违反PIT。属设�
 
 | # | 位置 | 现象 | 影响 |
 |---|---|---|---|
-| W4-1 | `src/hero_quant/agent/context.py:205-208` | `_collapse(text, 0)` 注释写"避免空输出"，实际 `marker[:0]` 返回空串 | 零预算折叠返回空串而非标记；与注释意图不符（低危） |
-| W4-2 | `src/hero_quant/backtest/metrics.py:141-146` | docstring 示例"w=[0,1,0] 时单边换手应为 1.0"，实现按日均口径返回 0.5 | 与同段后文"w=[0,1,0,1,0] 得 0.5"及 `docs/quant-semantics.md` 口径自相矛盾（文档缺陷） |
-| W4-3 | `src/hero_quant/llm/factory.py:199-203` | `setattr(chat, "timeout", timeout)` 在 pydantic v2 模型上被拒（未声明字段） | chat 对象缺 `timeout` 内省属性；超时透传实际由 `LLMClient.timeout` + `_invoke_once` 签名探测保证，不影响功能 |
-| W4-4 | `src/hero_quant/backtest/validation.py:53-58` | `weights_on/price_date/currency` 的 kwargs 兼容分支不可达（同名参数先被绑定，kwargs 永远取不到这三个 key） | 死代码（3 行） |
+| W4-1 | `src/hero_quant/agent/context.py` | `_collapse(text, 0)` 注释写"避免空输出"，实际 `marker[:0]` 返回空串 | 零预算折叠返回空串而非标记；与注释意图不符（低危） |
+| W4-2 | `src/hero_quant/backtest/metrics.py` | docstring 示例"w=[0,1,0] 时单边换手应为 1.0"，实现按日均口径返回 0.5 | 与同段后文"w=[0,1,0,1,0] 得 0.5"及 `docs/quant-semantics.md` 口径自相矛盾（文档缺陷） |
+| W4-3 | `src/hero_quant/llm/factory.py` | `setattr(chat, "timeout", timeout)` 在 pydantic v2 模型上被拒（未声明字段） | chat 对象缺 `timeout` 内省属性；超时透传实际由 `LLMClient.timeout` + `_invoke_once` 签名探测保证，不影响功能 |
+| W4-4 | `src/hero_quant/backtest/validation.py` | `weights_on/price_date/currency` 的 kwargs 兼容分支不可达（同名参数先被绑定，kwargs 永远取不到这三个 key） | 死代码（3 行） |
 
 ### W4 遗留台账
 
@@ -178,9 +178,9 @@ naive close复利 [1.0,1.1,1.21] 隐含bar0收盘即成交，违反PIT。属设�
   `IS_RUST=False`）；本波次用假扩展驱动了全部加速路径的语句覆盖，真实扩展路径未验证。
 - `agent/embed.py` 的 openai / sentence-transformers 真实网络调用未验证（本机无外网）；
   本波次用假模块驱动了协议层分支。
-- `backtest/engine.py` 的持仓回落路径（`raw_positions_rows` 长度不匹配，engine.py:1032-1051）
+- `backtest/engine.py` 的持仓回落路径（`raw_positions_rows` 长度不匹配，engine.py）
   在正常流程中不可达（主循环每 Bar 必产出一行），未覆盖。
-- `backtest/validation.py:54/56/58`（kwargs 兼容）与 `agent/graph.py:27-32`
+- `backtest/validation.py/56/58`（kwargs 兼容）与 `agent/graph.py`
   （`langgraph.types` 缺失回落 `langgraph.graph`）在本机不可达/为死代码，见 W4-4。
 - `agent/context.py` 的 `_cached_auto_digest` 真机路径依赖 `skills/` 目录扫描，
   已用假 loader 覆盖异常分支，真实 digest 内容由既有 skills 用例覆盖。

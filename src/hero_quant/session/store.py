@@ -3,7 +3,7 @@
 设计要点：
 - **tenant 硬边界**：每个方法都要求显式 tenant_id，每条 SQL 都带 `tenant_id = %s`；
   同一事务内 `set_config('app.tenant', ..., true)` 供 RLS FORCE 兜底。
-  跨租户访问表现为「不存在」（SessionNotFound / RunNotFound），不泄露对方是否存在。
+  跨租户访问表现为「不存在」（SessionNotFound / SessionRunNotFound），不泄露对方是否存在。
 - **工具幂等**：`(tenant_id, idempotency_key)` 唯一；重复调用返回首次行且不覆盖结果。
   与 `governance/dedup.py` 的分工：DedupStore 是执行前占位（PENDING→终态，决定「要不要执行」），
   本表的 tool_calls 是执行后留痕（结果引用/错误），两者共用同一 idempotency_key。
@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import logging
 import secrets
 import threading
 from contextlib import contextmanager
@@ -23,6 +24,8 @@ from typing import Any, Iterator
 
 from hero_quant.db.pool import DatabaseUnavailable, get_pool
 from hero_quant.db.rows import execute, fetch_all, fetch_one
+
+logger = logging.getLogger(__name__)
 
 try:  # 可选依赖：用于把连接池超时精确映射为 503（而非 500）
     from psycopg_pool import PoolTimeout as _PoolTimeout  # type: ignore
@@ -87,7 +90,7 @@ class SessionNotFound(SessionError):
     status_code = 404
 
 
-class RunNotFound(SessionError):
+class SessionRunNotFound(SessionError):
     """运行不存在或不属于该 tenant —— 404。"""
 
     error = "run_not_found"
@@ -132,18 +135,29 @@ def _clip(value: Any, max_len: int) -> str | None:
 class SessionStore:
     """PG 会话存储；构造需显式连接池（测试可注入），不隐式建池。"""
 
-    def __init__(self, pool: Any) -> None:
+    def __init__(self, pool: Any, *, audit_hook: Any = None) -> None:
         if pool is None or not callable(getattr(pool, "connection", None)):
             raise ValueError("pool must provide a callable .connection()")
         self._pool = pool
+        # 批次16：会话/运行生命周期事件旁路到审计链（session.run）。None = 不审计。
+        self._audit_hook = audit_hook
 
     @classmethod
-    def from_dsn(cls, dsn: str | None = None) -> "SessionStore":
+    def from_dsn(cls, dsn: str | None = None, *, audit_hook: Any = None) -> "SessionStore":
         """从 DSN / Settings.checkpoint_dsn 建池；不可用即 fail-closed。"""
         try:
-            return cls(get_pool(dsn))
+            return cls(get_pool(dsn), audit_hook=audit_hook)
         except DatabaseUnavailable as exc:
             raise SessionStoreUnavailable(exc.reason, str(exc)) from exc
+
+    def _notify_audit(self, event: dict[str, Any]) -> None:
+        """把生命周期事件交给钩子：失败只 warning，绝不影响会话写入（审计是旁路）。"""
+        if self._audit_hook is None:
+            return
+        try:
+            self._audit_hook(event)
+        except Exception as exc:  # noqa: BLE001 - 钩子异常不得改变会话操作结果
+            logger.warning("session.audit_hook_failed error_code=audit_hook_failed error_type=%s", type(exc).__name__)
 
     # ------------------------------------------------------------------ 基础
 
@@ -192,6 +206,7 @@ class SessionStore:
             )
         if row is None:
             raise SessionError("insert_returned_no_row")
+        self._notify_audit({"phase": "created", "tenant_id": tenant, "session_id": str(row.get("id") or sid)})
         return row
 
     def get_session(self, tenant_id: str, session_id: str) -> dict[str, Any]:
@@ -312,6 +327,10 @@ class SessionStore:
             )
         if row is None:
             raise SessionNotFound("unknown session")
+        # 批次16：运行启动事件入审计链（session.run / phase=started）
+        self._notify_audit(
+            {"phase": "started", "tenant_id": tenant, "session_id": sid, "run_id": str(row.get("id") or run_id)}
+        )
         return row
 
     def finish_run(
@@ -338,7 +357,17 @@ class SessionStore:
                 (status, safe_reason, cost, tenant, rid),
             )
         if row is None:
-            raise RunNotFound("unknown run")
+            raise SessionRunNotFound("unknown run")
+        # 批次16：运行结束事件入审计链（session.run / phase=finished）
+        self._notify_audit(
+            {
+                "phase": "finished",
+                "tenant_id": tenant,
+                "session_id": row.get("session_id"),
+                "run_id": rid,
+                "status": status,
+            }
+        )
         return row
 
     def get_run(self, tenant_id: str, run_id: str) -> dict[str, Any]:
@@ -351,7 +380,7 @@ class SessionStore:
                 (tenant, rid),
             )
         if row is None:
-            raise RunNotFound("unknown run")
+            raise SessionRunNotFound("unknown run")
         return row
 
     def list_runs(self, tenant_id: str, session_id: str, *, limit: int = 20) -> list[dict[str, Any]]:
@@ -414,7 +443,7 @@ class SessionStore:
             )
         if existing is None:
             # 既没有冲突行也没有可插入的 run：run 不存在或属于别的 tenant
-            raise RunNotFound("unknown run")
+            raise SessionRunNotFound("unknown run")
         return existing, False
 
     def complete_tool_call(
@@ -495,12 +524,26 @@ _store: SessionStore | None = None
 _store_lock = threading.Lock()
 
 
+def _default_audit_hook():
+    """会话/运行生命周期事件的默认审计钩子（批次16）。
+
+    惰性导入 audit 包：session 存储不依赖审计模块可用性；导入失败返回 None（不审计），
+    绝不因为审计不可用把会话功能打挂。
+    """
+    try:
+        from hero_quant.audit.producers import session_run_hook
+
+        return session_run_hook()
+    except Exception:  # noqa: BLE001 - 审计是旁路
+        return None
+
+
 def get_session_store() -> SessionStore:
     """进程级单例（供 API 复用；测试用 reset_session_store 清理）。"""
     global _store
     with _store_lock:
         if _store is None:
-            _store = SessionStore.from_dsn()
+            _store = SessionStore.from_dsn(audit_hook=_default_audit_hook())
         return _store
 
 
@@ -513,6 +556,7 @@ def reset_session_store() -> None:
 __all__ = [
     "MESSAGE_ROLES",
     "RUN_STATUSES",
+    "SessionRunNotFound",
     "RunNotFound",
     "SessionError",
     "SessionNotFound",
@@ -522,3 +566,7 @@ __all__ = [
     "get_session_store",
     "reset_session_store",
 ]
+
+# 兼容别名：历史调用方仍可 from hero_quant.session.store import RunNotFound；
+# 与 runs.store.RunNotFound 是不同异常类型，绝不通用 except。
+RunNotFound = SessionRunNotFound

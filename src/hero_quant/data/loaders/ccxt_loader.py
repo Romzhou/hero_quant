@@ -11,11 +11,9 @@ from typing import Any
 
 import pandas as pd
 
+from .errors import DataValidationError
+
 logger = logging.getLogger(__name__)
-
-
-class DataValidationError(ValueError):
-    """Loader validation error for unparseable dates/inputs."""
 
 
 # interval 到 ccxt timeframe 的显式映射

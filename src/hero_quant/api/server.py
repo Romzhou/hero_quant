@@ -376,6 +376,18 @@ def _checkpoint_dsn_explicit() -> str:
         return ""
 
 
+def _app_state_value(request, key: str, default=None):
+    """读 app.state 上的装配对象；request 无 app/state 时返回 default。
+
+    FastAPI 请求一定有 app，但离线调用方/单测会传精简 request 替身；取不到就按
+    「未装配」处理（loop 侧 None 等价于旧行为），不得让 AttributeError 打断查询。
+    """
+    state = getattr(getattr(request, "app", None), "state", None)
+    if state is None:
+        return default
+    return getattr(state, key, default)
+
+
 def _checkpoint_thread_for_request(request) -> tuple[str, str]:
     """checkpoint 三段式的 (thread, tenant)。
 
@@ -1121,18 +1133,65 @@ def _get_trace_consumer_stop() -> asyncio.Event:
     return _trace_consumer_stop
 
 
-def _inject_r1_state_on_startup() -> None:
-    """R1: lifespan state 注入 — memory_store + agent 容器；异常仅 debug，不阻断启动。"""
+def _inject_r1_state_on_startup(app=None) -> None:
+    """R1: lifespan state 注入 — memory_store / dedup_store / agent 容器；异常仅 debug，不阻断启动。"""
+    target = app if app is not None else globals()["app"]
     try:
-        import hero_quant.agent.memory.store as _memory_store_mod
+        import hero_quant.agent.memory.store as _session_buffer_mod
 
-        _memory_store_mod.inject_memory_store(app)
+        # P0-3：进程内会话缓冲只挂 session_buffer，绝不占用 app.state.memory_store。
+        _session_buffer_mod.inject_session_buffer(target)
     except Exception as _e:
-        logger.debug("r1.memory_inject_failed", error=str(_e))
+        logger.debug("r1.session_buffer_inject_failed", error=str(_e))
+    try:
+        from pathlib import Path as _Path
+
+        from hero_quant.config.settings import get_settings as _gs
+        from hero_quant.governance.dedup import DedupStore as _DedupStore
+        from hero_quant.memory.store import MemoryStore as _PersistentMemoryStore
+
+        _data_dir = _Path(_gs().data_dir)
+        # P0-4：工具幂等账本落 data 根目录（SQLite），无外部依赖；失败显式置 None，
+        # loop 侧 dedup_store=None 等价于未接线，绝不静默伪装成已去重。
+        target.state.dedup_store = _DedupStore(db_path=_data_dir / "dedup.db")
+        # P0-3：持久化记忆（文件 + SQLite FTS5）装配到 app.state.memory_store，
+        # 由两处 loop_kwargs 注入 AgentLoop；失败不静默旁路。
+        target.state.memory_store = _PersistentMemoryStore(base_path=_data_dir / "memory")
+    except Exception as _e:
+        target.state.dedup_store = None
+        target.state.memory_store = None
+        logger.warning("r1.state_inject_failed", error=str(_e), error_code="r1_state_inject_failed")
+    # 阶段3 护栏：把真实工厂产出挂到 app.state，供接线测试做非 None / 精确类型 / 行为探针。
+    # 全部来自生产实现，不用替身；失败显式置 None（由护栏测试发现），绝不静默伪装。
+    try:
+        from hero_quant.agent.grounding import GroundingLedger as _GroundingLedger
+        from hero_quant.config.settings import get_settings as _gs2
+        from hero_quant.pricing.base import get_pricing_provider as _gpp
+        from hero_quant.secrets.manager import get_secrets_provider as _gsp
+
+        # 账本按请求新建：挂工厂而不是单例，避免跨请求证据互相污染。
+        target.state.grounding_ledger_factory = _GroundingLedger
+        target.state.secrets_provider = _gsp()
+        target.state.pricing_provider = _gpp(_gs2().pricing_backend)
+    except Exception as _e:
+        target.state.grounding_ledger_factory = None
+        target.state.secrets_provider = None
+        target.state.pricing_provider = None
+        logger.warning("r1.provider_inject_failed", error=str(_e), error_code="r1_provider_inject_failed")
+    try:
+        from hero_quant.audit.store import get_audit_store as _gas
+        from hero_quant.session.store import get_session_store as _gss
+
+        target.state.audit_store = _gas()
+        target.state.session_store = _gss()
+    except Exception as _e:
+        target.state.audit_store = None
+        target.state.session_store = None
+        logger.debug("r1.pg_store_inject_failed", error=str(_e))
     try:
         import hero_quant.agent.container as _agent_container_mod
 
-        _agent_container_mod.inject_agent_container(app)
+        _agent_container_mod.inject_agent_container(target)
     except Exception as _e:
         logger.debug("r1.agent_inject_failed", error=str(_e))
 
@@ -1182,9 +1241,19 @@ async def _lifespan(app):
     _warm_checkpoint_maps_on_startup()
     await _warm_llm_gateway()
     await _start_ws_heartbeat()
-    _inject_r1_state_on_startup()
+    _inject_r1_state_on_startup(app)
     await _start_trace_consumer()
     yield
+    # 关闭持久化记忆：先 await 释放 pgvector 侧车的异步池（绑定启动事件循环），
+    # 再走幂等 close() 释放 SQLite 句柄；漏掉前者会让 TestClient/进程关闭挂住。
+    try:
+        _ms = getattr(app.state, "memory_store", None)
+        if _ms is not None and hasattr(_ms, "aclose"):
+            await _ms.aclose()
+        elif _ms is not None and hasattr(_ms, "close"):
+            _ms.close()
+    except Exception as _e:
+        logger.debug("r1.memory_close_failed", error=str(_e))
     await _stop_trace_consumer()
 
 
@@ -2244,7 +2313,10 @@ async def query(request: Request, background_tasks: BackgroundTasks, q: str = ""
         try:
             from hero_quant.agent.grounding import GroundingLedger
             # 中文：ledger 只吃真实工具结果——此处不预置任何 K 线（曾硬编码 600519 两根假 K 线，
-            # 导致"已校验"是自己发给自己，审计 §4.2）。真实 ingest 由工具执行路径负责。
+            # 导致"已校验"是自己发给自己，审计 §4.2）。真实 ingest 由
+            # AgentLoop._ingest_grounding_from_tool_result 负责（err 为空 + dict + ok=True +
+            # provenance 合法才入账）；graph 委托路径不 ingest，账本恒空时仍会调
+            # assert_price，故 use_graph=true 下带价格断言的查询无法通过接地校验。
             ledger = GroundingLedger()
         except Exception as _e:
             logger.warning("grounding.init_failed", error=str(_e))
@@ -2286,6 +2358,11 @@ async def query(request: Request, background_tasks: BackgroundTasks, q: str = ""
             _saver = None
             _ckpt_degraded, _ckpt_reason = True, "checkpoint saver unavailable, memory fallback"
         _ckpt_thread, _ckpt_tenant = _checkpoint_thread_for_request(request)
+        # P0-4：只有调用方给了稳定任务线程（X-Request-ID）才开幂等去重；
+        # "adhoc" 跨请求共享会把合法重复取数误判为重放，故显式关闭。
+        _dedup_store = _app_state_value(request, "dedup_store") if _ckpt_thread != "adhoc" else None
+        # P0-3：持久化记忆进入 loop_kwargs（不是 app.state 里的 SessionBuffer）。
+        _memory_store = _app_state_value(request, "memory_store")
         await _enforce_kill_switch(_request_tenant(), model=model_name)
         loop_kwargs = dict(
             llm=llm,
@@ -2302,6 +2379,8 @@ async def query(request: Request, background_tasks: BackgroundTasks, q: str = ""
             wall_time_budget=_wt,
             checkpoint_tenant=_ckpt_tenant,
             checkpoint_thread=_ckpt_thread,
+            dedup_store=_dedup_store,
+            memory_store=_memory_store,
         )
         if _saver is not None:
             # S2：AgentLoop 已显式接收 checkpoint（checkpoint/checkpointer 双别名），每轮迭代 put 一次
@@ -2748,7 +2827,8 @@ async def query_stream(request: Request, background_tasks: BackgroundTasks, q: s
                 trace = None
             try:
                 from hero_quant.agent.grounding import GroundingLedger
-                # 中文：同 /v1/query——不预置伪造 K 线，ledger 只吃真实工具结果（审计 §4.2）。
+                # 中文：同 /v1/query——不预置伪造 K 线，ledger 只吃真实工具结果（审计 §4.2）；
+                # ingest 唯一落点为 AgentLoop._ingest_grounding_from_tool_result（工具结果收口）。
                 ledger = GroundingLedger()
             except Exception as _e:
                 logger.warning("grounding.init_failed", error=str(_e))
@@ -2788,6 +2868,8 @@ async def query_stream(request: Request, background_tasks: BackgroundTasks, q: s
                 if "checkpoint saver unavailable, memory fallback" not in _gen_reasons:
                     _gen_reasons.append("checkpoint saver unavailable, memory fallback")
             _ckpt_thread2, _ckpt_tenant2 = _checkpoint_thread_for_request(request)
+            _dedup_store2 = _app_state_value(request, "dedup_store") if _ckpt_thread2 != "adhoc" else None
+            _memory_store2 = _app_state_value(request, "memory_store")
             loop_kwargs2 = dict(
                 llm=llm,
                 max_iterations=5,
@@ -2803,6 +2885,8 @@ async def query_stream(request: Request, background_tasks: BackgroundTasks, q: s
                 wall_time_budget=_wt,
                 checkpoint_tenant=_ckpt_tenant2,
                 checkpoint_thread=_ckpt_thread2,
+                dedup_store=_dedup_store2,
+                memory_store=_memory_store2,
             )
             if _saver2 is not None:
                 loop_kwargs2["checkpoint"] = _saver2

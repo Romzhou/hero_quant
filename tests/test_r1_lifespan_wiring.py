@@ -32,14 +32,18 @@ def test_r1_state_injection_on_startup():
     from hero_quant.api.server import app
 
     with (
-        patch.object(store_mod, "inject_memory_store", wraps=store_mod.inject_memory_store) as m_mem,
+        patch.object(store_mod, "inject_session_buffer", wraps=store_mod.inject_session_buffer) as m_mem,
         patch.object(container_mod, "inject_agent_container", wraps=container_mod.inject_agent_container) as m_agent,
         patch.object(ws_mod, "run_trace_consumer", new=AsyncMock()),
     ):
         with TestClient(app):
             assert hasattr(app.state, "memory_store"), "app.state.memory_store missing after startup"
+            assert hasattr(app.state, "session_buffer"), "app.state.session_buffer missing after startup"
             assert hasattr(app.state, "agent"), "app.state.agent missing after startup"
-    assert m_mem.called, "inject_memory_store not called on startup"
+            # 同名类陷阱护栏：持久化记忆与会话缓冲必须是不同模块的实例
+            assert type(app.state.memory_store).__module__ == "hero_quant.memory.store"
+            assert type(app.state.session_buffer).__module__ == "hero_quant.agent.memory.store"
+    assert m_mem.called, "inject_session_buffer not called on startup"
     assert m_agent.called, "inject_agent_container not called on startup"
 
 

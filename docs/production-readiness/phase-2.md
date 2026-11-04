@@ -7,7 +7,7 @@
 
 ## 1. W4 长任务队列与断点续跑
 
-**现状**：长任务在 API 线程内跑；无队列/重试/DLQ；Temporal 仅 scaffold（`scheduled/service.py:541`），`temporalio` 未安装。
+**现状**：长任务在 API 线程内跑；无队列/重试/DLQ；Temporal 仅 scaffold（`scheduled/service.py`），`temporalio` 未安装。
 **缺口**：任务队列、worker、取消、断点、DLQ。
 
 ### 怎么做
@@ -48,7 +48,7 @@
 
 ### 2.3 Risk 归因与 ShadowAccount（PR-214）
 
-**现状**：Risk 页归因 5 类数字写死（`Risk.tsx:229-240`：+1.2%/+0.8%/-0.1%/-0.4%/+0.2%）；ShadowAccount 仅文案。
+**现状**：Risk 页归因 5 类数字写死（`Risk.tsx`：+1.2%/+0.8%/-0.1%/-0.4%/+0.2%）；ShadowAccount 仅文案。
 **怎么做**：
 - 后端：新增 `/v1/risk/attribution`，从回测产物/持仓计算 5 类归因；`/v1/risk/shadow` 返回 ShadowJournal 对账结果。
 - 前端：接真实接口；无数据时显示 `--`，不得回退写死数字。

@@ -33,6 +33,8 @@ _PG_TESTS = (
     "tests/test_pr241_audit_pg.py",
     "tests/test_pr201_queue_pg.py",
     "tests/test_pr215_admin_pg.py",
+    # 批次16：会话级事件入审计链
+    "tests/test_pr241_session_pg.py",
 )
 _PG_PREFIXES = ("postgresql://", "postgres://", "postgresql+psycopg://")
 _DSN_KEYS = ("HERO_CHECKPOINT_DSN", "HERO_PG_DSN")

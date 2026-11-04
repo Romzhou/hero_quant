@@ -379,6 +379,7 @@ def check_bars(
     calendar: Iterable[date | datetime | str] | None = None,
     reference: Mapping[str, Sequence[Mapping[str, Any]]] | None = None,
     thresholds: QualityThresholds | None = None,
+    require_volume: bool = True,
 ) -> QualityReport:
     """对抬平后的 bars 跑完整性/异常值/跨源/日历四类检查，返回 QualityReport。
 
@@ -388,6 +389,12 @@ def check_bars(
     在 union < min_union_days(5) 时跳过，故「短窗口 + 标的根数不齐」不会误伤。
     `start`/`end` 给定时窗口以它为准；未给则窗口取全体 bar 的首尾日期，此时
     `missing_head`/`missing_tail` 不会命中（少了边界就无从判断「首尾」）。
+
+    `require_volume=False` 只用于「数据源本身不提供 volume 维度」的调用方（如
+    registry 出口闸遇到只有 close/date 的源）：此时 volume 缺失不再算 `bar_malformed`，
+    价格/时序规则照旧生效。默认 True 保持既有调用方（snapshot 入库路径）语义不变——
+    逐根缺 volume 在那里仍是坏数据。调用方必须把「volume 维度缺席」显式记账，
+    不得用它做静默旁路。
     """
     if isinstance(rows, (str, bytes)) or not isinstance(rows, Sequence):
         raise ValueError("rows_must_be_sequence")
@@ -432,8 +439,9 @@ def check_bars(
             sink.add("price_not_positive", SEVERITY_BLOCK, symbol, trade_date, note=f"close={close!r}",
                      samples=[trade_date.isoformat()])
         if volume is None:
-            sink.add("bar_malformed", SEVERITY_BLOCK, symbol, trade_date, note="volume_missing",
-                     samples=[trade_date.isoformat()])
+            if require_volume:
+                sink.add("bar_malformed", SEVERITY_BLOCK, symbol, trade_date, note="volume_missing",
+                         samples=[trade_date.isoformat()])
         elif not math.isfinite(volume):
             sink.add("volume_not_finite", SEVERITY_BLOCK, symbol, trade_date, note=f"volume={volume!r}",
                      samples=[trade_date.isoformat()])

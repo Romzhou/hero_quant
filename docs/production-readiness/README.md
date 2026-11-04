@@ -54,17 +54,17 @@
 
 | 层 | 缺口 | 现状证据 |
 |---|---|---|
-| 身份 | 匿名 SSE 票、无用户表/登录/RBAC/租户配额 | `api/security.py:233` |
+| 身份 | 匿名 SSE 票、无用户表/登录/RBAC/租户配额 | `api/security.py` |
 | 模型 | 无 API key，真模型一次未跑；评测默认 fake，real 结果 `skipped/no_llm_backend` | `evals/results_real.json` |
 | 数据 | 只取 20 根；无 PIT 库/快照/复权/幸存者偏差；回测不可复现 | `server.py:_BACKTEST_BARS_TARGET=20` |
 | 会话 | 无 conversation/session store；工具调用无幂等键 | `grep` 无 session store |
-| 任务 | 长任务无队列；Temporal 入队是 scaffold；`temporalio` 未安装 | `scheduled/service.py:541` |
+| 任务 | 长任务无队列；Temporal 入队是 scaffold；`temporalio` 未安装 | `scheduled/service.py` |
 | 迁移 | `migrations/` 已废弃，DDL 内联在 Python，无版本管理 | `migrations/README.md` |
 | 运维 | 仅有开发 compose；无生产 compose/反代/systemd/备份/多环境 | 仓库无 `deploy/` |
 | 安全 | 无密钥托管/轮换；提示注入/SSRF 未系统加固；无渗透测试 | `.env` + `security/` |
 | 合规 | 审批只是策略类，事件“日志占位”；无审计查询/留存策略 | `security/approval.py` |
-| 产品 | Billing 无 API/UI；调度无入口；Risk 归因写死；ShadowAccount 仅文案 | `api/server.py` 无 billing 路由；`Risk.tsx:229-240` |
-| 发布 | 版本双源（pyproject 0.3.0 / `__version__` 0.2.0）；无 feature flag | `src/hero_quant/__init__.py:7` |
+| 产品 | Billing 无 API/UI；调度无入口；Risk 归因写死；ShadowAccount 仅文案 | `api/server.py` 无 billing 路由；`Risk.tsx` |
+| 发布 | 版本双源（pyproject 0.3.0 / `__version__` 0.2.0）；无 feature flag | `src/hero_quant/__init__.py` |
 
 ---
 

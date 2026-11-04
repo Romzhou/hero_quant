@@ -157,6 +157,7 @@ docker build --build-arg HERO_QUANT_VERSION="$(python -c 'import tomllib;print(t
 | `HERO_EMBED_PROVIDER` | `offline` | `openai` / `sentence-transformers` / `offline` |
 | `HERO_OTEL_MODE` | `disabled` | `disabled`/`shared`/`private` |
 | `HERO_TRACE_*` | `50000/500` | `TOOL_RESULT_OFFLOAD/TEXT_OFFLOAD/PREVIEW` |
+| `HERO_DATA_DIR` | `data` | 运行时数据根目录：`memory/`（持久记忆）与 `dedup.db`（工具幂等账本）；相对路径按进程 cwd 解析 |
 | `FRONTEND_DIST` | 自动探测 | 显式设置即**唯一来源**：路径不存在时 fail-closed，**不回落** `/app/frontend/dist` 等默认候选（`server.py:2814`）。无产物时 `/` 与 SPA 路由返回 503 + `X-Frontend: missing|index-missing` + `Retry-After: 30` |
 | `HERO_AUTH_MODE` | `enforce` | `off`=迁移期关闭强制鉴权；`enforce`=强制 Bearer（非法值也按 `enforce`）。`auth_enabled()` 还要求 issuer + audience 同时存在，缺配置时开发环境不会被打穿 |
 | `HERO_OIDC_ISSUER` | 空 | OIDC issuer，形如 `https://sso.example.com/realms/hero`（Keycloak realm） |
@@ -208,6 +209,8 @@ npm --prefix frontend run test:run
 ```
 
 **测试口径（唯一可信来源是本机实跑）**：硬门是 `pyproject.toml:67` 的 `fail_under = 50`，`.github/workflows/test.yml:53` 与 `ci.yml:103` 同值。2026-10-28 基线：**2767 passed / 49 skipped / 覆盖率 72.15%**（`pytest -q --cov=src`）。49 个 skip 里绝大多数是“无真 PG 时”的守卫（有 PG 时只剩 1 个 Windows-only skip），所以看到跳过数变化先看环境，不要先怀疑用例。通过数随改动漂移，引用前请重跑，不要照抄本文。前端路由用例用 `tmp_path` 自造 dist 做**三态断言**（有 `dist` 断 200 HTML；`dist` 缺失断 503 + `X-Frontend: missing`；`index.html` 缺失断 503 + `X-Frontend: index-missing`），并通过 reload 锁定分支，**不依赖** CI 先 `npm run build`、也不随本机是否构建过而漂移。
+
+本地跑全量测试用唯一入口 `scripts/test_local.sh`（自动注入 PG DSN；直接 `pytest -q` 会因缺 DSN 让 PG 族 82 条整族 skip）。详见 `docs/local-development.md`。
 
 供应链：`requirements-lock.txt` 为 `uv pip compile --generate-hashes` 产物（真 sha256 非占位），`Dockerfile:32 pip install --require-hashes`，CI 校验 `pip-audit + gitleaks`（已接入真 hash 全量）。
 

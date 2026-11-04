@@ -2,8 +2,8 @@
 
 - 数据集：`evals/dataset.jsonl` — 38 条自然语言投研查询
 - Harness：`evals/run.py`，一键重跑见 `evals/README.md`
-- 被测链路：链A问答 `server.py -> LLMFactory -> AgentLoop.run(loop.py:616) -> trace.jsonl`；
-  fake 口径与 `server.py:1422` 的 `_FakeLLM` 模板一致；工具断言以
+- 被测链路：链A问答 `server.py -> LLMFactory -> AgentLoop.run(loop.py) -> trace.jsonl`；
+  fake 口径与 `server.py` 的 `_FakeLLM` 模板一致；工具断言以
   `tools/registry.TOOL_REGISTRY`（18 个已注册工具）为 ground truth
 - 本轮无任何 `src/` 修改（只写 `evals/**` + 本报告）；loop/prompt 问题一律只给最小 patch 建议
 
@@ -38,7 +38,7 @@
 ## 真 LLM 状态
 
 `--mode real` 已尝试：`LLMFactory.create()` 返回外层 `LLMClient`，
-内层经递归内省确认为 `_FallbackChat`（`src/hero_quant/llm/factory.py:147`，
+内层经递归内省确认为 `_FallbackChat`（`src/hero_quant/llm/factory.py`，
 `langchain_openai` 未安装，日志 `ChatOpenAI not installed, using fallback`）。
 harness 判定为离线 fallback，按 `skipped(no_llm_backend)` 退出码 0 落盘，
 未发起任何网络调用。有真实后端后重跑同一命令即可得到真基线；
@@ -46,8 +46,8 @@ real 模式只做连通性健康断言（terminated / 非空文本），数字�
 
 ## loop/prompt 最小修建议（仅建议，未落地，需 D 线确认）
 
-1. 两处 `_FakeLLM` 模板漂移 — `src/hero_quant/api/server.py:1422`（问答路径，
-   短模板）与 `src/hero_quant/api/server.py:1816`（stream 路径，多出
+1. 两处 `_FakeLLM` 模板漂移 — `src/hero_quant/api/server.py`（问答路径，
+   短模板）与 `src/hero_quant/api/server.py`（stream 路径，多出
    `数据来源 tencent(synthetic) / 回测区间 2026-07-20~2026-08-12 / 结论：等权策略跑赢基准` 三行）。
    建议：抽成同一常量，两处复用；本 eval 的 `FakeLLM` 以 `:1422` 为准，
    若 D 线统一为长模板，同步更新 `evals/run.py::FAKE_CHECKABLE`。

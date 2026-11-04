@@ -52,7 +52,7 @@ def test_b3a_market_data_narrow_except_transient_still_fallback(monkeypatch):
     # 中文：_get_shared_registry 带缓存，需直接桩 shared registry 避免上游用例缓存污染
     monkeypatch.setattr(md, "_get_shared_registry", lambda: types.SimpleNamespace(get_bars=_net_err, _loaders=[object()]))
 
-    r = md.get_market_data(symbol="600519.SH")
+    r = md.get_market_data(symbol="600519.SH", allow_synthetic=True)
     assert r.get("ok") is False
     assert (r.get("provenance") or {}).get("source") == "synthetic"
     assert r.get("bars")
@@ -115,7 +115,7 @@ def test_b3a_market_batch_all_fallback_top_ok_is_false(monkeypatch):
     fake_reg = types.SimpleNamespace(get_bars=_always_fail)
     monkeypatch.setattr(md, "_get_shared_registry", lambda: fake_reg)
     # 避免真实合成依赖外部，_synthetic_fallback 仍可用（本地实现）
-    r = md.get_bars_range(["A.US", "B.US"], start="2026-08-01", end="2026-08-03")
+    r = md.get_bars_range(["A.US", "B.US"], start="2026-08-01", end="2026-08-03", allow_synthetic=True)
     assert r.get("ok") is False, "全回退时顶层 ok 仍 True 误导调用方当 live 用"
     for sym in ["A.US", "B.US"]:
         assert r["data"][sym].get("ok") is False
@@ -133,7 +133,7 @@ def test_b3a_market_batch_partial_ok_is_false(monkeypatch):
 
     fake_reg = types.SimpleNamespace(get_bars=_half)
     monkeypatch.setattr(md, "_get_shared_registry", lambda: fake_reg)
-    r = md.get_bars_range(["GOOD.US", "BAD.US"], start="2026-08-01", end="2026-08-03")
+    r = md.get_bars_range(["GOOD.US", "BAD.US"], start="2026-08-01", end="2026-08-03", allow_synthetic=True)
     assert r.get("ok") is False, "部分回退时顶层仍 True 掩盖失败"
     assert r["data"]["GOOD.US"].get("ok") is True
     assert r["data"]["BAD.US"].get("ok") is False

@@ -5,7 +5,10 @@
 """
 
 from .questions import AskCardInterrupt, AskUserQuestionItem, Command, UserQuestionService
-from .approval import ApprovalPolicy, ApprovalService
+from .approval import ApprovalPolicy, InteractionApprovalService
+
+# 兼容别名（指向同一实现，不是同名类定义）
+ApprovalService = InteractionApprovalService
 
 __all__ = [
     "AskCardInterrupt",
@@ -13,5 +16,6 @@ __all__ = [
     "Command",
     "UserQuestionService",
     "ApprovalPolicy",
+    "InteractionApprovalService",
     "ApprovalService",
 ]

@@ -35,7 +35,7 @@ fake 只证明评测管道与断言自洽，**不证明模型质量**；模型�
 | # | 事项 | 归属 | 阻塞 |
 |---|---|---|---|
 | T1 | 注入可用 provider key（`HERO_API_KEY` 或 provider 专属 key）后重跑 `--mode real`，产出真实通过率 + 失败分类 | 需凭据 | key 不可用 |
-| T2 | P 线遗留 4 条 loop/prompt 最小修（`server.py:1422` / `:1816` 模板与免责声明、eval 侧 risk_warning 缺口等） | D 线（需改 `src/`） | 超出本线范围 |
+| T2 | P 线遗留 4 条 loop/prompt 最小修（`server.py` / `:1816` 模板与免责声明、eval 侧 risk_warning 缺口等） | D 线（需改 `src/`） | 超出本线范围 |
 | T3 | real 模式按 API 用量计费，**不消耗 Codex 订阅额度**；只以烧订阅额度为目的时可跳过本线，改由 Codex 自行跑 S/R/V | 决策 | — |
 
 - 交叉引用（Round 6 汇总）：本项「real 模式未做」（`.env` 占位 key → 401 → fail-closed 成 `skipped/no_llm_backend`，见本文件 §1）已并入 [round6-report.md §4 遗留台账](round6-report.md) **第 9 条**，与其余 9 条遗留（O3/O4/O5、W4-1..4、PG 环境、Rust/外网/redline）同表跟踪「当前状态 / 收口计划 / 需否人拍板」。

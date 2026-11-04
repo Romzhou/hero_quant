@@ -15,15 +15,15 @@ def _read_src(rel: str) -> str:
 def test_c2_agent_store_lock_exists():
     src = _read_src("src/hero_quant/agent/memory/store.py")
     assert "threading" in src, "应引入 threading"
-    assert "_lock" in src, "MemoryStore 应有 _lock"
+    assert "_lock" in src, "SessionBuffer 应有 _lock"
     # get_buffer / save_buffer / delete_buffer 应在锁内
     assert "with self._lock" in src or "with self._" in src, "关键区应加锁"
     # 验证运行时有锁对象
-    from hero_quant.agent.memory.store import MemoryStore
-    ms = MemoryStore(max_sessions=5)
+    from hero_quant.agent.memory.store import SessionBuffer
+    ms = SessionBuffer(max_sessions=5)
     assert hasattr(ms, "_lock"), "运行时应有 _lock 属性"
     # 粗略检查 dobble overshoot：并发 get_buffer 不应超限
-    ms2 = MemoryStore(max_sessions=10)
+    ms2 = SessionBuffer(max_sessions=10)
     errors = []
 
     def worker(sid):
@@ -43,9 +43,9 @@ def test_c2_agent_store_lock_exists():
 
 # 2 agent/memory/store.py:46-49 save_buffer 绕 MAX_SESSIONS
 def test_c2_agent_save_buffer_evicts():
-    from hero_quant.agent.memory.store import MemoryStore
+    from hero_quant.agent.memory.store import SessionBuffer
     from hero_quant.agent.memory.buffer import MemoryBuffer
-    ms = MemoryStore(max_sessions=2)
+    ms = SessionBuffer(max_sessions=2)
     ms.get_buffer(1)
     ms.get_buffer(2)
     assert ms.size == 2

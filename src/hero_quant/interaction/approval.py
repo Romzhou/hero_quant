@@ -19,7 +19,7 @@ from hero_quant.security.approval import (
 from .questions import AskCardInterrupt, Command
 
 
-class ApprovalService(SecurityApprovalService):
+class InteractionApprovalService(SecurityApprovalService):
     """交互层审批，扩展三段式 ask→guard 并支持问询中断语义。"""
 
     def request_sync_with_guard(self, tool: str, reason: str | None = None, questions: list[Any] | None = None) -> Any:
@@ -75,4 +75,7 @@ class ApprovalService(SecurityApprovalService):
         return cmd
 
 
-__all__ = ["ApprovalService", "ApprovalPolicy", "effectiveApprovalPolicy", "AskCardInterrupt", "Command"]
+# 兼容别名：历史调用方仍可 from ... import ApprovalService；不是类定义，不违反「禁止同名类」。
+ApprovalService = InteractionApprovalService
+
+__all__ = ["InteractionApprovalService", "ApprovalService", "ApprovalPolicy", "effectiveApprovalPolicy", "AskCardInterrupt", "Command"]

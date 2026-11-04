@@ -63,6 +63,7 @@ def validate(
     price_date: str | pd.Timestamp | None = None,
     currency: str | None = None,
     *args,
+    skip_pit: bool = False,
     **kwargs,
 ) -> None:
     """校验回测输入：PIT 时序、非正价格与混币种；通过则返回 None，违规抛 ValidationError。
@@ -70,6 +71,9 @@ def validate(
     PIT: weights_on must be <= price_date.
         - weights_on <= price_date : valid (weights use data available at or before price_date)
         - weights_on > price_date  : invalid (weights would need future data) -> raise ValidationError
+
+    skip_pit=True 只跳过上面的 PIT 时序比对；空帧/索引类型/重复/乱序/非正价格/混币种
+    等非 PIT 检查照常执行，绝不整段跳过校验（阶段4 契约）。
     """
     # 兼容：允许经 kwargs/*args 传入同名参数
     if weights_on is None and "weights_on" in kwargs:
@@ -121,7 +125,7 @@ def validate(
             raise ValidationError(f"invalid timestamp {v!r}: {e}") from e
         return ts
 
-    if weights_on is not None and price_date is not None:
+    if not skip_pit and weights_on is not None and price_date is not None:
         # Mixed naive/aware PIT inputs: normalize both to UTC-aware instants
         # (naive interpreted as UTC, documented convention) and compare actual
         # instants — the OCR mixed-awareness finding vs the Task13-10 contract

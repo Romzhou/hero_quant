@@ -16,11 +16,9 @@ from typing import Any
 
 from hero_quant.infra.redis import cache
 
+from .errors import DataValidationError
+
 logger = logging.getLogger(__name__)
-
-
-class DataValidationError(ValueError):
-    """Loader validation error for unparseable dates/inputs."""
 
 
 class TencentLoader:

@@ -1,17 +1,33 @@
-"""行情注册表：16 源契约、双源 fallback 与 provenance 全链路。
+"""行情注册表：provenance 全链路 + 双源 fallback（白名单仅为契约枚举）。
 
 位于 data 层核心，统一管理 _traits（类型注册）与 _loaders（实例 fallback 链）
 双轨；按 markets 做路由分发，经 audit_log 记录来源，并对跨源收盘价做 1%
 阈值告警；provenance{source, unit} 贯穿 loaders 到 tools。
+
+口径澄清：VALID_SOURCES 的 16 源是白名单枚举（契约声明），**运行时
+tools.market_data._make_registry 仅注册 Tencent + Yahoo 两源**；get_bars 在
+已注册 loader 间按注册顺序回退，不做 16 源择优/打分，也不存在覆盖 16 源的回退链。
+接入新源需先实现 loader 并显式 register，另开线，不得把白名单当已接线能力。
 """
 
-from dataclasses import dataclass, field
+from collections.abc import Mapping
+from dataclasses import dataclass, field, replace
+from datetime import date, datetime
 import math
 import threading
 import time
 import logging
 from collections import deque
 from typing import TYPE_CHECKING, Any
+
+# 质量闸依赖 data.quality（纯函数叶子模块，不反向依赖 registry，无循环导入）
+from hero_quant.data.quality import (
+    SEVERITY_BLOCK,
+    SEVERITY_WARN,
+    QualityReport,
+    assert_quality,
+    check_bars,
+)
 
 if TYPE_CHECKING:
     from hero_quant.data.trait import SourceTrait
@@ -30,6 +46,27 @@ from hero_quant.data.sources import VALID_SOURCES as _VALID_SOURCES  # noqa: E40
 
 _settings_mode_cache: str | None = None
 _settings_mode_cache_lock = threading.Lock()
+
+# 质量闸只对日线执行：分钟/周/月线的涨跌幅与休市口径与日线不同，套用即误杀
+_DAILY_INTERVALS = frozenset({"1d", "1D"})
+
+# A 股专属规则（quality._check_weekend 的判定依据是「A 股周末不交易」）。
+# 非 CN 市场（US/CRYPTO/UNKNOWN）在无交易所日历的前提下套用会整段误判：
+# crypto 周末正常交易，US 会话与时区口径也不同 —— 只留痕不阻断。
+_CN_ONLY_CODES = frozenset({"weekend_bar"})
+
+
+def _is_date_like(value: Any) -> bool:
+    """日期可解析判定，口径与 data.quality 的归一化一致（date/datetime/ISO 字符串）。"""
+    if isinstance(value, (datetime, date)):
+        return True
+    if isinstance(value, str):
+        try:
+            date.fromisoformat(value.strip()[:10])
+        except ValueError:
+            return False
+        return True
+    return False
 
 
 def _get_data_mode(*, force_refresh: bool = False) -> str:
@@ -681,6 +718,197 @@ class MarketDataRegistry:
                 ) from e
         return
 
+    @staticmethod
+    def _quality_log(op: str, msg: str, *args: Any, **fields: Any) -> None:
+        """质量闸日志：stdlib warning 为主、structlog 为辅，固定带 error_code=op。
+
+        日志不可用不得影响取数（故窄化捕获），但质量判定本身绝不吞错。
+        """
+        logger.warning(msg, *args)
+        if _slog is None:
+            return
+        try:
+            _slog.warning(op, error_code=op, **fields)
+        except (TypeError, ValueError, AttributeError):  # pragma: no cover — 日志后端局限
+            return
+
+    @staticmethod
+    def _quality_rows(bars: Any, symbol: str) -> tuple[list[Any], int, bool]:
+        """把 loader 返回的 bars 投影成质量门要的行（symbol/trade_date/close/volume）。
+
+        返回 (rows, dated_rows, volume_present)：
+        - rows：Mapping 行统一补 symbol、把 date 别名映射成 trade_date；非 Mapping 行原样保留，
+          交给 check_bars 判 bar_malformed（不在此处提前吞掉）；
+        - dated_rows：能解析出日期的行数；0 表示整批无日期（日期类规则无从判定）；
+        - volume_present：这批数据是否带 volume 维度（False 时不判 volume，但仍判价格）。
+        """
+        records: list[Any] | None = None
+        index_values: list[Any] = []
+        if hasattr(bars, "columns") and hasattr(bars, "to_dict"):
+            try:
+                records = list(bars.to_dict("records"))
+            except (TypeError, ValueError, AttributeError, LookupError) as e:
+                logger.warning("quality projection: DataFrame to_dict failed: %s", e, exc_info=e)
+                return [], 0, False
+            columns = {str(col).strip().lower() for col in getattr(bars, "columns", [])}
+            if not ({"trade_date", "date", "datetime"} & columns):
+                # 无日期列时才退回索引（DatetimeIndex 常见）；RangeIndex 解析不出日期会落到 skip 分支
+                try:
+                    index_values = list(bars.index)
+                except (TypeError, ValueError, AttributeError):
+                    index_values = []
+        elif isinstance(bars, (list, tuple)):
+            records = list(bars)
+        else:
+            logger.warning("quality projection: unsupported bars type %s", type(bars).__name__)
+            return [], 0, False
+
+        rows: list[Any] = []
+        dated = 0
+        volume_present = False
+        for position, record in enumerate(records or []):
+            if not isinstance(record, Mapping):
+                rows.append(record)
+                continue
+            row = dict(record)
+            row.setdefault("symbol", symbol)
+            if "trade_date" not in row:
+                raw_date = row.get("date", row.get("datetime"))
+                if raw_date is None and position < len(index_values):
+                    raw_date = index_values[position]
+                if raw_date is not None:
+                    row["trade_date"] = raw_date
+            if _is_date_like(row.get("trade_date")):
+                dated += 1
+            if row.get("volume") is not None:
+                volume_present = True
+            rows.append(row)
+        return rows, dated, volume_present
+
+    @staticmethod
+    def _relax_cn_only_blocks(report: QualityReport) -> tuple[QualityReport, tuple[str, ...]]:
+        """把 A 股专属规则的 block 降级为 warn，返回 (新报告, 被降级的 code 元组)。
+
+        只在非 CN 市场调用：weekend_bar 的判定依据是「A 股周末不交易」，crypto 周末正常
+        交易、US 会话/时区口径也不同，无交易所日历时套用会整段误判（假阳性一多门就废）。
+        CN 仍保持 fail-closed；降级事实由调用方写入 provenance，禁止静默。
+        """
+        relaxed_codes = tuple(
+            sorted(
+                {
+                    finding.code
+                    for finding in report.blocks
+                    if finding.code in _CN_ONLY_CODES
+                }
+            )
+        )
+        if not relaxed_codes:
+            return report, ()
+        findings = tuple(
+            replace(finding, severity=SEVERITY_WARN)
+            if finding.severity == SEVERITY_BLOCK and finding.code in relaxed_codes
+            else finding
+            for finding in report.findings
+        )
+        return (
+            QualityReport(
+                findings=findings,
+                checked_rows=report.checked_rows,
+                checked_symbols=report.checked_symbols,
+                thresholds=report.thresholds,
+            ),
+            relaxed_codes,
+        )
+
+    def _quality_gate(self, symbol: str, bars: Any, prov: Any, interval: str, market: str) -> None:
+        """日线出口质量闸：block 级 finding 抛 DataQualityError（fail-closed），warn 只留痕。
+
+        跳过口径一律写进 provenance.extra，禁止静默跳过：
+        - 非日线：quality_skipped="interval:<iv>"（分钟/周/月线涨跌幅与休市口径不同）；
+        - synthetic 源：quality_skipped="synthetic"——合成序列逐日历日铺满（含周末/占位），
+          A 股周末规则会整段误杀，且合成数据不是「坏数据」，不该在这里被判死；
+        - 整批无 trade_date：quality_skipped="no_trade_date"（日期类规则无从判定）。
+        源不提供 volume 时仍跑价格/时序规则，另记 extra["quality_volume"]="absent"，
+        避免「删掉 volume 字段就能绕过质量门」的旁路。
+        """
+        extra = getattr(prov, "extra", None)
+        if not isinstance(extra, dict):
+            extra = {}
+            try:
+                prov.extra = extra
+            except (AttributeError, TypeError):
+                # prov 不可写就不要假装已记账：明确告警并跳过（取数本身不受影响）
+                logger.warning("quality gate: provenance.extra not writable for %s", symbol)
+                return
+        if interval not in _DAILY_INTERVALS:
+            extra["quality_skipped"] = f"interval:{interval}"
+            self._quality_log(
+                "quality_gate_skipped_interval",
+                "quality gate skipped for %s: interval=%s (daily-only gate)",
+                symbol,
+                interval,
+                symbol=symbol,
+                interval=interval,
+            )
+            return
+        if getattr(prov, "source", None) == "synthetic":
+            extra["quality_skipped"] = "synthetic"
+            self._quality_log(
+                "quality_gate_skipped_synthetic",
+                "quality gate skipped for %s: synthetic series (weekend/placeholder rows)",
+                symbol,
+                symbol=symbol,
+            )
+            return
+        rows, dated, volume_present = self._quality_rows(bars, symbol)
+        if not rows or (dated == 0 and all(isinstance(row, Mapping) for row in rows)):
+            extra["quality_skipped"] = "no_trade_date"
+            self._quality_log(
+                "quality_gate_skipped_no_date",
+                "quality gate skipped for %s: no parseable trade_date in %d rows",
+                symbol,
+                len(rows),
+                symbol=symbol,
+                rows=len(rows),
+            )
+            return
+        report = check_bars(rows, require_volume=volume_present)
+        if market != "CN":
+            report, relaxed_codes = self._relax_cn_only_blocks(report)
+            if relaxed_codes:
+                extra["quality_relaxed"] = list(relaxed_codes)
+                self._quality_log(
+                    "quality_gate_relaxed_cn_only_rule",
+                    "quality gate relaxed A-share-only rule for %s: market=%s codes=%s",
+                    symbol,
+                    market,
+                    list(relaxed_codes),
+                    symbol=symbol,
+                    market=market,
+                    codes=list(relaxed_codes),
+                )
+        extra["quality"] = {
+            "ok": report.ok,
+            "reason": report.reason,
+            "block_codes": list(report.codes),
+            "checked_rows": report.checked_rows,
+        }
+        if not volume_present:
+            extra["quality_volume"] = "absent"
+        if not report.ok:
+            self._quality_log(
+                "quality_gate_blocked",
+                "quality gate blocked %s: reason=%s %s",
+                symbol,
+                report.reason,
+                report.detail(),
+                symbol=symbol,
+                reason=report.reason,
+                codes=list(report.codes),
+                rows=report.checked_rows,
+            )
+        assert_quality(report)
+
     def get_bars(self, symbol: str, start: str, end: str, interval: str = "1d") -> tuple[Any, "Provenance"]:
         """按市场路由获取 bars，记录审计日志并执行跨源校验；支持旧参数顺序兼容。"""
         _intervals = {"1d", "1m", "5m", "15m", "30m", "1h", "1wk", "1mo", "1D", "1W"}
@@ -780,6 +1008,8 @@ class MarketDataRegistry:
             except Exception as e:
                 # non-critical validation warnings are best-effort: log and continue (do not abort primary fetch)
                 logger.warning("cross_source check error for %s: %s", symbol, e, exc_info=e)
+            # 出口质量闸：必须在 return 前、且不套任何宽 except —— block 时 DataQualityError 直接上抛
+            self._quality_gate(symbol, bars, prov, interval, market)
             return bars, prov
         # 全部 loader 失败，透出最后的可操作错误 — 中文：保留异常链
         # （OCR high：非 ImportError 不得伪装成缺依赖；异常链必须保留供排查）

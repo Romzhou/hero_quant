@@ -131,13 +131,13 @@ def test_j4b_tools_market_data(monkeypatch):
     assert isinstance(MD.search_symbol("apple"), dict)
     from hero_quant.data.registry import CrossSourceError
     try:
-        out = MD.get_market_data(symbol="AAPL.US", start="2024-01-01", end="2024-01-03")
+        out = MD.get_market_data(symbol="AAPL.US", start="2024-01-01", end="2024-01-03", allow_synthetic=True)
         assert isinstance(out, dict) and "ok" in out
     except CrossSourceError:
         pass  # 跨源 synthetic 混合 fail-closed：market_data 透传（分支覆盖）
     # 跨源 synthetic 混合在 registry 层 fail-closed；market_data 透传 CrossSourceError
     try:
-        out_cn = MD.get_market_data(symbol="000001.SZ", start="2024-01-01", end="2024-01-03")
+        out_cn = MD.get_market_data(symbol="000001.SZ", start="2024-01-01", end="2024-01-03", allow_synthetic=True)
         assert isinstance(out_cn, dict) and "ok" in out_cn
     except CrossSourceError:
         pass

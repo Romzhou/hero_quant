@@ -1,7 +1,7 @@
 # API 契约快照（OpenAPI Contract）
 
 > 落地文件：`tests/test_openapi_contract.py`、`tests/contracts/openapi_snapshot.json`
-> 应用入口：`src/hero_quant/api/server.py:523`（`app = FastAPI(title="hero-quant")`），
+> 应用入口：`src/hero_quant/api/server.py`（`app = FastAPI(title="hero-quant")`），
 > 启动口径 `uvicorn hero_quant.api.server:app --port 8899` 见 AGENTS.md §3。
 
 ## 1. 这份快照解决什么问题
@@ -26,7 +26,7 @@
 
 | 项 | 内容 |
 | --- | --- |
-| 来源 | `app.openapi()`（FastAPI 由路由+签名自动生成，见 `server.py:523`） |
+| 来源 | `app.openapi()`（FastAPI 由路由+签名自动生成，见 `server.py`） |
 | 文件 | `tests/contracts/openapi_snapshot.json` |
 | 序列化 | `json.dumps(spec, ensure_ascii=False, sort_keys=True, indent=2)` + 末尾换行 |
 | 规模（c0b40aa 基线） | 885 行 / 24415 字节；17 个 path / 17 个 operation / 2 个响应模型 |
@@ -114,8 +114,8 @@ PR-182 派单要求的关键路径里写了 `/health`，但本仓**没有注册*
 ```bash
 # 唯一命中：鉴权中间件的公开路径白名单（预留 / 反代兼容），不是路由
 $ grep -rn '/healthz\?"' src/
-src/hero_quant/auth/middleware.py:29:    "/health",
-src/hero_quant/auth/middleware.py:30:    "/healthz",
+src/hero_quant/auth/middleware.py:    "/health",
+src/hero_quant/auth/middleware.py:    "/healthz",
 
 # 没有任何 health 路由注册
 $ grep -rn '@app\.\(get\|post\)("/health' src/     # 无命中
@@ -126,7 +126,7 @@ $ grep -n '"/live"\|"/ready"' src/hero_quant/api/server.py
 1811:@app.get("/ready")
 ```
 
-也就是说 `DEFAULT_PUBLIC_PATHS`（`src/hero_quant/auth/middleware.py:27-31`）把 `/health`、
+也就是说 `DEFAULT_PUBLIC_PATHS`（`src/hero_quant/auth/middleware.py`）把 `/health`、
 `/healthz` 当作免鉴权路径预留了，但 `app.routes` 里并没有对应 handler，`app.openapi()` 自然也
 不会出现它们。**契约按仓库实际锁 `/live`**（存活）与 `/ready`（就绪，AGENTS.md §3「`/ready` 绿」），
 不去断言一个不存在的路由；若后续确实要新增 `/health` handler，那就是新增 path，按 §4 流程走一遍即可。

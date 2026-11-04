@@ -2,7 +2,9 @@
 
 from typing import Final
 
-# 16 源白名单为契约枚举：新增/删除需同步更新文档与 trait 校验
+# 16 源白名单仅为契约枚举（校验/文档用），不是已接线的数据源清单：
+# 运行时 tools.market_data._make_registry 只注册 Tencent + Yahoo 两源。
+# 新增/删除需同步更新文档与 trait 校验；接入新 loader 另开线。
 VALID_SOURCES: Final[tuple[str, ...]] = (
     "tencent",
     "synthetic",

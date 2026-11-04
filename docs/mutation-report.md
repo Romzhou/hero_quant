@@ -108,87 +108,87 @@
 P1=信号正确性(RSI/MACD/布林/换手口径), P2=统计细节/鲁棒契约, P3=病态输入。
 
 ### P0 剩余: 无可杀项, 全部等价(证明如下)
-- `metrics.py:57` `cummax != 0 -> > / >=`(id50/51): 全负权益序列的 `dd >= 0` 恒成立证明——
+- `metrics.py` `cummax != 0 -> > / >=`(id50/51): 全负权益序列的 `dd >= 0` 恒成立证明——
   `cummax<=0` 的行满足 `s<=cummax<=0 ⇒ s/cummax>=1 ⇒ dd>=0`(更新行 `dd=0`), 而全局
   `min` 必 `<=0`(第 0 行 `dd=0` 或 where 置零), 故清零这些行不改变 `min`。证毕。
-- `metrics.py:95 [CONST] 2->0`(id86, `len>=0` 恒进): 单有效点在非病态输入下不可达;
+- `metrics.py [CONST] 2->0`(id86, `len>=0` 恒进): 单有效点在非病态输入下不可达;
   病态 DF(首列全 NaN)下内层 `try` 吸收异常, `n` 回落值不变。等价。
-- `metrics.py:259` 全 11 个(`<=`/`+`/`1`/`0` 变异, id237-246): 纯日志分支, 无状态变更。等价。
-- `validation.py:102 [LOR] and->or`(id15): pandas3 `Timestamp(None)=NaT`,
+- `metrics.py` 全 11 个(`<=`/`+`/`1`/`0` 变异, id237-246): 纯日志分支, 无状态变更。等价。
+- `validation.py [LOR] and->or`(id15): pandas3 `Timestamp(None)=NaT`,
   NaT 比较恒为 False, 额外进入的分支永不抛错。等价(已实证); 测试保留为契约 pin。
 
 ### P1 剩余: 全部等价/死代码(证明如下)
-- `metrics.py:26 [CONST] ddof 1->0`(id10): 该 `_std` 只用于零值守卫, 不进入公式;
+- `metrics.py [CONST] ddof 1->0`(id10): 该 `_std` 只用于零值守卫, 不进入公式;
   `std(ddof=0)≈0 ⟺ std(ddof=1)≈0`(同零点; 单点时两者分别走 nan/0→同归 0)。等价。
-- `metrics.py:36 [LOR] and`(id30)/`:37`(id31): `and` mutant 全路径同 verdict(逐分支演算); `:37`
+- `metrics.py [LOR] and`(id30)/`:37`(id31): `and` mutant 全路径同 verdict(逐分支演算); `:37`
   的 nan 守卫不可达(零波动已被 30 行拦截, inf 经清洗)。等价。
-- `metrics.py:127`(id147 作废说明: 已杀)——更正: `:129 [CONST]`(id147):
+- `metrics.py`(id147 作废说明: 已杀)——更正: `:129 [CONST]`(id147):
   `ratio**exp` 上溢走 `OverflowError` 分支(123 行), inf 无异常路径不可达。等价。
-- `metrics.py:247` fillna(0→1)×2 + UOR(id217-219): (a) fillna mutant 被首 Bar restore
+- `metrics.py` fillna(0→1)×2 + UOR(id217-219): (a) fillna mutant 被首 Bar restore
   吸收为纯尺度变化, 全部六个指标都是比率型(尺度不变)。(b) UOR(`-inf` 不洗):
   costs 路径的 `+inf` 要求前一 Bar 恰为 0, 而 `X→0(X≠0)` 必是 `-100%` 当 Bar,
   导致 `(1+net)<=0` 截断清零 cumprod(或首 Bar 零起点全零权益), 变异不可观测。等价。
-- `metrics.py:256 [AOR] *->/`(id231): 净权益整体除以 `s.iloc[0]` 是纯尺度变化,
+- `metrics.py [AOR] *->/`(id231): 净权益整体除以 `s.iloc[0]` 是纯尺度变化,
   六个指标全为比率/差分型。等价(已实证 mutant 输出与原值完全一致)。
-- `metrics.py:250 [ROR] >=->> / ->!=` + `[CONST] 0->1`(id223/227/228):
+- `metrics.py [ROR] >=->> / ->!=` + `[CONST] 0->1`(id223/227/228):
   成本路径恒 `len(net_ret)>=2`(受 245 行守卫), 三 mutant 永不改变分支。等价。
-- `metrics.py:261 [LOR] or`(id247)/`[UOR] iloc[-1]->[+1]`(id255):
+- `metrics.py [LOR] or`(id247)/`[UOR] iloc[-1]->[+1]`(id255):
   costs 路径的 `net_equity` 永不为空(首 Bar restore 保证), `or` 短路恒真分支一致;
   `iloc[+1]` 需长度 1, 与 `len>=2` 矛盾。等价。
-- `metrics.py:277` 五项(id263-266,271): 第二个 `sqrt(252)` 只在 `isfinite` 守卫内,
+- `metrics.py` 五项(id263-266,271): 第二个 `sqrt(252)` 只在 `isfinite` 守卫内,
   `isfinite(_std*c)` 与 `isfinite(_std*0)` 对有限/零/inf/nan 四类输入 verdict 一致
   (已逐类实证); `else 1.0` 要求 `_std` 有限而乘积非有限, 不可能。等价。
-- `indicators.py:122/123 [CONST] 1->0`(id48/53): 存活的是 `min_periods` 出现,
+- `indicators.py/123 [CONST] 1->0`(id48/53): 存活的是 `min_periods` 出现,
   非 `alpha` 分子(`alpha=0` 直接抛 ValueError, 已被基线杀死);
   `min_periods 1 vs 0` 在含前导 NaN 下输出逐位一致(已实证)。等价。
-- `indicators.py:129 [ROR] !=->> / ->>=`(id72/73): `avg_loss` 为 ewm 非负输出,
+- `indicators.py [ROR] !=->> / ->>=`(id72/73): `avg_loss` 为 ewm 非负输出,
   `> ⟺ !=` 恒成立; `>=` 恒真但 `loss==0` 行的计算值恰为 100, 与回落值一致。等价。
-- `indicators.py:135/137`(id89-91): RSI 的 `gain/loss` 经 `where(...,0.0)` 永不为 NaN,
+- `indicators.py/137`(id89-91): RSI 的 `gain/loss` 经 `where(...,0.0)` 永不为 NaN,
   ewm 有限输入给出有限输出(0/0 仅出现在 flat, 已被 flat_mask 先处理),
   故两处 `fillna(50)` 与 `replace→nan→fillna` 链不可达。等价(防御性死代码)。
-- `indicators.py:179-181/213-215 [UOR]`(id116-118/138-140):
+- `indicators.py/213-215 [UOR]`(id116-118/138-140):
   `_to_series` 已把 ±inf→NaN, rolling/ewm 在本 pandas 版本把残余 inf 当缺失,
   输出端不可能出现 -inf。等价(已实证)。
-- `indicators.py:233 [UOR/CONST]`(id150/151): `fillna` 只影响全 NaN-dd 情形,
+- `indicators.py [UOR/CONST]`(id150/151): `fillna` 只影响全 NaN-dd 情形,
   此时 `min=fill` 再经 `mdd>0` 钳位恒得 0。等价。
-- `indicators.py:237/238/239/241/242`(id153-162): `dd[0]` 恒为 0(或 where 置零),
+- `indicators.py/238/239/241/242`(id153-162): `dd[0]` 恒为 0(或 where 置零),
   故 `min<=0` 恒成立, `mdd>0` 钳位与 nan/inf 守卫永不触发。等价(死守卫)。
-- `indicators.py:43 [UOR]`(id6): 同上 rolling/ewm 掩蔽, `-inf` 不泄漏(已实证
+- `indicators.py [UOR]`(id6): 同上 rolling/ewm 掩蔽, `-inf` 不泄漏(已实证
   sma/ema/rsi/macd 四路)。等价; 测试保留为回归 pin。
 
 ### P2 剩余: 契约边界等价 + 不值得
-- `metrics.py:18`(id1/4/6)、`:70`(id61/67): 长度守卫的 `<=`/`==`/`2->0` 变异——
+- `metrics.py`(id1/4/6)、`:70`(id61/67): 长度守卫的 `<=`/`==`/`2->0` 变异——
   两点/单点/空输入在下游(空 ret→0、单 ret std nan→0)收敛到同一 verdict。等价。
-- `metrics.py:43`(id34/35/38): `len==0` 的 `<`/`<=`/`0->1`——空序列下游同样归零。等价。
-- `metrics.py:60/61/62`(id58-60): `dd.empty else` 分支不可达(43 行已拦截空);
+- `metrics.py`(id34/35/38): `len==0` 的 `<`/`<=`/`0->1`——空序列下游同样归零。等价。
+- `metrics.py/61/62`(id58-60): `dd.empty else` 分支不可达(43 行已拦截空);
   nan/inf 守卫防御性(见 P1 论证)。等价。
-- `metrics.py:83/84-const/85/105/110/115`(id69/75/110/112/125): dropna 后单点/空与
+- `metrics.py/84-const/85/105/110/115`(id69/75/110/112/125): dropna 后单点/空与
   float 转换异常分支——或下游收敛一致, 或 `to_numeric(coerce)` 永不抛错。等价/不值得。
-- `metrics.py:94`(id77-80)、`:103`(id100-103): `n=len(s)-1` 两处默认值——仅在
+- `metrics.py`(id77-80)、`:103`(id100-103): `n=len(s)-1` 两处默认值——仅在
   `_pos<2`(要求首列全 NaN 但 equity 列有效)或外层 try 抛错(实际不可达)时使用。P3 不值得。
-- `metrics.py:99-const`(id99, `max(x,1)->max(x,0)`): `_i1>=_i0` 恒成立, `x>=1`。等价。
-- `metrics.py:104/114 [ROR] <=->< / ->==`(id104/107/119/122): `n<=0` 不可达
+- `metrics.py-const`(id99, `max(x,1)->max(x,0)`): `_i1>=_i0` 恒成立, `x>=1`。等价。
+- `metrics.py/114 [ROR] <=->< / ->==`(id104/107/119/122): `n<=0` 不可达
   (`n>=1` 或早回)。等价。
-- `metrics.py:111` 已杀; `metrics.py:160/166/182`(id158/168/194):
+- `metrics.py` 已杀; `metrics.py/166/182`(id158/168/194):
   三元 `else 0.0` 要求 `_m` 非有限——`sum(|diff|)/2/len` 经清洗后恒有限。等价。
-- `metrics.py:169/186/292/293`(id169/196/289/290): except 回落/末端回落——
+- `metrics.py/186/292/293`(id169/196/289/290): except 回落/末端回落——
   `to_numeric/pct/diff` 在此路径不抛; 单点持仓测试保留为 pin。等价/不值得。
-- `metrics.py:175 [ROR] >= / !=` + `[CONST]`(id171/175/176)、`:178` 三项(id180/184/185):
+- `metrics.py [ROR] >= / !=` + `[CONST]`(id171/175/176)、`:178` 三项(id180/184/185):
   逐类演算: 空/单点/脏权重下与原分支 verdict 一致(脏权重由 `all-finite` 守卫先行)。等价。
-- `metrics.py:177 [UOR]`(id179): 权重 `-inf` 先被 175 行守卫拦截, 到 replace 时已返回。等价。
-- `metrics.py:219 [NOT]`(id198): Series 输入包一层拷贝 vs 非 Series 跳过包装——
+- `metrics.py [UOR]`(id179): 权重 `-inf` 先被 175 行守卫拦截, 到 replace 时已返回。等价。
+- `metrics.py [NOT]`(id198): Series 输入包一层拷贝 vs 非 Series 跳过包装——
   `to_numeric` 对两者结果一致。等价。
-- `metrics.py:245 [CONST] 1e-12->0`(id210): 1e-13 量级成本在容差内不可观测。容差, 不 pin。
-- `metrics.py:245 [CONST] 2->0`(id216): 退化单点序列上下游同归零。等价。
-- `indicators.py:25 [ROR] >= / !=`(id0/4): `shape[1]` 无负值/零列不可能。等价。
-- `indicators.py:57 [ROR] ==`(id10): 负窗口原实现与 pandas 均抛 ValueError, 仅文案不同。等价。
-- `indicators.py:74/91/107/155/197/198/199`(id13/14/16/94/126-128):
+- `metrics.py [CONST] 1e-12->0`(id210): 1e-13 量级成本在容差内不可观测。容差, 不 pin。
+- `metrics.py [CONST] 2->0`(id216): 退化单点序列上下游同归零。等价。
+- `indicators.py [ROR] >= / !=`(id0/4): `shape[1]` 无负值/零列不可能。等价。
+- `indicators.py [ROR] ==`(id10): 负窗口原实现与 pandas 均抛 ValueError, 仅文案不同。等价。
+- `indicators.py/91/107/155/197/198/199`(id13/14/16/94/126-128):
   `_validate_window(..., default=...)` 的 `default` 形参在函数体内**从未被使用**——
   死参数。等价(给 Q 线的清理建议见第 5 节)。
-- `indicators.py:118 [ROR] >=`(id29)、`:119 [ROR] <=`(id37)、`:131 ×2`(id78/84):
+- `indicators.py [ROR] >=`(id29)、`:119 [ROR] <=`(id37)、`:131 ×2`(id78/84):
   零增量在 gain/loss 置零语义下恒等。等价。
-- `indicators.py:129 [CONST] 0->1`(id74, `avg_loss != 1`): 需 ewm 恰为 1.0, 特设输入。不值得。
-- `validation.py:64`(id7)、`validation.py:208`(id65/id69)、`validation.py:213 ×2`(id72/id76):
+- `indicators.py [CONST] 0->1`(id74, `avg_loss != 1`): 需 ewm 恰为 1.0, 特设输入。不值得。
+- `validation.py`(id7)、`validation.py`(id65/id69)、`validation.py ×2`(id72/id76):
   id7/id69/id72/id76 **四个均等价**, 本节原"恒等"表述对这四个 id 本来成立(是审计表把
   编号标反了, 订正来源见 `docs/mutation-audit.md` §1/§2, 依据 TEMP harness results.json
   原始 desc): id7 `len(args)>0` 定义域 `len>=0` ⇒ `>0 ⟺ !=0`; id69 `:208 nuniq>1`
@@ -199,10 +199,10 @@ P1=信号正确性(RSI/MACD/布林/换手口径), P2=统计细节/鲁棒契约, 
 - 真正缺 pin 的非等价 mutant 是 id65(`:208 > -> >=`, 恒真会误杀单币种)与 id81
   (`:213 == -> <=`): id65 已补 pin
   `tests/mutation/test_mutation_validation.py::test_currency_single_matching_passes`
-  (全量 `tests/test_j2_mcp_skills_validation.py:290` 放行断言可杀), id81 由既有
+  (全量 `tests/test_j2_mcp_skills_validation.py` 放行断言可杀), id81 由既有
   `test_currency_lexicographic_mismatch_rejected` 覆盖; 二者均非 `src` 错, 只属
   窄 oracle 缺口(见 `docs/mutation-audit.md` §2 F1)。
-- `validation.py:123/125`(id21/22): `utcoffset()` 抛错回落, 触发需 tz 实现抛错。不值得。
+- `validation.py/125`(id21/22): `utcoffset()` 抛错回落, 触发需 tz 实现抛错。不值得。
 
 ### 顺带发现(未改 src, 记账给对应专线)
 1. `turnover` DataFrame 路径 vs Series 路径稀释口径不一致: DF 路径 `sum(axis=1, skipna)`
@@ -219,9 +219,9 @@ P1=信号正确性(RSI/MACD/布林/换手口径), P2=统计细节/鲁棒契约, 
 ## 5. 给 Q 线的 patch 建议(本专线未改 src, 仅记账)
 
 - 如需统一换手口径: 二选一——(a) DF 路径 `sum(axis=1)` 改 `min_count=1` 使首行保持 NaN
-  并被 `dropna` 剔除 (与 Series 一致得 0.5); (b) 接受稀释并文档化。影响 `metrics.py:157`。
+  并被 `dropna` 剔除 (与 Series 一致得 0.5); (b) 接受稀释并文档化。影响 `metrics.py`。
 - 如需删除死参数: `_validate_window(window, default=...)` 去掉 `default`
-  (`indicators.py:47-60`, 调用点 :74/91/107/155/197/198/199 同步)。
+  (`indicators.py`, 调用点 :74/91/107/155/197/198/199 同步)。
 - 负权益回撤语义: 在 `max_drawdown` 文档串中声明“全负权益返回 0.0”, 或改为按
   `s/cummax-1` 原值返回(将改变 :57 mutant 的等价性, 需同步更新本报告测试)。
 

@@ -18,11 +18,19 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from .grounding import GroundingError as _GroundingError
+from hero_quant.tools.registry import execute_tool_call as _execute_tool_call
+
 # 模块加载时预导入 RetryPolicy，避免 run() 热路径临时导入导致并行场景壁时间超过 0.35s
 try:
     from .policies import RetryPolicy as _RetryPolicy  # type: ignore
 except Exception:  # pragma: no cover
     _RetryPolicy = None  # type: ignore
+
+# P0-1：工具结果 -> 证据账本的 ingest 失败面。GroundingError 是账本契约异常（缺 provenance /
+# 非数值 close 等），其余为形状异常（bars 非 list、provenance 非 dict 等）；刻意不用
+# Exception 兜全量，避免把真实 bug 静默吞掉。
+_GROUNDING_INGEST_ERRORS = (_GroundingError, TypeError, ValueError, KeyError, AttributeError, IndexError)
 
 try:
     import structlog as _structlog  # type: ignore
@@ -160,6 +168,7 @@ class AgentLoop:
         retry_policy=None,
         memory_store=None,
         skills_loader=None,
+        dedup_store=None,
         checkpoint=None,
         checkpointer=None,
         checkpoint_tenant="default",
@@ -244,6 +253,8 @@ class AgentLoop:
             self.skills_loader = _sl_alias
         else:
             self.skills_loader = None
+        # P0-4：工具调用幂等账本（None = 与接线前完全一致；生产由 server 装配）
+        self.dedup_store = dedup_store
         # S2 checkpoint 显式接线：旧实现经 **kwargs 收下后直接丢弃（全文 0 处 checkpoint），
         # saver 成了装饰。这里显式保存，并由 run() 每轮迭代结束 put 一次。
         _ckpt_alias = checkpointer if checkpointer is not None else kwargs.pop("checkpointer", None)
@@ -633,6 +644,128 @@ class AgentLoop:
             return [{"type": "text", "text": stream}]
         return stream  # type: ignore[return-value]
 
+    # ---- P0-1：工具执行路径 -> 证据账本（GroundingLedger.ingest）接线 ----
+    # 背景：run() 每轮末用 grounding.assert_price 校验 buffer，但此前 src/ 内无任何
+    # ingest 调用方，账本恒空 -> grounding_verified 恒 False -> 纠正轮 -> grounding_failed。
+
+    @staticmethod
+    def _coerce_grounding_symbol(raw: Any) -> str:
+        """归一 symbol：去空白后必须非空字符串，否则视为缺失（不猜、不兜默认标的）。"""
+        if not isinstance(raw, str):
+            return ""
+        return raw.strip()
+
+    @staticmethod
+    def _append_grounding_trace(trace_writer: Any, event: Dict[str, Any]) -> None:
+        """账本相关 trace 落盘 best-effort：失败只 debug，绝不影响证据与主循环。"""
+        if trace_writer is None:
+            return
+        try:
+            trace_writer.append(event)
+        except (AttributeError, TypeError, ValueError, OSError) as exc:
+            logging.getLogger(__name__).debug(
+                "grounding trace append failed error_code=grounding_trace_append_failed: %s", exc
+            )
+
+    def _grounding_ingest_entries(
+        self, args: Optional[Dict[str, Any]], result: Dict[str, Any]
+    ) -> List[tuple[str, List[Any], Dict[str, Any]]]:
+        """从工具返回体提取可入账的 (symbol, bars, provenance) 列表。
+
+        只认 tools/market_data.py 里真实存在的三种形状：
+        - 单标的 {"bars": [...], "provenance": {...}, "ok": bool}（get_market_data）
+        - 批量   {"data": {sym: {"bars","provenance","ok"}}, "ok": bool}（get_bars_range）
+        - 裸映射 {sym: {"bars","provenance","ok"}}
+
+        ok 门（fail-closed）：单标的看顶层 ok —— 合成回退会给 ok=False，不得当 live 证据；
+        批量按逐 symbol ok 判定 —— get_bars_range 的顶层 ok 是 all_ok（全成功才 True），
+        拿它当门会让单个 symbol 回退拖死其它真数据。
+        symbol 优先级：调用 args["symbol"] > 条目 provenance["symbol"] > 批量键名。
+        """
+        entries: List[tuple[str, List[Any], Dict[str, Any]]] = []
+        bars = result.get("bars")
+        if isinstance(bars, list) and bars:
+            provenance = result.get("provenance")
+            if isinstance(provenance, dict) and result.get("ok") is True:
+                symbol = self._coerce_grounding_symbol((args or {}).get("symbol")) or self._coerce_grounding_symbol(
+                    provenance.get("symbol")
+                )
+                if symbol:
+                    entries.append((symbol, bars, provenance))
+            return entries
+        payload = result.get("data")
+        if not isinstance(payload, dict):
+            payload = result
+        for raw_symbol, item in payload.items():
+            if not isinstance(item, dict) or item.get("ok") is not True:
+                continue
+            item_bars = item.get("bars")
+            item_provenance = item.get("provenance")
+            if not isinstance(item_bars, list) or not item_bars or not isinstance(item_provenance, dict):
+                continue
+            symbol = self._coerce_grounding_symbol(item_provenance.get("symbol")) or self._coerce_grounding_symbol(
+                raw_symbol
+            )
+            if symbol:
+                entries.append((symbol, item_bars, item_provenance))
+        return entries
+
+    def _ingest_grounding_from_tool_result(
+        self,
+        tool_name: str,
+        args: Optional[Dict[str, Any]],
+        result: Any,
+        err: Optional[Exception],
+        trace_writer: Any,
+        iteration: int,
+    ) -> None:
+        """把成功工具结果里的 bars 灌进证据账本（P0-1 唯一接线点）。
+
+        只在 err is None 且返回体为 dict 时尝试；每个 symbol 独立 ingest，
+        失败按 _GROUNDING_INGEST_ERRORS 窄捕获并记 trace + warning，绝不中断主循环，
+        本轮仍走 run() 原有的 assert_price 校验逻辑（本函数不改变终止/纠正判定）。
+        """
+        if self.grounding is None or err is not None or not isinstance(result, dict):
+            return
+        for symbol, bars, provenance in self._grounding_ingest_entries(args, result):
+            try:
+                self.grounding.ingest(symbol, bars, provenance)
+            except _GROUNDING_INGEST_ERRORS as exc:
+                _warn(
+                    "grounding_ingest_error",
+                    "grounding ingest rejected tool=%s symbol=%s: %s",
+                    tool_name,
+                    symbol,
+                    exc,
+                    exc_info=True,
+                    tool=tool_name,
+                    symbol=symbol,
+                )
+                self._append_grounding_trace(
+                    trace_writer,
+                    {
+                        "type": "grounding_ingest_error",
+                        "iteration": iteration,
+                        "tool": tool_name,
+                        "symbol": symbol,
+                        "error_code": "grounding_ingest_error",
+                        "error": str(exc),
+                    },
+                )
+            else:
+                self._append_grounding_trace(
+                    trace_writer,
+                    {
+                        "type": "grounding_ingest",
+                        "iteration": iteration,
+                        "tool": tool_name,
+                        "symbol": symbol,
+                        "bars": len(bars),
+                        "source": provenance.get("source"),
+                        "unit": provenance.get("unit"),
+                    },
+                )
+
     # ---- S2 checkpoint 落盘（tenant/thread/seq 三段式，签名见 checkpoint/postgres.py:1187/1285） ----
     @staticmethod
     def _ckpt_segment(raw: Any, default: str) -> str:
@@ -773,6 +906,8 @@ class AgentLoop:
 
         # buffer uses str concat (+=) for simplicity; iterations capped so O(n^2) acceptable, alt is list+join
         buffer = ""
+        # P1-9：记录每次工具回显片段，接地校验时从 buffer 剥离。
+        tool_echo_fragments: List[str] = []
         iterations = 0
         token_count = 0
         grounding_verified = False
@@ -1433,7 +1568,21 @@ class AgentLoop:
                 # 单个工具执行辅助：返回 (结果, 异常)
                 def _exec_spec(spec: Any, args: Dict[str, Any]) -> tuple[Any, Optional[Exception]]:
                     try:
-                        res = spec.func(**args) if isinstance(args, dict) else spec.func(args)
+                        if isinstance(args, dict):
+                            # P0-4：AgentLoop 工具路径的幂等执行器；dedup_store=None 与旧行为一致，
+                            # args 非 dict 的兜底分支（下方 else: spec.func(args)）不走去重。
+                            # workflow 用 checkpoint_thread（同一任务重跑必须同线程）；
+                            # step 用迭代号，避免同一次运行内后续轮次的合法重复调用被误去重。
+                            res = _execute_tool_call(
+                                spec,
+                                args,
+                                dedup_store=self.dedup_store,
+                                workflow_id=self.checkpoint_thread,
+                                step_id=f"it{iterations}",
+                                wait_timeout=1.0,
+                            )
+                        else:
+                            res = spec.func(args)
                         return res, None
                     except (KeyboardInterrupt, SystemExit, GeneratorExit):
                         raise
@@ -1455,8 +1604,13 @@ class AgentLoop:
                         except Exception:
                             return str(result)
 
-                def _handle_result(tool_name: str, result: Any, err: Optional[Exception]):
-                    nonlocal tool_success_this_iter, _tool_success_global, buffer
+                def _handle_result(
+                    tool_name: str,
+                    result: Any,
+                    err: Optional[Exception],
+                    args: Optional[Dict[str, Any]] = None,
+                ):
+                    nonlocal tool_success_this_iter, _tool_success_global, buffer, tool_echo_fragments
                     # PR-241 接线（批次14）：工具级审计 best-effort。无租户上下文（离线/测试）直接跳过，
                     # 失败只 warning —— 审计绝不改变工具结果，也绝不现编 run_id。
                     try:
@@ -1499,6 +1653,11 @@ class AgentLoop:
                             )
                         except Exception:
                             pass
+                    # P0-1：工具结果 -> 证据账本。并发/串行两条路径都经过本函数，
+                    # 故 ingest 只在这里接一次；失败窄捕获 + trace，不中断循环。
+                    self._ingest_grounding_from_tool_result(
+                        tool_name, args, result, err, trace_writer, iterations
+                    )
                     try:
                         snippet = redacted_result_str[:2000] if isinstance(redacted_result_str, str) else str(redacted_result_str)[:2000]
                         # 中文：工具返回是不可信数据（PR-152）——用显式边界 + 固定提示包裹后
@@ -1508,7 +1667,9 @@ class AgentLoop:
                         try:
                             from hero_quant.security.untrusted import wrap_tool_output as _wrap_untrusted
 
-                            buffer += "\n" + _wrap_untrusted(tool_name, snippet)
+                            _echo = "\n" + _wrap_untrusted(tool_name, snippet)
+                            buffer += _echo
+                            tool_echo_fragments.append(_echo)
                         except Exception as e:
                             try:
                                 logging.getLogger(__name__).debug(
@@ -1516,7 +1677,9 @@ class AgentLoop:
                                 )
                             except Exception:
                                 pass
-                            buffer += f"\n[tool {tool_name} result] {snippet}"
+                            _echo = f"\n[tool {tool_name} result] {snippet}"
+                            buffer += _echo
+                            tool_echo_fragments.append(_echo)
                     except Exception:
                         pass
 
@@ -1567,7 +1730,7 @@ class AgentLoop:
                         # 按原始顺序写入 buffer，保证确定性
                         for item in concurrent_items:
                             res, err = results_map[str(id(item))]
-                            _handle_result(item["tool_name"], res, err)
+                            _handle_result(item["tool_name"], res, err, item["args"])
                     finally:
                         # 中文：非阻塞关闭，超时线程不阻塞主循环
                         try:
@@ -1590,7 +1753,7 @@ class AgentLoop:
                     else:
                         result = f"tool_not_found: {tool_name}"
                         _tool_error = Exception(result)
-                    _handle_result(tool_name, result, _tool_error)
+                    _handle_result(tool_name, result, _tool_error, args)
 
                 token_count = estimate_tokens(buffer)
 
@@ -1605,6 +1768,14 @@ class AgentLoop:
                             symbols = list(ev.keys())
                     except Exception:
                         symbols = []
+                    # P1-9：工具结果回显含真实 bars 数字，不得替模型的价格断言自证。
+                    # 校验对象限定为模型文本：把 _handle_result 追加的回显片段从
+                    # buffer 剥离后再抽取 claims；buffer 被压缩截断时片段可能不完整，
+                    # 残留数字只影响极长上下文，不影响常规路径。
+                    model_text = buffer
+                    for _echo in tool_echo_fragments:
+                        if _echo:
+                            model_text = model_text.replace(_echo, " ")
                     # 优先使用结构化 claim 提取（8 类掩码），仅价格类参与校验
                     nums: List[str] = []
                     _claims_for_grounding: List[Dict[str, Any]] = []
@@ -1612,7 +1783,7 @@ class AgentLoop:
                     try:
                         from .grounding import extract_claims as _extract_claims  # type: ignore
 
-                        _claims_for_grounding = _extract_claims(buffer)
+                        _claims_for_grounding = _extract_claims(model_text)
                         _extract_ok = True
                         for _c in _claims_for_grounding:
                             _t = _c.get("type", "")
@@ -1637,13 +1808,13 @@ class AgentLoop:
                     # 仅当 extract_claims 异常时回退正则，避免 percent/quantity/date/range 误入校验
                     if not _extract_ok:
                         try:
-                            nums = re.findall(r"\d+\.?\d*", buffer)
+                            nums = re.findall(r"\d+\.?\d*", model_text)
                         except Exception:
                             nums = []
                     verified = False
                     if symbols:
                         for sym in symbols:
-                            if sym in buffer:
+                            if sym in model_text:
                                 for n in nums:
                                     try:
                                         # grounding 已归一千分位/货币符号，故直接透传原始字符串

@@ -33,7 +33,7 @@
 
 ## 2. W1 身份与租户（Phase 1 核心）
 
-**现状**：SSE 票匿名（`api/security.py:233`），无用户表/登录/RBAC；tenant 由调用方字符串传入，checkpoint 只按 `thread_id`。
+**现状**：SSE 票匿名（`api/security.py`），无用户表/登录/RBAC；tenant 由调用方字符串传入，checkpoint 只按 `thread_id`。
 **缺口**：登录、JWT 校验、tenant 硬边界、角色、租户配额、跨租户隔离测试。
 
 ### 怎么做

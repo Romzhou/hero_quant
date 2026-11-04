@@ -24,6 +24,22 @@ except Exception:  # pragma: no cover — 最小环境无 structlog
 
 _CHAIN = "B"  # F线分级：本文件位于回测/行情链（数据源注册与并发安全回落即口径降级）
 
+# PIT 未接线：registry 只按区间取快照 bars，没有 point-in-time 对齐。
+# 必须在每次成功返回里显式标注，否则下游会默认「拿到的就是 PIT 数据」。
+_PIT_NOT_APPLIED = {"applied": False, "reason": "registry_get_bars"}
+
+
+def _pit_status() -> dict:
+    """返回 PIT 接线状态副本（调用方拿到的是快照，不应被就地改写）。"""
+    return dict(_PIT_NOT_APPLIED)
+
+
+def _quality_summary(provenance: dict) -> dict | None:
+    """透传 registry 出口质量摘要（只含有界字段）；跳过的批次没有摘要。"""
+    extra = provenance.get("extra") if isinstance(provenance, dict) else None
+    summary = extra.get("quality") if isinstance(extra, dict) else None
+    return summary if isinstance(summary, dict) else None
+
 
 def _warn(op: str, msg: str, *args: Any, **fields: Any) -> None:
     """F线分级告警（D线 risk 同款 schema）：stdlib warning 为主，structlog 结构化为辅
@@ -157,6 +173,11 @@ def _provenance_dict(prov) -> dict:
             "ok": {"type": "boolean"},
             "concurrency_safe": {"type": "boolean"},
             "error": {"type": "string"},
+            "reason": {"type": "string"},
+            "detail": {"type": "string"},
+            "codes": {"type": "array"},
+            "pit": {"type": "object"},
+            "quality": {"type": "object"},
         },
         "required": ["ok"],
         "additionalProperties": False,
@@ -168,13 +189,22 @@ def get_market_data(
     interval: str = "1d",
     start: str = "2026-08-01",
     end: str = "2026-08-03",
-    allow_synthetic: bool = True,
+    allow_synthetic: bool = False,
 ) -> Dict[str, Any]:
     """通过 Registry 拉取行情，含并发安全审计与双源回退；合成需显式 allow_synthetic=True。
 
     中文：合成自动回退仅靠 ok:False 标记不阻断——调用方忽略 ok 仍会把合成当 live
     用。修复后瞬时/网络错误默认直接抛错，仅当显式 allow_synthetic=True 才回退
     合成（且仍标记 ok:False + provenance synthetic）。
+
+    质量门（P0-2）刻意返回结构化失败而不是上抛：工具层调用方（agent/LLM）读的是
+    dict，抛异常会被外层宽 except 重新吞成「取数失败」，reason/detail 丢失；返回
+    ok:False + error=data_quality_error + reason/codes 才能被上游原样呈现。
+    关键点是**不落合成兜底**——DataQualityError 属于 RuntimeError 子类，一旦走到
+    瞬时错误分支就会被合成序列顶替，坏行情反而以 ok:False 的「网络问题」名义流下去。
+
+    成功返回带 pit{applied:False, reason}：registry 只按区间取快照，没接 point-in-time，
+    必须显式标注，禁止让下游默认拿到的是 PIT 数据。
     """
     spec = TOOL_REGISTRY.get("get_market_data")
     is_safe = False
@@ -190,10 +220,40 @@ def get_market_data(
         # MarketDataRegistry.get_bars 已在无 loader 时抛 ImportError，无需 len(reg) 私有探测
         bars, prov = reg.get_bars(symbol, start, end, interval=interval)
         provenance = _provenance_dict(prov)
-        return {"bars": bars, "provenance": provenance, "ok": True, "concurrency_safe": is_safe}
+        out = {
+            "bars": bars,
+            "provenance": provenance,
+            "ok": True,
+            "concurrency_safe": is_safe,
+            "pit": _pit_status(),
+        }
+        summary = _quality_summary(provenance)
+        if summary is not None:
+            out["quality"] = summary
+        return out
     except Exception as e:  # 中文：集中分发，需窄化后再决定合成或透传
+        from hero_quant.data.quality import DataQualityError as _DQE
         from hero_quant.data.registry import CrossSourceError as _CSE
 
+        if isinstance(e, _DQE):
+            # 质量门拦下的坏数据必须原样暴露：DataQualityError 是 RuntimeError 子类，
+            # 若落到下面「瞬时错误 -> 合成回退」分支，坏行情会被合成序列顶替冒充 live。
+            _logger.warning(
+                "get_market_data blocked by quality gate for %s: reason=%s error_code=data_quality_error",
+                symbol,
+                e.reason,
+                exc_info=True,
+            )
+            return {
+                "bars": [],
+                "provenance": {},
+                "ok": False,
+                "error": e.error,
+                "reason": e.reason,
+                "detail": e.detail,
+                "codes": list(e.codes),
+                "concurrency_safe": is_safe,
+            }
         if isinstance(e, _CSE):
             _logger.warning("cross_source check blocked get_market_data for %s: %s", symbol, e, exc_info=True)
             raise
@@ -388,12 +448,14 @@ def get_bars_range(
     interval: str = "1d",
     start: str = "2026-08-01",
     end: str = "2026-08-03",
-    allow_synthetic: bool = True,
+    allow_synthetic: bool = False,
 ) -> Dict[str, Any]:
     """批量拉取多标的行情，逐个调用 get_market_data 并聚合结果 — reuse shared registry.
 
-    中文：合成回退需显式 allow_synthetic=True（默认 True 保持存量离线可用，
-    但回退仍标记 ok:False + provenance synthetic；显式 False 时直接抛错）。
+    中文：合成回退需显式 allow_synthetic=True（默认 False，与 get_market_data 一致，
+    仅显式 opt-in 才回退；回退仍标记 ok:False + provenance synthetic）。
+    质量门（P0-2）逐标的生效：坏标的记 ok:False + error=data_quality_error + reason，
+    其余标的照常返回（一个坏标的不该把整批拖成合成兜底）；成功标的同样带 pit 标注。
     """
     data: Dict[str, Any] = {}
     reg = _get_shared_registry()
@@ -401,10 +463,33 @@ def get_bars_range(
         try:
             bars, prov = reg.get_bars(sym, start, end, interval=interval)
             provenance = _provenance_dict(prov)
-            data[sym] = {"bars": bars, "provenance": provenance, "ok": True}
+            entry = {"bars": bars, "provenance": provenance, "ok": True, "pit": _pit_status()}
+            summary = _quality_summary(provenance)
+            if summary is not None:
+                entry["quality"] = summary
+            data[sym] = entry
         except Exception as e:
+            from hero_quant.data.quality import DataQualityError as _DQE
             from hero_quant.data.registry import CrossSourceError as _CSE
 
+            if isinstance(e, _DQE):
+                # 逐标的 fail-closed：坏标的记结构化失败，不得合成兜底（同 get_market_data 口径）
+                _logger.warning(
+                    "get_bars_range blocked by quality gate for %s: reason=%s error_code=data_quality_error",
+                    sym,
+                    e.reason,
+                    exc_info=True,
+                )
+                data[sym] = {
+                    "bars": [],
+                    "provenance": {},
+                    "ok": False,
+                    "error": e.error,
+                    "reason": e.reason,
+                    "detail": e.detail,
+                    "codes": list(e.codes),
+                }
+                continue
             if isinstance(e, _CSE):
                 raise
             # 与 get_market_data 对齐 fail-closed：校验类与缺配置错误逐 symbol

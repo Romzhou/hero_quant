@@ -336,6 +336,25 @@ class PgVectorSidecar:
         except Exception:
             return False
 
+    async def aclose(self) -> None:
+        """关闭侧车连接池；异步池必须在创建它的事件循环里 await close。
+
+        lifespan 装配 MemoryStore 时异步池会绑定启动事件循环，若不显式关闭，
+        TestClient / 进程关闭会被池的后台任务挂住（真 PG 环境下已复现）。
+        """
+        pool = self._pool
+        self._pool = None
+        self._enabled = False
+        if pool is None:
+            return
+        try:
+            if self._is_async:
+                await pool.close(timeout=5.0)  # type: ignore[union-attr]
+            else:
+                pool.close(timeout=5.0)  # type: ignore[union-attr]
+        except Exception as e:
+            logger.debug("pgvector sidecar close failed: %s", e)
+
     def upsert(self, key: str, content: str, embedding: list[float], namespace: str | None = None) -> bool:
         """向侧车写入/更新一条向量记录，失败返回 False。"""
         if not self._enabled or not key:
@@ -589,7 +608,7 @@ class MemoryStore:
 
         默认仅清 L1 进程内缓存；写入路径经 ``_invalidate_search_caches``
         透传 ``include_redis_l2=True``，同步失效 Redis L2
-        ``hero:cache:memory:search:{ns}:*``，保证新写入对其它进程可见。
+        ``hero:cache:memory:search:{store}:{ns}:*``，保证新写入对其它进程可见。
         """
         try:
             with self._lock:
@@ -600,13 +619,30 @@ class MemoryStore:
         if include_redis_l2:
             self._invalidate_redis_search_cache()
 
+    def _store_tag(self) -> str:
+        """Redis L2 命名空间的 store 身份：解析后的数据根短哈希，跨进程稳定。"""
+        import hashlib as _hl
+
+        return _hl.sha256(str(self.base.resolve()).encode("utf-8")).hexdigest()[:12]
+
+    def _l2_prefix(self) -> str:
+        """L2 键前缀：含 store 身份 + namespace，不同数据根互不命中。"""
+        return f'hero:cache:memory:search:{self._store_tag()}:{self.namespace or "default"}:'
+
+    def _l2_key(self, query: str) -> str:
+        """L2 键：前缀 + query 摘要 + 向量后端。"""
+        import hashlib as _hl
+
+        _lq = _hl.sha256(str(query).encode("utf-8")).hexdigest()[:16]
+        return f'{self._l2_prefix()}{_lq}:{self.vector_backend}'
+
     def _invalidate_redis_search_cache(self) -> None:
-        """Invalidate Redis L2 hero:cache:memory:search:{ns}:* (best-effort)."""
+        """Invalidate Redis L2 hero:cache:memory:search:{store}:{ns}:* (best-effort)."""
         try:
             from hero_quant.infra.redis import get_redis_sync as _get_rsync
             _r = _get_rsync()
             if _r is not None:
-                _prefix = f"hero:cache:memory:search:{self.namespace or 'default'}:"
+                _prefix = self._l2_prefix()
                 try:
                     for _k in _r.scan_iter(f"{_prefix}*"):
                         try:
@@ -653,6 +689,16 @@ class MemoryStore:
                         self._conn = None  # type: ignore
         except Exception as e:
             _warn("memory_store_close_outer_failed", "MemoryStore close outer failed error_code=memory_store_close_outer_failed: %s", e)
+
+    async def aclose(self) -> None:
+        """异步关停：先释放 pgvector 侧车的异步池，再走幂等 close()。"""
+        pgv = getattr(self, "_pgvector", None)
+        if pgv is not None and hasattr(pgv, "aclose"):
+            try:
+                await pgv.aclose()
+            except Exception as e:
+                _warn("memory_store_aclose_failed", "MemoryStore aclose failed error_code=memory_store_aclose_failed: %s", e)
+        self.close()
 
     def __enter__(self):
         return self
@@ -1796,7 +1842,7 @@ class MemoryStore:
     def search(self, query: str) -> list[dict]:
         """混合检索：BM25 召回 + 向量余弦 via rank_fusion (0.5/0.5) + 可选 Cohere 重排（30s TTL）。
 
-        L1 进程内缓存命中直返；L2 Redis（hero:cache:memory:search:{ns}:{query}:{backend}）命中直返并回填 L1。
+        L1 进程内缓存命中直返；L2 Redis（hero:cache:memory:search:{store}:{ns}:{query}:{backend}）命中直返并回填 L1。
         """
         if not query:
             return []
@@ -1813,11 +1859,9 @@ class MemoryStore:
 
             _r = _get_redis_sync()
             if _r is not None:
-                import hashlib as _hl
                 import json as _js
 
-                _lq = _hl.sha256(str(query).encode()).hexdigest()[:16]
-                _lk = f"hero:cache:memory:search:{self.namespace or 'default'}:{_lq}:{self.vector_backend}"
+                _lk = self._l2_key(query)
                 try:
                     _raw = _r.get(_lk)
                 except Exception:
@@ -2002,11 +2046,9 @@ class MemoryStore:
 
                 _r2 = _get_redis_sync2()
                 if _r2 is not None:
-                    import hashlib as _hl2
                     import json as _js2
 
-                    _lq2 = _hl2.sha256(str(query).encode()).hexdigest()[:16]
-                    _lk2 = f"hero:cache:memory:search:{self.namespace or 'default'}:{_lq2}:{self.vector_backend}"
+                    _lk2 = self._l2_key(query)
                     _r2.set(_lk2, _js2.dumps(deduped, ensure_ascii=False, default=str), ex=30)
             except Exception:
                 pass

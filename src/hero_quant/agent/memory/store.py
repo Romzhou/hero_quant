@@ -1,10 +1,11 @@
-"""Agent 会话记忆存储：OrderedDict LRU。
+"""Agent 会话缓冲存储：OrderedDict LRU。
 
 职责：为 AgentLoop 提供进程内会话级 MemoryBuffer 的获取/淘汰（与
-memory/store.py 的持久化 MemoryStore 区分：此处 key 为 session_id，不落盘）。
+memory/store.py 的持久化 MemoryStore 区分：SessionBuffer 以 session_id 为 key，不落盘）。
 关键设计：上限 MAX_SESSIONS=1000，命中时 move_to_end 保 LRU；淘汰最久未用
-会话并显式 clear 释放引用；模块级 memory_store 仅为离线兜底，生产经
-inject_memory_store(app) 注入 app.state.memory_store。
+会话并显式 clear 释放引用；模块级 session_buffer 仅为离线兜底，生产经
+inject_session_buffer(app) 注入 app.state.session_buffer。
+app.state.memory_store 由 lifespan 装配持久化 hero_quant.memory.store.MemoryStore，两者不得混用。
 """
 
 from __future__ import annotations
@@ -21,8 +22,8 @@ logger = logging.getLogger(__name__)
 MAX_SESSIONS = 1000
 
 
-class MemoryStore:
-    """会话记忆存储（带 LRU 淘汰策略）。"""
+class SessionBuffer:
+    """会话缓冲存储（带 LRU 淘汰策略，进程内、不落盘）。"""
 
     def __init__(self, max_sessions: int = MAX_SESSIONS):
         self._buffers: OrderedDict[int, MemoryBuffer] = OrderedDict()
@@ -88,24 +89,24 @@ class MemoryStore:
             return len(self._buffers)
 
 
-# 离线兜底实例（生产应在启动时经 inject_memory_store 注入 app.state）
-memory_store = MemoryStore()
+# 离线兜底实例（生产应在启动时经 inject_session_buffer 注入 app.state）
+session_buffer = SessionBuffer()
 
 
-def get_memory_store(request) -> MemoryStore:
-    """FastAPI Depends 工厂：优先 app.state.memory_store，否则兜底全局实例。"""
-    store = getattr(request.app.state, "memory_store", None)
+def get_session_buffer(request) -> SessionBuffer:
+    """FastAPI Depends 工厂：优先 app.state.session_buffer，否则兜底全局实例。"""
+    store = getattr(request.app.state, "session_buffer", None)
     if store is None:
-        logger.warning("app.state.memory_store missing, using fallback instance")
-        return memory_store
+        logger.warning("app.state.session_buffer missing, using fallback instance")
+        return session_buffer
     return store
 
 
-def inject_memory_store(app, store: MemoryStore | None = None) -> MemoryStore:
-    """lifespan 注入点：把 MemoryStore 单例挂到 app.state.memory_store。
+def inject_session_buffer(app, store: SessionBuffer | None = None) -> SessionBuffer:
+    """lifespan 注入点：把 SessionBuffer 单例挂到 app.state.session_buffer。
 
-    server.py 正被他轨修改时可仅调用此函数而不改 lifespan 本体。
+    持久化记忆不走这里（见 server.py::_inject_r1_state_on_startup）。
     """
-    bound = store or MemoryStore()
-    app.state.memory_store = bound
+    bound = store or SessionBuffer()
+    app.state.session_buffer = bound
     return bound

@@ -3,7 +3,7 @@
 from hero_quant.session.store import (
     MESSAGE_ROLES,
     RUN_STATUSES,
-    RunNotFound,
+    SessionRunNotFound,
     SessionError,
     SessionNotFound,
     SessionStore,
@@ -13,9 +13,13 @@ from hero_quant.session.store import (
     reset_session_store,
 )
 
+# 兼容别名（不是同名类定义）
+RunNotFound = SessionRunNotFound
+
 __all__ = [
     "MESSAGE_ROLES",
     "RUN_STATUSES",
+    "SessionRunNotFound",
     "RunNotFound",
     "SessionError",
     "SessionNotFound",
